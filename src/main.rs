@@ -6,16 +6,12 @@ use show_image::create_window;
 
 #[show_image::main]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let w: usize = 1280;
-    let h: usize = 720;
-
     // create input image (same size as output)
     // for now, truncate at output size using raw bytes
     let mut input = Vec::<u8>::new();
-    input.reserve(w as usize * h as usize);
     let mut count = 0;
     for possible_value in io::stdin().bytes() {
-        if count >= w * h {
+        if count > 10000000 {
             break;
         }
         match possible_value {
@@ -24,6 +20,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         count += 1;
     }
+
+    let w = f64::sqrt(input.len() as f64) as usize;
+    let h = w;
 
     // create output image
     let mut img = DynamicImage::new_rgb8(w as u32, h as u32);

@@ -37,17 +37,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // null (0) bytes
                 // do nothing; default color is black
             }
+            else if input[i] == 0xFF {
+                // highest bytes - white
+                pixel = Rgba([255, 255, 255, 255]);
+            }
             else if input[i] <= 0x1F {
                 // low bytes/control characters
-                pixel = Rgba::<u8>([0, 255, 0, 255]);
+                let value = ((input[i] as f32 - 0x01 as f32) / (0x1F as f32 - 0x01 as f32)) * 255.0;
+                pixel = Rgba::<u8>([0, value as u8, 0, 255]);
             }
             else if input[i] <= 0x7E {
                 // ascii printable chars
-                pixel = Rgba::<u8>([0, 0, 255, 255]);
+                let value = ((input[i] as f32 - 0x20 as f32) / (0x7E as f32 - 0x20 as f32)) * 255.0;
+                pixel = Rgba::<u8>([0, 0, value as u8, 255]);
             }
             else {
-                // high bytes
-                pixel = Rgba::<u8>([255, 0, 0, 255]);
+                // higher bytes
+                let value = ((input[i] as f32 - 0x7F as f32) / (0xFE as f32 - 0x7F as f32)) * 255.0;
+                pixel = Rgba::<u8>([value as u8, 0, 0, 255]);
             }
             
             img.put_pixel(x as u32, y as u32, pixel);

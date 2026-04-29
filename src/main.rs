@@ -2,9 +2,12 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::PathBuf;
 
+use ab_glyph::{FontRef, PxScale};
 use clap::Parser;
 use fast_hilbert::h2xy;
-use image::{DynamicImage, GenericImage, Rgba};
+use image::{DynamicImage, GenericImage, Rgb, Rgba};
+use imageproc::drawing::{draw_filled_rect_mut, draw_text_mut, text_size};
+use imageproc::rect::Rect;
 use show_image::create_window;
 
 /// Visualize binary files as Hilbert curve plots.
@@ -161,6 +164,78 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         img.put_pixel(x, y, Rgba([0, 0, 0, 255]));
                     }
                 }
+            }
+        }
+    }
+
+    // Draw filename labels in each file's pixel region.
+    if !args.files.is_empty() {
+        // Compute per-file bounding boxes from pixel_file.
+        let mut bboxes: Vec<Option<(u32, u32, u32, u32)>> = vec![None; num_files];
+        for y in 0..side {
+            for x in 0..side {
+                if let Some(fi) = pixel_file[y as usize * side as usize + x as usize] {
+                    bboxes[fi] = Some(match bboxes[fi] {
+                        None => (x, y, x, y),
+                        Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+                    });
+                }
+            }
+        }
+
+        let font = FontRef::try_from_slice(include_bytes!("DejaVuSans.ttf"))
+            .expect("bundled DejaVuSans.ttf is valid");
+        let scale = PxScale { x: 14.0, y: 14.0 };
+        let canvas = img.as_mut_rgb8().expect("canvas is RGB8");
+
+        for (fi, path) in args.files.iter().enumerate() {
+            let Some((x0, y0, x1, y1)) = bboxes[fi] else {
+                continue;
+            };
+            let raw = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let label: String = if raw.chars().count() > 40 {
+                let truncated: String = raw.chars().take(40).collect();
+                format!("{truncated}…")
+            } else {
+                raw
+            };
+
+            let (text_w, text_h) = text_size(scale, &font, &label);
+            let box_w = text_w + 8;
+            let box_h = text_h + 8;
+
+            let mut j = 0u32;
+            loop {
+                let label_y = y0 + 20 + 512 * j;
+                if label_y + box_h - 1 > y1 {
+                    break;
+                }
+                let mut i = 0u32;
+                loop {
+                    let label_x = x0 + 20 + 512 * i;
+                    if label_x + box_w - 1 > x1 {
+                        break;
+                    }
+                    draw_filled_rect_mut(
+                        canvas,
+                        Rect::at(label_x as i32, label_y as i32).of_size(box_w, box_h),
+                        Rgb([0u8, 0, 0]),
+                    );
+                    draw_text_mut(
+                        canvas,
+                        Rgb([0u8, 255, 0]),
+                        (label_x + 4) as i32,
+                        (label_y + 4) as i32,
+                        scale,
+                        &font,
+                        &label,
+                    );
+                    i += 1;
+                }
+                j += 1;
             }
         }
     }

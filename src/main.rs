@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, BufReader, IsTerminal, Read};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read};
 use std::path::PathBuf;
 
 use indicatif::{ProgressBar, ProgressStyle};
@@ -24,6 +24,10 @@ use show_image::create_window;
 struct Args {
     /// Files to visualize (defaults to stdin); multiple files are concatenated
     files: Vec<PathBuf>,
+
+    /// Read file list from this file (one path per line), or - for stdin
+    #[arg(short = 'l', long)]
+    file_list: Option<PathBuf>,
 
     /// Write the canvas to this PNG file instead of displaying a window
     #[arg(short, long)]
@@ -212,8 +216,24 @@ fn draw_file_label(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let num_files = args.files.len().max(1);
-    let (sources, total) = prepare_sources(&args.files)?;
+    let mut files = args.files;
+    if let Some(list_path) = args.file_list {
+        let reader: Box<dyn Read> = if list_path == PathBuf::from("-") {
+            Box::new(io::stdin())
+        } else {
+            Box::new(File::open(&list_path)?)
+        };
+        for line in BufReader::new(reader).lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                files.push(PathBuf::from(trimmed));
+            }
+        }
+    }
+
+    let num_files = files.len().max(1);
+    let (sources, total) = prepare_sources(&files)?;
 
     let total_usize = (total as usize).max(1);
     // Smallest k such that (2^k)^2 >= total, capped at 12 (4096×4096, ~50MB RGB8)
@@ -287,12 +307,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pixel_count += 1;
                 if pixel_count >= canvas_size {
                     // Canvas is full — draw the label for the current file before stopping.
-                    if window.is_some() && !args.files.is_empty() {
+                    if window.is_some() && !files.is_empty() {
                         if let Some(bbox) = bboxes[fi] {
                             draw_file_label(
                                 fi,
                                 bbox,
-                                &args.files,
+                                &files,
                                 img.as_mut_rgb8().expect("canvas is RGB8"),
                                 &pixel_file,
                                 &font,
@@ -314,12 +334,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Source fully consumed — show its label immediately in interactive mode.
-        if window.is_some() && !args.files.is_empty() {
+        if window.is_some() && !files.is_empty() {
             if let Some(bbox) = bboxes[fi] {
                 draw_file_label(
                     fi,
                     bbox,
-                    &args.files,
+                    &files,
                     img.as_mut_rgb8().expect("canvas is RGB8"),
                     &pixel_file,
                     &font,
@@ -364,11 +384,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(path) = args.output {
         // Output mode: draw all labels after the border pass.
-        if !args.files.is_empty() {
+        if !files.is_empty() {
             let canvas = img.as_mut_rgb8().expect("canvas is RGB8");
-            for (fi, _) in args.files.iter().enumerate() {
+            for (fi, _) in files.iter().enumerate() {
                 if let Some(bbox) = bboxes[fi] {
-                    draw_file_label(fi, bbox, &args.files, canvas, &pixel_file, &font, scale, side);
+                    draw_file_label(fi, bbox, &files, canvas, &pixel_file, &font, scale, side);
                 }
             }
         }

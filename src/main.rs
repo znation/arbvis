@@ -207,6 +207,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let box_w = text_w + 8;
             let box_h = text_h + 8;
 
+            let mut try_place = |label_x: u32, label_y: u32| -> bool {
+                if label_x < x0 || label_y < y0 {
+                    return false;
+                }
+                if label_x + box_w - 1 > x1 || label_y + box_h - 1 > y1 {
+                    return false;
+                }
+                let owned = (label_y..label_y + box_h).all(|py| {
+                    (label_x..label_x + box_w).all(|px| {
+                        pixel_file[py as usize * side as usize + px as usize] == Some(fi)
+                    })
+                });
+                if !owned {
+                    return false;
+                }
+                draw_filled_rect_mut(
+                    canvas,
+                    Rect::at(label_x as i32, label_y as i32).of_size(box_w, box_h),
+                    Rgb([0u8, 0, 0]),
+                );
+                draw_text_mut(
+                    canvas,
+                    Rgb([0u8, 255, 0]),
+                    (label_x + 4) as i32,
+                    (label_y + 4) as i32,
+                    scale,
+                    &font,
+                    &label,
+                );
+                true
+            };
+
+            // Phase 1: primary TL grid — preserves multi-label behavior on large files.
+            let mut placed_any = false;
             let mut j = 0u32;
             loop {
                 let label_y = y0 + 20 + 512 * j;
@@ -219,30 +253,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if label_x + box_w - 1 > x1 {
                         break;
                     }
-                    let owned = (label_y..label_y + box_h).all(|py| {
-                        (label_x..label_x + box_w).all(|px| {
-                            pixel_file[py as usize * side as usize + px as usize] == Some(fi)
-                        })
-                    });
-                    if owned {
-                        draw_filled_rect_mut(
-                            canvas,
-                            Rect::at(label_x as i32, label_y as i32).of_size(box_w, box_h),
-                            Rgb([0u8, 0, 0]),
-                        );
-                        draw_text_mut(
-                            canvas,
-                            Rgb([0u8, 255, 0]),
-                            (label_x + 4) as i32,
-                            (label_y + 4) as i32,
-                            scale,
-                            &font,
-                            &label,
-                        );
+                    if try_place(label_x, label_y) {
+                        placed_any = true;
                     }
                     i += 1;
                 }
                 j += 1;
+            }
+
+            // Phase 2: try the other three corners with the same 20px inset.
+            if !placed_any {
+                let right_x = (x1 + 1).saturating_sub(box_w + 20);
+                let bottom_y = (y1 + 1).saturating_sub(box_h + 20);
+                for (cx, cy) in [
+                    (right_x, y0 + 20),  // TR
+                    (x0 + 20, bottom_y), // BL
+                    (right_x, bottom_y), // BR
+                ] {
+                    if try_place(cx, cy) {
+                        placed_any = true;
+                        break;
+                    }
+                }
+            }
+
+            // Phase 3: coarse scan of the entire bbox for any owned position.
+            if !placed_any {
+                const STRIDE: u32 = 8;
+                let max_x = (x1 + 1).saturating_sub(box_w);
+                let max_y = (y1 + 1).saturating_sub(box_h);
+                'scan: for cy in (y0..=max_y).step_by(STRIDE as usize) {
+                    for cx in (x0..=max_x).step_by(STRIDE as usize) {
+                        if try_place(cx, cy) {
+                            break 'scan;
+                        }
+                    }
+                }
             }
         }
     }

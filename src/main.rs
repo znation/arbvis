@@ -1,11 +1,29 @@
-use std::io::{self, Read};
+use std::fs::File;
+use std::io::{self, BufReader, Read};
+use std::path::PathBuf;
 
+use clap::Parser;
 use fast_hilbert::h2xy;
 use image::{DynamicImage, GenericImage, Rgba};
 use show_image::create_window;
 
+/// Visualize binary files as Hilbert curve plots.
+///
+/// Each byte is mapped to a color and placed along a Hilbert curve, so
+/// structural patterns in the file (e.g. repeated null regions, ASCII text,
+/// high-entropy compressed data) become visually apparent.
+///
+/// Reads from FILE if provided, otherwise reads from stdin.
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// File to visualize (defaults to stdin)
+    file: Option<PathBuf>,
+}
+
 #[show_image::main]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
     const W: u32 = 400;
     const H: u32 = 400;
     const LEN: usize = W as usize * H as usize;
@@ -20,7 +38,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // create input image (same size as output)
     // for now, truncate at output size using raw bytes
     let mut count = 0;
-    for possible_value in io::stdin().bytes() {
+    let reader: Box<dyn Read> = match args.file {
+        Some(path) => Box::new(BufReader::new(File::open(path)?)),
+        None => Box::new(io::stdin()),
+    };
+    for possible_value in reader.bytes() {
         if count >= LEN {
             window.set_image("image-001", img)?;
             img = DynamicImage::new_rgb8(W, H);

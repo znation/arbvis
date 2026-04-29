@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 fast_hilbert = "2.0"
 image = "0.25"
 show-image = {version = "0.14", features = ["image"]}

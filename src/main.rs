@@ -81,6 +81,117 @@ fn prepare_sources(files: &[PathBuf]) -> Result<(Vec<Source>, u64), Box<dyn std:
     Ok((sources, total))
 }
 
+fn draw_file_label(
+    fi: usize,
+    bbox: (u32, u32, u32, u32),
+    files: &[PathBuf],
+    canvas: &mut image::ImageBuffer<Rgb<u8>, Vec<u8>>,
+    pixel_file: &[Option<usize>],
+    font: &FontRef<'static>,
+    scale: PxScale,
+    side: u32,
+) {
+    let (x0, y0, x1, y1) = bbox;
+    let raw = files[fi]
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let label: String = if raw.chars().count() > 40 {
+        let truncated: String = raw.chars().take(40).collect();
+        format!("{truncated}…")
+    } else {
+        raw
+    };
+
+    let (text_w, text_h) = text_size(scale, font, &label);
+    let box_w = text_w + 8;
+    let box_h = text_h + 8;
+
+    let mut try_place = |label_x: u32, label_y: u32| -> bool {
+        if label_x < x0 || label_y < y0 {
+            return false;
+        }
+        if label_x + box_w - 1 > x1 || label_y + box_h - 1 > y1 {
+            return false;
+        }
+        let owned = (label_y..label_y + box_h).all(|py| {
+            (label_x..label_x + box_w).all(|px| {
+                pixel_file[py as usize * side as usize + px as usize] == Some(fi)
+            })
+        });
+        if !owned {
+            return false;
+        }
+        draw_filled_rect_mut(
+            canvas,
+            Rect::at(label_x as i32, label_y as i32).of_size(box_w, box_h),
+            Rgb([0u8, 0, 0]),
+        );
+        draw_text_mut(
+            canvas,
+            Rgb([0u8, 255, 0]),
+            (label_x + 4) as i32,
+            (label_y + 4) as i32,
+            scale,
+            font,
+            &label,
+        );
+        true
+    };
+
+    // Phase 1: primary TL grid — preserves multi-label behavior on large files.
+    let mut placed_any = false;
+    let mut j = 0u32;
+    loop {
+        let label_y = y0 + 20 + 512 * j;
+        if label_y + box_h - 1 > y1 {
+            break;
+        }
+        let mut i = 0u32;
+        loop {
+            let label_x = x0 + 20 + 512 * i;
+            if label_x + box_w - 1 > x1 {
+                break;
+            }
+            if try_place(label_x, label_y) {
+                placed_any = true;
+            }
+            i += 1;
+        }
+        j += 1;
+    }
+
+    // Phase 2: try the other three corners with the same 20px inset.
+    if !placed_any {
+        let right_x = (x1 + 1).saturating_sub(box_w + 20);
+        let bottom_y = (y1 + 1).saturating_sub(box_h + 20);
+        for (cx, cy) in [
+            (right_x, y0 + 20),  // TR
+            (x0 + 20, bottom_y), // BL
+            (right_x, bottom_y), // BR
+        ] {
+            if try_place(cx, cy) {
+                placed_any = true;
+                break;
+            }
+        }
+    }
+
+    // Phase 3: coarse scan of the entire bbox for any owned position.
+    if !placed_any {
+        const STRIDE: u32 = 8;
+        let max_x = (x1 + 1).saturating_sub(box_w);
+        let max_y = (y1 + 1).saturating_sub(box_h);
+        'scan: for cy in (y0..=max_y).step_by(STRIDE as usize) {
+            for cx in (x0..=max_x).step_by(STRIDE as usize) {
+                if try_place(cx, cy) {
+                    break 'scan;
+                }
+            }
+        }
+    }
+}
+
 #[show_image::main]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -113,18 +224,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let font = FontRef::try_from_slice(include_bytes!("DejaVuSans.ttf"))
+        .expect("bundled DejaVuSans.ttf is valid");
+    let scale = PxScale { x: 14.0, y: 14.0 };
+
     // pixel_file[y * side + x] = which file index painted this pixel
     let mut pixel_file: Vec<Option<usize>> = vec![None; canvas_size];
+    let mut bboxes: Vec<Option<(u32, u32, u32, u32)>> = vec![None; num_files];
     let mut byte_pos: u64 = 0;
     let mut pixel_count: usize = 0;
 
     'outer: for source in sources {
+        let fi = source.file_idx;
         for b in source.reader.bytes() {
             let b = b?;
             if byte_pos % stride == 0 {
                 let (x, y): (u32, u32) = h2xy(pixel_count as u64, 1);
                 img.put_pixel(x, y, byte_to_pixel(b));
-                pixel_file[y as usize * side as usize + x as usize] = Some(source.file_idx);
+                pixel_file[y as usize * side as usize + x as usize] = Some(fi);
+
+                bboxes[fi] = Some(match bboxes[fi] {
+                    None => (x, y, x, y),
+                    Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+                });
 
                 if let Some(ref w) = window {
                     if pixel_count % 10000 == 0 {
@@ -134,10 +256,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 pixel_count += 1;
                 if pixel_count >= canvas_size {
+                    // Canvas is full — draw the label for the current file before stopping.
+                    if window.is_some() && !args.files.is_empty() {
+                        if let Some(bbox) = bboxes[fi] {
+                            draw_file_label(
+                                fi,
+                                bbox,
+                                &args.files,
+                                img.as_mut_rgb8().expect("canvas is RGB8"),
+                                &pixel_file,
+                                &font,
+                                scale,
+                                side,
+                            );
+                            window.as_ref().unwrap().set_image("image-001", img.clone())?;
+                        }
+                    }
                     break 'outer;
                 }
             }
             byte_pos += 1;
+        }
+
+        // Source fully consumed — show its label immediately in interactive mode.
+        if window.is_some() && !args.files.is_empty() {
+            if let Some(bbox) = bboxes[fi] {
+                draw_file_label(
+                    fi,
+                    bbox,
+                    &args.files,
+                    img.as_mut_rgb8().expect("canvas is RGB8"),
+                    &pixel_file,
+                    &font,
+                    scale,
+                    side,
+                );
+                window.as_ref().unwrap().set_image("image-001", img.clone())?;
+            }
         }
     }
 
@@ -168,134 +323,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Draw filename labels in each file's pixel region.
-    if !args.files.is_empty() {
-        // Compute per-file bounding boxes from pixel_file.
-        let mut bboxes: Vec<Option<(u32, u32, u32, u32)>> = vec![None; num_files];
-        for y in 0..side {
-            for x in 0..side {
-                if let Some(fi) = pixel_file[y as usize * side as usize + x as usize] {
-                    bboxes[fi] = Some(match bboxes[fi] {
-                        None => (x, y, x, y),
-                        Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
-                    });
-                }
-            }
-        }
-
-        let font = FontRef::try_from_slice(include_bytes!("DejaVuSans.ttf"))
-            .expect("bundled DejaVuSans.ttf is valid");
-        let scale = PxScale { x: 14.0, y: 14.0 };
-        let canvas = img.as_mut_rgb8().expect("canvas is RGB8");
-
-        for (fi, path) in args.files.iter().enumerate() {
-            let Some((x0, y0, x1, y1)) = bboxes[fi] else {
-                continue;
-            };
-            let raw = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let label: String = if raw.chars().count() > 40 {
-                let truncated: String = raw.chars().take(40).collect();
-                format!("{truncated}…")
-            } else {
-                raw
-            };
-
-            let (text_w, text_h) = text_size(scale, &font, &label);
-            let box_w = text_w + 8;
-            let box_h = text_h + 8;
-
-            let mut try_place = |label_x: u32, label_y: u32| -> bool {
-                if label_x < x0 || label_y < y0 {
-                    return false;
-                }
-                if label_x + box_w - 1 > x1 || label_y + box_h - 1 > y1 {
-                    return false;
-                }
-                let owned = (label_y..label_y + box_h).all(|py| {
-                    (label_x..label_x + box_w).all(|px| {
-                        pixel_file[py as usize * side as usize + px as usize] == Some(fi)
-                    })
-                });
-                if !owned {
-                    return false;
-                }
-                draw_filled_rect_mut(
-                    canvas,
-                    Rect::at(label_x as i32, label_y as i32).of_size(box_w, box_h),
-                    Rgb([0u8, 0, 0]),
-                );
-                draw_text_mut(
-                    canvas,
-                    Rgb([0u8, 255, 0]),
-                    (label_x + 4) as i32,
-                    (label_y + 4) as i32,
-                    scale,
-                    &font,
-                    &label,
-                );
-                true
-            };
-
-            // Phase 1: primary TL grid — preserves multi-label behavior on large files.
-            let mut placed_any = false;
-            let mut j = 0u32;
-            loop {
-                let label_y = y0 + 20 + 512 * j;
-                if label_y + box_h - 1 > y1 {
-                    break;
-                }
-                let mut i = 0u32;
-                loop {
-                    let label_x = x0 + 20 + 512 * i;
-                    if label_x + box_w - 1 > x1 {
-                        break;
-                    }
-                    if try_place(label_x, label_y) {
-                        placed_any = true;
-                    }
-                    i += 1;
-                }
-                j += 1;
-            }
-
-            // Phase 2: try the other three corners with the same 20px inset.
-            if !placed_any {
-                let right_x = (x1 + 1).saturating_sub(box_w + 20);
-                let bottom_y = (y1 + 1).saturating_sub(box_h + 20);
-                for (cx, cy) in [
-                    (right_x, y0 + 20),  // TR
-                    (x0 + 20, bottom_y), // BL
-                    (right_x, bottom_y), // BR
-                ] {
-                    if try_place(cx, cy) {
-                        placed_any = true;
-                        break;
-                    }
-                }
-            }
-
-            // Phase 3: coarse scan of the entire bbox for any owned position.
-            if !placed_any {
-                const STRIDE: u32 = 8;
-                let max_x = (x1 + 1).saturating_sub(box_w);
-                let max_y = (y1 + 1).saturating_sub(box_h);
-                'scan: for cy in (y0..=max_y).step_by(STRIDE as usize) {
-                    for cx in (x0..=max_x).step_by(STRIDE as usize) {
-                        if try_place(cx, cy) {
-                            break 'scan;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     if let Some(path) = args.output {
+        // Output mode: draw all labels after the border pass.
+        if !args.files.is_empty() {
+            let canvas = img.as_mut_rgb8().expect("canvas is RGB8");
+            for (fi, _) in args.files.iter().enumerate() {
+                if let Some(bbox) = bboxes[fi] {
+                    draw_file_label(fi, bbox, &args.files, canvas, &pixel_file, &font, scale, side);
+                }
+            }
+        }
         img.save(&path)?;
     } else if let Some(w) = window {
+        // Interactive mode: labels already drawn progressively; just push the border pass result.
         w.set_image("image-001", img)?;
         w.wait_until_destroyed()?;
     }

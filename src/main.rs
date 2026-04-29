@@ -107,9 +107,13 @@ fn prepare_sources(files: &[PathBuf]) -> Result<(Vec<Source>, u64), Box<dyn std:
     let mut sources = Vec::with_capacity(files.len());
     let mut total = 0u64;
     for (i, path) in files.iter().enumerate() {
-        let size = std::fs::metadata(path)
-            .map_err(|e| format!("{}: {}", path.display(), e))?
-            .len();
+        let size = match std::fs::metadata(path) {
+            Ok(m) => m.len(),
+            Err(e) => {
+                eprintln!("warning: {}: {} — skipping", path.display(), e);
+                continue;
+            }
+        };
         total += size;
         sources.push(Source {
             file_idx: i,

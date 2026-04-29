@@ -250,9 +250,7 @@ fn draw_file_label(
     }
 }
 
-#[show_image::main]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut files = args.files;
     if let Some(list_path) = args.file_list {
@@ -507,4 +505,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         w.wait_until_destroyed()?;
     }
     Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    if args.output.is_some() {
+        run(args)
+    } else {
+        show_image::run_context(move || run(args));
+    }
 }

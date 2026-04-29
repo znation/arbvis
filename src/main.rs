@@ -1,6 +1,8 @@
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, IsTerminal, Read};
 use std::path::PathBuf;
+
+use indicatif::{ProgressBar, ProgressStyle};
 
 use ab_glyph::{FontRef, PxScale};
 use clap::Parser;
@@ -234,6 +236,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut byte_pos: u64 = 0;
     let mut pixel_count: usize = 0;
 
+    let pb = if std::io::stderr().is_terminal() {
+        let pb = ProgressBar::new(total);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+            )
+            .unwrap()
+            .progress_chars("=>-"),
+        );
+        Some(pb)
+    } else {
+        None
+    };
+
     'outer: for source in sources {
         let fi = source.file_idx;
         for b in source.reader.bytes() {
@@ -276,6 +292,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             byte_pos += 1;
+            if let Some(ref pb) = pb {
+                if byte_pos % 100_000 == 0 {
+                    pb.set_position(byte_pos);
+                }
+            }
         }
 
         // Source fully consumed — show its label immediately in interactive mode.
@@ -294,6 +315,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 window.as_ref().unwrap().set_image("image-001", img.clone())?;
             }
         }
+    }
+
+    if let Some(pb) = pb {
+        pb.finish_and_clear();
     }
 
     // When multiple files are given, mark pixels on the border between files black.

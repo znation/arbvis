@@ -67,7 +67,10 @@ impl Source {
     fn open(self) -> Result<Box<dyn Read>, Box<dyn std::error::Error>> {
         Ok(match self.kind {
             SourceKind::Buffered(buf) => Box::new(io::Cursor::new(buf)),
-            SourceKind::File(path) => Box::new(BufReader::new(File::open(path)?)),
+            SourceKind::File(ref path) => Box::new(BufReader::new(
+                File::open(path)
+                    .map_err(|e| format!("{}: {}", path.display(), e))?,
+            )),
         })
     }
 }
@@ -92,7 +95,9 @@ fn prepare_sources(files: &[PathBuf]) -> Result<(Vec<Source>, u64), Box<dyn std:
     let mut sources = Vec::with_capacity(files.len());
     let mut total = 0u64;
     for (i, path) in files.iter().enumerate() {
-        total += std::fs::metadata(path)?.len();
+        total += std::fs::metadata(path)
+            .map_err(|e| format!("{}: {}", path.display(), e))?
+            .len();
         sources.push(Source {
             file_idx: i,
             kind: SourceKind::File(path.clone()),
@@ -235,7 +240,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let reader: Box<dyn Read> = if list_path == PathBuf::from("-") {
             Box::new(io::stdin())
         } else {
-            Box::new(File::open(&list_path)?)
+            Box::new(
+                File::open(&list_path)
+                    .map_err(|e| format!("{}: {}", list_path.display(), e))?,
+            )
         };
         for line in BufReader::new(reader).lines() {
             let line = line?;
@@ -407,7 +415,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        img.save(&path)?;
+        img.save(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
     } else if let Some(w) = window {
         // Interactive mode: labels already drawn progressively; just push the border pass result.
         w.set_image("image-001", img)?;

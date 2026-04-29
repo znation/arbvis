@@ -219,20 +219,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if label_x + box_w - 1 > x1 {
                         break;
                     }
-                    draw_filled_rect_mut(
-                        canvas,
-                        Rect::at(label_x as i32, label_y as i32).of_size(box_w, box_h),
-                        Rgb([0u8, 0, 0]),
-                    );
-                    draw_text_mut(
-                        canvas,
-                        Rgb([0u8, 255, 0]),
-                        (label_x + 4) as i32,
-                        (label_y + 4) as i32,
-                        scale,
-                        &font,
-                        &label,
-                    );
+                    let owned = (label_y..label_y + box_h).all(|py| {
+                        (label_x..label_x + box_w).all(|px| {
+                            pixel_file[py as usize * side as usize + px as usize] == Some(fi)
+                        })
+                    });
+                    if owned {
+                        draw_filled_rect_mut(
+                            canvas,
+                            Rect::at(label_x as i32, label_y as i32).of_size(box_w, box_h),
+                            Rgb([0u8, 0, 0]),
+                        );
+                        draw_text_mut(
+                            canvas,
+                            Rgb([0u8, 255, 0]),
+                            (label_x + 4) as i32,
+                            (label_y + 4) as i32,
+                            scale,
+                            &font,
+                            &label,
+                        );
+                    }
                     i += 1;
                 }
                 j += 1;

@@ -67,21 +67,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let total = all_bytes.len().max(1);
-    // Smallest k such that (2^k)^2 >= total.
+    // Smallest k such that (2^k)^2 >= total, capped at 12 (4096×4096, ~50MB RGB8)
+    // to stay within GPU max_buffer_binding_size limits (~128MB).
     let mut k = 1u32;
     while (1usize << (2 * k)) < total {
         k += 1;
     }
+    let k = k.min(12);
     let side = 1u32 << k;
-    let len = (side * side) as usize;
+    let canvas_size = (side * side) as usize;
+
+    // Subsample if there are more bytes than canvas pixels.
+    let stride = if total > canvas_size {
+        (total + canvas_size - 1) / canvas_size
+    } else {
+        1
+    };
+    let sampled: Vec<(usize, u8)> = all_bytes.iter().step_by(stride).take(canvas_size).cloned().collect();
 
     let mut img = DynamicImage::new_rgb8(side, side);
     let window = create_window("image", Default::default())?;
 
     // pixel_file[y * side + x] = which file index painted this pixel
-    let mut pixel_file: Vec<Option<usize>> = vec![None; len];
+    let mut pixel_file: Vec<Option<usize>> = vec![None; canvas_size];
 
-    for (count, (file_idx, v)) in all_bytes.iter().enumerate() {
+    for (count, (file_idx, v)) in sampled.iter().enumerate() {
         let (x, y): (u32, u32) = h2xy(count as u64, 1);
         img.put_pixel(x, y, byte_to_pixel(*v));
         pixel_file[y as usize * side as usize + x as usize] = Some(*file_idx);

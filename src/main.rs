@@ -442,7 +442,6 @@ fn write_leaflet_html(
     }});
     L.tileLayer('tiles/{{z}}/{{x}}/{{y}}.png', {{
       tileSize: 256,
-      tms: true,
       bounds: [[0, 0], [{side}, {side}]],
       noWrap: true,
       attribution: 'arbvis'

@@ -53,13 +53,28 @@ fn byte_to_pixel(v: u8) -> Rgba<u8> {
     }
 }
 
+enum SourceKind {
+    Buffered(Vec<u8>),
+    File(PathBuf),
+}
+
 struct Source {
     file_idx: usize,
-    reader: Box<dyn Read>,
+    kind: SourceKind,
+}
+
+impl Source {
+    fn open(self) -> Result<Box<dyn Read>, Box<dyn std::error::Error>> {
+        Ok(match self.kind {
+            SourceKind::Buffered(buf) => Box::new(io::Cursor::new(buf)),
+            SourceKind::File(path) => Box::new(BufReader::new(File::open(path)?)),
+        })
+    }
 }
 
 /// Build sources and return total byte count.
-/// Files are opened for streaming; stdin is buffered into memory (size unknown until read).
+/// Files are opened lazily (one at a time) to avoid exhausting OS fd limits.
+/// Stdin is buffered into memory upfront since its size is unknown.
 fn prepare_sources(files: &[PathBuf]) -> Result<(Vec<Source>, u64), Box<dyn std::error::Error>> {
     if files.is_empty() {
         let mut buf = Vec::new();
@@ -68,7 +83,7 @@ fn prepare_sources(files: &[PathBuf]) -> Result<(Vec<Source>, u64), Box<dyn std:
         return Ok((
             vec![Source {
                 file_idx: 0,
-                reader: Box::new(io::Cursor::new(buf)),
+                kind: SourceKind::Buffered(buf),
             }],
             len,
         ));
@@ -77,11 +92,10 @@ fn prepare_sources(files: &[PathBuf]) -> Result<(Vec<Source>, u64), Box<dyn std:
     let mut sources = Vec::with_capacity(files.len());
     let mut total = 0u64;
     for (i, path) in files.iter().enumerate() {
-        let byte_count = std::fs::metadata(path)?.len();
-        total += byte_count;
+        total += std::fs::metadata(path)?.len();
         sources.push(Source {
             file_idx: i,
-            reader: Box::new(BufReader::new(File::open(path)?)),
+            kind: SourceKind::File(path.clone()),
         });
     }
     Ok((sources, total))
@@ -286,7 +300,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     'outer: for source in sources {
         let fi = source.file_idx;
-        for b in source.reader.bytes() {
+        let reader = source.open()?;
+        for b in reader.bytes() {
             let b = b?;
             if byte_pos % stride == 0 {
                 let (x, y): (u32, u32) = h2xy(pixel_count as u64, 1);

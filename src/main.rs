@@ -19,6 +19,10 @@ use show_image::create_window;
 struct Args {
     /// Files to visualize (defaults to stdin); multiple files are concatenated
     files: Vec<PathBuf>,
+
+    /// Write the canvas to this PNG file instead of displaying a window
+    #[arg(short, long)]
+    output: Option<PathBuf>,
 }
 
 fn byte_to_pixel(v: u8) -> Rgba<u8> {
@@ -40,37 +44,52 @@ fn byte_to_pixel(v: u8) -> Rgba<u8> {
     }
 }
 
+struct Source {
+    file_idx: usize,
+    reader: Box<dyn Read>,
+}
+
+/// Build sources and return total byte count.
+/// Files are opened for streaming; stdin is buffered into memory (size unknown until read).
+fn prepare_sources(files: &[PathBuf]) -> Result<(Vec<Source>, u64), Box<dyn std::error::Error>> {
+    if files.is_empty() {
+        let mut buf = Vec::new();
+        io::stdin().read_to_end(&mut buf)?;
+        let len = buf.len() as u64;
+        return Ok((
+            vec![Source {
+                file_idx: 0,
+                reader: Box::new(io::Cursor::new(buf)),
+            }],
+            len,
+        ));
+    }
+
+    let mut sources = Vec::with_capacity(files.len());
+    let mut total = 0u64;
+    for (i, path) in files.iter().enumerate() {
+        let byte_count = std::fs::metadata(path)?.len();
+        total += byte_count;
+        sources.push(Source {
+            file_idx: i,
+            reader: Box::new(BufReader::new(File::open(path)?)),
+        });
+    }
+    Ok((sources, total))
+}
+
 #[show_image::main]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let readers: Vec<(usize, Box<dyn Read>)> = if args.files.is_empty() {
-        vec![(0, Box::new(io::stdin()))]
-    } else {
-        args.files
-            .iter()
-            .enumerate()
-            .map(|(i, p)| -> Result<(usize, Box<dyn Read>), io::Error> {
-                Ok((i, Box::new(BufReader::new(File::open(p)?))))
-            })
-            .collect::<Result<_, io::Error>>()?
-    };
+    let num_files = args.files.len().max(1);
+    let (sources, total) = prepare_sources(&args.files)?;
 
-    let num_files = readers.len();
-
-    // Read all bytes upfront so we know total size before sizing the canvas.
-    let mut all_bytes: Vec<(usize, u8)> = Vec::new();
-    for (file_idx, reader) in readers {
-        for b in reader.bytes() {
-            all_bytes.push((file_idx, b?));
-        }
-    }
-
-    let total = all_bytes.len().max(1);
+    let total_usize = (total as usize).max(1);
     // Smallest k such that (2^k)^2 >= total, capped at 12 (4096×4096, ~50MB RGB8)
     // to stay within GPU max_buffer_binding_size limits (~128MB).
     let mut k = 1u32;
-    while (1usize << (2 * k)) < total {
+    while (1usize << (2 * k)) < total_usize {
         k += 1;
     }
     let k = k.min(12);
@@ -78,26 +97,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let canvas_size = (side * side) as usize;
 
     // Subsample if there are more bytes than canvas pixels.
-    let stride = if total > canvas_size {
-        (total + canvas_size - 1) / canvas_size
+    let stride = if total_usize > canvas_size {
+        (total_usize + canvas_size - 1) / canvas_size
     } else {
         1
-    };
-    let sampled: Vec<(usize, u8)> = all_bytes.iter().step_by(stride).take(canvas_size).cloned().collect();
+    } as u64;
 
     let mut img = DynamicImage::new_rgb8(side, side);
-    let window = create_window("image", Default::default())?;
+    let window = if args.output.is_none() {
+        Some(create_window("image", Default::default())?)
+    } else {
+        None
+    };
 
     // pixel_file[y * side + x] = which file index painted this pixel
     let mut pixel_file: Vec<Option<usize>> = vec![None; canvas_size];
+    let mut byte_pos: u64 = 0;
+    let mut pixel_count: usize = 0;
 
-    for (count, (file_idx, v)) in sampled.iter().enumerate() {
-        let (x, y): (u32, u32) = h2xy(count as u64, 1);
-        img.put_pixel(x, y, byte_to_pixel(*v));
-        pixel_file[y as usize * side as usize + x as usize] = Some(*file_idx);
+    'outer: for source in sources {
+        for b in source.reader.bytes() {
+            let b = b?;
+            if byte_pos % stride == 0 {
+                let (x, y): (u32, u32) = h2xy(pixel_count as u64, 1);
+                img.put_pixel(x, y, byte_to_pixel(b));
+                pixel_file[y as usize * side as usize + x as usize] = Some(source.file_idx);
 
-        if count % 10000 == 0 {
-            window.set_image("image-001", img.clone())?;
+                if let Some(ref w) = window {
+                    if pixel_count % 10000 == 0 {
+                        w.set_image("image-001", img.clone())?;
+                    }
+                }
+
+                pixel_count += 1;
+                if pixel_count >= canvas_size {
+                    break 'outer;
+                }
+            }
+            byte_pos += 1;
         }
     }
 
@@ -128,7 +165,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    window.set_image("image-001", img)?;
-    window.wait_until_destroyed()?;
+    if let Some(path) = args.output {
+        img.save(&path)?;
+    } else if let Some(w) = window {
+        w.set_image("image-001", img)?;
+        w.wait_until_destroyed()?;
+    }
     Ok(())
 }

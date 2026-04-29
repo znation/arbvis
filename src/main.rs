@@ -468,6 +468,7 @@ fn write_leaflet_html(
       white-space: nowrap;
       border-radius: 2px;
       pointer-events: none;
+      transform: translate(-50%, -50%);
     }}
   </style>
 </head>
@@ -496,6 +497,7 @@ fn write_leaflet_html(
         icon: L.divIcon({{
           className: 'file-label',
           html: l.name,
+          iconSize: [0, 0],
           iconAnchor: [0, 0]
         }}),
         interactive: false
@@ -562,7 +564,8 @@ fn run_tiles(
         None
     };
 
-    // Pre-compute each file's starting pixel position for the label overlay.
+    // Pre-compute each file's label position at the midpoint byte, which maps
+    // to the approximate visual center of the file's Hilbert-curve region.
     let mut labels: Vec<FileLabel> = Vec::new();
     {
         let mut cumulative: u64 = 0;
@@ -574,8 +577,9 @@ fn run_tiles(
                     .unwrap_or_else(|| p.to_string_lossy().into_owned()),
                 SourceKind::Buffered(_) => "stdin".to_string(),
             };
-            let square_idx = cumulative / square_pixels;
-            let local_idx = cumulative % square_pixels;
+            let mid = cumulative + source.byte_size / 2;
+            let square_idx = mid / square_pixels;
+            let local_idx = mid % square_pixels;
             let (lx, ly): (u32, u32) = h2xy(local_idx, kh as u8);
             let pixel_x = square_idx as u32 * height + lx;
             let pixel_y = ly;

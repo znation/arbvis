@@ -415,10 +415,157 @@ fn build_pyramid(
     Ok(())
 }
 
-struct FileLabel {
+struct FileEntity {
     name: String,
     pixel_x: u32,
     pixel_y: u32,
+    hue: u16,
+    segments: Vec<(u32, u32, u32, u32)>, // (x0, y0, x1, y1) in pixel-boundary coords
+}
+
+// Hilbert sub-quadrant state table.
+// CHILD_TABLE[state][i] = (dx, dy, child_state) where (dx,dy) ∈ {0,1}²
+// give the child quadrant's position within the parent (units of child_side).
+// Derived from fast_hilbert's order-1 LUT.
+const CHILD_TABLE: [[(u32, u32, u8); 4]; 4] = [
+    [(0, 0, 1), (0, 1, 0), (1, 1, 0), (1, 0, 2)], // state 0
+    [(0, 0, 0), (1, 0, 1), (1, 1, 1), (0, 1, 3)], // state 1
+    [(1, 1, 3), (0, 1, 2), (0, 0, 2), (1, 0, 0)], // state 2
+    [(1, 1, 2), (1, 0, 3), (0, 0, 3), (0, 1, 1)], // state 3
+];
+
+fn name_hue(name: &str) -> u16 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    name.hash(&mut h);
+    (h.finish() % 360) as u16
+}
+
+/// Recursively decompose Hilbert local range [a, b) at `level` (order-`level`
+/// curve on a 2^level × 2^level square) into axis-aligned pixel rectangles.
+fn decompose_hilbert(
+    a: u64, b: u64,
+    level: u8,
+    x0: u32, y0: u32,
+    side: u32,
+    state: u8,
+    out: &mut Vec<(u32, u32, u32, u32)>,
+) {
+    let total = (side as u64) * (side as u64);
+    if a == 0 && b == total {
+        out.push((x0, y0, x0 + side, y0 + side));
+        return;
+    }
+    if level == 0 {
+        out.push((x0, y0, x0 + 1, y0 + 1));
+        return;
+    }
+    let child_side = side >> 1;
+    let q_size = (child_side as u64) * (child_side as u64);
+    for i in 0u64..4 {
+        let ca = i * q_size;
+        let cb = ca + q_size;
+        if a >= cb || b <= ca {
+            continue;
+        }
+        let (dx, dy, child_state) = CHILD_TABLE[state as usize][i as usize];
+        decompose_hilbert(
+            a.saturating_sub(ca),
+            b.min(cb) - ca,
+            level - 1,
+            x0 + dx * child_side,
+            y0 + dy * child_side,
+            child_side,
+            child_state,
+            out,
+        );
+    }
+}
+
+/// Compute the XOR-merged set of a list of intervals: ranges covered by an odd
+/// number of input intervals. Used for extracting outer boundary edges.
+fn xor_intervals(intervals: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut events: Vec<(u32, i8)> = Vec::with_capacity(intervals.len() * 2);
+    for &(lo, hi) in intervals {
+        if lo < hi {
+            events.push((lo, 1));
+            events.push((hi, -1));
+        }
+    }
+    events.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut result = Vec::new();
+    let mut count: i32 = 0;
+    let mut seg_start = 0u32;
+    for (y, delta) in &events {
+        let was_odd = count % 2 != 0;
+        count += *delta as i32;
+        let is_odd = count % 2 != 0;
+        if !was_odd && is_odd {
+            seg_start = *y;
+        } else if was_odd && !is_odd && seg_start < *y {
+            result.push((seg_start, *y));
+        }
+    }
+    result
+}
+
+/// Compute outer boundary segments of a set of axis-aligned pixel rectangles
+/// that exactly tile a region. Returns (x0,y0,x1,y1) segments in pixel-boundary
+/// coords: a rect [px, px+w) × [py, py+h) has edges at x=px, x=px+w, y=py, y=py+h.
+fn outer_segments(rects: &[(u32, u32, u32, u32)]) -> Vec<(u32, u32, u32, u32)> {
+    let mut vert: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+    let mut horiz: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+    for &(x0, y0, x1, y1) in rects {
+        vert.entry(x0).or_default().push((y0, y1));
+        vert.entry(x1).or_default().push((y0, y1));
+        horiz.entry(y0).or_default().push((x0, x1));
+        horiz.entry(y1).or_default().push((x0, x1));
+    }
+    let mut result = Vec::new();
+    for (&x, intervals) in &vert {
+        for (lo, hi) in xor_intervals(intervals) {
+            result.push((x, lo, x, hi));
+        }
+    }
+    for (&y, intervals) in &horiz {
+        for (lo, hi) in xor_intervals(intervals) {
+            result.push((lo, y, hi, y));
+        }
+    }
+    result
+}
+
+/// Decompose a file's pixel footprint (given as a byte range in the tile grid)
+/// into outer boundary segments in global pixel-boundary coordinates.
+fn file_boundary_segments(
+    byte_start: u64,
+    byte_end: u64,
+    total_pixels: u64,
+    square_pixels: u64,
+    num_squares: u32,
+    height: u32,
+    kh: u8,
+) -> Vec<(u32, u32, u32, u32)> {
+    let byte_end = byte_end.min(total_pixels);
+    if byte_end <= byte_start {
+        return Vec::new();
+    }
+    let mut all_rects: Vec<(u32, u32, u32, u32)> = Vec::new();
+    for sq in 0..num_squares as u64 {
+        let sq_start = sq * square_pixels;
+        let sq_end = sq_start + square_pixels;
+        let local_a = byte_start.max(sq_start).saturating_sub(sq_start);
+        let local_b = byte_end.min(sq_end).saturating_sub(sq_start);
+        if local_b <= local_a {
+            continue;
+        }
+        let x_off = sq as u32 * height;
+        let mut rects = Vec::new();
+        decompose_hilbert(local_a, local_b, kh, x_off, 0, height, 0, &mut rects);
+        all_rects.extend(rects);
+    }
+    outer_segments(&all_rects)
 }
 
 fn write_leaflet_html(
@@ -426,20 +573,29 @@ fn write_leaflet_html(
     world_w: u32,
     max_zoom: u32,
     height: u32,
-    labels: &[FileLabel],
+    entities: &[FileEntity],
 ) -> Result<(), Box<dyn std::error::Error>> {
     // L.CRS.Simple uses transformation (1,0,-1,0): pixel.y = -lat.
     // World height is always 256 units (one tile at zoom 0 in y).
     // World width = 256 * 2^(kw-kh), covering extra columns for wide rectangles.
     // Pixel (x,y) -> Leaflet [lat, lng]: lat = -y*256/height, lng = x*256/height
-    let labels_json: String = {
-        let entries: Vec<String> = labels
+    let entities_json: String = {
+        let entries: Vec<String> = entities
             .iter()
-            .map(|l| {
-                let escaped = l.name.replace('\\', "\\\\").replace('"', "\\\"");
+            .map(|e| {
+                let escaped = e.name.replace('\\', "\\\\").replace('"', "\\\"");
+                let segs: Vec<String> = e
+                    .segments
+                    .iter()
+                    .map(|&(x0, y0, x1, y1)| format!("[{},{},{},{}]", x0, y0, x1, y1))
+                    .collect();
                 format!(
-                    "{{\"name\":\"{}\",\"x\":{},\"y\":{}}}",
-                    escaped, l.pixel_x, l.pixel_y
+                    "{{\"name\":\"{}\",\"x\":{},\"y\":{},\"hue\":{},\"segs\":[{}]}}",
+                    escaped,
+                    e.pixel_x,
+                    e.pixel_y,
+                    e.hue,
+                    segs.join(",")
                 )
             })
             .collect();
@@ -479,6 +635,7 @@ fn write_leaflet_html(
       crs: L.CRS.Simple,
       minZoom: 0,
       maxZoom: {max_zoom},
+      preferCanvas: true,
     }});
     L.tileLayer('tiles/{{z}}/{{x}}/{{y}}.png', {{
       tileSize: 256,
@@ -489,7 +646,23 @@ fn write_leaflet_html(
     map.fitBounds([[-256, 0], [0, {world_w}]]);
 
     var HEIGHT = {height};
-    var labels = {labels_json};
+    var labels = {entities_json};
+    labels.forEach(function(l) {{
+      if (!l.segs || l.segs.length === 0) return;
+      var ll = l.segs.map(function(s) {{
+        return [
+          [-(s[1] / HEIGHT) * 256, (s[0] / HEIGHT) * 256],
+          [-(s[3] / HEIGHT) * 256, (s[2] / HEIGHT) * 256],
+        ];
+      }});
+      L.polyline(ll, {{
+        color: 'hsl(' + l.hue + ',70%,60%)',
+        weight: 1,
+        opacity: 0.9,
+        fill: false,
+        interactive: false,
+      }}).addTo(map);
+    }});
     labels.forEach(function(l) {{
       var lat = -(l.y / HEIGHT) * 256;
       var lng =  (l.x / HEIGHT) * 256;
@@ -509,7 +682,7 @@ fn write_leaflet_html(
         max_zoom = max_zoom,
         world_w = world_w,
         height = height,
-        labels_json = labels_json,
+        entities_json = entities_json,
     );
     std::fs::write(dir.join("index.html"), html)?;
     Ok(())
@@ -564,9 +737,12 @@ fn run_tiles(
         None
     };
 
-    // Pre-compute each file's label position at the midpoint byte, which maps
-    // to the approximate visual center of the file's Hilbert-curve region.
-    let mut labels: Vec<FileLabel> = Vec::new();
+    let total_pixels = width as u64 * height as u64;
+    let num_squares = 1u32 << (kw - kh); // number of Hilbert squares tiled horizontally
+
+    // Pre-compute each file's label position (midpoint byte → approx visual center)
+    // and exact outer-boundary segments via Hilbert-range decomposition.
+    let mut entities: Vec<FileEntity> = Vec::new();
     {
         let mut cumulative: u64 = 0;
         for source in &sources {
@@ -583,13 +759,22 @@ fn run_tiles(
             let (lx, ly): (u32, u32) = h2xy(local_idx, kh as u8);
             let pixel_x = square_idx as u32 * height + lx;
             let pixel_y = ly;
-            labels.push(FileLabel { name, pixel_x, pixel_y });
+            let hue = name_hue(&name);
+            let segments = file_boundary_segments(
+                cumulative,
+                cumulative + source.byte_size,
+                total_pixels,
+                square_pixels,
+                num_squares,
+                height,
+                kh as u8,
+            );
+            entities.push(FileEntity { name, pixel_x, pixel_y, hue, segments });
             cumulative += source.byte_size;
         }
     }
 
     let mut pixel_idx = 0u64;
-    let total_pixels = width as u64 * height as u64;
 
     'outer: for source in sources {
         let mut reader = source.open()?;
@@ -648,7 +833,7 @@ fn run_tiles(
     eprintln!("Building pyramid …");
     build_pyramid(&tile_dir.join("tiles"), tile_size, max_zoom, width_tiles, height_tiles)?;
 
-    write_leaflet_html(&tile_dir, world_w, max_zoom, height, &labels)?;
+    write_leaflet_html(&tile_dir, world_w, max_zoom, height, &entities)?;
 
     eprintln!("Tiled output written to {}", tile_dir.display());
     Ok(())

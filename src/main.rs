@@ -43,16 +43,6 @@ fn byte_to_pixel(v: u8) -> Rgba<u8> {
 #[show_image::main]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    const W: u32 = 400;
-    const H: u32 = 400;
-    const LEN: usize = (W * H) as usize;
-    let mut hilbert_cache: [Option<(u32, u32)>; LEN] = [None; LEN];
-
-    let mut img = DynamicImage::new_rgb8(W, H);
-    let window = create_window("image", Default::default())?;
-
-    // pixel_file[y * W + x] = which file index painted this pixel
-    let mut pixel_file: Vec<Option<usize>> = vec![None; LEN];
 
     let readers: Vec<(usize, Box<dyn Read>)> = if args.files.is_empty() {
         vec![(0, Box::new(io::stdin()))]
@@ -67,48 +57,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let num_files = readers.len();
-    let mut count = 0usize;
-    'outer: for (file_idx, reader) in readers {
-        for possible_value in reader.bytes() {
-            if count >= LEN {
-                break 'outer;
-            }
-            match possible_value {
-                Ok(v) => {
-                    if hilbert_cache[count].is_none() {
-                        hilbert_cache[count] = Some(h2xy(count as u64, 1));
-                    }
-                    let (x, y) = hilbert_cache[count].unwrap();
 
-                    if x < W && y < H {
-                        img.put_pixel(x, y, byte_to_pixel(v));
-                        pixel_file[y as usize * W as usize + x as usize] = Some(file_idx);
-                    }
+    // Read all bytes upfront so we know total size before sizing the canvas.
+    let mut all_bytes: Vec<(usize, u8)> = Vec::new();
+    for (file_idx, reader) in readers {
+        for b in reader.bytes() {
+            all_bytes.push((file_idx, b?));
+        }
+    }
 
-                    if count % 1000 == 0 {
-                        window.set_image("image-001", img.clone())?;
-                    }
-                }
-                Err(e) => return Err(Box::new(e)),
-            }
-            count += 1;
+    let total = all_bytes.len().max(1);
+    // Smallest k such that (2^k)^2 >= total.
+    let mut k = 1u32;
+    while (1usize << (2 * k)) < total {
+        k += 1;
+    }
+    let side = 1u32 << k;
+    let len = (side * side) as usize;
+
+    let mut img = DynamicImage::new_rgb8(side, side);
+    let window = create_window("image", Default::default())?;
+
+    // pixel_file[y * side + x] = which file index painted this pixel
+    let mut pixel_file: Vec<Option<usize>> = vec![None; len];
+
+    for (count, (file_idx, v)) in all_bytes.iter().enumerate() {
+        let (x, y): (u32, u32) = h2xy(count as u64, 1);
+        img.put_pixel(x, y, byte_to_pixel(*v));
+        pixel_file[y as usize * side as usize + x as usize] = Some(*file_idx);
+
+        if count % 10000 == 0 {
+            window.set_image("image-001", img.clone())?;
         }
     }
 
     // When multiple files are given, mark pixels on the border between files black.
     // A border pixel is any pixel whose 4-neighbor was painted by a different file.
     if num_files > 1 {
-        for y in 0..H {
-            for x in 0..W {
-                let idx = y as usize * W as usize + x as usize;
+        for y in 0..side {
+            for x in 0..side {
+                let idx = y as usize * side as usize + x as usize;
                 if let Some(file_idx) = pixel_file[idx] {
                     let is_border = [(0i32, 1i32), (0, -1), (1, 0), (-1, 0)]
                         .iter()
                         .any(|(dx, dy)| {
                             let nx = x as i32 + dx;
                             let ny = y as i32 + dy;
-                            if nx >= 0 && nx < W as i32 && ny >= 0 && ny < H as i32 {
-                                let nidx = ny as usize * W as usize + nx as usize;
+                            if nx >= 0 && nx < side as i32 && ny >= 0 && ny < side as i32 {
+                                let nidx = ny as usize * side as usize + nx as usize;
                                 pixel_file[nidx].map_or(false, |nf| nf != file_idx)
                             } else {
                                 false

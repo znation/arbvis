@@ -413,9 +413,13 @@ fn build_pyramid(
 
 fn write_leaflet_html(
     dir: &Path,
-    side: u32,
+    _side: u32,
     max_zoom: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // L.CRS.Simple uses transformation (1,0,-1,0): pixel.y = -lat.
+    // For tile y=0 to be at the top and increase downward, lat must decrease downward.
+    // The world must be exactly tile_size units wide/tall so that zoom 0 has 1 tile.
+    // At zoom z, scale = 2^z, so at max_zoom the grid is 2^max_zoom tiles per side.
     let html = format!(
         r#"<!DOCTYPE html>
 <html>
@@ -442,15 +446,14 @@ fn write_leaflet_html(
     }});
     L.tileLayer('tiles/{{z}}/{{x}}/{{y}}.png', {{
       tileSize: 256,
-      bounds: [[0, 0], [{side}, {side}]],
+      bounds: [[-256, 0], [0, 256]],
       noWrap: true,
       attribution: 'arbvis'
     }}).addTo(map);
-    map.fitBounds([[0, 0], [{side}, {side}]]);
+    map.fitBounds([[-256, 0], [0, 256]]);
   </script>
 </body>
 </html>"#,
-        side = side,
         max_zoom = max_zoom,
     );
     std::fs::write(dir.join("index.html"), html)?;

@@ -1,13 +1,14 @@
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use indicatif::{ProgressBar, ProgressStyle};
 
 use ab_glyph::{FontRef, PxScale};
 use clap::Parser;
 use fast_hilbert::h2xy;
-use image::{DynamicImage, GenericImage, Rgb, Rgba};
+use image::{DynamicImage, Rgb};
 use imageproc::drawing::{draw_filled_rect_mut, draw_text_mut, text_size};
 use imageproc::rect::Rect;
 use show_image::create_window;
@@ -34,22 +35,22 @@ struct Args {
     output: Option<PathBuf>,
 }
 
-fn byte_to_pixel(v: u8) -> Rgba<u8> {
+fn byte_to_pixel(v: u8) -> Rgb<u8> {
     // color scheme from
     // https://stairwell.com/resources/hilbert-curves-visualizing-binary-files-with-color-and-patterns/
     if v == 0 {
-        Rgba([0, 0, 0, 255])
+        Rgb([0, 0, 0])
     } else if v == 0xFF {
-        Rgba([255, 255, 255, 255])
+        Rgb([255, 255, 255])
     } else if v <= 0x1F {
         let value = ((v as f32 - 0x01 as f32) / (0x1F as f32 - 0x01 as f32)) * 255.0;
-        Rgba([0, value as u8, 0, 255])
+        Rgb([0, value as u8, 0])
     } else if v <= 0x7E {
         let value = ((v as f32 - 0x20 as f32) / (0x7E as f32 - 0x20 as f32)) * 255.0;
-        Rgba([0, 0, value as u8, 255])
+        Rgb([0, 0, value as u8])
     } else {
         let value = ((v as f32 - 0x7F as f32) / (0xFE as f32 - 0x7F as f32)) * 255.0;
-        Rgba([value as u8, 0, 0, 255])
+        Rgb([value as u8, 0, 0])
     }
 }
 
@@ -275,7 +276,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         1
     } as u64;
 
-    let mut img = DynamicImage::new_rgb8(side, side);
+    // Precomputed 256-entry color lookup table — avoids f32 arithmetic per byte.
+    let pixel_lut: [Rgb<u8>; 256] = {
+        let mut lut = [Rgb([0u8, 0, 0]); 256];
+        for v in 0u16..=255 {
+            lut[v as usize] = byte_to_pixel(v as u8);
+        }
+        lut
+    };
+
+    // Work directly with ImageBuffer<Rgb<u8>> to avoid DynamicImage dispatch overhead
+    // on every pixel write.
+    let mut img: image::ImageBuffer<Rgb<u8>, Vec<u8>> = image::ImageBuffer::new(side, side);
+
     let window = if args.output.is_none() {
         Some(create_window("image", Default::default())?)
     } else {
@@ -306,52 +319,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Throttle display updates: push to the window at most ~10 times/sec.
+    // Previously we cloned the full image every 10,000 pixels, which for a 4096²
+    // canvas meant ~1,600 × 48 MB copies. Time-based throttling eliminates that.
+    let update_interval = Duration::from_millis(100);
+    let mut last_update = Instant::now();
+
+    // Read in 64 KB chunks to avoid per-byte Read trait overhead.
+    let mut read_buf = vec![0u8; 65536];
+
     'outer: for source in sources {
         let fi = source.file_idx;
-        let reader = source.open()?;
-        for b in reader.bytes() {
-            let b = b?;
-            if byte_pos % stride == 0 {
-                let (x, y): (u32, u32) = h2xy(pixel_count as u64, 1);
-                img.put_pixel(x, y, byte_to_pixel(b));
-                pixel_file[y as usize * side as usize + x as usize] = Some(fi);
+        let mut reader = source.open()?;
 
-                bboxes[fi] = Some(match bboxes[fi] {
-                    None => (x, y, x, y),
-                    Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
-                });
+        loop {
+            let n = reader.read(&mut read_buf)?;
+            if n == 0 {
+                break;
+            }
+            for &b in &read_buf[..n] {
+                if byte_pos % stride == 0 {
+                    let (x, y): (u32, u32) = h2xy(pixel_count as u64, 1);
+                    let color = pixel_lut[b as usize];
+                    img.put_pixel(x, y, color);
+                    pixel_file[y as usize * side as usize + x as usize] = Some(fi);
 
-                if let Some(ref w) = window {
-                    if pixel_count % 10000 == 0 {
-                        w.set_image("image-001", img.clone())?;
-                    }
-                }
+                    bboxes[fi] = Some(match bboxes[fi] {
+                        None => (x, y, x, y),
+                        Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+                    });
 
-                pixel_count += 1;
-                if pixel_count >= canvas_size {
-                    // Canvas is full — draw the label for the current file before stopping.
-                    if window.is_some() && !files.is_empty() {
-                        if let Some(bbox) = bboxes[fi] {
-                            draw_file_label(
-                                fi,
-                                bbox,
-                                &files,
-                                img.as_mut_rgb8().expect("canvas is RGB8"),
-                                &pixel_file,
-                                &font,
-                                scale,
-                                side,
-                            );
-                            window.as_ref().unwrap().set_image("image-001", img.clone())?;
+                    if let Some(ref w) = window {
+                        if last_update.elapsed() >= update_interval {
+                            w.set_image("image-001", DynamicImage::ImageRgb8(img.clone()))?;
+                            last_update = Instant::now();
                         }
                     }
-                    break 'outer;
+
+                    pixel_count += 1;
+                    if pixel_count >= canvas_size {
+                        // Canvas is full — draw the label for the current file before stopping.
+                        if window.is_some() && !files.is_empty() {
+                            if let Some(bbox) = bboxes[fi] {
+                                draw_file_label(
+                                    fi,
+                                    bbox,
+                                    &files,
+                                    &mut img,
+                                    &pixel_file,
+                                    &font,
+                                    scale,
+                                    side,
+                                );
+                                window
+                                    .as_ref()
+                                    .unwrap()
+                                    .set_image("image-001", DynamicImage::ImageRgb8(img.clone()))?;
+                            }
+                        }
+                        break 'outer;
+                    }
                 }
-            }
-            byte_pos += 1;
-            if let Some(ref pb) = pb {
-                if byte_pos % 100_000 == 0 {
-                    pb.set_position(byte_pos);
+                byte_pos += 1;
+                if let Some(ref pb) = pb {
+                    if byte_pos % 100_000 == 0 {
+                        pb.set_position(byte_pos);
+                    }
                 }
             }
         }
@@ -363,13 +396,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     fi,
                     bbox,
                     &files,
-                    img.as_mut_rgb8().expect("canvas is RGB8"),
+                    &mut img,
                     &pixel_file,
                     &font,
                     scale,
                     side,
                 );
-                window.as_ref().unwrap().set_image("image-001", img.clone())?;
+                window
+                    .as_ref()
+                    .unwrap()
+                    .set_image("image-001", DynamicImage::ImageRgb8(img.clone()))?;
             }
         }
     }
@@ -398,7 +434,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         });
                     if is_border {
-                        img.put_pixel(x, y, Rgba([0, 0, 0, 255]));
+                        img.put_pixel(x, y, Rgb([0, 0, 0]));
                     }
                 }
             }
@@ -408,17 +444,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = args.output {
         // Output mode: draw all labels after the border pass.
         if !files.is_empty() {
-            let canvas = img.as_mut_rgb8().expect("canvas is RGB8");
             for (fi, _) in files.iter().enumerate() {
                 if let Some(bbox) = bboxes[fi] {
-                    draw_file_label(fi, bbox, &files, canvas, &pixel_file, &font, scale, side);
+                    draw_file_label(fi, bbox, &files, &mut img, &pixel_file, &font, scale, side);
                 }
             }
         }
-        img.save(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
+        DynamicImage::ImageRgb8(img)
+            .save(&path)
+            .map_err(|e| format!("{}: {}", path.display(), e))?;
     } else if let Some(w) = window {
         // Interactive mode: labels already drawn progressively; just push the border pass result.
-        w.set_image("image-001", img)?;
+        w.set_image("image-001", DynamicImage::ImageRgb8(img))?;
         w.wait_until_destroyed()?;
     }
     Ok(())

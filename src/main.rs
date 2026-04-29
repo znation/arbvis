@@ -415,14 +415,37 @@ fn build_pyramid(
     Ok(())
 }
 
+struct FileLabel {
+    name: String,
+    pixel_x: u32,
+    pixel_y: u32,
+}
+
 fn write_leaflet_html(
     dir: &Path,
     world_w: u32,
     max_zoom: u32,
+    height: u32,
+    labels: &[FileLabel],
 ) -> Result<(), Box<dyn std::error::Error>> {
     // L.CRS.Simple uses transformation (1,0,-1,0): pixel.y = -lat.
     // World height is always 256 units (one tile at zoom 0 in y).
     // World width = 256 * 2^(kw-kh), covering extra columns for wide rectangles.
+    // Pixel (x,y) -> Leaflet [lat, lng]: lat = -y*256/height, lng = x*256/height
+    let labels_json: String = {
+        let entries: Vec<String> = labels
+            .iter()
+            .map(|l| {
+                let escaped = l.name.replace('\\', "\\\\").replace('"', "\\\"");
+                format!(
+                    "{{\"name\":\"{}\",\"x\":{},\"y\":{}}}",
+                    escaped, l.pixel_x, l.pixel_y
+                )
+            })
+            .collect();
+        format!("[{}]", entries.join(","))
+    };
+
     let html = format!(
         r#"<!DOCTYPE html>
 <html>
@@ -437,6 +460,15 @@ fn write_leaflet_html(
           crossorigin=""></script>
   <style>
     html, body, #map {{ height: 100%; margin: 0; padding: 0; }}
+    .file-label {{
+      background: rgba(0,0,0,0.65);
+      color: #fff;
+      padding: 2px 5px;
+      font: 11px/1.4 monospace;
+      white-space: nowrap;
+      border-radius: 2px;
+      pointer-events: none;
+    }}
   </style>
 </head>
 <body>
@@ -454,11 +486,28 @@ fn write_leaflet_html(
       attribution: 'arbvis'
     }}).addTo(map);
     map.fitBounds([[-256, 0], [0, {world_w}]]);
+
+    var HEIGHT = {height};
+    var labels = {labels_json};
+    labels.forEach(function(l) {{
+      var lat = -(l.y / HEIGHT) * 256;
+      var lng =  (l.x / HEIGHT) * 256;
+      L.marker([lat, lng], {{
+        icon: L.divIcon({{
+          className: 'file-label',
+          html: l.name,
+          iconAnchor: [0, 0]
+        }}),
+        interactive: false
+      }}).addTo(map);
+    }});
   </script>
 </body>
 </html>"#,
         max_zoom = max_zoom,
         world_w = world_w,
+        height = height,
+        labels_json = labels_json,
     );
     std::fs::write(dir.join("index.html"), html)?;
     Ok(())
@@ -512,6 +561,28 @@ fn run_tiles(
     } else {
         None
     };
+
+    // Pre-compute each file's starting pixel position for the label overlay.
+    let mut labels: Vec<FileLabel> = Vec::new();
+    {
+        let mut cumulative: u64 = 0;
+        for source in &sources {
+            let name = match &source.kind {
+                SourceKind::File(p) => p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.to_string_lossy().into_owned()),
+                SourceKind::Buffered(_) => "stdin".to_string(),
+            };
+            let square_idx = cumulative / square_pixels;
+            let local_idx = cumulative % square_pixels;
+            let (lx, ly): (u32, u32) = h2xy(local_idx, kh as u8);
+            let pixel_x = square_idx as u32 * height + lx;
+            let pixel_y = ly;
+            labels.push(FileLabel { name, pixel_x, pixel_y });
+            cumulative += source.byte_size;
+        }
+    }
 
     let mut pixel_idx = 0u64;
     let total_pixels = width as u64 * height as u64;
@@ -573,7 +644,7 @@ fn run_tiles(
     eprintln!("Building pyramid …");
     build_pyramid(&tile_dir.join("tiles"), tile_size, max_zoom, width_tiles, height_tiles)?;
 
-    write_leaflet_html(&tile_dir, world_w, max_zoom)?;
+    write_leaflet_html(&tile_dir, world_w, max_zoom, height, &labels)?;
 
     eprintln!("Tiled output written to {}", tile_dir.display());
     Ok(())

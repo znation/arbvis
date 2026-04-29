@@ -141,20 +141,34 @@ fn draw_file_label(
         true
     };
 
+    // Deterministic per-cell jitter: hash (i, j) to ±100px so repeated labels
+    // don't all align in a visible grid when zoomed out.
+    let jitter = |i: u32, j: u32| -> (u32, u32, bool, bool) {
+        let h = (i.wrapping_mul(2654435761)).wrapping_add(j.wrapping_mul(2246822519));
+        let jx = (h & 0xFF) % 101; // 0..=100
+        let jy = ((h >> 8) & 0xFF) % 101;
+        let neg_x = (h >> 16) & 1 == 1;
+        let neg_y = (h >> 17) & 1 == 1;
+        (jx, jy, neg_x, neg_y)
+    };
+
     // Phase 1: primary TL grid — preserves multi-label behavior on large files.
     let mut placed_any = false;
     let mut j = 0u32;
     loop {
-        let label_y = y0 + 20 + 512 * j;
-        if label_y + box_h - 1 > y1 {
+        let base_y = y0 + 20 + 512 * j;
+        if base_y + box_h - 1 > y1 {
             break;
         }
         let mut i = 0u32;
         loop {
-            let label_x = x0 + 20 + 512 * i;
-            if label_x + box_w - 1 > x1 {
+            let base_x = x0 + 20 + 512 * i;
+            if base_x + box_w - 1 > x1 {
                 break;
             }
+            let (jx, jy, neg_x, neg_y) = jitter(i, j);
+            let label_x = if neg_x { base_x.saturating_sub(jx) } else { base_x + jx };
+            let label_y = if neg_y { base_y.saturating_sub(jy) } else { base_y + jy };
             if try_place(label_x, label_y) {
                 placed_any = true;
             }

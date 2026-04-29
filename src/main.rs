@@ -25,7 +25,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             window.set_image("image-001", img)?;
             img = DynamicImage::new_rgb8(W, H);
             window = create_window("image", Default::default())?;
-            count = 0;
             break;
         }
         match possible_value {

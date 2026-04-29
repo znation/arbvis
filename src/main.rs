@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +38,10 @@ struct Args {
     /// Write the canvas to this PNG file instead of displaying a window
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Write a tiled pyramid to this directory for Leaflet.js viewing
+    #[arg(short, long)]
+    tiles: Option<PathBuf>,
 }
 
 fn byte_to_pixel(v: u8) -> Rgb<u8> {
@@ -251,6 +256,288 @@ fn draw_file_label(
     }
 }
 
+// ── Tiled / pyramidal output for Leaflet.js ────────────────────────────────
+
+struct TileBuffer {
+    img: image::ImageBuffer<Rgb<u8>, Vec<u8>>,
+    dirty: bool,
+}
+
+struct TileWriter {
+    dir: PathBuf,
+    tile_size: u32,
+    buffers: HashMap<(u32, u32, u32), TileBuffer>,
+    max_buffered: usize,
+}
+
+impl TileWriter {
+    fn new(dir: PathBuf, tile_size: u32) -> Self {
+        std::fs::create_dir_all(&dir).unwrap();
+        Self {
+            dir,
+            tile_size,
+            buffers: HashMap::new(),
+            max_buffered: 500,
+        }
+    }
+
+    fn tile_path(&self, z: u32, x: u32, y: u32) -> PathBuf {
+        self.dir.join(format!("{z}/{x}/{y}.png"))
+    }
+
+    fn get_or_create(&mut self, z: u32, x: u32, y: u32) -> &mut TileBuffer {
+        let key = (z, x, y);
+        if !self.buffers.contains_key(&key) {
+            let path = self.tile_path(z, x, y);
+            let img = if path.exists() {
+                image::open(&path)
+                    .map(|d| d.to_rgb8())
+                    .unwrap_or_else(|_| image::ImageBuffer::new(self.tile_size, self.tile_size))
+            } else {
+                image::ImageBuffer::new(self.tile_size, self.tile_size)
+            };
+            self.buffers.insert(key, TileBuffer { img, dirty: false });
+        }
+        self.buffers.get_mut(&key).unwrap()
+    }
+
+    fn write_pixel(
+        &mut self,
+        z: u32,
+        x: u32,
+        y: u32,
+        px: u32,
+        py: u32,
+        color: Rgb<u8>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let buf = self.get_or_create(z, x, y);
+        buf.img.put_pixel(px, py, color);
+        buf.dirty = true;
+        if self.buffers.len() > self.max_buffered {
+            self.flush_all()?;
+        }
+        Ok(())
+    }
+
+    fn flush_all(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = self.dir.clone();
+        for ((z, x, y), buf) in self.buffers.drain() {
+            if buf.dirty {
+                let path = dir.join(format!("{z}/{x}/{y}.png"));
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                buf.img.save(&path)
+                    .map_err(|e| format!("{}: {}", path.display(), e))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn build_pyramid(
+    tiles_dir: &Path,
+    tile_size: u32,
+    max_zoom: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if max_zoom == 0 {
+        return Ok(());
+    }
+    let half = tile_size / 2;
+    for z in (0..max_zoom).rev() {
+        let child_z = z + 1;
+        let parents = 1usize << z;
+        for y in 0..parents {
+            for x in 0..parents {
+                let mut parent = image::ImageBuffer::new(tile_size, tile_size);
+                let mut has_data = false;
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let cx = 2 * x + dx;
+                        let cy = 2 * y + dy;
+                        let child_path = tiles_dir.join(format!("{child_z}/{cx}/{cy}.png"));
+                        if !child_path.exists() {
+                            continue;
+                        }
+                        let child = image::open(&child_path)?.to_rgb8();
+                        has_data = true;
+                        for py in 0..half {
+                            for px in 0..half {
+                                let mut r = 0u32;
+                                let mut g = 0u32;
+                                let mut b = 0u32;
+                                let mut count = 0u32;
+                                for sy in 0..2 {
+                                    for sx in 0..2 {
+                                        let sx_ = (px * 2 + sx) as u32;
+                                        let sy_ = (py * 2 + sy) as u32;
+                                        if sx_ < child.width() && sy_ < child.height() {
+                                            let p = child.get_pixel(sx_, sy_);
+                                            r += p[0] as u32;
+                                            g += p[1] as u32;
+                                            b += p[2] as u32;
+                                            count += 1;
+                                        }
+                                    }
+                                }
+                                if count > 0 {
+                                    let out_x = (dx as u32) * half + px as u32;
+                                    let out_y = (dy as u32) * half + py as u32;
+                                    parent.put_pixel(
+                                        out_x,
+                                        out_y,
+                                        Rgb([
+                                            (r / count) as u8,
+                                            (g / count) as u8,
+                                            (b / count) as u8,
+                                        ]),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                if has_data {
+                    let parent_path = tiles_dir.join(format!("{z}/{x}/{y}.png"));
+                    if let Some(p) = parent_path.parent() {
+                        std::fs::create_dir_all(p)?;
+                    }
+                    parent.save(&parent_path)
+                        .map_err(|e| format!("{}: {}", parent_path.display(), e))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_leaflet_html(
+    dir: &Path,
+    side: u32,
+    max_zoom: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>arbvis tiled</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+        crossorigin=""/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+          crossorigin=""></script>
+  <style>
+    html, body, #map {{ height: 100%; margin: 0; padding: 0; }}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <script>
+    var map = L.map('map', {{
+      crs: L.CRS.Simple,
+      minZoom: 0,
+      maxZoom: {max_zoom},
+    }});
+    L.tileLayer('tiles/{{z}}/{{x}}/{{y}}.png', {{
+      tileSize: 256,
+      tms: true,
+      bounds: [[0, 0], [{side}, {side}]],
+      noWrap: true,
+      attribution: 'arbvis'
+    }}).addTo(map);
+    map.fitBounds([[0, 0], [{side}, {side}]]);
+  </script>
+</body>
+</html>"#,
+        side = side,
+        max_zoom = max_zoom,
+    );
+    std::fs::write(dir.join("index.html"), html)?;
+    Ok(())
+}
+
+fn run_tiles(
+    sources: Vec<Source>,
+    total: u64,
+    tile_dir: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let total_usize = total as usize;
+    let mut k = 1u32;
+    while (1usize << (2 * k)) < total_usize {
+        k += 1;
+    }
+    let side = 1u32 << k;
+    let tile_size = 256u32;
+    let max_zoom = if k >= 8 { k - 8 } else { 0 };
+
+    let pixel_lut: [Rgb<u8>; 256] = {
+        let mut lut = [Rgb([0u8, 0, 0]); 256];
+        for v in 0u16..=255 {
+            lut[v as usize] = byte_to_pixel(v as u8);
+        }
+        lut
+    };
+
+    let mut writer = TileWriter::new(tile_dir.join("tiles"), tile_size);
+
+    let pb = if std::io::stderr().is_terminal() {
+        let pb = ProgressBar::new(total);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+            )
+            .unwrap()
+            .progress_chars("=>-"),
+        );
+        Some(pb)
+    } else {
+        None
+    };
+
+    let mut pixel_idx = 0usize;
+
+    'outer: for source in sources {
+        let mut reader = source.open()?;
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            for &b in &buf[..n] {
+                if pixel_idx >= (side * side) as usize {
+                    break 'outer;
+                }
+                let (x, y): (u32, u32) = h2xy(pixel_idx as u64, k as u8);
+                let tx = x / tile_size;
+                let ty = y / tile_size;
+                let px = x % tile_size;
+                let py = y % tile_size;
+                writer.write_pixel(max_zoom, tx, ty, px, py, pixel_lut[b as usize])?;
+                pixel_idx += 1;
+            }
+            if let Some(ref pb) = pb {
+                pb.inc(n as u64);
+            }
+        }
+    }
+
+    writer.flush_all()?;
+    if let Some(ref pb) = pb {
+        pb.finish_and_clear();
+    }
+
+    eprintln!("Building pyramid …");
+    build_pyramid(&tile_dir.join("tiles"), tile_size, max_zoom)?;
+
+    write_leaflet_html(&tile_dir, side, max_zoom)?;
+
+    eprintln!("Tiled output written to {}", tile_dir.display());
+    Ok(())
+}
+
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut files = args.files;
@@ -274,6 +561,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let num_files = files.len().max(1);
     let (sources, total) = prepare_sources(&files)?;
+
+    if let Some(tile_dir) = args.tiles {
+        return run_tiles(sources, total, tile_dir);
+    }
 
     let total_usize = (total as usize).max(1);
     // Smallest k such that (2^k)^2 >= total, capped at 12 (4096×4096, ~50MB RGB8)
@@ -431,7 +722,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 for &b in &read_buf[..n] {
                     if cur_byte % stride == 0 {
-                        let (x, y): (u32, u32) = h2xy(cur_pixel as u64, 1);
+                        let (x, y): (u32, u32) = h2xy(cur_pixel as u64, k as u8);
                         let color = pixel_lut[b as usize];
                         let pixel_idx = y as usize * side as usize + x as usize;
                         unsafe {

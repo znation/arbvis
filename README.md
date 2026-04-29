@@ -35,6 +35,21 @@ cat /dev/urandom | head -c 65536 | arbvis
 
 When multiple files are provided, pixels on the border between file regions are drawn black, making the boundary between files visible.
 
+## Tiled / pyramidal output
+
+For large files (or when you want to preserve every byte at full resolution), use `--tiles <DIR>` to generate a [Leaflet.js](https://leafletjs.com/)-compatible tile pyramid instead of a single PNG:
+
+```sh
+# Generate tiles + index.html for browser viewing
+arbvis huge_file.bin --tiles ./output
+```
+
+This produces:
+- `output/tiles/{z}/{x}/{y}.png` — standard XYZ tiles at multiple zoom levels
+- `output/index.html` — ready-to-use Leaflet viewer
+
+The highest zoom level preserves **one pixel per byte** (no downsampling). Lower zoom levels are averaged down so you can zoom out smoothly. The tile size is 256×256 and the image dimensions are always powers of two, so the pyramid aligns cleanly with web map tiling conventions.
+
 ## Building
 
 Requires Rust (stable).

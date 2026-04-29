@@ -15,6 +15,7 @@ use image::{DynamicImage, Rgb};
 use imageproc::drawing::{draw_filled_rect_mut, draw_text_mut, text_size};
 use imageproc::rect::Rect;
 use show_image::create_window;
+use show_image::event::WindowEvent;
 
 /// Visualize binary files as Hilbert curve plots.
 ///
@@ -311,6 +312,23 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _event_thread = if let Some(ref w) = window {
+        let cancelled_c = Arc::clone(&cancelled);
+        let rx = w.event_channel()?;
+        Some(std::thread::spawn(move || {
+            while let Ok(event) = rx.recv() {
+                if matches!(event, WindowEvent::CloseRequested(_) | WindowEvent::Destroyed(_)) {
+                    cancelled_c.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+            cancelled_c.store(true, Ordering::Relaxed);
+        }))
+    } else {
+        None
+    };
+
     let font = FontRef::try_from_slice(include_bytes!("DejaVuSans.ttf"))
         .expect("bundled DejaVuSans.ttf is valid");
     let scale = PxScale { x: 14.0, y: 14.0 };
@@ -354,10 +372,11 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let display_thread = if let Some(ref w) = window {
         let img_ptr = img.as_ptr() as usize;
         let stop = Arc::clone(&stop_display);
+        let cancelled_disp = Arc::clone(&cancelled);
         let w_c = w.clone();
         let side_c = side;
         Some(std::thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
+            while !stop.load(Ordering::Relaxed) && !cancelled_disp.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(100));
                 let buf: Vec<u8> = unsafe {
                     std::slice::from_raw_parts(
@@ -387,6 +406,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let pb_shared: Option<Arc<ProgressBar>> = pb.map(Arc::new);
     let canvas_u = canvas_size as u64;
 
+    let cancelled_proc = Arc::clone(&cancelled);
     let par_results: Vec<(usize, Option<(u32, u32, u32, u32)>)> = sources
         .into_par_iter()
         .zip(file_meta.into_par_iter())
@@ -402,6 +422,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             let mut bbox: Option<(u32, u32, u32, u32)> = None;
 
             'read: loop {
+                if cancelled_proc.load(Ordering::Relaxed) {
+                    break;
+                }
                 let n = reader.read(&mut read_buf).map_err(|e| e.to_string())?;
                 if n == 0 {
                     break;
@@ -447,6 +470,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     stop_display.store(true, Ordering::Relaxed);
     if let Some(t) = display_thread {
         let _ = t.join();
+    }
+
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(());
     }
 
     if let Some(ref pb) = pb_shared {
@@ -501,8 +528,18 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        w.set_image("image-001", DynamicImage::ImageRgb8(img))?;
-        w.wait_until_destroyed()?;
+        if let Err(e) = w.set_image("image-001", DynamicImage::ImageRgb8(img)) {
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            return Err(e.into());
+        }
+        if let Err(e) = w.wait_until_destroyed() {
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            return Err(e.into());
+        }
     }
     Ok(())
 }

@@ -10,4 +10,5 @@ fast_hilbert = "2.0"
 image = "0.25"
 imageproc = "0.25"
 indicatif = "0.17"
+rayon = "1"
 show-image = {version = "0.14", features = ["image"]}

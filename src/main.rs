@@ -1,9 +1,12 @@
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 
 use ab_glyph::{FontRef, PxScale};
 use clap::Parser;
@@ -62,6 +65,7 @@ enum SourceKind {
 struct Source {
     file_idx: usize,
     kind: SourceKind,
+    byte_size: u64,
 }
 
 impl Source {
@@ -88,6 +92,7 @@ fn prepare_sources(files: &[PathBuf]) -> Result<(Vec<Source>, u64), Box<dyn std:
             vec![Source {
                 file_idx: 0,
                 kind: SourceKind::Buffered(buf),
+                byte_size: len,
             }],
             len,
         ));
@@ -96,15 +101,28 @@ fn prepare_sources(files: &[PathBuf]) -> Result<(Vec<Source>, u64), Box<dyn std:
     let mut sources = Vec::with_capacity(files.len());
     let mut total = 0u64;
     for (i, path) in files.iter().enumerate() {
-        total += std::fs::metadata(path)
+        let size = std::fs::metadata(path)
             .map_err(|e| format!("{}: {}", path.display(), e))?
             .len();
+        total += size;
         sources.push(Source {
             file_idx: i,
             kind: SourceKind::File(path.clone()),
+            byte_size: size,
         });
     }
     Ok((sources, total))
+}
+
+/// Count multiples of `stride` in the byte range `[byte_start, byte_end)`.
+fn sampled_in_range(byte_start: u64, byte_end: u64, stride: u64) -> u64 {
+    if byte_end <= byte_start { return 0; }
+    if stride == 1 { return byte_end - byte_start; }
+    if byte_start == 0 {
+        (byte_end - 1) / stride + 1
+    } else {
+        (byte_end - 1) / stride - (byte_start - 1) / stride
+    }
 }
 
 fn draw_file_label(
@@ -302,8 +320,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // pixel_file[y * side + x] = which file index painted this pixel
     let mut pixel_file: Vec<Option<usize>> = vec![None; canvas_size];
     let mut bboxes: Vec<Option<(u32, u32, u32, u32)>> = vec![None; num_files];
-    let mut byte_pos: u64 = 0;
-    let mut pixel_count: usize = 0;
 
     let pb = if std::io::stderr().is_terminal() {
         let pb = ProgressBar::new(total);
@@ -319,98 +335,123 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Throttle display updates: push to the window at most ~10 times/sec.
-    // Previously we cloned the full image every 10,000 pixels, which for a 4096²
-    // canvas meant ~1,600 × 48 MB copies. Time-based throttling eliminates that.
-    let update_interval = Duration::from_millis(100);
-    let mut last_update = Instant::now();
-
-    // Read in 64 KB chunks to avoid per-byte Read trait overhead.
-    let mut read_buf = vec![0u8; 65536];
-
-    'outer: for source in sources {
-        let fi = source.file_idx;
-        let mut reader = source.open()?;
-
-        loop {
-            let n = reader.read(&mut read_buf)?;
-            if n == 0 {
-                break;
-            }
-            for &b in &read_buf[..n] {
-                if byte_pos % stride == 0 {
-                    let (x, y): (u32, u32) = h2xy(pixel_count as u64, 1);
-                    let color = pixel_lut[b as usize];
-                    img.put_pixel(x, y, color);
-                    pixel_file[y as usize * side as usize + x as usize] = Some(fi);
-
-                    bboxes[fi] = Some(match bboxes[fi] {
-                        None => (x, y, x, y),
-                        Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
-                    });
-
-                    if let Some(ref w) = window {
-                        if last_update.elapsed() >= update_interval {
-                            w.set_image("image-001", DynamicImage::ImageRgb8(img.clone()))?;
-                            last_update = Instant::now();
-                        }
-                    }
-
-                    pixel_count += 1;
-                    if pixel_count >= canvas_size {
-                        // Canvas is full — draw the label for the current file before stopping.
-                        if window.is_some() && !files.is_empty() {
-                            if let Some(bbox) = bboxes[fi] {
-                                draw_file_label(
-                                    fi,
-                                    bbox,
-                                    &files,
-                                    &mut img,
-                                    &pixel_file,
-                                    &font,
-                                    scale,
-                                    side,
-                                );
-                                window
-                                    .as_ref()
-                                    .unwrap()
-                                    .set_image("image-001", DynamicImage::ImageRgb8(img.clone()))?;
-                            }
-                        }
-                        break 'outer;
-                    }
-                }
-                byte_pos += 1;
-                if let Some(ref pb) = pb {
-                    if byte_pos % 100_000 == 0 {
-                        pb.set_position(byte_pos);
-                    }
-                }
-            }
-        }
-
-        // Source fully consumed — show its label immediately in interactive mode.
-        if window.is_some() && !files.is_empty() {
-            if let Some(bbox) = bboxes[fi] {
-                draw_file_label(
-                    fi,
-                    bbox,
-                    &files,
-                    &mut img,
-                    &pixel_file,
-                    &font,
-                    scale,
-                    side,
-                );
-                window
-                    .as_ref()
-                    .unwrap()
-                    .set_image("image-001", DynamicImage::ImageRgb8(img.clone()))?;
-            }
+    // --- Pre-compute per-file byte and pixel offsets for parallel dispatch ---
+    let mut file_meta: Vec<(u64, u64)> = Vec::with_capacity(sources.len());
+    {
+        let mut b = 0u64;
+        let mut p = 0u64;
+        for s in &sources {
+            file_meta.push((b, p));
+            p += sampled_in_range(b, b + s.byte_size, stride);
+            b += s.byte_size;
         }
     }
 
-    if let Some(pb) = pb {
+    // --- Background display thread for interactive mode ---
+    // Reads the image buffer every 100 ms to show in-progress rendering.
+    // Torn frames (reads racing concurrent writes) are acceptable: only the
+    // final image must be coherent. The alternative — a mutex on every pixel
+    // write — would eliminate the parallelism benefit entirely.
+    let stop_display = Arc::new(AtomicBool::new(false));
+    let display_thread = if let Some(ref w) = window {
+        let img_ptr = img.as_ptr() as usize;
+        let stop = Arc::clone(&stop_display);
+        let w_c = w.clone();
+        let side_c = side;
+        Some(std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(100));
+                let buf: Vec<u8> = unsafe {
+                    std::slice::from_raw_parts(
+                        img_ptr as *const u8,
+                        side_c as usize * side_c as usize * 3,
+                    )
+                }
+                .to_vec();
+                if let Some(ib) =
+                    image::ImageBuffer::<Rgb<u8>, _>::from_raw(side_c, side_c, buf)
+                {
+                    let _ = w_c.set_image("image-001", DynamicImage::ImageRgb8(ib));
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    // --- Parallel file processing ---
+    // Each source writes exclusively to pixel indices in [pixel_start, pixel_end),
+    // determined by its non-overlapping byte range. Because every distinct
+    // pixel_count value maps to a unique Hilbert coordinate, writes to `img` and
+    // `pixel_file` across sources never alias — concurrent writes are race-free.
+    let img_base = img.as_mut_ptr() as usize;
+    let pf_base  = pixel_file.as_mut_ptr() as usize;
+    let pb_shared: Option<Arc<ProgressBar>> = pb.map(Arc::new);
+    let canvas_u = canvas_size as u64;
+
+    let par_results: Vec<(usize, Option<(u32, u32, u32, u32)>)> = sources
+        .into_par_iter()
+        .zip(file_meta.into_par_iter())
+        .map(|(source, (byte_start, pixel_start))| -> Result<_, String> {
+            let fi = source.file_idx;
+            if pixel_start >= canvas_u {
+                return Ok((fi, None));
+            }
+            let mut reader = source.open().map_err(|e| e.to_string())?;
+            let mut read_buf = vec![0u8; 65536];
+            let mut cur_byte = byte_start;
+            let mut cur_pixel = pixel_start as usize;
+            let mut bbox: Option<(u32, u32, u32, u32)> = None;
+
+            'read: loop {
+                let n = reader.read(&mut read_buf).map_err(|e| e.to_string())?;
+                if n == 0 {
+                    break;
+                }
+                for &b in &read_buf[..n] {
+                    if cur_byte % stride == 0 {
+                        let (x, y): (u32, u32) = h2xy(cur_pixel as u64, 1);
+                        let color = pixel_lut[b as usize];
+                        let pixel_idx = y as usize * side as usize + x as usize;
+                        unsafe {
+                            let p = (img_base as *mut u8).add(pixel_idx * 3);
+                            p.write(color[0]);
+                            p.add(1).write(color[1]);
+                            p.add(2).write(color[2]);
+                            (pf_base as *mut Option<usize>).add(pixel_idx).write(Some(fi));
+                        }
+                        bbox = Some(match bbox {
+                            None => (x, y, x, y),
+                            Some((x0, y0, x1, y1)) => {
+                                (x0.min(x), y0.min(y), x1.max(x), y1.max(y))
+                            }
+                        });
+                        cur_pixel += 1;
+                        if cur_pixel >= canvas_size {
+                            break 'read;
+                        }
+                    }
+                    cur_byte += 1;
+                }
+                if let Some(ref pb) = pb_shared {
+                    pb.inc(n as u64);
+                }
+            }
+            Ok((fi, bbox))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    for (fi, bbox) in par_results {
+        bboxes[fi] = bbox;
+    }
+
+    // Stop background display thread before mutating img further.
+    stop_display.store(true, Ordering::Relaxed);
+    if let Some(t) = display_thread {
+        let _ = t.join();
+    }
+
+    if let Some(ref pb) = pb_shared {
         pb.finish_and_clear();
     }
 
@@ -454,7 +495,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .save(&path)
             .map_err(|e| format!("{}: {}", path.display(), e))?;
     } else if let Some(w) = window {
-        // Interactive mode: labels already drawn progressively; just push the border pass result.
+        // Interactive mode: draw labels then push the final image.
+        if !files.is_empty() {
+            for (fi, _) in files.iter().enumerate() {
+                if let Some(bbox) = bboxes[fi] {
+                    draw_file_label(fi, bbox, &files, &mut img, &pixel_file, &font, scale, side);
+                }
+            }
+        }
         w.set_image("image-001", DynamicImage::ImageRgb8(img))?;
         w.wait_until_destroyed()?;
     }

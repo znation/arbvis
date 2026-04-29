@@ -171,6 +171,7 @@ dependencies = [
  "image",
  "imageproc",
  "indicatif",
+ "rayon",
  "show-image",
 ]
 

@@ -339,6 +339,8 @@ fn build_pyramid(
     tiles_dir: &Path,
     tile_size: u32,
     max_zoom: u32,
+    width_tiles: u32,
+    height_tiles: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if max_zoom == 0 {
         return Ok(());
@@ -346,9 +348,11 @@ fn build_pyramid(
     let half = tile_size / 2;
     for z in (0..max_zoom).rev() {
         let child_z = z + 1;
-        let parents = 1usize << z;
-        for y in 0..parents {
-            for x in 0..parents {
+        let levels_from_max = max_zoom - z;
+        let parent_nx = (width_tiles >> levels_from_max).max(1) as usize;
+        let parent_ny = (height_tiles >> levels_from_max).max(1) as usize;
+        for y in 0..parent_ny {
+            for x in 0..parent_nx {
                 let mut parent = image::ImageBuffer::new(tile_size, tile_size);
                 let mut has_data = false;
                 for dy in 0..2 {
@@ -413,13 +417,12 @@ fn build_pyramid(
 
 fn write_leaflet_html(
     dir: &Path,
-    _side: u32,
+    world_w: u32,
     max_zoom: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // L.CRS.Simple uses transformation (1,0,-1,0): pixel.y = -lat.
-    // For tile y=0 to be at the top and increase downward, lat must decrease downward.
-    // The world must be exactly tile_size units wide/tall so that zoom 0 has 1 tile.
-    // At zoom z, scale = 2^z, so at max_zoom the grid is 2^max_zoom tiles per side.
+    // World height is always 256 units (one tile at zoom 0 in y).
+    // World width = 256 * 2^(kw-kh), covering extra columns for wide rectangles.
     let html = format!(
         r#"<!DOCTYPE html>
 <html>
@@ -446,15 +449,16 @@ fn write_leaflet_html(
     }});
     L.tileLayer('tiles/{{z}}/{{x}}/{{y}}.png', {{
       tileSize: 256,
-      bounds: [[-256, 0], [0, 256]],
+      bounds: [[-256, 0], [0, {world_w}]],
       noWrap: true,
       attribution: 'arbvis'
     }}).addTo(map);
-    map.fitBounds([[-256, 0], [0, 256]]);
+    map.fitBounds([[-256, 0], [0, {world_w}]]);
   </script>
 </body>
 </html>"#,
         max_zoom = max_zoom,
+        world_w = world_w,
     );
     std::fs::write(dir.join("index.html"), html)?;
     Ok(())
@@ -465,14 +469,25 @@ fn run_tiles(
     total: u64,
     tile_dir: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let total_usize = total as usize;
-    let mut k = 1u32;
-    while (1usize << (2 * k)) < total_usize {
-        k += 1;
+    // Find s = ceil(log2(total)), minimum 16 so the image is at least 256×256.
+    // Split into kh = floor(s/2) (height) and kw = ceil(s/2) (width).
+    // When s is odd this gives a 2:1 rectangle, halving wasted space vs a square.
+    let mut s = 16u32;
+    while (1u64 << s) < total {
+        s += 1;
     }
-    let side = 1u32 << k;
+    let kh = s / 2;        // height exponent: height = 2^kh pixels
+    let kw = (s + 1) / 2;  // width exponent:  width  = 2^kw pixels
+    let height = 1u32 << kh;
+    let width = 1u32 << kw;
     let tile_size = 256u32;
-    let max_zoom = if k >= 8 { k - 8 } else { 0 };
+    let max_zoom = kh - 8;  // kh >= 8 guaranteed by minimum s=16
+    let width_tiles = width / tile_size;
+    let height_tiles = height / tile_size;
+    // World width for Leaflet: height = 256 units, width = 256 * 2^(kw-kh)
+    let world_w = 256u32 << (kw - kh);
+    // Each Hilbert square covers height×height pixels; tiles are laid left-to-right.
+    let square_pixels: u64 = (height as u64) * (height as u64);
 
     let pixel_lut: [Rgb<u8>; 256] = {
         let mut lut = [Rgb([0u8, 0, 0]); 256];
@@ -498,7 +513,8 @@ fn run_tiles(
         None
     };
 
-    let mut pixel_idx = 0usize;
+    let mut pixel_idx = 0u64;
+    let total_pixels = width as u64 * height as u64;
 
     'outer: for source in sources {
         let mut reader = source.open()?;
@@ -509,10 +525,17 @@ fn run_tiles(
                 break;
             }
             for &b in &buf[..n] {
-                if pixel_idx >= (side * side) as usize {
+                if pixel_idx >= total_pixels {
                     break 'outer;
                 }
-                let (x, y): (u32, u32) = h2xy(pixel_idx as u64, k as u8);
+                // Map sequential index into the rectangular grid by tiling Hilbert
+                // squares of order kh horizontally: square_idx selects the column-block,
+                // local_idx is the position within that square's Hilbert curve.
+                let square_idx = pixel_idx / square_pixels;
+                let local_idx = pixel_idx % square_pixels;
+                let (lx, ly): (u32, u32) = h2xy(local_idx, kh as u8);
+                let x = square_idx as u32 * height + lx;
+                let y = ly;
                 let tx = x / tile_size;
                 let ty = y / tile_size;
                 let px = x % tile_size;
@@ -532,9 +555,9 @@ fn run_tiles(
     }
 
     eprintln!("Building pyramid …");
-    build_pyramid(&tile_dir.join("tiles"), tile_size, max_zoom)?;
+    build_pyramid(&tile_dir.join("tiles"), tile_size, max_zoom, width_tiles, height_tiles)?;
 
-    write_leaflet_html(&tile_dir, side, max_zoom)?;
+    write_leaflet_html(&tile_dir, world_w, max_zoom)?;
 
     eprintln!("Tiled output written to {}", tile_dir.display());
     Ok(())

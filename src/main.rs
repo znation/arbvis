@@ -554,6 +554,22 @@ fn run_tiles(
         pb.finish_and_clear();
     }
 
+    // Write black tiles for every unfilled position at max_zoom so the pyramid
+    // is complete and the browser never receives a 404.
+    let black_tile = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(tile_size, tile_size);
+    for ty in 0..height_tiles {
+        for tx in 0..width_tiles {
+            let path = tile_dir.join(format!("tiles/{max_zoom}/{tx}/{ty}.png"));
+            if !path.exists() {
+                if let Some(p) = path.parent() {
+                    std::fs::create_dir_all(p)?;
+                }
+                black_tile.save(&path)
+                    .map_err(|e| format!("{}: {}", path.display(), e))?;
+            }
+        }
+    }
+
     eprintln!("Building pyramid …");
     build_pyramid(&tile_dir.join("tiles"), tile_size, max_zoom, width_tiles, height_tiles)?;
 

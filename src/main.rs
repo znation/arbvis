@@ -536,9 +536,8 @@ fn outer_segments(rects: &[(u32, u32, u32, u32)]) -> Vec<(u32, u32, u32, u32)> {
     result
 }
 
-/// Decompose a file's pixel footprint (given as a byte range in the tile grid)
-/// into outer boundary segments in global pixel-boundary coordinates.
-fn file_boundary_segments(
+/// Collect all dyadic pixel rectangles for a file's byte range.
+fn file_rects(
     byte_start: u64,
     byte_end: u64,
     total_pixels: u64,
@@ -551,7 +550,7 @@ fn file_boundary_segments(
     if byte_end <= byte_start {
         return Vec::new();
     }
-    let mut all_rects: Vec<(u32, u32, u32, u32)> = Vec::new();
+    let mut all_rects = Vec::new();
     for sq in 0..num_squares as u64 {
         let sq_start = sq * square_pixels;
         let sq_end = sq_start + square_pixels;
@@ -561,11 +560,27 @@ fn file_boundary_segments(
             continue;
         }
         let x_off = sq as u32 * height;
-        let mut rects = Vec::new();
-        decompose_hilbert(local_a, local_b, kh, x_off, 0, height, 0, &mut rects);
-        all_rects.extend(rects);
+        decompose_hilbert(local_a, local_b, kh, x_off, 0, height, 0, &mut all_rects);
     }
-    outer_segments(&all_rects)
+    all_rects
+}
+
+/// Area-weighted centroid of a set of axis-aligned pixel rectangles.
+/// Returns None if the rect set is empty.
+fn rects_centroid(rects: &[(u32, u32, u32, u32)]) -> Option<(u32, u32)> {
+    let mut total_area = 0f64;
+    let mut wx = 0f64;
+    let mut wy = 0f64;
+    for &(x0, y0, x1, y1) in rects {
+        let area = (x1 - x0) as f64 * (y1 - y0) as f64;
+        wx += area * (x0 + x1) as f64 / 2.0;
+        wy += area * (y0 + y1) as f64 / 2.0;
+        total_area += area;
+    }
+    if total_area == 0.0 {
+        return None;
+    }
+    Some(((wx / total_area) as u32, (wy / total_area) as u32))
 }
 
 fn write_leaflet_html(
@@ -740,8 +755,10 @@ fn run_tiles(
     let total_pixels = width as u64 * height as u64;
     let num_squares = 1u32 << (kw - kh); // number of Hilbert squares tiled horizontally
 
-    // Pre-compute each file's label position (midpoint byte → approx visual center)
-    // and exact outer-boundary segments via Hilbert-range decomposition.
+    // Pre-compute each file's boundary segments and label position.
+    // The label is placed at the area-weighted centroid of the file's dyadic
+    // pixel rectangles, which is the true visual center of its data region.
+    // Falls back to the midpoint-byte Hilbert position for empty files.
     let mut entities: Vec<FileEntity> = Vec::new();
     {
         let mut cumulative: u64 = 0;
@@ -753,14 +770,7 @@ fn run_tiles(
                     .unwrap_or_else(|| p.to_string_lossy().into_owned()),
                 SourceKind::Buffered(_) => "stdin".to_string(),
             };
-            let mid = cumulative + source.byte_size / 2;
-            let square_idx = mid / square_pixels;
-            let local_idx = mid % square_pixels;
-            let (lx, ly): (u32, u32) = h2xy(local_idx, kh as u8);
-            let pixel_x = square_idx as u32 * height + lx;
-            let pixel_y = ly;
-            let hue = name_hue(&name);
-            let segments = file_boundary_segments(
+            let rects = file_rects(
                 cumulative,
                 cumulative + source.byte_size,
                 total_pixels,
@@ -769,6 +779,14 @@ fn run_tiles(
                 height,
                 kh as u8,
             );
+            let (pixel_x, pixel_y) = rects_centroid(&rects).unwrap_or_else(|| {
+                let mid = cumulative + source.byte_size / 2;
+                let sq = mid / square_pixels;
+                let (lx, ly): (u32, u32) = h2xy(mid % square_pixels, kh as u8);
+                (sq as u32 * height + lx, ly)
+            });
+            let hue = name_hue(&name);
+            let segments = outer_segments(&rects);
             entities.push(FileEntity { name, pixel_x, pixel_y, hue, segments });
             cumulative += source.byte_size;
         }

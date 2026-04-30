@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, IsTerminal, Read};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -273,36 +273,79 @@ fn draw_file_label(
 /// Each tile at zoom `max_zoom` covers a 256×256-pixel region that corresponds
 /// to a contiguous Hilbert sub-curve of exactly 65536 bytes.  Because tiles are
 /// independent, many can be rendered simultaneously.
+///
+/// Files are opened, read, and closed per-tile rather than kept open, so the
+/// number of simultaneously open file descriptors is bounded by the thread-pool
+/// size rather than the total number of input files.
 fn render_leaf_tile(
     tile_path: &Path,
     tx: u32,
     ty: u32,
     kh: u8,
-    _height: u32,
     height_tiles: u32,
     square_pixels: u64,
     total: u64,
-    data: &[Data],
+    sources: &[Source],
     cumulative: &[u64],
     pixel_lut: &[Rgb<u8>; 256],
 ) -> Result<(), String> {
     const TILE: u32 = 256;
-    let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
-    // Which Hilbert square (column block) does this tile fall in?
+    const TILE_PIXELS: usize = 256 * 256;
+
     let sq = (tx / height_tiles) as u64;
     let sq_off = sq * square_pixels;
-    // Local tile coordinates within the square.
     let local_tx = tx % height_tiles;
+
+    // Each leaf tile is a level-(kh-8) Hilbert sub-square covering exactly
+    // TILE_PIXELS consecutive positions in the concatenated byte stream.
+    // Compute the starting position (base) so we can bulk-read those bytes.
+    let tile_order = kh - 8;
+    let base = xy2h::<u32>(local_tx, ty, tile_order) as u64 * TILE_PIXELS as u64;
+    let tile_pixel_start = sq_off + base;
+
+    // Read the tile's bytes from source files into a local buffer.
+    // Each file is opened, seeked, read, and immediately closed, so at most
+    // one fd per thread is open at any moment.
+    let mut tile_buf = [0u8; TILE_PIXELS];
+    let readable_end = (tile_pixel_start + TILE_PIXELS as u64).min(total);
+    if tile_pixel_start < readable_end {
+        let mut pos = tile_pixel_start;
+        let mut buf_off = 0usize;
+        while pos < readable_end {
+            let src_idx = cumulative.partition_point(|&c| c <= pos) - 1;
+            let src = &sources[src_idx];
+            let src_end = cumulative[src_idx] + src.byte_size;
+            let chunk_end = readable_end.min(src_end);
+            let chunk_len = (chunk_end - pos) as usize;
+            let local_off = pos - cumulative[src_idx];
+            match &src.kind {
+                SourceKind::File(p) => {
+                    let mut f = File::open(p)
+                        .map_err(|e| format!("{}: {}", p.display(), e))?;
+                    f.seek(SeekFrom::Start(local_off))
+                        .map_err(|e| format!("{}: {}", p.display(), e))?;
+                    f.read_exact(&mut tile_buf[buf_off..buf_off + chunk_len])
+                        .map_err(|e| format!("{}: {}", p.display(), e))?;
+                }
+                SourceKind::Buffered(v) => {
+                    let lo = local_off as usize;
+                    tile_buf[buf_off..buf_off + chunk_len].copy_from_slice(&v[lo..lo + chunk_len]);
+                }
+            }
+            pos = chunk_end;
+            buf_off += chunk_len;
+        }
+    }
+
+    let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
     for py in 0..TILE {
         let ly = ty * TILE + py;
         for px in 0..TILE {
             let lx = local_tx * TILE + px;
-            let local_idx: u64 = xy2h::<u32>(lx, ly, kh);
+            let local_idx = xy2h::<u32>(lx, ly, kh) as u64;
             let pixel_idx = sq_off + local_idx;
             let color = if pixel_idx < total {
-                let src = cumulative.partition_point(|&c| c <= pixel_idx) - 1;
-                let byte = data[src][(pixel_idx - cumulative[src]) as usize];
-                pixel_lut[byte as usize]
+                pixel_lut[tile_buf[(local_idx - base) as usize] as usize]
             } else {
                 Rgb([0u8, 0, 0])
             };
@@ -768,22 +811,6 @@ fn run_tiles(
         }
     }
 
-    // Memory-map each file (or keep stdin data in-memory) for random access.
-    let data: Vec<Data> = sources
-        .iter()
-        .map(|s| -> Result<Data, Box<dyn std::error::Error>> {
-            Ok(match &s.kind {
-                SourceKind::File(p) => {
-                    let f = File::open(p)
-                        .map_err(|e| format!("{}: {}", p.display(), e))?;
-                    Data::Mapped(unsafe { Mmap::map(&f) }
-                        .map_err(|e| format!("{}: {}", p.display(), e))?)
-                }
-                SourceKind::Buffered(v) => Data::Owned(v.clone()),
-            })
-        })
-        .collect::<Result<_, _>>()?;
-
     // Pre-compute per-file entity metadata (boundary segments, label positions).
     let mut entities: Vec<FileEntity> = Vec::new();
     {
@@ -849,11 +876,10 @@ fn run_tiles(
                 tx,
                 ty,
                 kh as u8,
-                height,
                 height_tiles,
                 square_pixels,
                 total,
-                &data,
+                &sources,
                 &cumulative_offsets,
                 &pixel_lut,
             );

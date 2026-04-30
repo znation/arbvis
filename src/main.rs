@@ -494,6 +494,8 @@ struct FileEntity {
     pixel_x: u32,
     pixel_y: u32,
     hue: u16,
+    byte_size: u64,
+    bbox: (u32, u32, u32, u32),
     segments: Vec<(u32, u32, u32, u32)>, // (x0, y0, x1, y1) in pixel-boundary coords
 }
 
@@ -682,11 +684,13 @@ fn write_leaflet_html(
                     .map(|&(x0, y0, x1, y1)| format!("[{},{},{},{}]", x0, y0, x1, y1))
                     .collect();
                 format!(
-                    "{{\"name\":\"{}\",\"x\":{},\"y\":{},\"hue\":{},\"segs\":[{}]}}",
+                    "{{\"name\":\"{}\",\"x\":{},\"y\":{},\"hue\":{},\"size\":{},\"bbox\":[{}, {}, {}, {}],\"segs\":[{}]}}",
                     escaped,
                     e.pixel_x,
                     e.pixel_y,
                     e.hue,
+                    e.byte_size,
+                    e.bbox.0, e.bbox.1, e.bbox.2, e.bbox.3,
                     segs.join(",")
                 )
             })
@@ -740,50 +744,69 @@ fn write_leaflet_html(
 
     var HEIGHT = {height};
 
-    // Fetch label data after the map is ready, then add overlays in batches
-    // so the main thread is never blocked for more than ~16 ms at a time.
+    var activeOverlays = L.layerGroup().addTo(map);
+
+    function updateLabels(labels) {{
+      var bounds = map.getBounds();
+      var sw = bounds.getSouthWest();
+      var ne = bounds.getNorthEast();
+      var minX = sw.lng * HEIGHT / 256;
+      var minY = -ne.lat * HEIGHT / 256;
+      var maxX = ne.lng * HEIGHT / 256;
+      var maxY = -sw.lat * HEIGHT / 256;
+
+      var visible = [];
+      for (var i = 0; i < labels.length; i++) {{
+        var l = labels[i];
+        var b = l.bbox;
+        if (b[0] < maxX && b[2] > minX && b[1] < maxY && b[3] > minY) {{
+          visible.push(l);
+        }}
+      }}
+
+      visible.sort(function(a, b) {{ return b.size - a.size; }});
+      if (visible.length > 1000) {{
+        visible.length = 1000;
+      }}
+
+      activeOverlays.clearLayers();
+
+      for (var i = 0; i < visible.length; i++) {{
+        var l = visible[i];
+        if (l.segs && l.segs.length > 0) {{
+          var ll = l.segs.map(function(s) {{
+            return [
+              [-(s[1] / HEIGHT) * 256, (s[0] / HEIGHT) * 256],
+              [-(s[3] / HEIGHT) * 256, (s[2] / HEIGHT) * 256],
+            ];
+          }});
+          activeOverlays.addLayer(L.polyline(ll, {{
+            color: 'hsl(' + l.hue + ',70%,60%)',
+            weight: 1,
+            opacity: 0.9,
+            fill: false,
+            interactive: false,
+          }}));
+        }}
+        var lat = -(l.y / HEIGHT) * 256;
+        var lng =  (l.x / HEIGHT) * 256;
+        activeOverlays.addLayer(L.marker([lat, lng], {{
+          icon: L.divIcon({{
+            className: 'file-label',
+            html: l.name,
+            iconSize: [0, 0],
+            iconAnchor: [0, 0]
+          }}),
+          interactive: false
+        }}));
+      }}
+    }}
+
     fetch('labels.json')
       .then(function(r) {{ return r.json(); }})
       .then(function(labels) {{
-        var i = 0;
-        var BATCH = 200;
-        var schedule = typeof requestIdleCallback === 'function'
-          ? function(fn) {{ requestIdleCallback(fn, {{timeout: 100}}); }}
-          : function(fn) {{ setTimeout(fn, 0); }};
-        function addBatch() {{
-          var end = Math.min(i + BATCH, labels.length);
-          for (; i < end; i++) {{
-            var l = labels[i];
-            if (l.segs && l.segs.length > 0) {{
-              var ll = l.segs.map(function(s) {{
-                return [
-                  [-(s[1] / HEIGHT) * 256, (s[0] / HEIGHT) * 256],
-                  [-(s[3] / HEIGHT) * 256, (s[2] / HEIGHT) * 256],
-                ];
-              }});
-              L.polyline(ll, {{
-                color: 'hsl(' + l.hue + ',70%,60%)',
-                weight: 1,
-                opacity: 0.9,
-                fill: false,
-                interactive: false,
-              }}).addTo(map);
-            }}
-            var lat = -(l.y / HEIGHT) * 256;
-            var lng =  (l.x / HEIGHT) * 256;
-            L.marker([lat, lng], {{
-              icon: L.divIcon({{
-                className: 'file-label',
-                html: l.name,
-                iconSize: [0, 0],
-                iconAnchor: [0, 0]
-              }}),
-              interactive: false
-            }}).addTo(map);
-          }}
-          if (i < labels.length) {{ schedule(addBatch); }}
-        }}
-        schedule(addBatch);
+        updateLabels(labels);
+        map.on('zoomend moveend', function() {{ updateLabels(labels); }});
       }});
   </script>
 </body>
@@ -871,7 +894,22 @@ fn run_tiles(
             });
             let hue = name_hue(&name);
             let segments = outer_segments(&rects);
-            entities.push(FileEntity { name, pixel_x, pixel_y, hue, segments });
+            let bbox = if let Some(first) = rects.first() {
+                rects.iter().skip(1).fold(*first, |(x0, y0, x1, y1), &(rx0, ry0, rx1, ry1)| {
+                    (x0.min(rx0), y0.min(ry0), x1.max(rx1), y1.max(ry1))
+                })
+            } else {
+                (0, 0, 0, 0)
+            };
+            entities.push(FileEntity {
+                name,
+                pixel_x,
+                pixel_y,
+                hue,
+                byte_size: source.byte_size,
+                bbox,
+                segments,
+            });
             cumulative += source.byte_size;
         }
     }

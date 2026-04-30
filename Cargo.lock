@@ -166,6 +166,7 @@ name = "arbvis"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "anyhow",
  "clap",
  "fast_hilbert",
  "image",

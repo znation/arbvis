@@ -7,11 +7,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressStyle};
+use memmap2::Mmap;
 use rayon::prelude::*;
 
 use ab_glyph::{FontRef, PxScale};
 use clap::Parser;
-use fast_hilbert::h2xy;
+use fast_hilbert::{h2xy, xy2h};
 use image::{DynamicImage, Rgb};
 use imageproc::drawing::{draw_filled_rect_mut, draw_text_mut, text_size};
 use imageproc::rect::Rect;
@@ -44,6 +45,22 @@ struct Args {
     tiles: Option<PathBuf>,
 }
 
+/// Mmapped or in-memory backing for a source's bytes.
+enum Data {
+    Mapped(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for Data {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Data::Mapped(m) => m,
+            Data::Owned(v) => v,
+        }
+    }
+}
+
 fn byte_to_pixel(v: u8) -> Rgb<u8> {
     // color scheme from
     // https://stairwell.com/resources/hilbert-curves-visualizing-binary-files-with-color-and-patterns/
@@ -74,17 +91,6 @@ struct Source {
     byte_size: u64,
 }
 
-impl Source {
-    fn open(self) -> Result<Box<dyn Read>, Box<dyn std::error::Error>> {
-        Ok(match self.kind {
-            SourceKind::Buffered(buf) => Box::new(io::Cursor::new(buf)),
-            SourceKind::File(ref path) => Box::new(BufReader::new(
-                File::open(path)
-                    .map_err(|e| format!("{}: {}", path.display(), e))?,
-            )),
-        })
-    }
-}
 
 /// Build sources and return total byte count.
 /// Files are opened lazily (one at a time) to avoid exhausting OS fd limits.
@@ -262,81 +268,52 @@ fn draw_file_label(
 
 // ── Tiled / pyramidal output for Leaflet.js ────────────────────────────────
 
-struct TileBuffer {
-    img: image::ImageBuffer<Rgb<u8>, Vec<u8>>,
-    dirty: bool,
-}
-
-struct TileWriter {
-    dir: PathBuf,
-    tile_size: u32,
-    buffers: HashMap<(u32, u32, u32), TileBuffer>,
-    max_buffered: usize,
-}
-
-impl TileWriter {
-    fn new(dir: PathBuf, tile_size: u32) -> Self {
-        std::fs::create_dir_all(&dir).unwrap();
-        Self {
-            dir,
-            tile_size,
-            buffers: HashMap::new(),
-            max_buffered: 500,
-        }
-    }
-
-    fn tile_path(&self, z: u32, x: u32, y: u32) -> PathBuf {
-        self.dir.join(format!("{z}/{x}/{y}.png"))
-    }
-
-    fn get_or_create(&mut self, z: u32, x: u32, y: u32) -> &mut TileBuffer {
-        let key = (z, x, y);
-        if !self.buffers.contains_key(&key) {
-            let path = self.tile_path(z, x, y);
-            let img = if path.exists() {
-                image::open(&path)
-                    .map(|d| d.to_rgb8())
-                    .unwrap_or_else(|_| image::ImageBuffer::new(self.tile_size, self.tile_size))
+/// Render one 256×256 leaf tile and write it to `tile_path`.
+///
+/// Each tile at zoom `max_zoom` covers a 256×256-pixel region that corresponds
+/// to a contiguous Hilbert sub-curve of exactly 65536 bytes.  Because tiles are
+/// independent, many can be rendered simultaneously.
+fn render_leaf_tile(
+    tile_path: &Path,
+    tx: u32,
+    ty: u32,
+    kh: u8,
+    _height: u32,
+    height_tiles: u32,
+    square_pixels: u64,
+    total: u64,
+    data: &[Data],
+    cumulative: &[u64],
+    pixel_lut: &[Rgb<u8>; 256],
+) -> Result<(), String> {
+    const TILE: u32 = 256;
+    let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
+    // Which Hilbert square (column block) does this tile fall in?
+    let sq = (tx / height_tiles) as u64;
+    let sq_off = sq * square_pixels;
+    // Local tile coordinates within the square.
+    let local_tx = tx % height_tiles;
+    for py in 0..TILE {
+        let ly = ty * TILE + py;
+        for px in 0..TILE {
+            let lx = local_tx * TILE + px;
+            let local_idx: u64 = xy2h::<u32>(lx, ly, kh);
+            let pixel_idx = sq_off + local_idx;
+            let color = if pixel_idx < total {
+                let src = cumulative.partition_point(|&c| c <= pixel_idx) - 1;
+                let byte = data[src][(pixel_idx - cumulative[src]) as usize];
+                pixel_lut[byte as usize]
             } else {
-                image::ImageBuffer::new(self.tile_size, self.tile_size)
+                Rgb([0u8, 0, 0])
             };
-            self.buffers.insert(key, TileBuffer { img, dirty: false });
+            img.put_pixel(px, py, color);
         }
-        self.buffers.get_mut(&key).unwrap()
     }
-
-    fn write_pixel(
-        &mut self,
-        z: u32,
-        x: u32,
-        y: u32,
-        px: u32,
-        py: u32,
-        color: Rgb<u8>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let buf = self.get_or_create(z, x, y);
-        buf.img.put_pixel(px, py, color);
-        buf.dirty = true;
-        if self.buffers.len() > self.max_buffered {
-            self.flush_all()?;
-        }
-        Ok(())
+    if let Some(parent) = tile_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-
-    fn flush_all(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let dir = self.dir.clone();
-        for ((z, x, y), buf) in self.buffers.drain() {
-            if buf.dirty {
-                let path = dir.join(format!("{z}/{x}/{y}.png"));
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                buf.img.save(&path)
-                    .map_err(|e| format!("{}: {}", path.display(), e))?;
-            }
-        }
-        Ok(())
-    }
+    img.save(tile_path).map_err(|e| format!("{}: {}", tile_path.display(), e))?;
+    Ok(())
 }
 
 fn build_pyramid(
@@ -355,65 +332,84 @@ fn build_pyramid(
         let levels_from_max = max_zoom - z;
         let parent_nx = (width_tiles >> levels_from_max).max(1) as usize;
         let parent_ny = (height_tiles >> levels_from_max).max(1) as usize;
-        for y in 0..parent_ny {
-            for x in 0..parent_nx {
-                let mut parent = image::ImageBuffer::new(tile_size, tile_size);
-                let mut has_data = false;
-                for dy in 0..2 {
-                    for dx in 0..2 {
-                        let cx = 2 * x + dx;
-                        let cy = 2 * y + dy;
-                        let child_path = tiles_dir.join(format!("{child_z}/{cx}/{cy}.png"));
-                        if !child_path.exists() {
-                            continue;
-                        }
-                        let child = image::open(&child_path)?.to_rgb8();
-                        has_data = true;
-                        for py in 0..half {
-                            for px in 0..half {
-                                let mut r = 0u32;
-                                let mut g = 0u32;
-                                let mut b = 0u32;
-                                let mut count = 0u32;
-                                for sy in 0..2 {
-                                    for sx in 0..2 {
-                                        let sx_ = (px * 2 + sx) as u32;
-                                        let sy_ = (py * 2 + sy) as u32;
-                                        if sx_ < child.width() && sy_ < child.height() {
-                                            let p = child.get_pixel(sx_, sy_);
-                                            r += p[0] as u32;
-                                            g += p[1] as u32;
-                                            b += p[2] as u32;
-                                            count += 1;
+        let errs: Vec<String> = (0..parent_ny * parent_nx)
+            .into_par_iter()
+            .filter_map(|i| {
+                let y = i / parent_nx;
+                let x = i % parent_nx;
+                let result = (|| -> Result<(), String> {
+                    let mut parent: image::ImageBuffer<Rgb<u8>, Vec<u8>> =
+                        image::ImageBuffer::new(tile_size, tile_size);
+                    let mut has_data = false;
+                    for dy in 0..2usize {
+                        for dx in 0..2usize {
+                            let cx = 2 * x + dx;
+                            let cy = 2 * y + dy;
+                            let child_path =
+                                tiles_dir.join(format!("{child_z}/{cx}/{cy}.png"));
+                            if !child_path.exists() {
+                                continue;
+                            }
+                            let child = image::open(&child_path)
+                                .map_err(|e| e.to_string())?
+                                .to_rgb8();
+                            has_data = true;
+                            let raw = child.as_raw();
+                            let row_stride = child.width() as usize * 3;
+                            for py in 0..half as usize {
+                                for px in 0..half as usize {
+                                    let mut r = 0u32;
+                                    let mut g = 0u32;
+                                    let mut b = 0u32;
+                                    let mut count = 0u32;
+                                    for sy in 0..2usize {
+                                        for sx in 0..2usize {
+                                            let sx_ = px * 2 + sx;
+                                            let sy_ = py * 2 + sy;
+                                            if sx_ < child.width() as usize
+                                                && sy_ < child.height() as usize
+                                            {
+                                                let off = sy_ * row_stride + sx_ * 3;
+                                                r += raw[off] as u32;
+                                                g += raw[off + 1] as u32;
+                                                b += raw[off + 2] as u32;
+                                                count += 1;
+                                            }
                                         }
                                     }
-                                }
-                                if count > 0 {
-                                    let out_x = (dx as u32) * half + px as u32;
-                                    let out_y = (dy as u32) * half + py as u32;
-                                    parent.put_pixel(
-                                        out_x,
-                                        out_y,
-                                        Rgb([
-                                            (r / count) as u8,
-                                            (g / count) as u8,
-                                            (b / count) as u8,
-                                        ]),
-                                    );
+                                    if count > 0 {
+                                        let out_x = dx as u32 * half + px as u32;
+                                        let out_y = dy as u32 * half + py as u32;
+                                        parent.put_pixel(
+                                            out_x,
+                                            out_y,
+                                            Rgb([
+                                                (r / count) as u8,
+                                                (g / count) as u8,
+                                                (b / count) as u8,
+                                            ]),
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                if has_data {
-                    let parent_path = tiles_dir.join(format!("{z}/{x}/{y}.png"));
-                    if let Some(p) = parent_path.parent() {
-                        std::fs::create_dir_all(p)?;
+                    if has_data {
+                        let parent_path = tiles_dir.join(format!("{z}/{x}/{y}.png"));
+                        if let Some(p) = parent_path.parent() {
+                            std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+                        }
+                        parent
+                            .save(&parent_path)
+                            .map_err(|e| format!("{}: {}", parent_path.display(), e))?;
                     }
-                    parent.save(&parent_path)
-                        .map_err(|e| format!("{}: {}", parent_path.display(), e))?;
-                }
-            }
+                    Ok(())
+                })();
+                result.err()
+            })
+            .collect();
+        if let Some(e) = errs.into_iter().next() {
+            return Err(e.into());
         }
     }
     Ok(())
@@ -731,6 +727,8 @@ fn run_tiles(
     let world_w = 256u32 << (kw - kh);
     // Each Hilbert square covers height×height pixels; tiles are laid left-to-right.
     let square_pixels: u64 = (height as u64) * (height as u64);
+    let total_pixels: u64 = width as u64 * height as u64;
+    let num_squares = 1u32 << (kw - kh);
 
     let pixel_lut: [Rgb<u8>; 256] = {
         let mut lut = [Rgb([0u8, 0, 0]); 256];
@@ -740,29 +738,34 @@ fn run_tiles(
         lut
     };
 
-    let mut writer = TileWriter::new(tile_dir.join("tiles"), tile_size);
+    // Build cumulative byte-start offsets so any pixel_idx can be resolved to
+    // (source_index, local_byte_offset) in O(log n) via binary search.
+    let mut cumulative_offsets: Vec<u64> = Vec::with_capacity(sources.len());
+    {
+        let mut off = 0u64;
+        for s in &sources {
+            cumulative_offsets.push(off);
+            off += s.byte_size;
+        }
+    }
 
-    let pb = if std::io::stderr().is_terminal() {
-        let pb = ProgressBar::new(total);
-        pb.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
-            )
-            .unwrap()
-            .progress_chars("=>-"),
-        );
-        Some(pb)
-    } else {
-        None
-    };
+    // Memory-map each file (or keep stdin data in-memory) for random access.
+    let data: Vec<Data> = sources
+        .iter()
+        .map(|s| -> Result<Data, Box<dyn std::error::Error>> {
+            Ok(match &s.kind {
+                SourceKind::File(p) => {
+                    let f = File::open(p)
+                        .map_err(|e| format!("{}: {}", p.display(), e))?;
+                    Data::Mapped(unsafe { Mmap::map(&f) }
+                        .map_err(|e| format!("{}: {}", p.display(), e))?)
+                }
+                SourceKind::Buffered(v) => Data::Owned(v.clone()),
+            })
+        })
+        .collect::<Result<_, _>>()?;
 
-    let total_pixels = width as u64 * height as u64;
-    let num_squares = 1u32 << (kw - kh); // number of Hilbert squares tiled horizontally
-
-    // Pre-compute each file's boundary segments and label position.
-    // The label is placed at the area-weighted centroid of the file's dyadic
-    // pixel rectangles, which is the true visual center of its data region.
-    // Falls back to the midpoint-byte Hilbert position for empty files.
+    // Pre-compute per-file entity metadata (boundary segments, label positions).
     let mut entities: Vec<FileEntity> = Vec::new();
     {
         let mut cumulative: u64 = 0;
@@ -796,60 +799,57 @@ fn run_tiles(
         }
     }
 
-    let mut pixel_idx = 0u64;
+    // Create the leaf-level tiles directory now (par_iter will create subdirs).
+    std::fs::create_dir_all(tile_dir.join(format!("tiles/{max_zoom}")))?;
 
-    'outer: for source in sources {
-        let mut reader = source.open()?;
-        let mut buf = vec![0u8; 65536];
-        loop {
-            let n = reader.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            for &b in &buf[..n] {
-                if pixel_idx >= total_pixels {
-                    break 'outer;
-                }
-                // Map sequential index into the rectangular grid by tiling Hilbert
-                // squares of order kh horizontally: square_idx selects the column-block,
-                // local_idx is the position within that square's Hilbert curve.
-                let square_idx = pixel_idx / square_pixels;
-                let local_idx = pixel_idx % square_pixels;
-                let (lx, ly): (u32, u32) = h2xy(local_idx, kh as u8);
-                let x = square_idx as u32 * height + lx;
-                let y = ly;
-                let tx = x / tile_size;
-                let ty = y / tile_size;
-                let px = x % tile_size;
-                let py = y % tile_size;
-                writer.write_pixel(max_zoom, tx, ty, px, py, pixel_lut[b as usize])?;
-                pixel_idx += 1;
-            }
+    let total_tiles = width_tiles as u64 * height_tiles as u64;
+    let pb: Option<Arc<ProgressBar>> = if std::io::stderr().is_terminal() {
+        let pb = ProgressBar::new(total_tiles);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} tiles ({eta})",
+            )
+            .unwrap()
+            .progress_chars("=>-"),
+        );
+        Some(Arc::new(pb))
+    } else {
+        None
+    };
+
+    // Render all leaf tiles in parallel.  Each tile owns a non-overlapping
+    // 256×256-pixel region, so threads never contend on data.
+    let errs: Vec<String> = (0..total_tiles)
+        .into_par_iter()
+        .filter_map(|i| {
+            let tx = (i % width_tiles as u64) as u32;
+            let ty = (i / width_tiles as u64) as u32;
+            let path = tile_dir.join(format!("tiles/{max_zoom}/{tx}/{ty}.png"));
+            let result = render_leaf_tile(
+                &path,
+                tx,
+                ty,
+                kh as u8,
+                height,
+                height_tiles,
+                square_pixels,
+                total,
+                &data,
+                &cumulative_offsets,
+                &pixel_lut,
+            );
             if let Some(ref pb) = pb {
-                pb.inc(n as u64);
+                pb.inc(1);
             }
-        }
-    }
+            result.err()
+        })
+        .collect();
 
-    writer.flush_all()?;
     if let Some(ref pb) = pb {
         pb.finish_and_clear();
     }
-
-    // Write black tiles for every unfilled position at max_zoom so the pyramid
-    // is complete and the browser never receives a 404.
-    let black_tile = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(tile_size, tile_size);
-    for ty in 0..height_tiles {
-        for tx in 0..width_tiles {
-            let path = tile_dir.join(format!("tiles/{max_zoom}/{tx}/{ty}.png"));
-            if !path.exists() {
-                if let Some(p) = path.parent() {
-                    std::fs::create_dir_all(p)?;
-                }
-                black_tile.save(&path)
-                    .map_err(|e| format!("{}: {}", path.display(), e))?;
-            }
-        }
+    if let Some(e) = errs.into_iter().next() {
+        return Err(e.into());
     }
 
     eprintln!("Building pyramid …");
@@ -965,14 +965,41 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // --- Pre-compute per-file byte and pixel offsets for parallel dispatch ---
-    let mut file_meta: Vec<(u64, u64)> = Vec::with_capacity(sources.len());
+    // --- Mmap sources for random access (enables intra-file parallelism) ---
+    let source_data: Vec<Data> = sources
+        .iter()
+        .map(|s| -> Result<Data, String> {
+            Ok(match &s.kind {
+                SourceKind::File(p) => {
+                    let f = File::open(p)
+                        .map_err(|e| format!("{}: {}", p.display(), e))?;
+                    Data::Mapped(unsafe { Mmap::map(&f) }.map_err(|e| e.to_string())?)
+                }
+                SourceKind::Buffered(v) => Data::Owned(v.clone()),
+            })
+        })
+        .collect::<Result<_, String>>()?;
+
+    // --- Split each source into chunks for fine-grained parallelism ---
+    // Targeting ~4 MB per chunk so every core gets work even for single-file input.
+    let chunk_bytes = (4 * 1024 * 1024u64).max(stride);
+    // Each entry: (fi, src_idx, src_global_byte_start, chunk_b_start, chunk_b_end, chunk_pixel_start)
+    let mut chunks: Vec<(usize, usize, u64, u64, u64, u64)> = Vec::new();
     {
         let mut b = 0u64;
         let mut p = 0u64;
-        for s in &sources {
-            file_meta.push((b, p));
-            p += sampled_in_range(b, b + s.byte_size, stride);
+        for (src_idx, s) in sources.iter().enumerate() {
+            let fi = s.file_idx;
+            let src_end = b + s.byte_size;
+            let mut cb = b;
+            let mut cp = p;
+            while cb < src_end {
+                let ce = (cb + chunk_bytes).min(src_end);
+                chunks.push((fi, src_idx, b, cb, ce, cp));
+                cp += sampled_in_range(cb, ce, stride);
+                cb = ce;
+            }
+            p += sampled_in_range(b, src_end, stride);
             b += s.byte_size;
         }
     }
@@ -1010,74 +1037,68 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // --- Parallel file processing ---
-    // Each source writes exclusively to pixel indices in [pixel_start, pixel_end),
-    // determined by its non-overlapping byte range. Because every distinct
-    // pixel_count value maps to a unique Hilbert coordinate, writes to `img` and
-    // `pixel_file` across sources never alias — concurrent writes are race-free.
+    // --- Parallel rendering ---
+    // Each chunk writes exclusively to a non-overlapping pixel range, so
+    // concurrent writes to `img` and `pixel_file` are race-free.
     let img_base = img.as_mut_ptr() as usize;
     let pf_base  = pixel_file.as_mut_ptr() as usize;
     let pb_shared: Option<Arc<ProgressBar>> = pb.map(Arc::new);
     let canvas_u = canvas_size as u64;
-
     let cancelled_proc = Arc::clone(&cancelled);
-    let par_results: Vec<(usize, Option<(u32, u32, u32, u32)>)> = sources
-        .into_par_iter()
-        .zip(file_meta.into_par_iter())
-        .map(|(source, (byte_start, pixel_start))| -> Result<_, String> {
-            let fi = source.file_idx;
-            if pixel_start >= canvas_u {
+
+    let chunk_results: Vec<(usize, Option<(u32, u32, u32, u32)>)> = chunks
+        .par_iter()
+        .map(|&(fi, src_idx, src_global_start, chunk_b_start, chunk_b_end, chunk_pixel_start)| -> Result<_, String> {
+            if chunk_pixel_start >= canvas_u || cancelled_proc.load(Ordering::Relaxed) {
                 return Ok((fi, None));
             }
-            let mut reader = source.open().map_err(|e| e.to_string())?;
-            let mut read_buf = vec![0u8; 65536];
-            let mut cur_byte = byte_start;
-            let mut cur_pixel = pixel_start as usize;
+            let data = &source_data[src_idx];
+            let local_start = (chunk_b_start - src_global_start) as usize;
+            let local_end   = (chunk_b_end   - src_global_start) as usize;
+            let bytes = &data[local_start..local_end];
+
+            let mut cur_byte = chunk_b_start;
+            let mut cur_pixel = chunk_pixel_start as usize;
             let mut bbox: Option<(u32, u32, u32, u32)> = None;
 
-            'read: loop {
-                if cancelled_proc.load(Ordering::Relaxed) {
-                    break;
-                }
-                let n = reader.read(&mut read_buf).map_err(|e| e.to_string())?;
-                if n == 0 {
-                    break;
-                }
-                for &b in &read_buf[..n] {
-                    if cur_byte % stride == 0 {
-                        let (x, y): (u32, u32) = h2xy(cur_pixel as u64, k as u8);
-                        let color = pixel_lut[b as usize];
-                        let pixel_idx = y as usize * side as usize + x as usize;
-                        unsafe {
-                            let p = (img_base as *mut u8).add(pixel_idx * 3);
-                            p.write(color[0]);
-                            p.add(1).write(color[1]);
-                            p.add(2).write(color[2]);
-                            (pf_base as *mut Option<usize>).add(pixel_idx).write(Some(fi));
-                        }
-                        bbox = Some(match bbox {
-                            None => (x, y, x, y),
-                            Some((x0, y0, x1, y1)) => {
-                                (x0.min(x), y0.min(y), x1.max(x), y1.max(y))
-                            }
-                        });
-                        cur_pixel += 1;
-                        if cur_pixel >= canvas_size {
-                            break 'read;
-                        }
+            for &b in bytes {
+                if cur_byte % stride == 0 {
+                    let (x, y): (u32, u32) = h2xy(cur_pixel as u64, k as u8);
+                    let color = pixel_lut[b as usize];
+                    let pixel_idx = y as usize * side as usize + x as usize;
+                    unsafe {
+                        let p = (img_base as *mut u8).add(pixel_idx * 3);
+                        p.write(color[0]);
+                        p.add(1).write(color[1]);
+                        p.add(2).write(color[2]);
+                        (pf_base as *mut Option<usize>).add(pixel_idx).write(Some(fi));
                     }
-                    cur_byte += 1;
+                    bbox = Some(match bbox {
+                        None => (x, y, x, y),
+                        Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+                    });
+                    cur_pixel += 1;
+                    if cur_pixel >= canvas_size {
+                        break;
+                    }
                 }
-                if let Some(ref pb) = pb_shared {
-                    pb.inc(n as u64);
-                }
+                cur_byte += 1;
+            }
+            if let Some(ref pb) = pb_shared {
+                pb.inc(chunk_b_end - chunk_b_start);
             }
             Ok((fi, bbox))
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    for (fi, bbox) in par_results {
-        bboxes[fi] = bbox;
+    // Merge per-chunk bboxes into per-file bboxes.
+    for (fi, bbox) in chunk_results {
+        if let Some(b) = bbox {
+            bboxes[fi] = Some(match bboxes[fi] {
+                None => b,
+                Some((x0, y0, x1, y1)) => (x0.min(b.0), y0.min(b.1), x1.max(b.2), y1.max(b.3)),
+            });
+        }
     }
 
     // Stop background display thread before mutating img further.
@@ -1096,29 +1117,39 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // When multiple files are given, mark pixels on the border between files black.
     // A border pixel is any pixel whose 4-neighbor was painted by a different file.
+    // Reads pixel_file (shared) and writes img via raw pointer — race-free because
+    // each row writes only its own pixels and neighbors are read-only.
     if num_files > 1 {
-        for y in 0..side {
-            for x in 0..side {
-                let idx = y as usize * side as usize + x as usize;
-                if let Some(file_idx) = pixel_file[idx] {
+        let img_ptr = img.as_mut_ptr() as usize;
+        let pf = &pixel_file;
+        let side_u = side as usize;
+        (0..side as usize).into_par_iter().for_each(|y| {
+            for x in 0..side_u {
+                let idx = y * side_u + x;
+                if let Some(file_idx) = pf[idx] {
                     let is_border = [(0i32, 1i32), (0, -1), (1, 0), (-1, 0)]
                         .iter()
                         .any(|(dx, dy)| {
-                            let nx = x as i32 + dx;
-                            let ny = y as i32 + dy;
-                            if nx >= 0 && nx < side as i32 && ny >= 0 && ny < side as i32 {
-                                let nidx = ny as usize * side as usize + nx as usize;
-                                pixel_file[nidx].map_or(false, |nf| nf != file_idx)
+                            let nx = x as i32 + *dx;
+                            let ny = y as i32 + *dy;
+                            if nx >= 0 && nx < side_u as i32 && ny >= 0 && ny < side_u as i32 {
+                                let nidx = ny as usize * side_u + nx as usize;
+                                pf[nidx].map_or(false, |nf| nf != file_idx)
                             } else {
                                 false
                             }
                         });
                     if is_border {
-                        img.put_pixel(x, y, Rgb([0, 0, 0]));
+                        unsafe {
+                            let p = (img_ptr as *mut u8).add(idx * 3);
+                            p.write(0);
+                            p.add(1).write(0);
+                            p.add(2).write(0);
+                        }
                     }
                 }
             }
-        }
+        });
     }
 
     if let Some(path) = args.output {

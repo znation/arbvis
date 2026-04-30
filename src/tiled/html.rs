@@ -119,6 +119,8 @@ pub fn write_leaflet_html(
 
       activeOverlays.clearLayers();
 
+      var placed = [];
+
       for (var i = 0; i < visible.length; i++) {{
         var l = visible[i];
         if (l.segs && l.segs.length > 0) {{
@@ -138,15 +140,31 @@ pub fn write_leaflet_html(
         }}
         var lat = -(l.y / HEIGHT) * 256;
         var lng =  (l.x / HEIGHT) * 256;
-        activeOverlays.addLayer(L.marker([lat, lng], {{
-          icon: L.divIcon({{
-            className: 'file-label',
-            html: l.name,
-            iconSize: [0, 0],
-            iconAnchor: [0, 0]
-          }}),
-          interactive: false
-        }}));
+        var pt = map.latLngToContainerPoint([lat, lng]);
+        var tw = l.name.length * 7 + 12;
+        var th = 22;
+        var lb = {{ x: pt.x - tw/2, y: pt.y - th/2, w: tw, h: th }};
+        var overlaps = false;
+        for (var j = 0; j < placed.length; j++) {{
+          var p = placed[j];
+          if (lb.x < p.x + p.w && lb.x + lb.w > p.x &&
+              lb.y < p.y + p.h && lb.y + lb.h > p.y) {{
+            overlaps = true;
+            break;
+          }}
+        }}
+        if (!overlaps) {{
+          placed.push(lb);
+          activeOverlays.addLayer(L.marker([lat, lng], {{
+            icon: L.divIcon({{
+              className: 'file-label',
+              html: l.name,
+              iconSize: [0, 0],
+              iconAnchor: [0, 0]
+            }}),
+            interactive: false
+          }}));
+        }}
       }}
     }}
 

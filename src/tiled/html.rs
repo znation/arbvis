@@ -63,7 +63,7 @@ pub fn write_leaflet_html(
     html, body, #map {{ height: 100%; margin: 0; padding: 0; }}
     .file-label {{
       background: rgba(0,0,0,0.65);
-      color: #fff;
+      color: #ccc;
       padding: 2px 5px;
       font: 11px/1.4 monospace;
       white-space: nowrap;

@@ -369,12 +369,37 @@ fn build_pyramid(
     if max_zoom == 0 {
         return Ok(());
     }
+
+    let total_pyramid_tiles: u64 = (0..max_zoom)
+        .map(|z| {
+            let levels_from_max = max_zoom - z;
+            let nx = (width_tiles >> levels_from_max).max(1) as u64;
+            let ny = (height_tiles >> levels_from_max).max(1) as u64;
+            nx * ny
+        })
+        .sum();
+    let pb: Option<Arc<ProgressBar>> = if std::io::stderr().is_terminal() {
+        let pb = ProgressBar::new(total_pyramid_tiles);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} tiles ({eta})",
+            )
+            .unwrap()
+            .progress_chars("##-"),
+        );
+        pb.enable_steady_tick(Duration::from_millis(100));
+        Some(Arc::new(pb))
+    } else {
+        None
+    };
+
     let half = tile_size / 2;
     for z in (0..max_zoom).rev() {
         let child_z = z + 1;
         let levels_from_max = max_zoom - z;
         let parent_nx = (width_tiles >> levels_from_max).max(1) as usize;
         let parent_ny = (height_tiles >> levels_from_max).max(1) as usize;
+        let pb = pb.clone();
         let errs: Vec<String> = (0..parent_ny * parent_nx)
             .into_par_iter()
             .filter_map(|i| {
@@ -448,12 +473,18 @@ fn build_pyramid(
                     }
                     Ok(())
                 })();
+                if let Some(ref pb) = pb {
+                    pb.inc(1);
+                }
                 result.err()
             })
             .collect();
         if let Some(e) = errs.into_iter().next() {
             return Err(e.into());
         }
+    }
+    if let Some(pb) = pb {
+        pb.finish_and_clear();
     }
     Ok(())
 }
@@ -897,7 +928,7 @@ fn run_tiles(
         return Err(e.into());
     }
 
-    eprintln!("Building pyramid …");
+    eprintln!("Building pyramid…");
     build_pyramid(&tile_dir.join("tiles"), tile_size, max_zoom, width_tiles, height_tiles)?;
 
     write_leaflet_html(&tile_dir, world_w, max_zoom, height, &entities)?;

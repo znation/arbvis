@@ -594,6 +594,9 @@ fn write_leaflet_html(
     // World height is always 256 units (one tile at zoom 0 in y).
     // World width = 256 * 2^(kw-kh), covering extra columns for wide rectangles.
     // Pixel (x,y) -> Leaflet [lat, lng]: lat = -y*256/height, lng = x*256/height
+
+    // Write entity data to a separate file so the HTML loads instantly and the
+    // browser can fetch/process labels asynchronously after the map is visible.
     let entities_json: String = {
         let entries: Vec<String> = entities
             .iter()
@@ -616,6 +619,7 @@ fn write_leaflet_html(
             .collect();
         format!("[{}]", entries.join(","))
     };
+    std::fs::write(dir.join("labels.json"), &entities_json)?;
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -661,43 +665,58 @@ fn write_leaflet_html(
     map.fitBounds([[-256, 0], [0, {world_w}]]);
 
     var HEIGHT = {height};
-    var labels = {entities_json};
-    labels.forEach(function(l) {{
-      if (!l.segs || l.segs.length === 0) return;
-      var ll = l.segs.map(function(s) {{
-        return [
-          [-(s[1] / HEIGHT) * 256, (s[0] / HEIGHT) * 256],
-          [-(s[3] / HEIGHT) * 256, (s[2] / HEIGHT) * 256],
-        ];
+
+    // Fetch label data after the map is ready, then add overlays in batches
+    // so the main thread is never blocked for more than ~16 ms at a time.
+    fetch('labels.json')
+      .then(function(r) {{ return r.json(); }})
+      .then(function(labels) {{
+        var i = 0;
+        var BATCH = 200;
+        var schedule = typeof requestIdleCallback === 'function'
+          ? function(fn) {{ requestIdleCallback(fn, {{timeout: 100}}); }}
+          : function(fn) {{ setTimeout(fn, 0); }};
+        function addBatch() {{
+          var end = Math.min(i + BATCH, labels.length);
+          for (; i < end; i++) {{
+            var l = labels[i];
+            if (l.segs && l.segs.length > 0) {{
+              var ll = l.segs.map(function(s) {{
+                return [
+                  [-(s[1] / HEIGHT) * 256, (s[0] / HEIGHT) * 256],
+                  [-(s[3] / HEIGHT) * 256, (s[2] / HEIGHT) * 256],
+                ];
+              }});
+              L.polyline(ll, {{
+                color: 'hsl(' + l.hue + ',70%,60%)',
+                weight: 1,
+                opacity: 0.9,
+                fill: false,
+                interactive: false,
+              }}).addTo(map);
+            }}
+            var lat = -(l.y / HEIGHT) * 256;
+            var lng =  (l.x / HEIGHT) * 256;
+            L.marker([lat, lng], {{
+              icon: L.divIcon({{
+                className: 'file-label',
+                html: l.name,
+                iconSize: [0, 0],
+                iconAnchor: [0, 0]
+              }}),
+              interactive: false
+            }}).addTo(map);
+          }}
+          if (i < labels.length) {{ schedule(addBatch); }}
+        }}
+        schedule(addBatch);
       }});
-      L.polyline(ll, {{
-        color: 'hsl(' + l.hue + ',70%,60%)',
-        weight: 1,
-        opacity: 0.9,
-        fill: false,
-        interactive: false,
-      }}).addTo(map);
-    }});
-    labels.forEach(function(l) {{
-      var lat = -(l.y / HEIGHT) * 256;
-      var lng =  (l.x / HEIGHT) * 256;
-      L.marker([lat, lng], {{
-        icon: L.divIcon({{
-          className: 'file-label',
-          html: l.name,
-          iconSize: [0, 0],
-          iconAnchor: [0, 0]
-        }}),
-        interactive: false
-      }}).addTo(map);
-    }});
   </script>
 </body>
 </html>"#,
         max_zoom = max_zoom,
         world_w = world_w,
         height = height,
-        entities_json = entities_json,
     );
     std::fs::write(dir.join("index.html"), html)?;
     Ok(())

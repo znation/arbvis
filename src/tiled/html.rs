@@ -86,7 +86,7 @@ pub fn write_leaflet_html(
       tileSize: 256,
       bounds: [[-256, 0], [0, {world_w}]],
       noWrap: true,
-      attribution: 'arbvis'
+      attribution: '<a href="https://github.com/znation/arbvis">arbvis</a>'
     }}).addTo(map);
     map.fitBounds([[-256, 0], [0, {world_w}]]);
 

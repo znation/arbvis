@@ -61,6 +61,8 @@ pub fn write_leaflet_html(
           crossorigin=""></script>
   <style>
     html, body, #map {{ height: 100%; margin: 0; padding: 0; }}
+    .leaflet-right .leaflet-control {{ margin-right: 10px; }}
+    .leaflet-control-attribution {{ box-sizing: border-box; }}
     .file-label {{
       background: rgba(0,0,0,0.65);
       color: #ccc;

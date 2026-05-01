@@ -32,7 +32,7 @@ The tiled viewer offers significant advantages over the single-image mode:
 
 ## Color scheme
 
-Bytes are colored by range (based on [Stairwell's approach](https://stairwell.com/resources/hilbert-curves-visualizing-binary-files-with-color-and-patterns/)):
+Bytes are colored by range (based on [Stairwell's approach](https://stairwell.com/blog/hilbert-curves-visualizing-binary-files-with-color-and-patterns/)):
 
 | Value | Color |
 |-------|-------|

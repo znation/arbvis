@@ -1,8 +1,8 @@
 # arbvis
 
-![arbvis screenshot](arbvis.png)
-
 Visualize binary files as [Hilbert curve](https://en.wikipedia.org/wiki/Hilbert_curve) plots. Each byte is mapped to a color and placed along a Hilbert curve, making structural patterns in the file visually apparent — null regions, ASCII text, compressed/encrypted data, and boundaries between file sections all produce recognizable visual signatures.
+
+![arbvis screenshot](arbvis.png)
 
 ## Quick start
 

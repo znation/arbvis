@@ -87,6 +87,24 @@ pub fn prepare_sources(
     Ok((sources, total))
 }
 
+/// Sort bytes within each source by byte value, loading all sources into memory.
+pub fn sort_sources(sources: Vec<Source>) -> anyhow::Result<Vec<Source>> {
+    let mut sorted = Vec::with_capacity(sources.len());
+    for s in sources {
+        let mut bytes: Vec<u8> = match s.kind {
+            SourceKind::File(ref p) => std::fs::read(p)?,
+            SourceKind::Buffered(v) => v,
+        };
+        bytes.sort_unstable();
+        sorted.push(Source {
+            file_idx: s.file_idx,
+            byte_size: s.byte_size,
+            kind: SourceKind::Buffered(bytes),
+        });
+    }
+    Ok(sorted)
+}
+
 /// Open a source for random access (mmap file or clone owned buffer).
 pub fn open_source_data(s: &Source) -> anyhow::Result<Data> {
     Ok(match &s.kind {

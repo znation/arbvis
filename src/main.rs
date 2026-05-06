@@ -36,6 +36,10 @@ struct Args {
     /// Write a tiled pyramid to this directory for Leaflet.js viewing
     #[arg(short, long, conflicts_with = "output")]
     tiles: Option<PathBuf>,
+
+    /// Sort bytes by value within each file before rendering (loads files into memory)
+    #[arg(short = 's', long)]
+    sort: bool,
 }
 
 fn run(args: Args) -> anyhow::Result<()> {
@@ -59,6 +63,11 @@ fn run(args: Args) -> anyhow::Result<()> {
     }
 
     let (sources, total) = data::prepare_sources(&files)?;
+    let sources = if args.sort {
+        data::sort_sources(sources)?
+    } else {
+        sources
+    };
 
     if let Some(tile_dir) = args.tiles {
         return tiled::run_tiles(sources, total, tile_dir);

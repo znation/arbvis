@@ -5,6 +5,7 @@ pub mod pyramid;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
@@ -47,16 +48,33 @@ pub fn run_tiles(
     // Load all source data in parallel: mmaps for the unsorted path, or
     // full reads + sort for the sorted path. Tiled rendering accesses any
     // source for any tile, so all data must be available before rendering starts.
-    log::info!("Loading {} source(s){}...", sources.len(), if sort { " and sorting" } else { "" });
+    let sort_pb: Option<Arc<ProgressBar>> = if sort && std::io::stderr().is_terminal() {
+        let pb = ProgressBar::new(total);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} sorting ({eta})",
+            )
+            .unwrap()
+            .progress_chars("=>-"),
+        );
+        pb.enable_steady_tick(Duration::from_millis(100));
+        Some(Arc::new(pb))
+    } else {
+        None
+    };
     let source_data: Vec<Data> = sources
         .par_iter()
-        .map(|s| {
-            if sort {
-                log::info!("  sorting {} ({} bytes)...", s.name(), s.byte_size);
+        .map(|s| -> anyhow::Result<Data> {
+            let data = load_source_data(s, sort)?;
+            if let Some(ref pb) = sort_pb {
+                pb.inc(s.byte_size);
             }
-            load_source_data(s, sort)
+            Ok(data)
         })
         .collect::<anyhow::Result<_>>()?;
+    if let Some(ref pb) = sort_pb {
+        pb.finish_and_clear();
+    }
 
     // Build cumulative byte-start offsets.
     let mut cumulative_offsets: Vec<u64> = Vec::with_capacity(sources.len());
@@ -69,7 +87,6 @@ pub fn run_tiles(
     }
 
     // Pre-compute per-file entity metadata.
-    log::info!("Computing layout for {} file(s)...", sources.len());
     let mut entities: Vec<FileEntity> = Vec::new();
     {
         let mut cumulative: u64 = 0;
@@ -119,6 +136,7 @@ pub fn run_tiles(
     std::fs::create_dir_all(tile_dir.join(format!("tiles/{max_zoom}")))?;
 
     let total_tiles = width_tiles as u64 * height_tiles as u64;
+    log::info!("Rendering {} leaf tiles...", total_tiles);
     let pb: Option<Arc<ProgressBar>> = if std::io::stderr().is_terminal() {
         let pb = ProgressBar::new(total_tiles);
         pb.set_style(
@@ -128,13 +146,11 @@ pub fn run_tiles(
             .unwrap()
             .progress_chars("=>-"),
         );
+        pb.enable_steady_tick(Duration::from_millis(100));
         Some(Arc::new(pb))
     } else {
         None
     };
-
-    // Render all leaf tiles in parallel.
-    log::info!("Rendering {} leaf tiles...", total_tiles);
     let first_err = (0..total_tiles).into_par_iter().find_map_any(|i| {
         let tx = (i % width_tiles as u64) as u32;
         let ty = (i / width_tiles as u64) as u32;

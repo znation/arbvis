@@ -1,5 +1,6 @@
 mod color;
 mod data;
+mod deploy;
 mod geometry;
 mod label;
 mod single;
@@ -45,6 +46,11 @@ struct Args {
     /// Visualize abs(modified - original) byte differences; ORIGINAL and MODIFIED are files or directories
     #[arg(long, num_args = 2, value_names = ["ORIGINAL", "MODIFIED"])]
     diff: Option<Vec<PathBuf>>,
+
+    /// Render tiles and deploy to this HF Space (e.g. username/my-vis);
+    /// bucket is auto-named as <namespace>/<repo>_bucket
+    #[arg(long, conflicts_with = "output")]
+    space: Option<String>,
 }
 
 fn run(args: Args) -> anyhow::Result<()> {
@@ -53,7 +59,17 @@ fn run(args: Args) -> anyhow::Result<()> {
             data::prepare_diff_sources(&diff_args[0], &diff_args[1])?;
         let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
         if let Some(tile_dir) = args.tiles {
-            return tiled::run_tiles(sources, total, tile_dir, args.sort, true);
+            tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, true)?;
+            if let Some(ref space_id) = args.space {
+                deploy::run_deploy(&tile_dir, space_id)?;
+            }
+            return Ok(());
+        }
+        if let Some(ref space_id) = args.space {
+            let tile_dir = derive_space_tile_dir(space_id);
+            tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, true)?;
+            deploy::run_deploy(&tile_dir, space_id)?;
+            return Ok(());
         }
         return single::run_single(&labels, args.output, sources, total, args.sort, true);
     }
@@ -80,16 +96,32 @@ fn run(args: Args) -> anyhow::Result<()> {
     let (sources, total) = data::prepare_sources(&files)?;
 
     if let Some(tile_dir) = args.tiles {
-        return tiled::run_tiles(sources, total, tile_dir, args.sort, false);
+        tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, false)?;
+        if let Some(ref space_id) = args.space {
+            deploy::run_deploy(&tile_dir, space_id)?;
+        }
+        return Ok(());
+    }
+
+    if let Some(ref space_id) = args.space {
+        let tile_dir = derive_space_tile_dir(space_id);
+        tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, false)?;
+        deploy::run_deploy(&tile_dir, space_id)?;
+        return Ok(());
     }
 
     single::run_single(&files, args.output, sources, total, args.sort, false)
 }
 
+fn derive_space_tile_dir(space_id: &str) -> PathBuf {
+    let repo = space_id.split('/').last().unwrap_or(space_id);
+    PathBuf::from(repo)
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
-    let has_output = args.output.is_some() || args.tiles.is_some();
+    let has_output = args.output.is_some() || args.tiles.is_some() || args.space.is_some();
 
     if has_output {
         run(args)

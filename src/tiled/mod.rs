@@ -54,6 +54,7 @@ pub fn run_tiles(
     }
 
     // Pre-compute per-file entity metadata.
+    log::info!("Computing layout for {} file(s)...", sources.len());
     let mut entities: Vec<FileEntity> = Vec::new();
     {
         let mut cumulative: u64 = 0;
@@ -118,6 +119,7 @@ pub fn run_tiles(
     };
 
     // Render all leaf tiles in parallel.
+    log::info!("Rendering {} leaf tiles...", total_tiles);
     let first_err = (0..total_tiles).into_par_iter().find_map_any(|i| {
         let tx = (i % width_tiles as u64) as u32;
         let ty = (i / width_tiles as u64) as u32;
@@ -147,7 +149,7 @@ pub fn run_tiles(
         return Err(anyhow::anyhow!("{e}"));
     }
 
-    eprintln!("Building pyramid…");
+    log::info!("Building tile pyramid ({} zoom levels)...", max_zoom);
     build_pyramid(
         &tile_dir.join("tiles"),
         tile_size,
@@ -156,8 +158,9 @@ pub fn run_tiles(
         height_tiles,
     )?;
 
+    log::info!("Writing HTML viewer...");
     html::write_leaflet_html(&tile_dir, world_w, max_zoom, height, &entities)?;
 
-    eprintln!("Tiled output written to {}", tile_dir.display());
+    log::info!("Tiled output written to {}", tile_dir.display());
     Ok(())
 }

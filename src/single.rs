@@ -94,6 +94,7 @@ pub fn run_single(
     };
 
     // Open all sources for random access.
+    log::info!("Opening {} source(s)...", sources.len());
     let source_data: Vec<_> = sources
         .iter()
         .map(open_source_data)
@@ -153,6 +154,7 @@ pub fn run_single(
 
     // Parallel rendering: each chunk writes exclusively to non-overlapping
     // pixel ranges, so concurrent writes to `img` and `pixel_file` are race-free.
+    log::info!("Rendering {}×{} image ({} bytes)...", side, side, total);
     let img_base = img.as_mut_ptr() as usize;
     let pf_base = pixel_file.as_mut_ptr() as usize;
     let pb_shared: Option<Arc<ProgressBar>> = pb.map(Arc::new);

@@ -54,6 +54,7 @@ pub fn prepare_sources(
     files: &[PathBuf],
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     if files.is_empty() {
+        log::info!("Reading stdin...");
         let mut buf = Vec::new();
         io::stdin().read_to_end(&mut buf)?;
         let len = buf.len() as u64;
@@ -91,10 +92,16 @@ pub fn prepare_sources(
 pub fn sort_sources(sources: Vec<Source>) -> anyhow::Result<Vec<Source>> {
     let mut sorted = Vec::with_capacity(sources.len());
     for s in sources {
+        let name = s.name();
+        let byte_size = s.byte_size;
         let mut bytes: Vec<u8> = match s.kind {
-            SourceKind::File(ref p) => std::fs::read(p)?,
+            SourceKind::File(ref p) => {
+                log::info!("Loading {} ({} bytes)...", p.display(), byte_size);
+                std::fs::read(p)?
+            }
             SourceKind::Buffered(v) => v,
         };
+        log::info!("Sorting {} ({} bytes)...", name, bytes.len());
         bytes.sort_unstable();
         sorted.push(Source {
             file_idx: s.file_idx,

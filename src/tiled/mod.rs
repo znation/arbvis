@@ -10,7 +10,7 @@ use std::time::Duration;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 
-use crate::color::build_pixel_lut;
+use crate::color::{build_diff_pixel_lut, build_pixel_lut};
 use crate::data::{load_source_data, Data, Histogram, Source};
 use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, rects_centroid};
 use crate::tiled::html::FileEntity;
@@ -23,6 +23,7 @@ pub fn run_tiles(
     total: u64,
     tile_dir: PathBuf,
     sort: bool,
+    diff_mode: bool,
 ) -> anyhow::Result<()> {
     // Find s = ceil(log2(total)), minimum 16 so the image is at least 256×256.
     // Split into kh = floor(s/2) (height) and kw = ceil(s/2) (width).
@@ -43,7 +44,7 @@ pub fn run_tiles(
     let total_pixels: u64 = width as u64 * height as u64;
     let num_squares = 1u32 << (kw - kh);
 
-    let pixel_lut = build_pixel_lut();
+    let pixel_lut = if diff_mode { build_diff_pixel_lut() } else { build_pixel_lut() };
 
     // Build cumulative byte-start offsets.
     let mut cumulative_offsets: Vec<u64> = Vec::with_capacity(sources.len());

@@ -12,7 +12,7 @@ use rayon::prelude::*;
 use show_image::create_window;
 use show_image::event::WindowEvent;
 
-use crate::color::build_pixel_lut;
+use crate::color::{build_diff_pixel_lut, build_pixel_lut};
 use crate::data::{load_source_data, Histogram, Source};
 use crate::geometry::{sampled_in_range, hilbert_to_xy_u64};
 use crate::label::draw_file_label;
@@ -24,6 +24,7 @@ pub fn run_single(
     sources: Vec<Source>,
     total: u64,
     sort: bool,
+    diff_mode: bool,
 ) -> anyhow::Result<()> {
     let num_files = files.len().max(1);
     let total_usize = (total as usize).max(1);
@@ -45,7 +46,7 @@ pub fn run_single(
         1
     } as u64;
 
-    let pixel_lut = build_pixel_lut();
+    let pixel_lut = if diff_mode { build_diff_pixel_lut() } else { build_pixel_lut() };
 
     let mut img: image::ImageBuffer<Rgb<u8>, Vec<u8>> = image::ImageBuffer::new(side, side);
 

@@ -53,9 +53,9 @@ fn run(args: Args) -> anyhow::Result<()> {
             data::prepare_diff_sources(&diff_args[0], &diff_args[1])?;
         let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
         if let Some(tile_dir) = args.tiles {
-            return tiled::run_tiles(sources, total, tile_dir, args.sort);
+            return tiled::run_tiles(sources, total, tile_dir, args.sort, true);
         }
-        return single::run_single(&labels, args.output, sources, total, args.sort);
+        return single::run_single(&labels, args.output, sources, total, args.sort, true);
     }
 
     let mut files = args.files;
@@ -80,10 +80,10 @@ fn run(args: Args) -> anyhow::Result<()> {
     let (sources, total) = data::prepare_sources(&files)?;
 
     if let Some(tile_dir) = args.tiles {
-        return tiled::run_tiles(sources, total, tile_dir, args.sort);
+        return tiled::run_tiles(sources, total, tile_dir, args.sort, false);
     }
 
-    single::run_single(&files, args.output, sources, total, args.sort)
+    single::run_single(&files, args.output, sources, total, args.sort, false)
 }
 
 fn main() -> anyhow::Result<()> {

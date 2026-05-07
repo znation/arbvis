@@ -32,6 +32,15 @@ pub fn build_pixel_lut() -> [Rgb<u8>; 256] {
     lut
 }
 
+/// Diff color LUT: linearly scales black (0) → magenta (255).
+pub fn build_diff_pixel_lut() -> [Rgb<u8>; 256] {
+    let mut lut = [Rgb([0u8, 0, 0]); 256];
+    for (i, entry) in lut.iter_mut().enumerate() {
+        *entry = Rgb([i as u8, 0, i as u8]);
+    }
+    lut
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

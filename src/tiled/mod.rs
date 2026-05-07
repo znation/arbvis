@@ -82,7 +82,7 @@ pub fn run_tiles(
             })
             .collect::<anyhow::Result<_>>()?;
         if let Some(ref pb) = sort_pb {
-            pb.finish_and_clear();
+            pb.finish();
         }
         result
     } else {
@@ -199,7 +199,7 @@ pub fn run_tiles(
     });
 
     if let Some(ref pb) = pb {
-        pb.finish_and_clear();
+        pb.finish();
     }
     if let Some(e) = first_err {
         return Err(anyhow::anyhow!("{e}"));

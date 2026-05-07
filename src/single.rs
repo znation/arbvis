@@ -315,7 +315,7 @@ pub fn run_single(
     }
 
     if let Some(ref pb) = pb_shared {
-        pb.finish_and_clear();
+        pb.finish();
     }
 
     // When multiple files are given, mark border pixels black.

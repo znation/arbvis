@@ -80,8 +80,11 @@ pub fn run_single(
     let mut pixel_file: Vec<Option<usize>> = vec![None; canvas_size];
     let mut bboxes: Vec<Option<(u32, u32, u32, u32)>> = vec![None; num_files];
 
+    // For --sort, the progress bar covers two equal phases: loading+sorting (first half)
+    // and rendering (second half). For non-sort, it covers rendering only.
+    let pb_total = if sort { total.saturating_mul(2) } else { total };
     let pb = if std::io::stderr().is_terminal() {
-        let pb = ProgressBar::new(total);
+        let pb = ProgressBar::new(pb_total);
         pb.set_style(
             ProgressStyle::with_template(
                 "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
@@ -158,7 +161,11 @@ pub fn run_single(
     log::info!("Rendering {}×{} image ({} bytes)...", side, side, total);
     let img_base = img.as_mut_ptr() as usize;
     let pf_base = pixel_file.as_mut_ptr() as usize;
-    let pb_shared: Option<Arc<ProgressBar>> = pb.map(Arc::new);
+    // Enable steady_tick after the log message above so the bar doesn't interleave with it.
+    let pb_shared: Option<Arc<ProgressBar>> = pb.map(|pb| {
+        pb.enable_steady_tick(Duration::from_millis(100));
+        Arc::new(pb)
+    });
     let canvas_u = canvas_size as u64;
     let cancelled_proc = Arc::clone(&cancelled);
 
@@ -171,6 +178,12 @@ pub fn run_single(
                     return Ok(vec![]);
                 }
                 let data = load_source_data(&sources[src_idx], sort)?;
+                // For --sort, count the load+sort phase as the first half of total progress.
+                if sort {
+                    if let Some(ref pb) = pb_shared {
+                        pb.inc(sources[src_idx].byte_size);
+                    }
+                }
                 let results = source_chunks
                     .par_iter()
                     .map(|&(fi, src_global_start, chunk_b_start, chunk_b_end, chunk_pixel_start)| {

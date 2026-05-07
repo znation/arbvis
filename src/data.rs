@@ -92,14 +92,12 @@ pub fn prepare_sources(
 ///
 /// For file sources: mmaps the file (sort=false) or reads and sorts it
 /// (sort=true). For buffered sources (stdin): clones the buffer, sorting
-/// if requested. Only sort=true paths log to avoid spam for large file sets.
+/// if requested.
 pub fn load_source_data(s: &Source, sort: bool) -> anyhow::Result<Data> {
     match &s.kind {
         SourceKind::File(p) => {
             if sort {
-                log::info!("Loading {} ({} bytes)...", p.display(), s.byte_size);
                 let mut bytes = std::fs::read(p)?;
-                log::info!("Sorting {} ({} bytes)...", p.display(), bytes.len());
                 bytes.sort_unstable();
                 Ok(Data::Owned(bytes))
             } else {
@@ -109,7 +107,6 @@ pub fn load_source_data(s: &Source, sort: bool) -> anyhow::Result<Data> {
         }
         SourceKind::Buffered(v) => {
             if sort {
-                log::info!("Sorting stdin ({} bytes)...", v.len());
                 let mut bytes = v.clone();
                 bytes.sort_unstable();
                 Ok(Data::Owned(bytes))

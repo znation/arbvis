@@ -47,10 +47,15 @@ pub fn run_tiles(
     // Load all source data in parallel: mmaps for the unsorted path, or
     // full reads + sort for the sorted path. Tiled rendering accesses any
     // source for any tile, so all data must be available before rendering starts.
-    log::info!("Loading {} source(s)...", sources.len());
+    log::info!("Loading {} source(s){}...", sources.len(), if sort { " and sorting" } else { "" });
     let source_data: Vec<Data> = sources
         .par_iter()
-        .map(|s| load_source_data(s, sort))
+        .map(|s| {
+            if sort {
+                log::info!("  sorting {} ({} bytes)...", s.name(), s.byte_size);
+            }
+            load_source_data(s, sort)
+        })
         .collect::<anyhow::Result<_>>()?;
 
     // Build cumulative byte-start offsets.

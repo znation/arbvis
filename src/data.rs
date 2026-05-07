@@ -88,37 +88,34 @@ pub fn prepare_sources(
     Ok((sources, total))
 }
 
-/// Sort bytes within each source by byte value, loading all sources into memory.
-pub fn sort_sources(sources: Vec<Source>) -> anyhow::Result<Vec<Source>> {
-    let mut sorted = Vec::with_capacity(sources.len());
-    for s in sources {
-        let name = s.name();
-        let byte_size = s.byte_size;
-        let mut bytes: Vec<u8> = match s.kind {
-            SourceKind::File(ref p) => {
-                log::info!("Loading {} ({} bytes)...", p.display(), byte_size);
-                std::fs::read(p)?
-            }
-            SourceKind::Buffered(v) => v,
-        };
-        log::info!("Sorting {} ({} bytes)...", name, bytes.len());
-        bytes.sort_unstable();
-        sorted.push(Source {
-            file_idx: s.file_idx,
-            byte_size: s.byte_size,
-            kind: SourceKind::Buffered(bytes),
-        });
-    }
-    Ok(sorted)
-}
-
-/// Open a source for random access (mmap file or clone owned buffer).
-pub fn open_source_data(s: &Source) -> anyhow::Result<Data> {
-    Ok(match &s.kind {
+/// Load a source's bytes, optionally sorting them by value.
+///
+/// For file sources: mmaps the file (sort=false) or reads and sorts it
+/// (sort=true). For buffered sources (stdin): clones the buffer, sorting
+/// if requested. Only sort=true paths log to avoid spam for large file sets.
+pub fn load_source_data(s: &Source, sort: bool) -> anyhow::Result<Data> {
+    match &s.kind {
         SourceKind::File(p) => {
-            let f = File::open(p)?;
-            Data::Mapped(unsafe { Mmap::map(&f) }?)
+            if sort {
+                log::info!("Loading {} ({} bytes)...", p.display(), s.byte_size);
+                let mut bytes = std::fs::read(p)?;
+                log::info!("Sorting {} ({} bytes)...", p.display(), bytes.len());
+                bytes.sort_unstable();
+                Ok(Data::Owned(bytes))
+            } else {
+                let f = File::open(p)?;
+                Ok(Data::Mapped(unsafe { Mmap::map(&f) }?))
+            }
         }
-        SourceKind::Buffered(v) => Data::Owned(v.clone()),
-    })
+        SourceKind::Buffered(v) => {
+            if sort {
+                log::info!("Sorting stdin ({} bytes)...", v.len());
+                let mut bytes = v.clone();
+                bytes.sort_unstable();
+                Ok(Data::Owned(bytes))
+            } else {
+                Ok(Data::Owned(v.clone()))
+            }
+        }
+    }
 }

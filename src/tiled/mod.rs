@@ -10,7 +10,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 
 use crate::color::build_pixel_lut;
-use crate::data::Source;
+use crate::data::{load_source_data, Data, Source};
 use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, rects_centroid};
 use crate::tiled::html::FileEntity;
 use crate::tiled::leaf::render_leaf_tile;
@@ -21,6 +21,7 @@ pub fn run_tiles(
     sources: Vec<Source>,
     total: u64,
     tile_dir: PathBuf,
+    sort: bool,
 ) -> anyhow::Result<()> {
     // Find s = ceil(log2(total)), minimum 16 so the image is at least 256×256.
     // Split into kh = floor(s/2) (height) and kw = ceil(s/2) (width).
@@ -42,6 +43,15 @@ pub fn run_tiles(
     let num_squares = 1u32 << (kw - kh);
 
     let pixel_lut = build_pixel_lut();
+
+    // Load all source data in parallel: mmaps for the unsorted path, or
+    // full reads + sort for the sorted path. Tiled rendering accesses any
+    // source for any tile, so all data must be available before rendering starts.
+    log::info!("Loading {} source(s)...", sources.len());
+    let source_data: Vec<Data> = sources
+        .par_iter()
+        .map(|s| load_source_data(s, sort))
+        .collect::<anyhow::Result<_>>()?;
 
     // Build cumulative byte-start offsets.
     let mut cumulative_offsets: Vec<u64> = Vec::with_capacity(sources.len());
@@ -132,7 +142,7 @@ pub fn run_tiles(
             height_tiles,
             square_pixels,
             total,
-            &sources,
+            &source_data,
             &cumulative_offsets,
             &pixel_lut,
         );

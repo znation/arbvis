@@ -63,17 +63,12 @@ fn run(args: Args) -> anyhow::Result<()> {
     }
 
     let (sources, total) = data::prepare_sources(&files)?;
-    let sources = if args.sort {
-        data::sort_sources(sources)?
-    } else {
-        sources
-    };
 
     if let Some(tile_dir) = args.tiles {
-        return tiled::run_tiles(sources, total, tile_dir);
+        return tiled::run_tiles(sources, total, tile_dir, args.sort);
     }
 
-    single::run_single(&files, args.output, sources, total)
+    single::run_single(&files, args.output, sources, total, args.sort)
 }
 
 fn main() -> anyhow::Result<()> {

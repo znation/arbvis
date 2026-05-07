@@ -1,16 +1,15 @@
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use image::Rgb;
 
-use crate::data::{Source, SourceKind};
+use crate::data::Data;
 
 /// Render one 256×256 leaf tile and write it to `tile_path`.
 ///
 /// Each tile at the highest zoom level covers a 256×256-pixel region that
 /// corresponds to a contiguous Hilbert sub-curve of exactly 65536 bytes.
-/// Files are opened, read, and closed per-tile to bound open fd counts.
+/// Source data is passed as pre-loaded slices (mmaps or owned buffers),
+/// so this function performs no file I/O beyond writing the output PNG.
 ///
 /// Uses u64 for Hilbert indices to support files > 16 GiB.
 pub fn render_leaf_tile(
@@ -21,7 +20,7 @@ pub fn render_leaf_tile(
     height_tiles: u32,
     square_pixels: u64,
     total: u64,
-    sources: &[Source],
+    source_data: &[Data],
     cumulative_offsets: &[u64],
     pixel_lut: &[Rgb<u8>; 256],
 ) -> Result<(), String> {
@@ -39,7 +38,7 @@ pub fn render_leaf_tile(
     let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
     let tile_pixel_start = sq_off + base;
 
-    // Read the tile's bytes from source files into a local buffer.
+    // Copy the tile's bytes from the pre-loaded source buffers.
     let mut tile_buf = [0u8; TILE_PIXELS];
     let readable_end = (tile_pixel_start + TILE_AREA).min(total);
     if tile_pixel_start < readable_end {
@@ -47,26 +46,13 @@ pub fn render_leaf_tile(
         let mut buf_off = 0usize;
         while pos < readable_end {
             let src_idx = cumulative_offsets.partition_point(|&c| c <= pos) - 1;
-            let src = &sources[src_idx];
-            let src_end = cumulative_offsets[src_idx] + src.byte_size;
+            let data = &source_data[src_idx];
+            let src_end = cumulative_offsets[src_idx] + data.len() as u64;
             let chunk_end = readable_end.min(src_end);
             let chunk_len = (chunk_end - pos) as usize;
-            let local_off = pos - cumulative_offsets[src_idx];
-            match &src.kind {
-                SourceKind::File(p) => {
-                    let mut f = File::open(p)
-                        .map_err(|e| format!("{}: {}", p.display(), e))?;
-                    f.seek(SeekFrom::Start(local_off))
-                        .map_err(|e| format!("{}: {}", p.display(), e))?;
-                    f.read_exact(&mut tile_buf[buf_off..buf_off + chunk_len])
-                        .map_err(|e| format!("{}: {}", p.display(), e))?;
-                }
-                SourceKind::Buffered(v) => {
-                    let lo = local_off as usize;
-                    tile_buf[buf_off..buf_off + chunk_len]
-                        .copy_from_slice(&v[lo..lo + chunk_len]);
-                }
-            }
+            let local_off = (pos - cumulative_offsets[src_idx]) as usize;
+            tile_buf[buf_off..buf_off + chunk_len]
+                .copy_from_slice(&data[local_off..local_off + chunk_len]);
             pos = chunk_end;
             buf_off += chunk_len;
         }

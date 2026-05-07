@@ -11,10 +11,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 
 use crate::color::build_pixel_lut;
-use crate::data::{load_source_data, Data, Source};
+use crate::data::{load_source_data, Data, Histogram, Source};
 use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, rects_centroid};
 use crate::tiled::html::FileEntity;
-use crate::tiled::leaf::render_leaf_tile;
+use crate::tiled::leaf::{render_leaf_tile, render_leaf_tile_sorted};
 use crate::tiled::pyramid::build_pyramid;
 
 /// Run the tiled/pyramidal output pipeline.
@@ -45,37 +45,6 @@ pub fn run_tiles(
 
     let pixel_lut = build_pixel_lut();
 
-    // Load all source data in parallel: mmaps for the unsorted path, or
-    // full reads + sort for the sorted path. Tiled rendering accesses any
-    // source for any tile, so all data must be available before rendering starts.
-    let sort_pb: Option<Arc<ProgressBar>> = if sort && std::io::stderr().is_terminal() {
-        let pb = ProgressBar::new(total);
-        pb.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} sorting ({eta})",
-            )
-            .unwrap()
-            .progress_chars("=>-"),
-        );
-        pb.enable_steady_tick(Duration::from_millis(100));
-        Some(Arc::new(pb))
-    } else {
-        None
-    };
-    let source_data: Vec<Data> = sources
-        .par_iter()
-        .map(|s| -> anyhow::Result<Data> {
-            let data = load_source_data(s, sort)?;
-            if let Some(ref pb) = sort_pb {
-                pb.inc(s.byte_size);
-            }
-            Ok(data)
-        })
-        .collect::<anyhow::Result<_>>()?;
-    if let Some(ref pb) = sort_pb {
-        pb.finish_and_clear();
-    }
-
     // Build cumulative byte-start offsets.
     let mut cumulative_offsets: Vec<u64> = Vec::with_capacity(sources.len());
     {
@@ -85,6 +54,48 @@ pub fn run_tiles(
             off += s.byte_size;
         }
     }
+
+    // For the sort path: stream each source to build a 256-entry histogram
+    // (O(1) extra memory), then render tiles directly from the histogram.
+    // For the non-sort path: mmap all sources upfront (all tiles need random access).
+    let histograms: Vec<([u64; 257], u64)> = if sort {
+        let sort_pb: Option<Arc<ProgressBar>> = if std::io::stderr().is_terminal() {
+            let pb = ProgressBar::new(total);
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} scanning ({eta})",
+                )
+                .unwrap()
+                .progress_chars("=>-"),
+            );
+            pb.enable_steady_tick(Duration::from_millis(100));
+            Some(Arc::new(pb))
+        } else {
+            None
+        };
+        let result = sources
+            .par_iter()
+            .zip(cumulative_offsets.par_iter())
+            .map(|(s, &off)| -> anyhow::Result<([u64; 257], u64)> {
+                let hist = Histogram::build(s, sort_pb.as_deref())?;
+                Ok((hist.prefix_sums(), off))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        if let Some(ref pb) = sort_pb {
+            pb.finish_and_clear();
+        }
+        result
+    } else {
+        vec![]
+    };
+    let source_data: Vec<Data> = if !sort {
+        sources
+            .par_iter()
+            .map(|s| load_source_data(s))
+            .collect::<anyhow::Result<_>>()?
+    } else {
+        vec![]
+    };
 
     // Pre-compute per-file entity metadata.
     let mut entities: Vec<FileEntity> = Vec::new();
@@ -155,18 +166,32 @@ pub fn run_tiles(
         let tx = (i % width_tiles as u64) as u32;
         let ty = (i / width_tiles as u64) as u32;
         let path = tile_dir.join(format!("tiles/{max_zoom}/{tx}/{ty}.png"));
-        let result = render_leaf_tile(
-            &path,
-            tx,
-            ty,
-            kh as u8,
-            height_tiles,
-            square_pixels,
-            total,
-            &source_data,
-            &cumulative_offsets,
-            &pixel_lut,
-        );
+        let result = if sort {
+            render_leaf_tile_sorted(
+                &path,
+                tx,
+                ty,
+                kh as u8,
+                height_tiles,
+                square_pixels,
+                total,
+                &histograms,
+                &pixel_lut,
+            )
+        } else {
+            render_leaf_tile(
+                &path,
+                tx,
+                ty,
+                kh as u8,
+                height_tiles,
+                square_pixels,
+                total,
+                &source_data,
+                &cumulative_offsets,
+                &pixel_lut,
+            )
+        };
         if let Some(ref pb) = pb {
             pb.inc(1);
         }

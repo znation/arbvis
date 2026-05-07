@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::PathBuf;
 
+use indicatif::ProgressBar;
 use memmap2::Mmap;
 
 /// Backing storage for a source's bytes.
@@ -50,9 +51,7 @@ impl Source {
 ///
 /// Files are opened lazily (one at a time) to avoid exhausting OS fd limits.
 /// Stdin is buffered into memory upfront since its size is unknown.
-pub fn prepare_sources(
-    files: &[PathBuf],
-) -> anyhow::Result<(Vec<Source>, u64)> {
+pub fn prepare_sources(files: &[PathBuf]) -> anyhow::Result<(Vec<Source>, u64)> {
     if files.is_empty() {
         log::info!("Reading stdin...");
         let mut buf = Vec::new();
@@ -88,31 +87,73 @@ pub fn prepare_sources(
     Ok((sources, total))
 }
 
-/// Load a source's bytes, optionally sorting them by value.
-///
-/// For file sources: mmaps the file (sort=false) or reads and sorts it
-/// (sort=true). For buffered sources (stdin): clones the buffer, sorting
-/// if requested.
-pub fn load_source_data(s: &Source, sort: bool) -> anyhow::Result<Data> {
+/// Load a source's bytes for random access: mmaps file sources, clones buffered sources.
+pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
     match &s.kind {
         SourceKind::File(p) => {
-            if sort {
-                let mut bytes = std::fs::read(p)?;
-                bytes.sort_unstable();
-                Ok(Data::Owned(bytes))
-            } else {
-                let f = File::open(p)?;
-                Ok(Data::Mapped(unsafe { Mmap::map(&f) }?))
+            let f = File::open(p)?;
+            Ok(Data::Mapped(unsafe { Mmap::map(&f) }?))
+        }
+        SourceKind::Buffered(v) => Ok(Data::Owned(v.clone())),
+    }
+}
+
+/// Byte-value frequency histogram for a source.
+///
+/// Enables O(1)-memory sorted rendering: rather than sorting bytes and storing
+/// the result, the renderer derives the sorted layout from the 256-entry count
+/// array alone (see `prefix_sums`).
+pub struct Histogram(pub [u64; 256]);
+
+impl Histogram {
+    /// Build a histogram by streaming through the source.
+    ///
+    /// For file sources the file is read in 4 MB chunks so peak extra memory
+    /// is bounded regardless of file size. An optional progress bar is
+    /// incremented by the number of bytes processed in each chunk.
+    pub fn build(s: &Source, pb: Option<&ProgressBar>) -> anyhow::Result<Self> {
+        const CHUNK: usize = 4 * 1024 * 1024;
+        let mut counts = [0u64; 256];
+
+        match &s.kind {
+            SourceKind::File(p) => {
+                let mut f = File::open(p)?;
+                let mut buf = vec![0u8; CHUNK];
+                loop {
+                    let n = f.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    for &b in &buf[..n] {
+                        counts[b as usize] += 1;
+                    }
+                    if let Some(pb) = pb {
+                        pb.inc(n as u64);
+                    }
+                }
+            }
+            SourceKind::Buffered(v) => {
+                for chunk in v.chunks(CHUNK) {
+                    for &b in chunk {
+                        counts[b as usize] += 1;
+                    }
+                    if let Some(pb) = pb {
+                        pb.inc(chunk.len() as u64);
+                    }
+                }
             }
         }
-        SourceKind::Buffered(v) => {
-            if sort {
-                let mut bytes = v.clone();
-                bytes.sort_unstable();
-                Ok(Data::Owned(bytes))
-            } else {
-                Ok(Data::Owned(v.clone()))
-            }
+
+        Ok(Histogram(counts))
+    }
+
+    /// Prefix sums: `prefix[v]` = number of bytes with value strictly less than `v`.
+    /// `prefix[256]` = total byte count.
+    pub fn prefix_sums(&self) -> [u64; 257] {
+        let mut prefix = [0u64; 257];
+        for i in 0..256 {
+            prefix[i + 1] = prefix[i] + self.0[i];
         }
+        prefix
     }
 }

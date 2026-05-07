@@ -13,7 +13,7 @@ use show_image::create_window;
 use show_image::event::WindowEvent;
 
 use crate::color::build_pixel_lut;
-use crate::data::{load_source_data, Source};
+use crate::data::{load_source_data, Histogram, Source};
 use crate::geometry::{sampled_in_range, hilbert_to_xy_u64};
 use crate::label::draw_file_label;
 
@@ -80,11 +80,9 @@ pub fn run_single(
     let mut pixel_file: Vec<Option<usize>> = vec![None; canvas_size];
     let mut bboxes: Vec<Option<(u32, u32, u32, u32)>> = vec![None; num_files];
 
-    // For --sort, the progress bar covers two equal phases: loading+sorting (first half)
-    // and rendering (second half). For non-sort, it covers rendering only.
-    let pb_total = if sort { total.saturating_mul(2) } else { total };
+    // Both paths track the same amount of work (one pass over total bytes).
     let pb = if std::io::stderr().is_terminal() {
-        let pb = ProgressBar::new(pb_total);
+        let pb = ProgressBar::new(total);
         pb.set_style(
             ProgressStyle::with_template(
                 "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
@@ -97,28 +95,34 @@ pub fn run_single(
         None
     };
 
-    // Split each source into chunks for fine-grained parallelism, grouped by source.
-    // Targeting ~4 MB per chunk so every core gets work even for single-file input.
-    // Chunks are grouped so each source's data is loaded once and shared across its chunks.
+    // Compute per-source byte and pixel offsets (needed by both paths).
+    // For the non-sort path also split each source into ~4 MB chunks for
+    // fine-grained parallelism.
     let chunk_bytes = (4 * 1024 * 1024u64).max(stride);
-    // Each entry: (fi, src_global_start, chunk_b_start, chunk_b_end, chunk_pixel_start)
+    let mut src_byte_starts: Vec<u64> = Vec::with_capacity(sources.len());
+    let mut src_pixel_starts: Vec<u64> = Vec::with_capacity(sources.len());
+    // Each chunk entry: (fi, src_global_start, chunk_b_start, chunk_b_end, chunk_pixel_start)
     let mut chunks_by_source: Vec<Vec<(usize, u64, u64, u64, u64)>> =
-        vec![vec![]; sources.len()];
+        if sort { vec![] } else { vec![vec![]; sources.len()] };
     {
         let mut b = 0u64;
         let mut p = 0u64;
         for (src_idx, s) in sources.iter().enumerate() {
-            let fi = s.file_idx;
-            let src_end = b + s.byte_size;
-            let mut cb = b;
-            let mut cp = p;
-            while cb < src_end {
-                let ce = (cb + chunk_bytes).min(src_end);
-                chunks_by_source[src_idx].push((fi, b, cb, ce, cp));
-                cp += sampled_in_range(cb, ce, stride);
-                cb = ce;
+            src_byte_starts.push(b);
+            src_pixel_starts.push(p);
+            if !sort {
+                let fi = s.file_idx;
+                let src_end = b + s.byte_size;
+                let mut cb = b;
+                let mut cp = p;
+                while cb < src_end {
+                    let ce = (cb + chunk_bytes).min(src_end);
+                    chunks_by_source[src_idx].push((fi, b, cb, ce, cp));
+                    cp += sampled_in_range(cb, ce, stride);
+                    cb = ce;
+                }
             }
-            p += sampled_in_range(b, src_end, stride);
+            p += sampled_in_range(b, b + s.byte_size, stride);
             b += s.byte_size;
         }
     }
@@ -152,16 +156,12 @@ pub fn run_single(
         None
     };
 
-    // Parallel rendering: each chunk writes exclusively to non-overlapping pixel ranges,
-    // so concurrent writes to `img` and `pixel_file` are race-free.
-    //
-    // Two levels of parallelism: outer over sources (loading each file on demand),
-    // inner over chunks within each source. This bounds peak memory to the files
-    // being actively processed rather than all files at once.
+    // Each chunk writes exclusively to non-overlapping pixel ranges, so concurrent
+    // writes to `img` and `pixel_file` are race-free.
     log::info!("Rendering {}×{} image ({} bytes)...", side, side, total);
     let img_base = img.as_mut_ptr() as usize;
     let pf_base = pixel_file.as_mut_ptr() as usize;
-    // Enable steady_tick after the log message above so the bar doesn't interleave with it.
+    // Enable steady_tick after the log message so the bar doesn't interleave with it.
     let pb_shared: Option<Arc<ProgressBar>> = pb.map(|pb| {
         pb.enable_steady_tick(Duration::from_millis(100));
         Arc::new(pb)
@@ -169,75 +169,128 @@ pub fn run_single(
     let canvas_u = canvas_size as u64;
     let cancelled_proc = Arc::clone(&cancelled);
 
-    let chunk_results: Vec<(usize, Option<(u32, u32, u32, u32)>)> = chunks_by_source
-        .par_iter()
-        .enumerate()
-        .map(
-            |(src_idx, source_chunks)| -> anyhow::Result<Vec<(usize, Option<(u32, u32, u32, u32)>)>> {
-                if source_chunks.is_empty() {
-                    return Ok(vec![]);
-                }
-                let data = load_source_data(&sources[src_idx], sort)?;
-                // For --sort, count the load+sort phase as the first half of total progress.
-                if sort {
-                    if let Some(ref pb) = pb_shared {
-                        pb.inc(sources[src_idx].byte_size);
+    let chunk_results: Vec<(usize, Option<(u32, u32, u32, u32)>)> = if sort {
+        // Sorted path: stream each source once to build a histogram, then render
+        // directly from the 256-entry count array. No sorted buffer is ever allocated;
+        // peak extra memory is O(1) regardless of file size.
+        (0..sources.len())
+            .into_par_iter()
+            .map(|src_idx| -> anyhow::Result<(usize, Option<(u32, u32, u32, u32)>)> {
+                let source = &sources[src_idx];
+                let hist = Histogram::build(source, pb_shared.as_deref())?;
+                let prefix = hist.prefix_sums();
+                let fi = source.file_idx;
+                let src_byte_start = src_byte_starts[src_idx];
+                let mut cur_pixel = src_pixel_starts[src_idx];
+                let mut bbox: Option<(u32, u32, u32, u32)> = None;
+
+                for v in 0usize..=255 {
+                    if cancelled_proc.load(Ordering::Acquire) {
+                        break;
                     }
-                }
-                let results = source_chunks
-                    .par_iter()
-                    .map(|&(fi, src_global_start, chunk_b_start, chunk_b_end, chunk_pixel_start)| {
-                        if chunk_pixel_start >= canvas_u || cancelled_proc.load(Ordering::Acquire) {
-                            return (fi, None);
+                    let n = hist.0[v];
+                    if n == 0 {
+                        continue;
+                    }
+                    let global_byte_start = src_byte_start + prefix[v];
+                    let global_byte_end = src_byte_start + prefix[v + 1];
+                    let n_pixels = sampled_in_range(global_byte_start, global_byte_end, stride);
+                    let color = pixel_lut[v];
+
+                    for p_off in 0..n_pixels {
+                        let p = cur_pixel + p_off;
+                        if p >= canvas_u {
+                            break;
                         }
-                        let local_start = (chunk_b_start - src_global_start) as usize;
-                        let local_end = (chunk_b_end - src_global_start) as usize;
-                        let bytes = &data[local_start..local_end];
-
-                        let mut cur_byte = chunk_b_start;
-                        let mut cur_pixel = chunk_pixel_start as usize;
-                        let mut bbox: Option<(u32, u32, u32, u32)> = None;
-
-                        for &b in bytes {
-                            if cur_byte % stride == 0 {
-                                let (x, y) = hilbert_to_xy_u64(cur_pixel as u64, k as u8);
-                                let color = pixel_lut[b as usize];
-                                let pixel_idx = y as usize * side as usize + x as usize;
-                                unsafe {
-                                    let p = (img_base as *mut u8).add(pixel_idx * 3);
-                                    p.write(color[0]);
-                                    p.add(1).write(color[1]);
-                                    p.add(2).write(color[2]);
-                                    (pf_base as *mut Option<usize>)
-                                        .add(pixel_idx)
-                                        .write(Some(fi));
-                                }
-                                bbox = Some(match bbox {
-                                    None => (x, y, x, y),
-                                    Some((x0, y0, x1, y1)) => {
-                                        (x0.min(x), y0.min(y), x1.max(x), y1.max(y))
-                                    }
-                                });
-                                cur_pixel += 1;
-                                if cur_pixel >= canvas_size {
-                                    break;
-                                }
+                        let (x, y) = hilbert_to_xy_u64(p, k as u8);
+                        let pixel_idx = y as usize * side as usize + x as usize;
+                        unsafe {
+                            let ptr = (img_base as *mut u8).add(pixel_idx * 3);
+                            ptr.write(color[0]);
+                            ptr.add(1).write(color[1]);
+                            ptr.add(2).write(color[2]);
+                            (pf_base as *mut Option<usize>).add(pixel_idx).write(Some(fi));
+                        }
+                        bbox = Some(match bbox {
+                            None => (x, y, x, y),
+                            Some((x0, y0, x1, y1)) => {
+                                (x0.min(x), y0.min(y), x1.max(x), y1.max(y))
                             }
-                            cur_byte += 1;
-                        }
-                        if let Some(ref pb) = pb_shared {
-                            pb.inc(chunk_b_end - chunk_b_start);
-                        }
-                        (fi, bbox)
-                    })
-                    .collect();
-                Ok(results)
-            },
-        )
-        .collect::<anyhow::Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect();
+                        });
+                    }
+                    cur_pixel += n_pixels;
+                }
+
+                Ok((fi, bbox))
+            })
+            .collect::<anyhow::Result<_>>()?
+    } else {
+        // Non-sort path: two-level parallelism — outer over sources (mmap on demand,
+        // drop after), inner over ~4 MB chunks for fine-grained work distribution.
+        chunks_by_source
+            .par_iter()
+            .enumerate()
+            .map(
+                |(src_idx, source_chunks)| -> anyhow::Result<Vec<(usize, Option<(u32, u32, u32, u32)>)>> {
+                    if source_chunks.is_empty() {
+                        return Ok(vec![]);
+                    }
+                    let data = load_source_data(&sources[src_idx])?;
+                    let results = source_chunks
+                        .par_iter()
+                        .map(|&(fi, src_global_start, chunk_b_start, chunk_b_end, chunk_pixel_start)| {
+                            if chunk_pixel_start >= canvas_u || cancelled_proc.load(Ordering::Acquire) {
+                                return (fi, None);
+                            }
+                            let local_start = (chunk_b_start - src_global_start) as usize;
+                            let local_end = (chunk_b_end - src_global_start) as usize;
+                            let bytes = &data[local_start..local_end];
+
+                            let mut cur_byte = chunk_b_start;
+                            let mut cur_pixel = chunk_pixel_start as usize;
+                            let mut bbox: Option<(u32, u32, u32, u32)> = None;
+
+                            for &b in bytes {
+                                if cur_byte % stride == 0 {
+                                    let (x, y) = hilbert_to_xy_u64(cur_pixel as u64, k as u8);
+                                    let color = pixel_lut[b as usize];
+                                    let pixel_idx = y as usize * side as usize + x as usize;
+                                    unsafe {
+                                        let p = (img_base as *mut u8).add(pixel_idx * 3);
+                                        p.write(color[0]);
+                                        p.add(1).write(color[1]);
+                                        p.add(2).write(color[2]);
+                                        (pf_base as *mut Option<usize>)
+                                            .add(pixel_idx)
+                                            .write(Some(fi));
+                                    }
+                                    bbox = Some(match bbox {
+                                        None => (x, y, x, y),
+                                        Some((x0, y0, x1, y1)) => {
+                                            (x0.min(x), y0.min(y), x1.max(x), y1.max(y))
+                                        }
+                                    });
+                                    cur_pixel += 1;
+                                    if cur_pixel >= canvas_size {
+                                        break;
+                                    }
+                                }
+                                cur_byte += 1;
+                            }
+                            if let Some(ref pb) = pb_shared {
+                                pb.inc(chunk_b_end - chunk_b_start);
+                            }
+                            (fi, bbox)
+                        })
+                        .collect();
+                    Ok(results)
+                },
+            )
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect()
+    };
 
     // Merge per-chunk bboxes into per-file bboxes.
     for (fi, bbox) in chunk_results {

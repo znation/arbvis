@@ -81,6 +81,83 @@ pub fn render_leaf_tile(
     Ok(())
 }
 
+/// Render one 256×256 leaf tile in sorted mode from pre-built per-source histograms.
+///
+/// Each element of `histograms` is `(prefix_sums, cumulative_byte_offset)` for one source.
+/// `prefix_sums[v]` = count of bytes with value < v in that source; `prefix_sums[256]` = total.
+/// The sorted pixel stream places source `i`'s bytes (sorted by value) at global positions
+/// `[cumulative_offset, cumulative_offset + prefix_sums[256])`, so tile_buf is filled with
+/// the correct byte value for each consecutive sorted position the tile covers.
+pub fn render_leaf_tile_sorted(
+    tile_path: &Path,
+    tx: u32,
+    ty: u32,
+    kh: u8,
+    height_tiles: u32,
+    square_pixels: u64,
+    total: u64,
+    histograms: &[([u64; 257], u64)],
+    pixel_lut: &[Rgb<u8>; 256],
+) -> Result<(), String> {
+    const TILE: u32 = 256;
+    const TILE_PIXELS: usize = (TILE as usize) * (TILE as usize);
+    const TILE_AREA: u64 = TILE_PIXELS as u64;
+
+    let sq = (tx / height_tiles) as u64;
+    let sq_off = sq * square_pixels;
+    let local_tx = tx % height_tiles;
+
+    let tile_order = kh - 8;
+    let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
+    let tile_pixel_start = sq_off + base;
+    let tile_pixel_end = (tile_pixel_start + TILE_AREA).min(total);
+
+    let mut tile_buf = [0u8; TILE_PIXELS];
+
+    if tile_pixel_start < tile_pixel_end {
+        for (prefix, src_offset) in histograms {
+            let src_end = src_offset + prefix[256];
+            if *src_offset >= tile_pixel_end || src_end <= tile_pixel_start {
+                continue;
+            }
+            for v in 0usize..256 {
+                let range_start = src_offset + prefix[v];
+                let range_end = src_offset + prefix[v + 1];
+                if range_end <= tile_pixel_start || range_start >= tile_pixel_end {
+                    continue;
+                }
+                let fill_start = range_start.max(tile_pixel_start);
+                let fill_end = range_end.min(tile_pixel_end);
+                let buf_start = (fill_start - tile_pixel_start) as usize;
+                let buf_end = (fill_end - tile_pixel_start) as usize;
+                tile_buf[buf_start..buf_end].fill(v as u8);
+            }
+        }
+    }
+
+    let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
+    for py in 0..TILE {
+        let ly = ty * TILE + py;
+        for px in 0..TILE {
+            let lx = local_tx * TILE + px;
+            let local_idx = xy2h_u64(lx as u64, ly as u64, kh);
+            let pixel_idx = sq_off + local_idx;
+            let color = if pixel_idx < total {
+                pixel_lut[tile_buf[(local_idx - base) as usize] as usize]
+            } else {
+                Rgb([0u8, 0, 0])
+            };
+            img.put_pixel(px, py, color);
+        }
+    }
+    if let Some(parent) = tile_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    img.save(tile_path)
+        .map_err(|e| format!("{}: {}", tile_path.display(), e))?;
+    Ok(())
+}
+
 /// x,y → Hilbert index using u64 intermediate arithmetic.
 /// Supports curve orders up to 32 (files up to ~4 EiB).
 fn xy2h_u64(x: u64, y: u64, order: u8) -> u64 {

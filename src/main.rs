@@ -23,10 +23,11 @@ use clap::Parser;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Files to visualize (defaults to stdin); multiple files are concatenated
+    #[arg(conflicts_with = "diff")]
     files: Vec<PathBuf>,
 
     /// Read file list from this file (one path per line), or - for stdin
-    #[arg(short = 'l', long)]
+    #[arg(short = 'l', long, conflicts_with = "diff")]
     file_list: Option<PathBuf>,
 
     /// Write the canvas to this PNG file instead of displaying a window
@@ -40,9 +41,23 @@ struct Args {
     /// Sort bytes by value within each file before rendering (loads files into memory)
     #[arg(short = 's', long)]
     sort: bool,
+
+    /// Visualize abs(modified - original) byte differences; ORIGINAL and MODIFIED are files or directories
+    #[arg(long, num_args = 2, value_names = ["ORIGINAL", "MODIFIED"])]
+    diff: Option<Vec<PathBuf>>,
 }
 
 fn run(args: Args) -> anyhow::Result<()> {
+    if let Some(diff_args) = args.diff {
+        let (sources, total) =
+            data::prepare_diff_sources(&diff_args[0], &diff_args[1])?;
+        let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
+        if let Some(tile_dir) = args.tiles {
+            return tiled::run_tiles(sources, total, tile_dir, args.sort);
+        }
+        return single::run_single(&labels, args.output, sources, total, args.sort);
+    }
+
     let mut files = args.files;
     if let Some(list_path) = args.file_list {
         let reader: Box<dyn Read> = if list_path == PathBuf::from("-") {

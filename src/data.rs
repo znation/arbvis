@@ -49,6 +49,10 @@ pub struct Source {
     /// Position of this source within the original file, as a ratio in [0.0, 1.0].
     /// Set for per-tensor diff sources; None for all other source types.
     pub position_hint: Option<f32>,
+    /// Bytes of invisible zero-padding prepended to this source's buffer to align
+    /// its data start to a Hilbert quadrant boundary.  Zero for non-diff sources.
+    /// The actual tensor data begins at `cumulative_offset + leading_gap`.
+    pub leading_gap: u64,
 }
 
 impl Source {
@@ -95,6 +99,7 @@ pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::R
                 safetensors: None,
                 name_override: None,
                 position_hint: None,
+                leading_gap: 0,
             }],
             len,
         ));
@@ -134,6 +139,7 @@ pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::R
             safetensors: safetensors_info,
             name_override: None,
             position_hint: None,
+            leading_gap: 0,
         });
     }
     Ok((sources, total))
@@ -338,6 +344,7 @@ pub fn prepare_diff_sources(
             safetensors: None,
             name_override: None,
             position_hint: None,
+            leading_gap: 0,
         };
         return Ok((vec![source], size_o));
     }
@@ -439,6 +446,7 @@ pub fn prepare_diff_sources(
                         safetensors: None,
                         name_override: None,
                         position_hint: None,
+                        leading_gap: 0,
                     });
                     total += size_o;
                 }
@@ -548,7 +556,7 @@ fn build_safetensors_diff_sources(
 
     for tw in work {
         let t = tw.orig;
-        let mut buf: Vec<u8> = tw.diffs.iter().map(|&diff| {
+        let buf: Vec<u8> = tw.diffs.iter().map(|&diff| {
             if diff.is_finite() {
                 let normalized = (diff as f64 + 1.0).ln() / log_max;
                 (normalized * 255.0).round().clamp(0.0, 255.0) as u8
@@ -556,19 +564,34 @@ fn build_safetensors_diff_sources(
                 255
             }
         }).collect();
-        // Pad to the next power of 4 so this tensor occupies exactly one Hilbert
-        // quadrant (a perfect square). Padding bytes are 0 = no diff = black.
-        let padded_len = next_power_of_4(buf.len()).max(1);
-        buf.resize(padded_len, 0u8);
-        let byte_size = buf.len() as u64;
+        // Pad element count to the next power of 4 so this tensor fits in exactly
+        // one Hilbert sub-quadrant (a perfect square region).
+        let padded_size = next_power_of_4(buf.len()).max(1) as u64;
+
+        // Align the tensor's START to a padded_size boundary so that
+        // decompose_hilbert produces a single rectangle for the data region.
+        // If the current cumulative offset isn't already aligned, prepend enough
+        // zero bytes to reach the next aligned position.
+        let leading_gap = {
+            let rem = total % padded_size;
+            if rem == 0 { 0u64 } else { padded_size - rem }
+        };
+
+        // Build: [leading_gap zeros] [element diffs, zero-padded to padded_size]
+        let mut full_buf = vec![0u8; leading_gap as usize];
+        full_buf.extend_from_slice(&buf);
+        full_buf.resize((leading_gap + padded_size) as usize, 0u8);
+
+        let byte_size = full_buf.len() as u64;
         let position_hint = t.file_start as f32 / file_total;
         sources.push(Source {
             file_idx: sources.len(),
-            kind: SourceKind::Buffered(buf),
+            kind: SourceKind::Buffered(full_buf),
             byte_size,
             safetensors: None,
             name_override: Some(t.label()),
             position_hint: Some(position_hint),
+            leading_gap,
         });
         total += byte_size;
     }

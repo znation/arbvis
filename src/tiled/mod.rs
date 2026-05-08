@@ -190,9 +190,12 @@ pub fn run_tiles(
                 }
             } else {
                 let name = source.name();
+                // Skip leading_gap: the data starts after any alignment padding.
+                let data_start = cumulative + source.leading_gap;
+                let data_end = cumulative + source.byte_size;
                 let rects = file_rects(
-                    cumulative,
-                    cumulative + source.byte_size,
+                    data_start,
+                    data_end,
                     total_pixels,
                     square_pixels,
                     num_squares,
@@ -200,7 +203,7 @@ pub fn run_tiles(
                     kh as u8,
                 );
                 let (pixel_x, pixel_y) = rects_centroid(&rects).unwrap_or_else(|| {
-                    let mid = cumulative + source.byte_size / 2;
+                    let mid = data_start + (data_end - data_start) / 2;
                     let sq = mid / square_pixels;
                     let (lx, ly) = hilbert_to_xy_u64(mid % square_pixels, kh as u8);
                     (sq as u32 * height + lx, ly)
@@ -222,7 +225,7 @@ pub fn run_tiles(
                     pixel_x,
                     pixel_y,
                     hue,
-                    byte_size: source.byte_size,
+                    byte_size: data_end - data_start,
                     bbox,
                     segments,
                 });

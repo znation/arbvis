@@ -558,7 +558,9 @@ fn build_safetensors_diff_sources(
     // Pass 2: normalize with log scale and build per-tensor Buffered Sources.
     // One byte per element: each diff element maps to exactly one pixel, giving
     // maximum visual density regardless of the original dtype's byte width.
-    let log_max = if global_max > 0.0 { (global_max as f64 + 1.0).ln() } else { 1.0 };
+    // Double-log scale: ln(ln(x+1)+1) compresses the range more aggressively than
+    // a single log, giving significantly more brightness to small differences.
+    let log_max = if global_max > 0.0 { ((global_max as f64 + 1.0).ln() + 1.0).ln() } else { 1.0 };
     let file_total = m_o.len().max(1) as f32;
     let mut sources: Vec<Source> = Vec::new();
     let mut total = 0u64;
@@ -567,7 +569,7 @@ fn build_safetensors_diff_sources(
         let t = tw.orig;
         let buf: Vec<u8> = tw.diffs.iter().map(|&diff| {
             if diff.is_finite() {
-                let normalized = (diff as f64 + 1.0).ln() / log_max;
+                let normalized = ((diff as f64 + 1.0).ln() + 1.0).ln() / log_max;
                 (normalized * 255.0).round().clamp(0.0, 255.0) as u8
             } else {
                 255

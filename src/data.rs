@@ -383,6 +383,23 @@ pub fn prepare_diff_sources(
                     );
                 }
                 Some(mod_abs) => {
+                    if is_st(orig_abs) && is_st(mod_abs) {
+                        match build_safetensors_diff_sources(orig_abs, mod_abs) {
+                            Ok((mut tensor_sources, bytes)) => {
+                                let base_idx = sources.len();
+                                for s in &mut tensor_sources {
+                                    s.file_idx += base_idx;
+                                }
+                                sources.extend(tensor_sources);
+                                total += bytes;
+                            }
+                            Err(e) => eprintln!(
+                                "warning: {}: safetensors diff failed: {e} — skipping",
+                                rel.display()
+                            ),
+                        }
+                        continue;
+                    }
                     let size_o = match std::fs::metadata(orig_abs) {
                         Ok(m) => m.len(),
                         Err(e) => {
@@ -498,27 +515,23 @@ fn build_safetensors_diff_sources(
     }
 
     // Pass 2: normalize with log scale and build per-tensor Buffered Sources.
+    // One byte per element: each diff element maps to exactly one pixel, giving
+    // maximum visual density regardless of the original dtype's byte width.
     let log_max = if global_max > 0.0 { (global_max as f64 + 1.0).ln() } else { 1.0 };
     let mut sources: Vec<Source> = Vec::new();
     let mut total = 0u64;
 
     for tw in work {
         let t = tw.orig;
-        let es = t.dtype.element_size();
-        let buf_size = tw.diffs.len() * es;
-        let mut buf = vec![0u8; buf_size];
-        for (i, &diff) in tw.diffs.iter().enumerate() {
-            let byte_val = if diff.is_finite() {
+        let buf: Vec<u8> = tw.diffs.iter().map(|&diff| {
+            if diff.is_finite() {
                 let normalized = (diff as f64 + 1.0).ln() / log_max;
                 (normalized * 255.0).round().clamp(0.0, 255.0) as u8
             } else {
                 255
-            };
-            let start = i * es;
-            let end = (start + es).min(buf_size);
-            buf[start..end].fill(byte_val);
-        }
-        let byte_size = buf_size as u64;
+            }
+        }).collect();
+        let byte_size = buf.len() as u64;
         sources.push(Source {
             file_idx: sources.len(),
             kind: SourceKind::Buffered(buf),

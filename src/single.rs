@@ -244,34 +244,36 @@ pub fn run_single(
                     if source_chunks.is_empty() {
                         return Ok(vec![]);
                     }
-                    let data = load_source_data(&sources[src_idx])?;
                     let dtype_ranges = sources[src_idx]
                         .safetensors
                         .as_ref()
                         .map(|st| st.color_ranges.as_slice());
+                    // Dtype sources are colored by byte position, not value — skip file I/O.
+                    let data = if dtype_ranges.is_none() {
+                        Some(load_source_data(&sources[src_idx])?)
+                    } else {
+                        None
+                    };
                     let results = source_chunks
                         .par_iter()
                         .map(|&(fi, src_global_start, chunk_b_start, chunk_b_end, chunk_pixel_start)| {
                             if chunk_pixel_start >= canvas_u || cancelled_proc.load(Ordering::Acquire) {
                                 return (fi, None);
                             }
-                            let local_start = (chunk_b_start - src_global_start) as usize;
-                            let local_end = (chunk_b_end - src_global_start) as usize;
-                            let bytes = &data[local_start..local_end];
 
-                            let mut cur_byte = chunk_b_start;
                             let mut cur_pixel = chunk_pixel_start as usize;
                             let mut bbox: Option<(u32, u32, u32, u32)> = None;
 
-                            for &b in bytes {
-                                if cur_byte % stride == 0 {
+                            if let Some(ranges) = dtype_ranges {
+                                // Color from byte position only — no file read needed.
+                                let first = chunk_b_start
+                                    + (stride - chunk_b_start % stride) % stride;
+                                for strided_b in (first..chunk_b_end).step_by(stride as usize) {
+                                    if cur_pixel >= canvas_size {
+                                        break;
+                                    }
                                     let (x, y) = hilbert_to_xy_u64(cur_pixel as u64, k as u8);
-                                    let color = if let Some(ranges) = dtype_ranges {
-                                        // color_for_pos uses file-relative positions
-                                        color_for_pos(cur_byte - src_byte_starts[src_idx], ranges)
-                                    } else {
-                                        pixel_lut[b as usize]
-                                    };
+                                    let color = color_for_pos(strided_b - src_global_start, ranges);
                                     let pixel_idx = y as usize * side as usize + x as usize;
                                     unsafe {
                                         let p = (img_base as *mut u8).add(pixel_idx * 3);
@@ -289,11 +291,41 @@ pub fn run_single(
                                         }
                                     });
                                     cur_pixel += 1;
-                                    if cur_pixel >= canvas_size {
-                                        break;
-                                    }
                                 }
-                                cur_byte += 1;
+                            } else {
+                                let data = data.as_ref().unwrap();
+                                let local_start = (chunk_b_start - src_global_start) as usize;
+                                let local_end = (chunk_b_end - src_global_start) as usize;
+                                let bytes = &data[local_start..local_end];
+                                let mut cur_byte = chunk_b_start;
+
+                                for &b in bytes {
+                                    if cur_byte % stride == 0 {
+                                        let (x, y) = hilbert_to_xy_u64(cur_pixel as u64, k as u8);
+                                        let color = pixel_lut[b as usize];
+                                        let pixel_idx = y as usize * side as usize + x as usize;
+                                        unsafe {
+                                            let p = (img_base as *mut u8).add(pixel_idx * 3);
+                                            p.write(color[0]);
+                                            p.add(1).write(color[1]);
+                                            p.add(2).write(color[2]);
+                                            (pf_base as *mut Option<usize>)
+                                                .add(pixel_idx)
+                                                .write(Some(fi));
+                                        }
+                                        bbox = Some(match bbox {
+                                            None => (x, y, x, y),
+                                            Some((x0, y0, x1, y1)) => {
+                                                (x0.min(x), y0.min(y), x1.max(x), y1.max(y))
+                                            }
+                                        });
+                                        cur_pixel += 1;
+                                        if cur_pixel >= canvas_size {
+                                            break;
+                                        }
+                                    }
+                                    cur_byte += 1;
+                                }
                             }
                             if let Some(ref pb) = pb_shared {
                                 pb.inc(chunk_b_end - chunk_b_start);

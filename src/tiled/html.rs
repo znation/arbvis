@@ -126,12 +126,19 @@ pub fn write_leaflet_html(
       for (var i = 0; i < visible.length; i++) {{
         var l = visible[i];
         if (l.segs && l.segs.length > 0) {{
-          var ll = l.segs.map(function(s) {{
-            return [
-              [-(s[1] / HEIGHT) * 256, (s[0] / HEIGHT) * 256],
-              [-(s[3] / HEIGHT) * 256, (s[2] / HEIGHT) * 256],
-            ];
-          }});
+          var scale = (256 / HEIGHT) * Math.pow(2, map.getZoom());
+          var minWorld = 2 / scale;
+          var ll = l.segs
+            .filter(function(s) {{
+              var len = Math.max(Math.abs(s[2] - s[0]), Math.abs(s[3] - s[1]));
+              return len >= minWorld;
+            }})
+            .map(function(s) {{
+              return [
+                [-(s[1] / HEIGHT) * 256, (s[0] / HEIGHT) * 256],
+                [-(s[3] / HEIGHT) * 256, (s[2] / HEIGHT) * 256],
+              ];
+            }});
           activeOverlays.addLayer(L.polyline(ll, {{
             color: 'hsl(' + l.hue + ',70%,60%)',
             weight: 1,

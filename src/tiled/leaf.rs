@@ -101,6 +101,8 @@ pub fn render_leaf_tile_diff_positional(
     source_data: &[Data],
     cumulative_offsets: &[u64],
     pixel_luts: &[[Rgb<u8>; 256]],
+    // Per-source (leading_gap, data_end): bytes outside [leading_gap, data_end) are padding.
+    data_ranges: &[(u64, u64)],
 ) -> Result<(), String> {
     const TILE: u32 = 256;
     const TILE_PIXELS: usize = (TILE as usize) * (TILE as usize);
@@ -147,7 +149,14 @@ pub fn render_leaf_tile_diff_positional(
             let pixel_idx = sq_off + local_idx;
             let color = if pixel_idx < total {
                 let k = (local_idx - base) as usize;
-                pixel_luts[source_idx_buf[k] as usize][tile_buf[k] as usize]
+                let src = source_idx_buf[k] as usize;
+                let src_local = pixel_idx - cumulative_offsets[src];
+                let (gap, dend) = data_ranges[src];
+                if src_local < gap || src_local >= dend {
+                    Rgb([100u8, 100, 100]) // alignment padding — medium gray
+                } else {
+                    pixel_luts[src][tile_buf[k] as usize]
+                }
             } else {
                 Rgb([0u8, 0, 0])
             };

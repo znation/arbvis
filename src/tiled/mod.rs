@@ -73,6 +73,10 @@ pub fn run_tiles(
     } else {
         vec![]
     };
+    let per_source_data_ranges: Vec<(u64, u64)> = sources
+        .iter()
+        .map(|s| (s.leading_gap, s.data_end))
+        .collect();
 
     // Build cumulative byte-start offsets.
     let mut cumulative_offsets: Vec<u64> = Vec::with_capacity(sources.len());
@@ -292,6 +296,7 @@ pub fn run_tiles(
                 &source_data,
                 &cumulative_offsets,
                 &per_source_luts,
+                &per_source_data_ranges,
             )
         } else {
             render_leaf_tile(

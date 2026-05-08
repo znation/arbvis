@@ -53,6 +53,11 @@ pub struct Source {
     /// its data start to a Hilbert quadrant boundary.  Zero for non-diff sources.
     /// The actual tensor data begins at `cumulative_offset + leading_gap`.
     pub leading_gap: u64,
+    /// Offset within this source's buffer where actual data ends (exclusive).
+    /// Bytes in `[0, leading_gap)` and `[data_end, byte_size)` are alignment padding
+    /// and should be colored differently from real data bytes.
+    /// Equals `byte_size` for non-padded sources.
+    pub data_end: u64,
 }
 
 impl Source {
@@ -100,6 +105,7 @@ pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::R
                 name_override: None,
                 position_hint: None,
                 leading_gap: 0,
+                data_end: len,
             }],
             len,
         ));
@@ -140,6 +146,7 @@ pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::R
             name_override: None,
             position_hint: None,
             leading_gap: 0,
+            data_end: size,
         });
     }
     Ok((sources, total))
@@ -345,6 +352,7 @@ pub fn prepare_diff_sources(
             name_override: None,
             position_hint: None,
             leading_gap: 0,
+            data_end: size_o,
         };
         return Ok((vec![source], size_o));
     }
@@ -447,6 +455,7 @@ pub fn prepare_diff_sources(
                         name_override: None,
                         position_hint: None,
                         leading_gap: 0,
+                        data_end: size_o,
                     });
                     total += size_o;
                 }
@@ -578,6 +587,7 @@ fn build_safetensors_diff_sources(
         };
 
         // Build: [leading_gap zeros] [element diffs, zero-padded to padded_size]
+        let data_end = leading_gap + buf.len() as u64;
         let mut full_buf = vec![0u8; leading_gap as usize];
         full_buf.extend_from_slice(&buf);
         full_buf.resize((leading_gap + padded_size) as usize, 0u8);
@@ -592,6 +602,7 @@ fn build_safetensors_diff_sources(
             name_override: Some(t.label()),
             position_hint: Some(position_hint),
             leading_gap,
+            data_end,
         });
         total += byte_size;
     }

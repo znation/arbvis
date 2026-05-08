@@ -153,7 +153,8 @@ pub fn render_leaf_tile_diff_positional(
                 let src_local = pixel_idx - cumulative_offsets[src];
                 let (gap, dend) = data_ranges[src];
                 if src_local < gap || src_local >= dend {
-                    Rgb([100u8, 100, 100]) // alignment padding — medium gray
+                    // Checkerboard: 75% gray / 25% gray to distinguish padding from data.
+                    if (px + py) % 2 == 0 { Rgb([191u8, 191, 191]) } else { Rgb([64u8, 64, 64]) }
                 } else {
                     pixel_luts[src][tile_buf[k] as usize]
                 }

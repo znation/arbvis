@@ -102,6 +102,7 @@ fn run(args: Args) -> anyhow::Result<()> {
     }
 
     let (sources, total) = data::prepare_sources(&files, format_safetensors)?;
+    let display_files: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
 
     if let Some(tile_dir) = args.tiles {
         tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, false)?;
@@ -118,7 +119,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    single::run_single(&files, args.output, sources, total, args.sort, false)
+    single::run_single(&display_files, args.output, sources, total, args.sort, false)
 }
 
 fn derive_space_tile_dir(space_id: &str) -> PathBuf {

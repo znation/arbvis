@@ -33,7 +33,7 @@ pub fn run_deploy(tiles_dir: &Path, space_id: &str) -> anyhow::Result<()> {
     ])?;
 
     eprintln!("Ensuring Space {} exists...", space_id);
-    hf_idempotent(&["repo", "create", space_id, "--repo-type=space"])?;
+    hf_idempotent(&["repos", "create", space_id, "--repo-type=space", "--space-sdk=docker"])?;
 
     eprintln!("Uploading Space files...");
     let tmp = tempfile::TempDir::new()?;
@@ -117,7 +117,11 @@ fn hf_idempotent(args: &[&str]) -> anyhow::Result<()> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let combined = format!("{}{}", stderr, stdout).to_lowercase();
-    if combined.contains("already exist") || combined.contains("already exists") {
+    if combined.contains("already exist")
+        || combined.contains("already exists")
+        || combined.contains("already created")
+        || combined.contains("409")
+    {
         return Ok(());
     }
 

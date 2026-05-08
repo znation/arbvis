@@ -7,15 +7,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use image;
+use image::{self, Rgb};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 
-use crate::color::{build_diff_pixel_lut, build_pixel_lut};
+use crate::color::{build_diff_pixel_lut, build_diff_position_lut, build_pixel_lut};
 use crate::data::{load_source_data, Data, Histogram, Source};
 use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, rects_centroid};
 use crate::tiled::html::FileEntity;
-use crate::tiled::leaf::{render_leaf_tile, render_leaf_tile_dtype, render_leaf_tile_sorted};
+use crate::tiled::leaf::{
+    render_leaf_tile, render_leaf_tile_diff_positional, render_leaf_tile_dtype,
+    render_leaf_tile_sorted,
+};
 use crate::tiled::pyramid::build_pyramid;
 
 /// Run the tiled/pyramidal output pipeline.
@@ -54,6 +57,22 @@ pub fn run_tiles(
     let num_squares = 1u32 << (kw - kh);
 
     let pixel_lut = if diff_mode { build_diff_pixel_lut() } else { build_pixel_lut() };
+
+    // Positional diff: every source has a position_hint (only true for safetensors diffs).
+    // Falls back to the single-LUT path for plain binary diffs (position_hint is None).
+    let positional_diff_mode = diff_mode
+        && !sort
+        && !sources.is_empty()
+        && sources.iter().all(|s| s.position_hint.is_some());
+
+    let per_source_luts: Vec<[Rgb<u8>; 256]> = if positional_diff_mode {
+        sources
+            .iter()
+            .map(|s| build_diff_position_lut(s.position_hint.unwrap_or(0.0)))
+            .collect()
+    } else {
+        vec![]
+    };
 
     // Build cumulative byte-start offsets.
     let mut cumulative_offsets: Vec<u64> = Vec::with_capacity(sources.len());
@@ -257,6 +276,19 @@ pub fn run_tiles(
                 total,
                 &histograms,
                 &pixel_lut,
+            )
+        } else if positional_diff_mode {
+            render_leaf_tile_diff_positional(
+                &path,
+                tx,
+                ty,
+                kh as u8,
+                height_tiles,
+                square_pixels,
+                total,
+                &source_data,
+                &cumulative_offsets,
+                &per_source_luts,
             )
         } else {
             render_leaf_tile(

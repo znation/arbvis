@@ -46,6 +46,9 @@ pub struct Source {
     pub safetensors: Option<SafetensorsInfo>,
     /// Override the display name (used when kind is Buffered but has a real filename).
     pub name_override: Option<String>,
+    /// Position of this source within the original file, as a ratio in [0.0, 1.0].
+    /// Set for per-tensor diff sources; None for all other source types.
+    pub position_hint: Option<f32>,
 }
 
 impl Source {
@@ -91,6 +94,7 @@ pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::R
                 byte_size: len,
                 safetensors: None,
                 name_override: None,
+                position_hint: None,
             }],
             len,
         ));
@@ -129,6 +133,7 @@ pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::R
             byte_size: size,
             safetensors: safetensors_info,
             name_override: None,
+            position_hint: None,
         });
     }
     Ok((sources, total))
@@ -332,6 +337,7 @@ pub fn prepare_diff_sources(
             byte_size: size_o,
             safetensors: None,
             name_override: None,
+            position_hint: None,
         };
         return Ok((vec![source], size_o));
     }
@@ -432,6 +438,7 @@ pub fn prepare_diff_sources(
                         byte_size: size_o,
                         safetensors: None,
                         name_override: None,
+                        position_hint: None,
                     });
                     total += size_o;
                 }
@@ -449,6 +456,22 @@ pub fn prepare_diff_sources(
         if orig_is_file { "file" } else if orig_is_dir { "directory" } else { "missing path" },
         if mod_is_file { "file" } else if mod_is_dir { "directory" } else { "missing path" }
     );
+}
+
+/// Return the smallest power of 4 that is >= n, minimum 1.
+///
+/// Powers of 4 align with Hilbert curve quadrant boundaries, so padding each
+/// tensor's diff buffer to the next power of 4 makes the tensor occupy exactly
+/// one complete Hilbert sub-square (a perfect square region in the 2D image).
+fn next_power_of_4(n: usize) -> usize {
+    if n <= 1 {
+        return 1;
+    }
+    let mut p = 1usize;
+    while p < n {
+        p = p.saturating_mul(4);
+    }
+    p
 }
 
 /// Build per-tensor diff Sources from two .safetensors files.
@@ -519,12 +542,13 @@ fn build_safetensors_diff_sources(
     // One byte per element: each diff element maps to exactly one pixel, giving
     // maximum visual density regardless of the original dtype's byte width.
     let log_max = if global_max > 0.0 { (global_max as f64 + 1.0).ln() } else { 1.0 };
+    let file_total = m_o.len().max(1) as f32;
     let mut sources: Vec<Source> = Vec::new();
     let mut total = 0u64;
 
     for tw in work {
         let t = tw.orig;
-        let buf: Vec<u8> = tw.diffs.iter().map(|&diff| {
+        let mut buf: Vec<u8> = tw.diffs.iter().map(|&diff| {
             if diff.is_finite() {
                 let normalized = (diff as f64 + 1.0).ln() / log_max;
                 (normalized * 255.0).round().clamp(0.0, 255.0) as u8
@@ -532,16 +556,42 @@ fn build_safetensors_diff_sources(
                 255
             }
         }).collect();
+        // Pad to the next power of 4 so this tensor occupies exactly one Hilbert
+        // quadrant (a perfect square). Padding bytes are 0 = no diff = black.
+        let padded_len = next_power_of_4(buf.len()).max(1);
+        buf.resize(padded_len, 0u8);
         let byte_size = buf.len() as u64;
+        let position_hint = t.file_start as f32 / file_total;
         sources.push(Source {
             file_idx: sources.len(),
             kind: SourceKind::Buffered(buf),
             byte_size,
             safetensors: None,
             name_override: Some(t.label()),
+            position_hint: Some(position_hint),
         });
         total += byte_size;
     }
 
     Ok((sources, total))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_power_of_4;
+
+    #[test]
+    fn next_power_of_4_values() {
+        assert_eq!(next_power_of_4(0), 1);
+        assert_eq!(next_power_of_4(1), 1);
+        assert_eq!(next_power_of_4(2), 4);
+        assert_eq!(next_power_of_4(3), 4);
+        assert_eq!(next_power_of_4(4), 4);
+        assert_eq!(next_power_of_4(5), 16);
+        assert_eq!(next_power_of_4(16), 16);
+        assert_eq!(next_power_of_4(17), 64);
+        assert_eq!(next_power_of_4(64), 64);
+        assert_eq!(next_power_of_4(65), 256);
+        assert_eq!(next_power_of_4(1_000_000), 1_048_576); // 4^10
+    }
 }

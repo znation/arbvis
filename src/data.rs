@@ -480,13 +480,13 @@ pub fn prepare_diff_sources(
 /// Powers of 4 align with Hilbert curve quadrant boundaries, so padding each
 /// tensor's diff buffer to the next power of 4 makes the tensor occupy exactly
 /// one complete Hilbert sub-square (a perfect square region in the 2D image).
-fn next_power_of_4(n: usize) -> usize {
+fn next_power_of_2(n: usize) -> usize {
     if n <= 1 {
         return 1;
     }
     let mut p = 1usize;
     while p < n {
-        p = p.saturating_mul(4);
+        p = p.saturating_mul(2);
     }
     p
 }
@@ -575,7 +575,7 @@ fn build_safetensors_diff_sources(
         }).collect();
         // Pad element count to the next power of 4 so this tensor fits in exactly
         // one Hilbert sub-quadrant (a perfect square region).
-        let padded_size = next_power_of_4(buf.len()).max(1) as u64;
+        let padded_size = next_power_of_2(buf.len()).max(1) as u64;
 
         // Align the tensor's START to a padded_size boundary so that
         // decompose_hilbert produces a single rectangle for the data region.
@@ -612,20 +612,20 @@ fn build_safetensors_diff_sources(
 
 #[cfg(test)]
 mod tests {
-    use super::next_power_of_4;
+    use super::next_power_of_2;
 
     #[test]
-    fn next_power_of_4_values() {
-        assert_eq!(next_power_of_4(0), 1);
-        assert_eq!(next_power_of_4(1), 1);
-        assert_eq!(next_power_of_4(2), 4);
-        assert_eq!(next_power_of_4(3), 4);
-        assert_eq!(next_power_of_4(4), 4);
-        assert_eq!(next_power_of_4(5), 16);
-        assert_eq!(next_power_of_4(16), 16);
-        assert_eq!(next_power_of_4(17), 64);
-        assert_eq!(next_power_of_4(64), 64);
-        assert_eq!(next_power_of_4(65), 256);
-        assert_eq!(next_power_of_4(1_000_000), 1_048_576); // 4^10
+    fn next_power_of_2_values() {
+        assert_eq!(next_power_of_2(0), 1);
+        assert_eq!(next_power_of_2(1), 1);
+        assert_eq!(next_power_of_2(2), 2);
+        assert_eq!(next_power_of_2(3), 4);
+        assert_eq!(next_power_of_2(4), 4);
+        assert_eq!(next_power_of_2(5), 8);
+        assert_eq!(next_power_of_2(16), 16);
+        assert_eq!(next_power_of_2(17), 32);
+        assert_eq!(next_power_of_2(64), 64);
+        assert_eq!(next_power_of_2(65), 128);
+        assert_eq!(next_power_of_2(1_000_000), 1_048_576); // 2^20
     }
 }

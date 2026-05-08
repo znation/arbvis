@@ -154,7 +154,7 @@ pub fn render_leaf_tile_diff_positional(
                 let (gap, dend) = data_ranges[src];
                 if src_local < gap || src_local >= dend {
                     // Checkerboard: 75% gray / 25% gray to distinguish padding from data.
-                    if (px / 2 + py / 2) % 2 == 0 { Rgb([191u8, 191, 191]) } else { Rgb([64u8, 64, 64]) }
+                    if (px / 2 + py / 2) % 2 == 0 { Rgb([128u8, 128, 128]) } else { Rgb([0u8, 0, 0]) }
                 } else {
                     pixel_luts[src][tile_buf[k] as usize]
                 }

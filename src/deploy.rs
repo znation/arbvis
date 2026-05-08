@@ -37,7 +37,7 @@ pub fn run_deploy(tiles_dir: &Path, space_id: &str) -> anyhow::Result<()> {
 
     eprintln!("Uploading Space files...");
     let tmp = tempfile::TempDir::new()?;
-    write_space_files(tmp.path(), &bucket_id)?;
+    write_space_files(tmp.path(), &bucket_id, space_id)?;
 
     for (src, dest) in [
         (tmp.path().join("README.md"), "README.md"),
@@ -133,11 +133,12 @@ fn hf_idempotent(args: &[&str]) -> anyhow::Result<()> {
     );
 }
 
-fn write_space_files(dir: &Path, bucket_id: &str) -> anyhow::Result<()> {
-    std::fs::write(
-        dir.join("README.md"),
-        "---\ntitle: arbvis\nemoji: 🗺\ncolorFrom: blue\ncolorTo: indigo\nsdk: docker\napp_port: 7860\npinned: false\n---\n",
-    )?;
+fn write_space_files(dir: &Path, bucket_id: &str, space_id: &str) -> anyhow::Result<()> {
+    let repo_name = space_id.split('/').nth(1).unwrap_or(space_id);
+    let readme = format!(
+        "---\ntitle: arbvis: {repo_name}\nemoji: 🗺\ncolorFrom: blue\ncolorTo: indigo\nsdk: docker\napp_port: 7860\npinned: false\n---\n"
+    );
+    std::fs::write(dir.join("README.md"), readme)?;
 
     std::fs::write(
         dir.join("Dockerfile"),

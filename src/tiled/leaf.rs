@@ -81,6 +81,75 @@ pub fn render_leaf_tile(
     Ok(())
 }
 
+/// Render one 256×256 leaf tile using position-based dtype coloring (safetensors mode).
+///
+/// Unlike `render_leaf_tile`, this function does not read file bytes at all — the color
+/// of each pixel is determined entirely by its byte position in the global stream via
+/// `color_ranges`, a sorted list of `(start, end, color)` entries from
+/// `safetensors::build_color_ranges`.
+pub fn render_leaf_tile_dtype(
+    tile_path: &Path,
+    tx: u32,
+    ty: u32,
+    kh: u8,
+    height_tiles: u32,
+    square_pixels: u64,
+    total: u64,
+    color_ranges: &[(u64, u64, image::Rgb<u8>)],
+) -> Result<(), String> {
+    const TILE: u32 = 256;
+    const TILE_PIXELS: usize = (TILE as usize) * (TILE as usize);
+    const TILE_AREA: u64 = TILE_PIXELS as u64;
+
+    let sq = (tx / height_tiles) as u64;
+    let sq_off = sq * square_pixels;
+    let local_tx = tx % height_tiles;
+
+    let tile_order = kh - 8;
+    let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
+    let tile_pixel_start = sq_off + base;
+    let tile_pixel_end = (tile_pixel_start + TILE_AREA).min(total);
+
+    // Find the first color range overlapping this tile's byte span.
+    let first_range = color_ranges.partition_point(|r| r.1 <= tile_pixel_start);
+    // Collect overlapping ranges into a small stack array (typically 1-3).
+    let local_ranges: Vec<(u64, u64, image::Rgb<u8>)> = color_ranges[first_range..]
+        .iter()
+        .take_while(|r| r.0 < tile_pixel_end)
+        .copied()
+        .collect();
+
+    let mut img = image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::new(TILE, TILE);
+    for py in 0..TILE {
+        let ly = ty * TILE + py;
+        for px in 0..TILE {
+            let lx = local_tx * TILE + px;
+            let local_idx = xy2h_u64(lx as u64, ly as u64, kh);
+            let pixel_idx = sq_off + local_idx;
+            let color = if pixel_idx < total {
+                // Linear scan over the small local list (O(1) for typical tensors).
+                let mut found = image::Rgb([0u8, 0, 0]);
+                for &(start, end, c) in &local_ranges {
+                    if pixel_idx >= start && pixel_idx < end {
+                        found = c;
+                        break;
+                    }
+                }
+                found
+            } else {
+                image::Rgb([0u8, 0, 0])
+            };
+            img.put_pixel(px, py, color);
+        }
+    }
+    if let Some(parent) = tile_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    img.save(tile_path)
+        .map_err(|e| format!("{}: {}", tile_path.display(), e))?;
+    Ok(())
+}
+
 /// Render one 256×256 leaf tile in sorted mode from pre-built per-source histograms.
 ///
 /// Each element of `histograms` is `(prefix_sums, cumulative_byte_offset)` for one source.

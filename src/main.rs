@@ -3,6 +3,7 @@ mod data;
 mod deploy;
 mod geometry;
 mod label;
+mod safetensors;
 mod single;
 mod tiled;
 
@@ -51,12 +52,19 @@ struct Args {
     /// bucket is auto-named as <namespace>/<repo>_bucket
     #[arg(long, conflicts_with = "output")]
     space: Option<String>,
+
+    /// Treat inputs as a specific format (currently only "safetensors" is supported).
+    /// Auto-detected from .safetensors file extension when omitted.
+    #[arg(long, value_name = "FORMAT")]
+    format: Option<String>,
 }
 
 fn run(args: Args) -> anyhow::Result<()> {
+    let format_safetensors = args.format.as_deref() == Some("safetensors");
+
     if let Some(diff_args) = args.diff {
         let (sources, total) =
-            data::prepare_diff_sources(&diff_args[0], &diff_args[1])?;
+            data::prepare_diff_sources(&diff_args[0], &diff_args[1], format_safetensors)?;
         let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
         if let Some(tile_dir) = args.tiles {
             tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, true)?;
@@ -93,7 +101,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         }
     }
 
-    let (sources, total) = data::prepare_sources(&files)?;
+    let (sources, total) = data::prepare_sources(&files, format_safetensors)?;
 
     if let Some(tile_dir) = args.tiles {
         tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, false)?;

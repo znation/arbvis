@@ -3,8 +3,16 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use image::Rgb;
 use indicatif::ProgressBar;
 use memmap2::Mmap;
+
+use crate::safetensors::{self, TensorMeta};
+
+pub struct SafetensorsInfo {
+    pub tensors: Vec<TensorMeta>,
+    pub color_ranges: Vec<(u64, u64, Rgb<u8>)>,
+}
 
 /// Backing storage for a source's bytes.
 pub enum Data {
@@ -34,11 +42,18 @@ pub struct Source {
     pub file_idx: usize,
     pub kind: SourceKind,
     pub byte_size: u64,
+    /// Populated for safetensors sources (including diff buffers derived from them).
+    pub safetensors: Option<SafetensorsInfo>,
+    /// Override the display name (used when kind is Buffered but has a real filename).
+    pub name_override: Option<String>,
 }
 
 impl Source {
     /// Human-readable name for this source (file name or "stdin").
     pub fn name(&self) -> String {
+        if let Some(ref n) = self.name_override {
+            return n.clone();
+        }
         match &self.kind {
             SourceKind::File(p) => p
                 .file_name()
@@ -57,7 +72,9 @@ impl Source {
 ///
 /// Files are opened lazily (one at a time) to avoid exhausting OS fd limits.
 /// Stdin is buffered into memory upfront since its size is unknown.
-pub fn prepare_sources(files: &[PathBuf]) -> anyhow::Result<(Vec<Source>, u64)> {
+/// When `format_safetensors` is true, or when a file has a `.safetensors` extension,
+/// the header is parsed and tensor metadata is stored on the source.
+pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::Result<(Vec<Source>, u64)> {
     if files.is_empty() {
         log::info!("Reading stdin...");
         let mut buf = Vec::new();
@@ -68,6 +85,8 @@ pub fn prepare_sources(files: &[PathBuf]) -> anyhow::Result<(Vec<Source>, u64)> 
                 file_idx: 0,
                 kind: SourceKind::Buffered(buf),
                 byte_size: len,
+                safetensors: None,
+                name_override: None,
             }],
             len,
         ));
@@ -84,10 +103,28 @@ pub fn prepare_sources(files: &[PathBuf]) -> anyhow::Result<(Vec<Source>, u64)> 
             }
         };
         total += size;
+
+        let is_st = format_safetensors
+            || path.extension().and_then(|e| e.to_str()) == Some("safetensors");
+
+        let st_info = if is_st {
+            match load_safetensors_info(path, size) {
+                Ok(info) => Some(info),
+                Err(e) => {
+                    eprintln!("warning: {}: failed to parse safetensors header: {} — using byte coloring", path.display(), e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         sources.push(Source {
             file_idx: i,
             kind: SourceKind::File(path.clone()),
             byte_size: size,
+            safetensors: st_info,
+            name_override: None,
         });
     }
     Ok((sources, total))
@@ -115,6 +152,26 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
             Ok(Data::Owned(diff))
         }
     }
+}
+
+/// Read just the header of a safetensors file and return parsed metadata.
+fn load_safetensors_info(path: &Path, file_size: u64) -> anyhow::Result<SafetensorsInfo> {
+    // Read the first 8 bytes to get header_size, then read header_size more bytes.
+    let mut f = File::open(path)?;
+    let mut size_buf = [0u8; 8];
+    f.read_exact(&mut size_buf)?;
+    let header_size = u64::from_le_bytes(size_buf);
+    if header_size > 100 * 1024 * 1024 {
+        anyhow::bail!("header_size={} exceeds 100 MB safety limit", header_size);
+    }
+    let total_header = 8 + header_size as usize;
+    let mut header_buf = vec![0u8; total_header];
+    header_buf[..8].copy_from_slice(&size_buf);
+    f.read_exact(&mut header_buf[8..])?;
+
+    let (tensors, header_end) = safetensors::parse_header(&header_buf)?;
+    let color_ranges = safetensors::build_color_ranges(&tensors, header_end, file_size);
+    Ok(SafetensorsInfo { tensors, color_ranges })
 }
 
 /// Byte-value frequency histogram for a source.
@@ -224,19 +281,53 @@ fn collect_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
 
 /// Build diff sources from two files or two directories.
 ///
-/// For files: both must be the same size (error if not).
+/// For files: both must be the same size (error if not), unless both are safetensors
+/// (in which case a tensor-aligned diff buffer is computed).
 /// For directories: files are matched by relative path; pairs with mismatched sizes
 /// or no counterpart on the other side are skipped with a warning.
 pub fn prepare_diff_sources(
     original: &Path,
     modified: &Path,
+    format_safetensors: bool,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     let orig_is_file = original.is_file();
     let mod_is_file = modified.is_file();
     let orig_is_dir = original.is_dir();
     let mod_is_dir = modified.is_dir();
 
+    let is_st = |p: &Path| -> bool {
+        format_safetensors || p.extension().and_then(|e| e.to_str()) == Some("safetensors")
+    };
+
     if orig_is_file && mod_is_file {
+        // Safetensors diff: tensor-aligned, allows different file sizes.
+        if is_st(original) && is_st(modified) {
+            let diff_buf = build_safetensors_diff_files(original, modified)?;
+            let byte_size = diff_buf.len() as u64;
+            // Attach the original file's tensor metadata so the viewer shows per-tensor
+            // boundaries and labels. Color ranges aren't used in diff rendering (the
+            // diff LUT is used instead), but tensors drives entity generation.
+            let st_info = match load_safetensors_info(original, byte_size) {
+                Ok(info) => Some(info),
+                Err(e) => {
+                    eprintln!("warning: diff tensor metadata: {} — labels will be missing", e);
+                    None
+                }
+            };
+            let orig_name = original
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| original.to_string_lossy().into_owned());
+            let source = Source {
+                file_idx: 0,
+                kind: SourceKind::Buffered(diff_buf),
+                byte_size,
+                safetensors: st_info,
+                name_override: Some(orig_name),
+            };
+            return Ok((vec![source], byte_size));
+        }
+
         let size_o = std::fs::metadata(original)?.len();
         let size_m = std::fs::metadata(modified)?.len();
         if size_o != size_m {
@@ -255,6 +346,8 @@ pub fn prepare_diff_sources(
                 modified: modified.to_path_buf(),
             },
             byte_size: size_o,
+            safetensors: None,
+            name_override: None,
         };
         return Ok((vec![source], size_o));
     }
@@ -336,6 +429,8 @@ pub fn prepare_diff_sources(
                             modified: mod_abs.clone(),
                         },
                         byte_size: size_o,
+                        safetensors: None,
+                        name_override: None,
                     });
                     total += size_o;
                 }
@@ -353,4 +448,13 @@ pub fn prepare_diff_sources(
         if orig_is_file { "file" } else if orig_is_dir { "directory" } else { "missing path" },
         if mod_is_file { "file" } else if mod_is_dir { "directory" } else { "missing path" }
     );
+}
+
+/// Mmap both safetensors files and produce a tensor-aligned diff buffer.
+fn build_safetensors_diff_files(original: &Path, modified: &Path) -> anyhow::Result<Vec<u8>> {
+    let f_o = File::open(original)?;
+    let f_m = File::open(modified)?;
+    let m_o = unsafe { Mmap::map(&f_o) }?;
+    let m_m = unsafe { Mmap::map(&f_m) }?;
+    safetensors::build_diff_buffer(&m_o, &m_m)
 }

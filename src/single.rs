@@ -16,6 +16,7 @@ use crate::color::{build_diff_pixel_lut, build_pixel_lut};
 use crate::data::{load_source_data, Histogram, Source};
 use crate::geometry::{sampled_in_range, hilbert_to_xy_u64};
 use crate::label::draw_file_label;
+use crate::safetensors::color_for_pos;
 
 /// Render a single Hilbert-curve image (non-tiled mode).
 pub fn run_single(
@@ -26,6 +27,13 @@ pub fn run_single(
     sort: bool,
     diff_mode: bool,
 ) -> anyhow::Result<()> {
+    if sort && sources.iter().any(|s| s.safetensors.is_some()) {
+        anyhow::bail!(
+            "--sort is incompatible with safetensors files: sort reorders bytes by value, \
+             which destroys positional dtype information"
+        );
+    }
+
     let num_files = files.len().max(1);
     let total_usize = (total as usize).max(1);
 
@@ -237,6 +245,10 @@ pub fn run_single(
                         return Ok(vec![]);
                     }
                     let data = load_source_data(&sources[src_idx])?;
+                    let dtype_ranges = sources[src_idx]
+                        .safetensors
+                        .as_ref()
+                        .map(|st| st.color_ranges.as_slice());
                     let results = source_chunks
                         .par_iter()
                         .map(|&(fi, src_global_start, chunk_b_start, chunk_b_end, chunk_pixel_start)| {
@@ -254,7 +266,12 @@ pub fn run_single(
                             for &b in bytes {
                                 if cur_byte % stride == 0 {
                                     let (x, y) = hilbert_to_xy_u64(cur_pixel as u64, k as u8);
-                                    let color = pixel_lut[b as usize];
+                                    let color = if let Some(ranges) = dtype_ranges {
+                                        // color_for_pos uses file-relative positions
+                                        color_for_pos(cur_byte - src_byte_starts[src_idx], ranges)
+                                    } else {
+                                        pixel_lut[b as usize]
+                                    };
                                     let pixel_idx = y as usize * side as usize + x as usize;
                                     unsafe {
                                         let p = (img_base as *mut u8).add(pixel_idx * 3);

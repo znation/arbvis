@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use image;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 
@@ -14,7 +15,7 @@ use crate::color::{build_diff_pixel_lut, build_pixel_lut};
 use crate::data::{load_source_data, Data, Histogram, Source};
 use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, rects_centroid};
 use crate::tiled::html::FileEntity;
-use crate::tiled::leaf::{render_leaf_tile, render_leaf_tile_sorted};
+use crate::tiled::leaf::{render_leaf_tile, render_leaf_tile_dtype, render_leaf_tile_sorted};
 use crate::tiled::pyramid::build_pyramid;
 
 /// Run the tiled/pyramidal output pipeline.
@@ -25,6 +26,14 @@ pub fn run_tiles(
     sort: bool,
     diff_mode: bool,
 ) -> anyhow::Result<()> {
+    // --sort is incompatible with safetensors dtype coloring.
+    if sort && sources.iter().any(|s| s.safetensors.is_some()) {
+        anyhow::bail!(
+            "--sort is incompatible with safetensors files: sort reorders bytes by value, \
+             which destroys positional dtype information"
+        );
+    }
+
     // Find s = ceil(log2(total)), minimum 16 so the image is at least 256×256.
     // Split into kh = floor(s/2) (height) and kw = ceil(s/2) (width).
     let mut s = 16u32;
@@ -98,48 +107,107 @@ pub fn run_tiles(
         vec![]
     };
 
-    // Pre-compute per-file entity metadata.
+    // Build combined dtype color ranges for the whole byte stream (safetensors mode).
+    // Dtype coloring is only used when NOT in diff mode — in diff mode we keep the
+    // black→magenta diff LUT but still generate per-tensor entity overlays.
+    let dtype_mode = !diff_mode && sources.iter().any(|s| s.safetensors.is_some());
+    let combined_dtype_ranges: Vec<(u64, u64, image::Rgb<u8>)> = if dtype_mode {
+        let mut ranges = Vec::new();
+        let mut cumulative: u64 = 0;
+        for source in &sources {
+            if let Some(st) = &source.safetensors {
+                for &(start, end, color) in &st.color_ranges {
+                    ranges.push((cumulative + start, cumulative + end, color));
+                }
+            }
+            cumulative += source.byte_size;
+        }
+        ranges
+    } else {
+        vec![]
+    };
+
+    // Pre-compute entity metadata.
+    // For safetensors sources: one entity per tensor.
+    // For regular sources: one entity per source.
     let mut entities: Vec<FileEntity> = Vec::new();
     {
         let mut cumulative: u64 = 0;
         for source in &sources {
-            let name = source.name();
-            let rects = file_rects(
-                cumulative,
-                cumulative + source.byte_size,
-                total_pixels,
-                square_pixels,
-                num_squares,
-                height,
-                kh as u8,
-            );
-            let (pixel_x, pixel_y) = rects_centroid(&rects).unwrap_or_else(|| {
-                let mid = cumulative + source.byte_size / 2;
-                let sq = mid / square_pixels;
-                let (lx, ly) = hilbert_to_xy_u64(mid % square_pixels, kh as u8);
-                (sq as u32 * height + lx, ly)
-            });
-            let hue = name_hue(&name);
-            let segments = outer_segments(&rects);
-            let bbox = if let Some(first) = rects.first() {
-                rects
-                    .iter()
-                    .skip(1)
-                    .fold(*first, |(x0, y0, x1, y1), &(rx0, ry0, rx1, ry1)| {
-                        (x0.min(rx0), y0.min(ry0), x1.max(rx1), y1.max(ry1))
-                    })
+            if let Some(st) = &source.safetensors {
+                // Emit one entity per tensor (boundary + label).
+                for tensor in &st.tensors {
+                    let t_start = cumulative + tensor.file_start;
+                    let t_end = cumulative + tensor.file_end;
+                    if t_end <= t_start {
+                        continue;
+                    }
+                    let rects = file_rects(t_start, t_end, total_pixels, square_pixels, num_squares, height, kh as u8);
+                    let (pixel_x, pixel_y) = rects_centroid(&rects).unwrap_or_else(|| {
+                        let mid = t_start + (t_end - t_start) / 2;
+                        let sq = mid / square_pixels;
+                        let (lx, ly) = hilbert_to_xy_u64(mid % square_pixels, kh as u8);
+                        (sq as u32 * height + lx, ly)
+                    });
+                    let name = tensor.label();
+                    let hue = name_hue(&tensor.name);
+                    let segments = outer_segments(&rects);
+                    let bbox = if let Some(first) = rects.first() {
+                        rects.iter().skip(1).fold(*first, |(x0, y0, x1, y1), &(rx0, ry0, rx1, ry1)| {
+                            (x0.min(rx0), y0.min(ry0), x1.max(rx1), y1.max(ry1))
+                        })
+                    } else {
+                        (0, 0, 0, 0)
+                    };
+                    entities.push(FileEntity {
+                        name,
+                        pixel_x,
+                        pixel_y,
+                        hue,
+                        byte_size: t_end - t_start,
+                        bbox,
+                        segments,
+                    });
+                }
             } else {
-                (0, 0, 0, 0)
-            };
-            entities.push(FileEntity {
-                name,
-                pixel_x,
-                pixel_y,
-                hue,
-                byte_size: source.byte_size,
-                bbox,
-                segments,
-            });
+                let name = source.name();
+                let rects = file_rects(
+                    cumulative,
+                    cumulative + source.byte_size,
+                    total_pixels,
+                    square_pixels,
+                    num_squares,
+                    height,
+                    kh as u8,
+                );
+                let (pixel_x, pixel_y) = rects_centroid(&rects).unwrap_or_else(|| {
+                    let mid = cumulative + source.byte_size / 2;
+                    let sq = mid / square_pixels;
+                    let (lx, ly) = hilbert_to_xy_u64(mid % square_pixels, kh as u8);
+                    (sq as u32 * height + lx, ly)
+                });
+                let hue = name_hue(&name);
+                let segments = outer_segments(&rects);
+                let bbox = if let Some(first) = rects.first() {
+                    rects
+                        .iter()
+                        .skip(1)
+                        .fold(*first, |(x0, y0, x1, y1), &(rx0, ry0, rx1, ry1)| {
+                            (x0.min(rx0), y0.min(ry0), x1.max(rx1), y1.max(ry1))
+                        })
+                } else {
+                    (0, 0, 0, 0)
+                };
+                entities.push(FileEntity {
+                    name,
+                    pixel_x,
+                    pixel_y,
+                    hue,
+                    byte_size: source.byte_size,
+                    bbox,
+                    segments,
+                });
+            }
             cumulative += source.byte_size;
         }
     }
@@ -167,7 +235,18 @@ pub fn run_tiles(
         let tx = (i % width_tiles as u64) as u32;
         let ty = (i / width_tiles as u64) as u32;
         let path = tile_dir.join(format!("tiles/{max_zoom}/{tx}/{ty}.png"));
-        let result = if sort {
+        let result = if dtype_mode {
+            render_leaf_tile_dtype(
+                &path,
+                tx,
+                ty,
+                kh as u8,
+                height_tiles,
+                square_pixels,
+                total,
+                &combined_dtype_ranges,
+            )
+        } else if sort {
             render_leaf_tile_sorted(
                 &path,
                 tx,

@@ -494,8 +494,9 @@ fn build_safetensors_diff_sources(
                 continue;
             }
         };
-        if orig_t.dtype != mod_t.dtype || orig_t.shape != mod_t.shape {
-            eprintln!("warning: safetensors diff: tensor '{}' dtype/shape mismatch — skipping", orig_t.name);
+        if orig_t.shape != mod_t.shape {
+            eprintln!("warning: safetensors diff: tensor '{}' shape mismatch {:?} vs {:?} — skipping",
+                orig_t.name, orig_t.shape, mod_t.shape);
             continue;
         }
         let orig_bytes = &m_o[orig_t.file_start as usize..orig_t.file_end as usize];

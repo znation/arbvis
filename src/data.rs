@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use image::Rgb;
@@ -46,9 +46,6 @@ pub struct Source {
     pub safetensors: Option<SafetensorsInfo>,
     /// Override the display name (used when kind is Buffered but has a real filename).
     pub name_override: Option<String>,
-    /// If set, only the bytes [start, end) within the file are used for this source.
-    /// Used for per-tensor expansion so each tensor occupies its own Hilbert region.
-    pub byte_range: Option<(u64, u64)>,
 }
 
 impl Source {
@@ -77,10 +74,10 @@ impl Source {
 /// Stdin is buffered into memory upfront since its size is unknown.
 ///
 /// For .safetensors files (or when `format_safetensors` is true): the header is
-/// parsed and the file is expanded into one Source per tensor (plus a `__header__`
-/// Source for the JSON metadata region). Each tensor occupies its own contiguous
-/// Hilbert region, eliminating the block-boundary artifacting that occurs when
-/// 65536-byte tile boundaries cut through tensor data.
+/// parsed and attached as SafetensorsInfo for dtype coloring. The file is kept as
+/// a single Source (one per file) so that inter-tensor borders are not drawn and
+/// the Hilbert curve flows smoothly across the whole file with color transitions
+/// only at tensor boundaries.
 pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::Result<(Vec<Source>, u64)> {
     if files.is_empty() {
         log::info!("Reading stdin...");
@@ -94,7 +91,6 @@ pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::R
                 byte_size: len,
                 safetensors: None,
                 name_override: None,
-                byte_range: None,
             }],
             len,
         ));
@@ -114,110 +110,37 @@ pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::R
         let is_st = format_safetensors
             || path.extension().and_then(|e| e.to_str()) == Some("safetensors");
 
-        if is_st {
-            match expand_safetensors_sources(path, size, &mut sources) {
-                Ok(file_total) => { total += file_total; }
+        let safetensors_info = if is_st {
+            match load_safetensors_info(path, size) {
+                Ok(info) => Some(info),
                 Err(e) => {
                     eprintln!("warning: {}: failed to parse safetensors header: {} — treating as plain binary", path.display(), e);
-                    total += size;
-                    sources.push(Source {
-                        file_idx: sources.len(),
-                        kind: SourceKind::File(path.clone()),
-                        byte_size: size,
-                        safetensors: None,
-                        name_override: None,
-                        byte_range: None,
-                    });
+                    None
                 }
             }
         } else {
-            total += size;
-            sources.push(Source {
-                file_idx: sources.len(),
-                kind: SourceKind::File(path.clone()),
-                byte_size: size,
-                safetensors: None,
-                name_override: None,
-                byte_range: None,
-            });
-        }
+            None
+        };
+
+        total += size;
+        sources.push(Source {
+            file_idx: sources.len(),
+            kind: SourceKind::File(path.clone()),
+            byte_size: size,
+            safetensors: safetensors_info,
+            name_override: None,
+        });
     }
     Ok((sources, total))
 }
 
-/// Expand a single .safetensors file into per-tensor Sources, appending them to `out`.
-///
-/// Emits one `__header__` Source covering the JSON metadata region, then one Source
-/// per tensor sorted by file offset. Each Source gets local color_ranges so that
-/// existing dtype-coloring code in the rendering pipeline works without modification.
-///
-/// Returns the file's total byte count (header + all tensor data).
-fn expand_safetensors_sources(
-    path: &Path,
-    file_size: u64,
-    out: &mut Vec<Source>,
-) -> anyhow::Result<u64> {
-    let st_info = load_safetensors_info(path, file_size)?;
-    let header_end = st_info.tensors.first().map(|t| t.file_start).unwrap_or(file_size);
-
-    // Header source (gray dtype coloring).
-    let header_size = header_end;
-    out.push(Source {
-        file_idx: out.len(),
-        kind: SourceKind::File(path.to_path_buf()),
-        byte_size: header_size,
-        safetensors: Some(SafetensorsInfo {
-            tensors: vec![],
-            color_ranges: vec![(0, header_size, image::Rgb([100, 100, 100]))],
-        }),
-        name_override: Some("__header__ (metadata)".to_string()),
-        byte_range: Some((0, header_size)),
-    });
-
-    // Per-tensor sources.
-    for tensor in &st_info.tensors {
-        let tensor_size = tensor.file_end - tensor.file_start;
-        let dtype_color = tensor.dtype.to_color();
-        // Build a local TensorMeta with positions relative to this source (0-based).
-        let local_tensor = safetensors::TensorMeta {
-            name: tensor.name.clone(),
-            dtype: tensor.dtype,
-            shape: tensor.shape.clone(),
-            file_start: 0,
-            file_end: tensor_size,
-        };
-        out.push(Source {
-            file_idx: out.len(),
-            kind: SourceKind::File(path.to_path_buf()),
-            byte_size: tensor_size,
-            safetensors: Some(SafetensorsInfo {
-                tensors: vec![local_tensor],
-                color_ranges: vec![(0, tensor_size, dtype_color)],
-            }),
-            name_override: Some(tensor.label()),
-            byte_range: Some((tensor.file_start, tensor.file_end)),
-        });
-    }
-
-    Ok(file_size)
-}
-
 /// Load a source's bytes for random access: mmaps file sources, clones buffered sources.
 /// For diff sources, mmaps both files and returns `abs(modified - original)` as an owned vec.
-/// When `byte_range` is set on a File source, only those bytes are returned.
 pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
     match &s.kind {
         SourceKind::File(p) => {
-            if let Some((start, end)) = s.byte_range {
-                let mut f = File::open(p)?;
-                f.seek(SeekFrom::Start(start))?;
-                let mut buf = vec![0u8; (end - start) as usize];
-                f.read_exact(&mut buf)?;
-                Ok(Data::Owned(buf))
-            } else {
-                let f = File::open(p)?;
-                Ok(Data::Mapped(unsafe { Mmap::map(&f) }?))
-            }
+            let f = File::open(p)?;
+            Ok(Data::Mapped(unsafe { Mmap::map(&f) }?))
         }
         SourceKind::Buffered(v) => Ok(Data::Owned(v.clone())),
         SourceKind::Diff { original, modified } => {
@@ -275,9 +198,6 @@ impl Histogram {
         match &s.kind {
             SourceKind::File(p) => {
                 let mut f = File::open(p)?;
-                if let Some((start, _)) = s.byte_range {
-                    f.seek(SeekFrom::Start(start))?;
-                }
                 let mut remaining = s.byte_size;
                 let mut buf = vec![0u8; CHUNK];
                 while remaining > 0 {
@@ -412,7 +332,6 @@ pub fn prepare_diff_sources(
             byte_size: size_o,
             safetensors: None,
             name_override: None,
-            byte_range: None,
         };
         return Ok((vec![source], size_o));
     }
@@ -496,7 +415,6 @@ pub fn prepare_diff_sources(
                         byte_size: size_o,
                         safetensors: None,
                         name_override: None,
-                        byte_range: None,
                     });
                     total += size_o;
                 }
@@ -607,7 +525,6 @@ fn build_safetensors_diff_sources(
             byte_size,
             safetensors: None,
             name_override: Some(t.label()),
-            byte_range: None,
         });
         total += byte_size;
     }

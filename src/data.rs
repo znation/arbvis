@@ -518,14 +518,23 @@ fn build_safetensors_diff_sources(
         }
     }
 
-    // Pass 1: compute all per-element diffs and find the global max for normalization.
-    struct TensorWork<'a> {
-        orig: &'a safetensors::TensorMeta,
-        diffs: Vec<f32>,
-    }
-    let mut work: Vec<TensorWork> = Vec::new();
-    let mut global_max: f32 = 0.0;
-
+    // Single pass: compute per-element relative diffs and build per-tensor sources.
+    //
+    // Each element is normalized by its own original magnitude:
+    //   relative_diff = |orig - mod| / max(|orig|, ε)
+    // so the brightness encodes *how much the weight changed relative to what it was*:
+    //   black  → identical (0% change)
+    //   dim    → small relative change (e.g. 1–5%)
+    //   bright → large relative change (e.g. 50%+)
+    //   max    → diff ≥ original magnitude (100%+ change)
+    //
+    // A sqrt scale maps the [0, 1] relative range to [0, 255] so that small-but-real
+    // changes (e.g. 1%) are visible (byte ≈ 16) rather than crushed near zero.
+    // Values > 1 are clamped to max brightness.
+    const EPSILON: f32 = 1e-6;
+    let file_total = m_o.len().max(1) as f32;
+    let mut sources: Vec<Source> = Vec::new();
+    let mut total = 0u64;
     for orig_t in &orig_tensors {
         let mod_t = match mod_map.get(orig_t.name.as_str()) {
             Some(t) => t,
@@ -540,40 +549,16 @@ fn build_safetensors_diff_sources(
             continue;
         }
         let orig_bytes = &m_o[orig_t.file_start as usize..orig_t.file_end as usize];
-        let mod_bytes = &m_m[mod_t.file_start as usize..mod_t.file_end as usize];
+        let mod_bytes  = &m_m[mod_t.file_start  as usize..mod_t.file_end  as usize];
         let orig_vals = orig_t.dtype.decode_to_f32(orig_bytes);
-        let mod_vals = mod_t.dtype.decode_to_f32(mod_bytes);
-        let diffs: Vec<f32> = orig_vals.iter().zip(mod_vals.iter())
-            .map(|(&a, &b)| (a - b).abs()).collect();
-        for &d in &diffs {
-            if d.is_finite() && d > global_max { global_max = d; }
-        }
-        work.push(TensorWork { orig: orig_t, diffs });
-    }
+        let mod_vals  = mod_t.dtype.decode_to_f32(mod_bytes);
 
-    if work.is_empty() {
-        anyhow::bail!("--diff: no matching tensor pairs found between the two safetensors files");
-    }
-
-    // Pass 2: normalize with log scale and build per-tensor Buffered Sources.
-    // One byte per element: each diff element maps to exactly one pixel, giving
-    // maximum visual density regardless of the original dtype's byte width.
-    // Double-log scale: ln(ln(x+1)+1) compresses the range more aggressively than
-    // a single log, giving significantly more brightness to small differences.
-    let log_max = if global_max > 0.0 { ((global_max as f64 + 1.0).ln() + 1.0).ln() } else { 1.0 };
-    let file_total = m_o.len().max(1) as f32;
-    let mut sources: Vec<Source> = Vec::new();
-    let mut total = 0u64;
-
-    for tw in work {
-        let t = tw.orig;
-        let buf: Vec<u8> = tw.diffs.iter().map(|&diff| {
-            if diff.is_finite() {
-                let normalized = ((diff as f64 + 1.0).ln() + 1.0).ln() / log_max;
-                (normalized * 255.0).round().clamp(0.0, 255.0) as u8
-            } else {
-                255
-            }
+        let t = orig_t;
+        let buf: Vec<u8> = orig_vals.iter().zip(mod_vals.iter()).map(|(&o, &m)| {
+            if !o.is_finite() || !m.is_finite() { return 255u8; }
+            let rel = (o - m).abs() / o.abs().max(EPSILON);
+            // sqrt scale: 1% change → byte≈16, 25% → 128, 100%+ → 255
+            (rel.sqrt().min(1.0) * 255.0).round() as u8
         }).collect();
         // Pad element count to the next power of 4 so this tensor fits in exactly
         // one Hilbert sub-quadrant (a perfect square region).

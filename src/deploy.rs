@@ -39,27 +39,15 @@ pub fn run_deploy(tiles_dir: &Path, space_id: &str) -> anyhow::Result<()> {
     let tmp = tempfile::TempDir::new()?;
     write_space_files(tmp.path(), &bucket_id, space_id)?;
 
-    for (src, dest) in [
-        (tmp.path().join("README.md"), "README.md"),
-        (tmp.path().join("Dockerfile"), "Dockerfile"),
-        (tmp.path().join("requirements.txt"), "requirements.txt"),
-        (tmp.path().join("app.py"), "app.py"),
-    ] {
-        hf(&[
-            "upload",
-            space_id,
-            src.to_str().context("non-UTF-8 temp path")?,
-            dest,
-            "--repo-type=space",
-        ])?;
-    }
-
+    // Copy index.html into the same temp dir so all Space files go in one commit.
     let index_path = tiles_dir.join("index.html");
-    hf(&[
+    std::fs::copy(&index_path, tmp.path().join("index.html"))?;
+
+    hf_idempotent(&[
         "upload",
         space_id,
-        index_path.to_str().context("non-UTF-8 index path")?,
-        "index.html",
+        tmp.path().to_str().context("non-UTF-8 temp path")?,
+        ".",
         "--repo-type=space",
     ])?;
 
@@ -136,7 +124,7 @@ fn hf_idempotent(args: &[&str]) -> anyhow::Result<()> {
 fn write_space_files(dir: &Path, bucket_id: &str, space_id: &str) -> anyhow::Result<()> {
     let repo_name = space_id.split('/').nth(1).unwrap_or(space_id);
     let readme = format!(
-        "---\ntitle: arbvis: {repo_name}\nemoji: 🗺\ncolorFrom: blue\ncolorTo: indigo\nsdk: docker\napp_port: 7860\npinned: false\n---\n"
+        "---\ntitle: \"arbvis: {repo_name}\"\nemoji: 📊\ncolorFrom: blue\ncolorTo: indigo\nsdk: docker\napp_port: 7860\npinned: false\n---\n"
     );
     std::fs::write(dir.join("README.md"), readme)?;
 

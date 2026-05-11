@@ -82,6 +82,17 @@ fn run(args: Args) -> anyhow::Result<()> {
         return single::run_single(&labels, args.output, sources, total, args.sort, true);
     }
 
+    // Deploy-only shortcut: --space + --tiles with no input files/list means
+    // the tiles directory is already fully rendered; just deploy it without
+    // re-running the renderer (which would otherwise read empty stdin and
+    // overwrite labels.json with a useless "stdin" entry).
+    if args.files.is_empty() && args.file_list.is_none() {
+        if let (Some(ref tile_dir), Some(ref space_id)) = (args.tiles.as_ref(), args.space.as_ref()) {
+            deploy::run_deploy(tile_dir, space_id)?;
+            return Ok(());
+        }
+    }
+
     let mut files = args.files;
     if let Some(list_path) = args.file_list {
         let reader: Box<dyn Read> = if list_path == PathBuf::from("-") {

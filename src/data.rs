@@ -46,9 +46,6 @@ pub struct Source {
     pub safetensors: Option<SafetensorsInfo>,
     /// Override the display name (used when kind is Buffered but has a real filename).
     pub name_override: Option<String>,
-    /// Position of this source within the original file, as a ratio in [0.0, 1.0].
-    /// Set for per-tensor diff sources; None for all other source types.
-    pub position_hint: Option<f32>,
     /// Bytes of invisible zero-padding prepended to this source's buffer to align
     /// its data start to a Hilbert quadrant boundary.  Zero for non-diff sources.
     /// The actual tensor data begins at `cumulative_offset + leading_gap`.
@@ -103,7 +100,6 @@ pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::R
                 byte_size: len,
                 safetensors: None,
                 name_override: None,
-                position_hint: None,
                 leading_gap: 0,
                 data_end: len,
             }],
@@ -144,7 +140,6 @@ pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::R
             byte_size: size,
             safetensors: safetensors_info,
             name_override: None,
-            position_hint: None,
             leading_gap: 0,
             data_end: size,
         });
@@ -350,7 +345,6 @@ pub fn prepare_diff_sources(
             byte_size: size_o,
             safetensors: None,
             name_override: None,
-            position_hint: None,
             leading_gap: 0,
             data_end: size_o,
         };
@@ -453,7 +447,6 @@ pub fn prepare_diff_sources(
                         byte_size: size_o,
                         safetensors: None,
                         name_override: None,
-                        position_hint: None,
                         leading_gap: 0,
                         data_end: size_o,
                     });
@@ -532,7 +525,6 @@ fn build_safetensors_diff_sources(
     // changes (e.g. 1%) are visible (byte ≈ 16) rather than crushed near zero.
     // Values > 1 are clamped to max brightness.
     const EPSILON: f32 = 1e-6;
-    let file_total = m_o.len().max(1) as f32;
     let mut sources: Vec<Source> = Vec::new();
     let mut total = 0u64;
     for orig_t in &orig_tensors {
@@ -580,14 +572,12 @@ fn build_safetensors_diff_sources(
         full_buf.resize((leading_gap + padded_size) as usize, 0u8);
 
         let byte_size = full_buf.len() as u64;
-        let position_hint = t.file_start as f32 / file_total;
         sources.push(Source {
             file_idx: sources.len(),
             kind: SourceKind::Buffered(full_buf),
             byte_size,
             safetensors: None,
             name_override: Some(t.label()),
-            position_hint: Some(position_hint),
             leading_gap,
             data_end,
         });

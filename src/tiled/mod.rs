@@ -58,12 +58,9 @@ pub fn run_tiles(
 
     let pixel_lut = if diff_mode { build_diff_pixel_lut() } else { build_pixel_lut() };
 
-    // Positional diff: every source has a position_hint (only true for safetensors diffs).
-    // Falls back to the single-LUT path for plain binary diffs (position_hint is None).
-    let positional_diff_mode = diff_mode
-        && !sort
-        && !sources.is_empty()
-        && sources.iter().all(|s| s.position_hint.is_some());
+    // Positional diff (cyan→magenta by layer position) is disabled in favour of
+    // uniform magenta so that brightness alone encodes the diff magnitude.
+    let positional_diff_mode = false;
 
     let per_source_luts: Vec<[Rgb<u8>; 256]> = if positional_diff_mode {
         sources

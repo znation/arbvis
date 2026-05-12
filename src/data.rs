@@ -150,9 +150,15 @@ pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::R
         ));
     }
 
+    // Expand any directory paths (e.g. from a repo-level hf:// download) into
+    // their constituent files so they can be treated as individual sources.
+    let expanded: Vec<PathBuf> = files.iter().flat_map(|p| {
+        if p.is_dir() { collect_files_recursive(p) } else { vec![p.clone()] }
+    }).collect();
+
     let mut sources = Vec::new();
     let mut total = 0u64;
-    for path in files.iter() {
+    for path in &expanded {
         let size = match std::fs::metadata(path) {
             Ok(m) => m.len(),
             Err(e) => {

@@ -51,11 +51,14 @@ struct HfUrl {
 /// Parse an `hf://` URL into its components.
 ///
 /// Supported forms:
-///   hf://{owner}/{repo}[@{rev}]/{path}          → model (default)
-///   hf://models/{owner}/{repo}[@{rev}]/{path}   → model
-///   hf://datasets/{owner}/{repo}[@{rev}]/{path} → dataset
-///   hf://spaces/{owner}/{repo}[@{rev}]/{path}   → space
-///   hf://buckets/{owner}/{bucket}[@{rev}]/{path} → dataset (Xet bucket, best-effort)
+///   hf://{owner}/{repo}[@{rev}]            → model (default), repo-level
+///   hf://{owner}/{repo}[@{rev}]/{path}     → model (default), single file
+///   hf://models/{owner}/{repo}[@{rev}][/{path}]   → model
+///   hf://datasets/{owner}/{repo}[@{rev}][/{path}] → dataset
+///   hf://spaces/{owner}/{repo}[@{rev}][/{path}]   → space
+///   hf://buckets/{owner}/{bucket}[@{rev}][/{path}] → dataset (Xet bucket, best-effort)
+///
+/// When `path_in_repo` is empty the URL refers to the whole repo (no specific file).
 fn parse(raw: &str) -> anyhow::Result<HfUrl> {
     let rest = raw
         .strip_prefix("hf://")
@@ -78,9 +81,9 @@ fn parse(raw: &str) -> anyhow::Result<HfUrl> {
         _ => (RepoType::Model, &segs[..]),
     };
 
-    if segs.len() < 3 {
+    if segs.len() < 2 {
         anyhow::bail!(
-            "hf:// URL must have the form hf://[type/]owner/repo[@@rev]/path, got {raw:?}"
+            "hf:// URL must have the form hf://[type/]owner/repo[@@rev][/path], got {raw:?}"
         );
     }
 
@@ -94,11 +97,7 @@ fn parse(raw: &str) -> anyhow::Result<HfUrl> {
     };
 
     let repo_id = format!("{owner}/{repo_name}");
-    let path_in_repo = segs[2..].join("/");
-
-    if path_in_repo.is_empty() {
-        anyhow::bail!("hf:// URL must include a file path after the repo, got {raw:?}");
-    }
+    let path_in_repo = if segs.len() >= 3 { segs[2..].join("/") } else { String::new() };
 
     Ok(HfUrl {
         repo_type,
@@ -118,8 +117,56 @@ fn make_api_builder() -> ApiBuilder {
     builder
 }
 
-/// If `path` starts with `hf://`, download the file and return its local
-/// cache path. Otherwise returns `path` unchanged.
+/// Download every file in `hf`'s repo to the local hf-hub cache and return
+/// the snapshot directory that contains them all.
+fn download_repo_files(hf: &HfUrl) -> anyhow::Result<PathBuf> {
+    let api = make_api_builder()
+        .build()
+        .context("failed to initialise HF API client")?;
+    let repo = api.repo(Repo::with_revision(
+        hf.repo_id.clone(),
+        hf.repo_type,
+        hf.revision.clone(),
+    ));
+
+    let info = repo
+        .info()
+        .with_context(|| format!("failed to get file list for {}", hf.repo_id))?;
+
+    if info.siblings.is_empty() {
+        anyhow::bail!("repo {} has no files", hf.repo_id);
+    }
+
+    log::info!("Downloading {} file(s) from {} ...", info.siblings.len(), hf.repo_id);
+
+    let mut snapshot_dir: Option<PathBuf> = None;
+    for sibling in &info.siblings {
+        let fname = &sibling.rfilename;
+        log::info!("  Fetching {} ...", fname);
+        let local = repo
+            .get(fname)
+            .with_context(|| format!("failed to fetch {fname} from {}", hf.repo_id))?;
+
+        if snapshot_dir.is_none() {
+            // Derive snapshot root by stripping the file's own path components.
+            let n = PathBuf::from(fname).components().count();
+            let mut dir = local.clone();
+            for _ in 0..n {
+                dir = dir
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("unexpected cache path: {}", local.display()))?
+                    .to_path_buf();
+            }
+            snapshot_dir = Some(dir);
+        }
+    }
+
+    Ok(snapshot_dir.unwrap())
+}
+
+/// If `path` starts with `hf://`, download and return its local cache path.
+/// For repo-level URLs (no file path), downloads all repo files and returns
+/// the snapshot directory. Otherwise returns `path` unchanged.
 ///
 /// The first download shows a live progress bar via indicatif. Subsequent
 /// calls for the same file return instantly from `~/.cache/huggingface/hub/`.
@@ -130,6 +177,12 @@ pub fn resolve(path: &Path) -> anyhow::Result<PathBuf> {
     }
 
     let hf = parse(&s).with_context(|| format!("invalid hf:// URL: {s:?}"))?;
+
+    if hf.path_in_repo.is_empty() {
+        log::info!("Resolving repo {} ...", hf.repo_id);
+        return download_repo_files(&hf).with_context(|| format!("resolving {s:?}"));
+    }
+
     log::info!("Fetching {} from {} ...", hf.path_in_repo, hf.repo_id);
 
     let api = make_api_builder()

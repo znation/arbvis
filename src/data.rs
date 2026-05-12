@@ -46,15 +46,6 @@ pub struct Source {
     pub safetensors: Option<SafetensorsInfo>,
     /// Override the display name (used when kind is Buffered but has a real filename).
     pub name_override: Option<String>,
-    /// Bytes of invisible zero-padding prepended to this source's buffer to align
-    /// its data start to a Hilbert quadrant boundary.  Zero for non-diff sources.
-    /// The actual tensor data begins at `cumulative_offset + leading_gap`.
-    pub leading_gap: u64,
-    /// Offset within this source's buffer where actual data ends (exclusive).
-    /// Bytes in `[0, leading_gap)` and `[data_end, byte_size)` are alignment padding
-    /// and should be colored differently from real data bytes.
-    /// Equals `byte_size` for non-padded sources.
-    pub data_end: u64,
 }
 
 impl Source {
@@ -100,8 +91,6 @@ pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::R
                 byte_size: len,
                 safetensors: None,
                 name_override: None,
-                leading_gap: 0,
-                data_end: len,
             }],
             len,
         ));
@@ -140,15 +129,14 @@ pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::R
             byte_size: size,
             safetensors: safetensors_info,
             name_override: None,
-            leading_gap: 0,
-            data_end: size,
         });
     }
     Ok((sources, total))
 }
 
 /// Load a source's bytes for random access: mmaps file sources, clones buffered sources.
-/// For diff sources, mmaps both files and returns `abs(modified - original)` as an owned vec.
+/// For diff sources, mmaps both files and returns the signed diff encoding used by the
+/// diff LUT: 127 = no change, 128–254 = byte grew (green), 0–126 = byte shrank (red).
 pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
     match &s.kind {
         SourceKind::File(p) => {
@@ -164,7 +152,11 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
             let diff: Vec<u8> = m_o
                 .iter()
                 .zip(m_m.iter())
-                .map(|(&a, &b)| a.abs_diff(b))
+                .map(|(&a, &b)| {
+                    let delta = b as i16 - a as i16; // positive = byte grew
+                    let brightness = (delta.unsigned_abs() as f32 / 255.0 * 127.0).round() as u8;
+                    if delta >= 0 { 127u8 + brightness } else { 127u8 - brightness }
+                })
                 .collect();
             Ok(Data::Owned(diff))
         }
@@ -345,8 +337,6 @@ pub fn prepare_diff_sources(
             byte_size: size_o,
             safetensors: None,
             name_override: None,
-            leading_gap: 0,
-            data_end: size_o,
         };
         return Ok((vec![source], size_o));
     }
@@ -447,8 +437,6 @@ pub fn prepare_diff_sources(
                         byte_size: size_o,
                         safetensors: None,
                         name_override: None,
-                        leading_gap: 0,
-                        data_end: size_o,
                     });
                     total += size_o;
                 }
@@ -468,21 +456,6 @@ pub fn prepare_diff_sources(
     );
 }
 
-/// Return the smallest power of 4 that is >= n, minimum 1.
-///
-/// Powers of 4 align with Hilbert curve quadrant boundaries, so padding each
-/// tensor's diff buffer to the next power of 4 makes the tensor occupy exactly
-/// one complete Hilbert sub-square (a perfect square region in the 2D image).
-fn next_power_of_2(n: usize) -> usize {
-    if n <= 1 {
-        return 1;
-    }
-    let mut p = 1usize;
-    while p < n {
-        p = p.saturating_mul(2);
-    }
-    p
-}
 
 /// Build per-tensor diff Sources from two .safetensors files.
 ///
@@ -558,34 +531,13 @@ fn build_safetensors_diff_sources(
             let brightness = (signed_rel.abs().sqrt().min(1.0) * 127.0).round() as u8;
             if signed_rel >= 0.0 { 127u8 + brightness } else { 127u8 - brightness }
         }).collect();
-        // Pad element count to the next power of 4 so this tensor fits in exactly
-        // one Hilbert sub-quadrant (a perfect square region).
-        let padded_size = next_power_of_2(buf.len()).max(1) as u64;
-
-        // Align the tensor's START to a padded_size boundary so that
-        // decompose_hilbert produces a single rectangle for the data region.
-        // If the current cumulative offset isn't already aligned, prepend enough
-        // zero bytes to reach the next aligned position.
-        let leading_gap = {
-            let rem = total % padded_size;
-            if rem == 0 { 0u64 } else { padded_size - rem }
-        };
-
-        // Build: [leading_gap zeros] [element diffs, zero-padded to padded_size]
-        let data_end = leading_gap + buf.len() as u64;
-        let mut full_buf = vec![0u8; leading_gap as usize];
-        full_buf.extend_from_slice(&buf);
-        full_buf.resize((leading_gap + padded_size) as usize, 0u8);
-
-        let byte_size = full_buf.len() as u64;
+        let byte_size = buf.len() as u64;
         sources.push(Source {
             file_idx: sources.len(),
-            kind: SourceKind::Buffered(full_buf),
+            kind: SourceKind::Buffered(buf),
             byte_size,
             safetensors: None,
             name_override: Some(t.label()),
-            leading_gap,
-            data_end,
         });
         total += byte_size;
     }
@@ -593,22 +545,3 @@ fn build_safetensors_diff_sources(
     Ok((sources, total))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::next_power_of_2;
-
-    #[test]
-    fn next_power_of_2_values() {
-        assert_eq!(next_power_of_2(0), 1);
-        assert_eq!(next_power_of_2(1), 1);
-        assert_eq!(next_power_of_2(2), 2);
-        assert_eq!(next_power_of_2(3), 4);
-        assert_eq!(next_power_of_2(4), 4);
-        assert_eq!(next_power_of_2(5), 8);
-        assert_eq!(next_power_of_2(16), 16);
-        assert_eq!(next_power_of_2(17), 32);
-        assert_eq!(next_power_of_2(64), 64);
-        assert_eq!(next_power_of_2(65), 128);
-        assert_eq!(next_power_of_2(1_000_000), 1_048_576); // 2^20
-    }
-}

@@ -11,7 +11,7 @@ use image;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 
-use crate::color::{build_diff_pixel_lut, build_pixel_lut};
+use crate::color::{build_diff_pixel_lut, build_diff_signed_lut, build_pixel_lut};
 use crate::data::{load_source_data, Data, Histogram, Source};
 use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, rects_centroid};
 use crate::tiled::html::FileEntity;
@@ -53,7 +53,16 @@ pub fn run_tiles(
     let total_pixels: u64 = width as u64 * height as u64;
     let num_squares = 1u32 << (kw - kh);
 
-    let pixel_lut = if diff_mode { build_diff_pixel_lut() } else { build_pixel_lut() };
+    // Per-tensor safetensors diffs use a signed encoding (127=no change, >127=increased,
+    // <127=decreased); plain binary diffs use unsigned brightness → magenta.
+    let signed_diff_mode = diff_mode && sources.iter().all(|s| s.name_override.is_some());
+    let pixel_lut = if signed_diff_mode {
+        build_diff_signed_lut()
+    } else if diff_mode {
+        build_diff_pixel_lut()
+    } else {
+        build_pixel_lut()
+    };
 
 
     // Build cumulative byte-start offsets.

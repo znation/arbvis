@@ -548,9 +548,15 @@ fn build_safetensors_diff_sources(
         let t = orig_t;
         let buf: Vec<u8> = orig_vals.iter().zip(mod_vals.iter()).map(|(&o, &m)| {
             if !o.is_finite() || !m.is_finite() { return 255u8; }
-            let rel = (o - m).abs() / o.abs().max(EPSILON);
-            // sqrt scale: 1% change → byte≈16, 25% → 128, 100%+ → 255
-            (rel.sqrt().min(1.0) * 255.0).round() as u8
+            // Signed relative change: positive = weight grew, negative = weight shrank.
+            // Encoded as a u8 centred at 127:
+            //   127         → no change (black)
+            //   128..=254   → increased (red), brightness ∝ sqrt(rel)
+            //   0..=126     → decreased (cyan), brightness ∝ sqrt(rel)
+            //   255         → non-finite (reserved above)
+            let signed_rel = (m - o) / o.abs().max(EPSILON);
+            let brightness = (signed_rel.abs().sqrt().min(1.0) * 127.0).round() as u8;
+            if signed_rel >= 0.0 { 127u8 + brightness } else { 127u8 - brightness }
         }).collect();
         // Pad element count to the next power of 4 so this tensor fits in exactly
         // one Hilbert sub-quadrant (a perfect square region).

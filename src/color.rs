@@ -32,11 +32,37 @@ pub fn build_pixel_lut() -> [Rgb<u8>; 256] {
     lut
 }
 
-/// Diff color LUT: linearly scales black (0) → magenta (255).
+/// Unsigned diff LUT for plain binary diffs: black (0) → magenta (255).
 pub fn build_diff_pixel_lut() -> [Rgb<u8>; 256] {
     let mut lut = [Rgb([0u8, 0, 0]); 256];
     for (i, entry) in lut.iter_mut().enumerate() {
         *entry = Rgb([i as u8, 0, i as u8]);
+    }
+    lut
+}
+
+/// Signed diff LUT for per-tensor safetensors diffs.
+///
+/// Encoding (produced by `build_safetensors_diff_sources`):
+///   127         → no change          → black
+///   128..=254   → weight increased   → red,  brightness = (v − 127) / 127
+///   0..=126     → weight decreased   → cyan, brightness = (127 − v) / 127
+///   255         → non-finite         → white
+pub fn build_diff_signed_lut() -> [Rgb<u8>; 256] {
+    let mut lut = [Rgb([0u8, 0, 0]); 256];
+    for (i, entry) in lut.iter_mut().enumerate() {
+        *entry = match i {
+            127 => Rgb([0, 0, 0]),
+            255 => Rgb([255, 255, 255]),
+            128..=254 => {
+                let b = ((i - 127) as f32 / 127.0 * 255.0).round() as u8;
+                Rgb([b, 0, 0])   // red: weight increased
+            }
+            _ => {
+                let b = ((127 - i) as f32 / 127.0 * 255.0).round() as u8;
+                Rgb([0, b, b])   // cyan: weight decreased
+            }
+        };
     }
     lut
 }

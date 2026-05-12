@@ -76,7 +76,7 @@ fn build_labels_json(entities: &[FileEntity]) -> String {
 fn hf_url_to_web(s: &str) -> Option<String> {
     let rest = s.strip_prefix("hf://")?;
     let segs: Vec<&str> = rest.split('/').collect();
-    if segs.len() < 3 {
+    if segs.len() < 2 {
         return None;
     }
 
@@ -112,6 +112,52 @@ fn hf_url_to_web(s: &str) -> Option<String> {
     let path = path_parts.join("/");
     let verb = if rest.ends_with('/') { "tree" } else { "blob" };
     Some(format!("{base}/{verb}/{rev}/{path}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hf_url_to_web;
+
+    #[test]
+    fn bare_model_repo() {
+        assert_eq!(
+            hf_url_to_web("hf://owner/repo"),
+            Some("https://huggingface.co/owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn bare_dataset_repo() {
+        assert_eq!(
+            hf_url_to_web("hf://datasets/owner/repo"),
+            Some("https://huggingface.co/datasets/owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn file_in_model_repo() {
+        assert_eq!(
+            hf_url_to_web("hf://owner/repo/model.safetensors"),
+            Some("https://huggingface.co/owner/repo/blob/main/model.safetensors".to_string())
+        );
+    }
+
+    #[test]
+    fn file_in_dataset_repo() {
+        assert_eq!(
+            hf_url_to_web("hf://datasets/owner/repo/data.safetensors"),
+            Some(
+                "https://huggingface.co/datasets/owner/repo/blob/main/data.safetensors"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn non_hf_url_returns_none() {
+        assert_eq!(hf_url_to_web("/local/path/file.safetensors"), None);
+        assert_eq!(hf_url_to_web("hf://owner"), None);
+    }
 }
 
 fn escape_html(s: &str) -> String {

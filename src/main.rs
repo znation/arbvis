@@ -2,6 +2,7 @@ mod color;
 mod data;
 mod deploy;
 mod geometry;
+mod hf_url;
 mod label;
 mod safetensors;
 mod single;
@@ -70,14 +71,42 @@ fn run(args: Args) -> anyhow::Result<()> {
 
     let format_safetensors = args.format.as_deref() == Some("safetensors");
 
-    if let Some(diff_args) = args.diff {
+    // Intercept hf:// output paths: render to a local temp location first, upload after.
+    // _tiles_tempdir / _output_tempdir keep the directories alive until upload is done.
+    let (_tiles_tempdir, tiles_arg, tiles_upload) = match args.tiles {
+        None => (None, None, None),
+        Some(ref p) if p.to_string_lossy().starts_with("hf://") => {
+            let td = tempfile::tempdir()?;
+            let local = td.path().to_path_buf();
+            (Some(td), Some(local), Some(p.to_string_lossy().into_owned()))
+        }
+        Some(p) => (None, Some(p), None),
+    };
+    let (_output_tempdir, output_arg, output_upload) = match args.output {
+        None => (None, None, None),
+        Some(ref p) if p.to_string_lossy().starts_with("hf://") => {
+            let td = tempfile::tempdir()?;
+            let local = td.path().join("output.png");
+            (Some(td), Some(local), Some(p.to_string_lossy().into_owned()))
+        }
+        Some(p) => (None, Some(p), None),
+    };
+
+    if let Some(raw_diff_args) = args.diff {
+        let diff_args: Vec<PathBuf> = raw_diff_args
+            .into_iter()
+            .map(resolve_input)
+            .collect::<anyhow::Result<_>>()?;
         let (sources, total) =
             data::prepare_diff_sources(&diff_args[0], &diff_args[1], format_safetensors)?;
         let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
-        if let Some(tile_dir) = args.tiles {
+        if let Some(ref tile_dir) = tiles_arg {
             tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, true)?;
             if let Some(ref space_id) = args.space {
-                deploy::run_deploy(&tile_dir, space_id)?;
+                deploy::run_deploy(tile_dir, space_id)?;
+            }
+            if let Some(ref url) = tiles_upload {
+                hf_url::upload_dir_to(url, tile_dir)?;
             }
             return Ok(());
         }
@@ -87,15 +116,20 @@ fn run(args: Args) -> anyhow::Result<()> {
             deploy::run_deploy(&tile_dir, space_id)?;
             return Ok(());
         }
-        return single::run_single(&labels, args.output, sources, total, args.sort, true);
+        single::run_single(&labels, output_arg.clone(), sources, total, args.sort, true)?;
+        if let (Some(ref url), Some(ref local)) = (&output_upload, &output_arg) {
+            hf_url::upload_file_to(url, local)?;
+        }
+        return Ok(());
     }
 
     // Deploy-only shortcut: --space + --tiles with no input files/list means
     // the tiles directory is already fully rendered; just deploy it without
     // re-running the renderer (which would otherwise read empty stdin and
     // overwrite labels.json with a useless "stdin" entry).
-    if args.files.is_empty() && args.file_list.is_none() {
-        if let (Some(ref tile_dir), Some(ref space_id)) = (args.tiles.as_ref(), args.space.as_ref()) {
+    // Only applies when --tiles is a local path (not hf://).
+    if args.files.is_empty() && args.file_list.is_none() && tiles_upload.is_none() {
+        if let (Some(ref tile_dir), Some(ref space_id)) = (&tiles_arg, &args.space) {
             deploy::run_deploy(tile_dir, space_id)?;
             return Ok(());
         }
@@ -120,13 +154,22 @@ fn run(args: Args) -> anyhow::Result<()> {
         }
     }
 
+    // Resolve any hf:// paths in the file list (including from --file-list).
+    let files: Vec<PathBuf> = files
+        .into_iter()
+        .map(resolve_input)
+        .collect::<anyhow::Result<_>>()?;
+
     let (sources, total) = data::prepare_sources(&files, format_safetensors)?;
     let display_files: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
 
-    if let Some(tile_dir) = args.tiles {
+    if let Some(ref tile_dir) = tiles_arg {
         tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, false)?;
         if let Some(ref space_id) = args.space {
-            deploy::run_deploy(&tile_dir, space_id)?;
+            deploy::run_deploy(tile_dir, space_id)?;
+        }
+        if let Some(ref url) = tiles_upload {
+            hf_url::upload_dir_to(url, tile_dir)?;
         }
         return Ok(());
     }
@@ -138,13 +181,23 @@ fn run(args: Args) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    single::run_single(&display_files, args.output, sources, total, args.sort, false)
+    single::run_single(&display_files, output_arg.clone(), sources, total, args.sort, false)?;
+    if let (Some(ref url), Some(ref local)) = (&output_upload, &output_arg) {
+        hf_url::upload_file_to(url, local)?;
+    }
+    Ok(())
 }
 
 fn derive_space_tile_dir(space_id: &str) -> PathBuf {
     let repo = space_id.split('/').last().unwrap_or(space_id);
     PathBuf::from(repo)
 }
+
+/// Resolve an input path: download from HF if it starts with `hf://`.
+fn resolve_input(path: PathBuf) -> anyhow::Result<PathBuf> {
+    hf_url::resolve(&path).with_context(|| format!("resolving {}", path.display()))
+}
+
 
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();

@@ -3,6 +3,54 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context};
 
+/// Upload a single local file to a Hugging Face repo via the `hf` CLI.
+///
+/// `repo_type` must be one of `"model"`, `"dataset"`, or `"space"`.
+pub fn upload_file(
+    local: &Path,
+    repo_id: &str,
+    repo_type: &str,
+    path_in_repo: &str,
+) -> anyhow::Result<()> {
+    log::info!(
+        "Uploading {} → hf://{}/{} ...",
+        local.display(),
+        repo_id,
+        path_in_repo
+    );
+    hf(&[
+        "upload",
+        &format!("--repo-type={repo_type}"),
+        repo_id,
+        local.to_str().context("non-UTF-8 local path")?,
+        path_in_repo,
+    ])
+}
+
+/// Upload a local directory tree to a path prefix in a Hugging Face repo.
+///
+/// `repo_type` must be one of `"model"`, `"dataset"`, or `"space"`.
+pub fn upload_dir(
+    local_dir: &Path,
+    repo_id: &str,
+    repo_type: &str,
+    path_prefix: &str,
+) -> anyhow::Result<()> {
+    log::info!(
+        "Uploading {}/ → hf://{}/{} ...",
+        local_dir.display(),
+        repo_id,
+        path_prefix
+    );
+    hf(&[
+        "upload",
+        &format!("--repo-type={repo_type}"),
+        repo_id,
+        local_dir.to_str().context("non-UTF-8 local path")?,
+        path_prefix,
+    ])
+}
+
 pub fn run_deploy(tiles_dir: &Path, space_id: &str) -> anyhow::Result<()> {
     validate_tiles_dir(tiles_dir)?;
 

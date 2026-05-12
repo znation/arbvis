@@ -192,6 +192,7 @@ fn build_info_html(title: &str, inputs: &[String]) -> String {
 
 fn build_html(world_w: u32, max_zoom: u32, height: u32, title: &str, inputs: &[String]) -> String {
     let info_html = build_info_html(title, inputs);
+    let viewer_max_zoom = max_zoom + 3;
     format!(
         r#"<!DOCTYPE html>
 <html>
@@ -245,11 +246,12 @@ fn build_html(world_w: u32, max_zoom: u32, height: u32, title: &str, inputs: &[S
     var map = L.map('map', {{
       crs: L.CRS.Simple,
       minZoom: 0,
-      maxZoom: {max_zoom},
+      maxZoom: {viewer_max_zoom},
       preferCanvas: true,
     }});
     L.tileLayer('tiles/{{z}}/{{x}}/{{y}}.png', {{
       tileSize: 256,
+      maxNativeZoom: {max_zoom},
       bounds: [[-256, 0], [0, {world_w}]],
       noWrap: true,
       attribution: '<a href="https://github.com/znation/arbvis">arbvis</a>'
@@ -367,6 +369,7 @@ fn build_html(world_w: u32, max_zoom: u32, height: u32, title: &str, inputs: &[S
         title_escaped = escape_html(title),
         info_html = info_html,
         max_zoom = max_zoom,
+        viewer_max_zoom = viewer_max_zoom,
         world_w = world_w,
         height = height,
     )

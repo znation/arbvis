@@ -5,6 +5,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::Context;
 use image::Rgb;
 use indicatif::ProgressBar;
 use memmap2::Mmap;
@@ -495,9 +496,38 @@ pub fn prepare_diff_sources(
         let orig_files = collect_files_recursive(original);
         let mod_files = collect_files_recursive(modified);
 
-        // Build relative-path → absolute-path maps for each side.
+        let mut sources = Vec::new();
+        let mut total = 0u64;
+
+        // Safetensors: match by tensor name across ALL .safetensors files on each side,
+        // regardless of filename. This handles sharded vs unsharded and different naming
+        // conventions (e.g. model.safetensors-00001-of-00001.safetensors vs model.safetensors).
+        let orig_st: Vec<PathBuf> = orig_files.iter().filter(|p| is_st(p)).cloned().collect();
+        let mod_st: Vec<PathBuf> = mod_files.iter().filter(|p| is_st(p)).cloned().collect();
+        if !orig_st.is_empty() || !mod_st.is_empty() {
+            if orig_st.is_empty() {
+                eprintln!("warning: original has no .safetensors files — skipping model weight diff");
+            } else if mod_st.is_empty() {
+                eprintln!("warning: modified has no .safetensors files — skipping model weight diff");
+            } else {
+                match build_multi_safetensors_diff_sources(&orig_st, &mod_st) {
+                    Ok((mut tensor_sources, bytes)) => {
+                        let base_idx = sources.len();
+                        for s in &mut tensor_sources {
+                            s.file_idx += base_idx;
+                        }
+                        sources.extend(tensor_sources);
+                        total += bytes;
+                    }
+                    Err(e) => eprintln!("warning: safetensors diff failed: {e} — skipping"),
+                }
+            }
+        }
+
+        // Non-safetensors: match by relative path, require equal sizes.
         let orig_map: HashMap<PathBuf, PathBuf> = orig_files
             .iter()
+            .filter(|p| !is_st(p))
             .filter_map(|p| {
                 p.strip_prefix(original)
                     .ok()
@@ -506,6 +536,7 @@ pub fn prepare_diff_sources(
             .collect();
         let mod_map: HashMap<PathBuf, PathBuf> = mod_files
             .iter()
+            .filter(|p| !is_st(p))
             .filter_map(|p| {
                 p.strip_prefix(modified)
                     .ok()
@@ -513,7 +544,6 @@ pub fn prepare_diff_sources(
             })
             .collect();
 
-        // Warn about files only in modified.
         for rel in mod_map.keys() {
             if !orig_map.contains_key(rel) {
                 eprintln!(
@@ -523,8 +553,6 @@ pub fn prepare_diff_sources(
             }
         }
 
-        let mut sources = Vec::new();
-        let mut total = 0u64;
         let mut sorted_keys: Vec<&PathBuf> = orig_map.keys().collect();
         sorted_keys.sort();
 
@@ -538,23 +566,6 @@ pub fn prepare_diff_sources(
                     );
                 }
                 Some(mod_abs) => {
-                    if is_st(orig_abs) && is_st(mod_abs) {
-                        match build_safetensors_diff_sources(orig_abs, mod_abs) {
-                            Ok((mut tensor_sources, bytes)) => {
-                                let base_idx = sources.len();
-                                for s in &mut tensor_sources {
-                                    s.file_idx += base_idx;
-                                }
-                                sources.extend(tensor_sources);
-                                total += bytes;
-                            }
-                            Err(e) => eprintln!(
-                                "warning: {}: safetensors diff failed: {e} — skipping",
-                                rel.display()
-                            ),
-                        }
-                        continue;
-                    }
                     let size_o = match std::fs::metadata(orig_abs) {
                         Ok(m) => m.len(),
                         Err(e) => {
@@ -606,6 +617,207 @@ pub fn prepare_diff_sources(
     );
 }
 
+/// Strip the first `n` dot-delimited path components from `name`.
+/// Returns the remainder after the n-th dot, or `None` if `name` has fewer than n+1 components.
+fn strip_prefix_components(name: &str, n: usize) -> Option<&str> {
+    let mut idx = 0;
+    for _ in 0..n {
+        idx += name[idx..].find('.')? + 1;
+    }
+    Some(&name[idx..])
+}
+
+/// Find (strip_orig, strip_mod) prefix depths that maximise unique 1-to-1 tensor name matches.
+/// Returns (0, 0) if exact matching already produces matches.
+fn find_strip_depths(
+    orig_names: &[String],
+    mod_names: &[String],
+) -> (usize, usize) {
+    // Count unique-suffix occurrences for a set of names stripped by `n` components.
+    let unique_suffixes = |names: &[String], n: usize| -> HashMap<String, usize> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for name in names {
+            if let Some(s) = strip_prefix_components(name, n) {
+                if !s.is_empty() {
+                    *counts.entry(s.to_owned()).or_insert(0) += 1;
+                }
+            }
+        }
+        counts
+    };
+
+    let mut best = (0usize, 0usize, 0usize); // (strip_orig, strip_mod, match_count)
+    for so in 0usize..=5 {
+        let orig_counts = unique_suffixes(orig_names, so);
+        for sm in 0usize..=5 {
+            if so == 0 && sm == 0 { continue; }
+            let mod_counts = unique_suffixes(mod_names, sm);
+            let matches = orig_counts.iter()
+                .filter(|(s, &oc)| oc == 1 && mod_counts.get(s.as_str()) == Some(&1))
+                .count();
+            if matches > best.2 {
+                best = (so, sm, matches);
+            }
+        }
+    }
+    (best.0, best.1)
+}
+
+/// Build per-tensor diff Sources from multiple .safetensors files on each side.
+///
+/// Tensors are matched by name across ALL files on each side, so sharded models
+/// (model.safetensors-00001-of-00002.safetensors, …) and single-file models
+/// (model.safetensors) are compared correctly even when filenames differ.
+///
+/// When no tensors match by exact name (e.g. because a fine-tuned model wraps
+/// the backbone under a deeper module path), the function automatically searches
+/// for a prefix-strip depth that maximises unique 1-to-1 tensor matches.
+fn build_multi_safetensors_diff_sources(
+    orig_files: &[PathBuf],
+    mod_files: &[PathBuf],
+) -> anyhow::Result<(Vec<Source>, u64)> {
+    let open_mmaps = |files: &[PathBuf]| -> anyhow::Result<Vec<Mmap>> {
+        files.iter().map(|p| {
+            let f = File::open(p).with_context(|| format!("opening {}", p.display()))?;
+            Ok(unsafe { Mmap::map(&f) }?)
+        }).collect()
+    };
+    let orig_mmaps = open_mmaps(orig_files)?;
+    let mod_mmaps  = open_mmaps(mod_files)?;
+
+    // Build tensor maps: full name → (mmap_index, TensorMeta).
+    let mut orig_map: HashMap<String, (usize, safetensors::TensorMeta)> = HashMap::new();
+    for (i, mmap) in orig_mmaps.iter().enumerate() {
+        let (tensors, _) = safetensors::parse_header(mmap)?;
+        for t in tensors {
+            orig_map.entry(t.name.clone()).or_insert((i, t));
+        }
+    }
+    let mut mod_map: HashMap<String, (usize, safetensors::TensorMeta)> = HashMap::new();
+    for (i, mmap) in mod_mmaps.iter().enumerate() {
+        let (tensors, _) = safetensors::parse_header(mmap)?;
+        for t in tensors {
+            mod_map.entry(t.name.clone()).or_insert((i, t));
+        }
+    }
+
+    let orig_names: Vec<String> = orig_map.keys().cloned().collect();
+    let mod_names: Vec<String> = mod_map.keys().cloned().collect();
+
+    // Determine how many leading name components to strip on each side.
+    // (0, 0) means exact names match; non-zero means the backbone was re-nested
+    // (e.g. model.layers.* in original vs model.lm.model.layers.* in modified).
+    let exact_overlap = orig_names.iter().any(|n| mod_map.contains_key(n.as_str()));
+    let (strip_o, strip_m) = if exact_overlap {
+        (0, 0)
+    } else {
+        let depths = find_strip_depths(&orig_names, &mod_names);
+        if depths != (0, 0) {
+            log::info!(
+                "safetensors diff: no exact tensor name overlap; \
+                 stripping {} prefix component(s) from original and {} from modified",
+                depths.0, depths.1
+            );
+        }
+        depths
+    };
+
+    // Build lookup map keyed by stripped name → full orig name.
+    // (When strip_o == 0 this is just the identity.)
+    let orig_by_stripped: HashMap<String, &str> = orig_map.keys()
+        .filter_map(|n| {
+            strip_prefix_components(n, strip_o)
+                .filter(|s| !s.is_empty())
+                .map(|s| (s.to_owned(), n.as_str()))
+        })
+        .fold(HashMap::new(), |mut acc, (stripped, full)| {
+            // Keep only unique stripped suffixes to avoid false matches.
+            acc.entry(stripped).and_modify(|v| *v = "").or_insert(full);
+            acc
+        });
+
+    let mod_by_stripped: HashMap<String, &str> = mod_map.keys()
+        .filter_map(|n| {
+            strip_prefix_components(n, strip_m)
+                .filter(|s| !s.is_empty())
+                .map(|s| (s.to_owned(), n.as_str()))
+        })
+        .fold(HashMap::new(), |mut acc, (stripped, full)| {
+            acc.entry(stripped).and_modify(|v| *v = "").or_insert(full);
+            acc
+        });
+
+    // Warn about tensors only in modified (by stripped suffix).
+    for stripped in mod_by_stripped.keys() {
+        if !orig_by_stripped.contains_key(stripped.as_str()) {
+            // Only warn when mod full name isn't in orig_by_stripped — too noisy for large mismatches.
+            // Skip per-tensor warnings when strip depths differ; a summary suffices.
+            if strip_o == 0 && strip_m == 0 {
+                if let Some(&full) = mod_by_stripped.get(stripped.as_str()) {
+                    if !full.is_empty() {
+                        eprintln!("warning: safetensors diff: tensor '{full}' only in modified — skipping");
+                    }
+                }
+            }
+        }
+    }
+
+    const EPSILON: f32 = 1e-6;
+    let mut sources: Vec<Source> = Vec::new();
+    let mut total = 0u64;
+
+    let mut sorted_orig: Vec<&str> = orig_by_stripped.values().copied().filter(|s| !s.is_empty()).collect();
+    sorted_orig.sort();
+
+    for orig_full in sorted_orig {
+        let stripped = match strip_prefix_components(orig_full, strip_o) {
+            Some(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+        let mod_full = match mod_by_stripped.get(stripped) {
+            Some(s) if !s.is_empty() => *s,
+            _ => {
+                if strip_o == 0 && strip_m == 0 {
+                    eprintln!("warning: safetensors diff: tensor '{orig_full}' only in original — skipping");
+                }
+                continue;
+            }
+        };
+
+        let (oi, orig_t) = &orig_map[orig_full];
+        let (mi, mod_t) = &mod_map[mod_full];
+
+        if orig_t.shape != mod_t.shape {
+            eprintln!(
+                "warning: safetensors diff: tensor '{orig_full}' shape mismatch {:?} vs {:?} — skipping",
+                orig_t.shape, mod_t.shape
+            );
+            continue;
+        }
+        let orig_bytes = &orig_mmaps[*oi][orig_t.file_start as usize..orig_t.file_end as usize];
+        let mod_bytes  = &mod_mmaps[*mi][mod_t.file_start  as usize..mod_t.file_end  as usize];
+        let orig_vals = orig_t.dtype.decode_to_f32(orig_bytes);
+        let mod_vals  = mod_t.dtype.decode_to_f32(mod_bytes);
+
+        let buf: Vec<u8> = orig_vals.iter().zip(mod_vals.iter()).map(|(&o, &m)| {
+            if !o.is_finite() || !m.is_finite() { return 255u8; }
+            let signed_rel = (m - o) / o.abs().max(EPSILON);
+            let brightness = (signed_rel.abs().sqrt().min(1.0) * 127.0).round() as u8;
+            if signed_rel >= 0.0 { 127u8 + brightness } else { 127u8 - brightness }
+        }).collect();
+        let byte_size = buf.len() as u64;
+        sources.push(Source {
+            file_idx: sources.len(),
+            kind: SourceKind::Buffered(buf),
+            byte_size,
+            safetensors: None,
+            name_override: Some(orig_t.label()),
+        });
+        total += byte_size;
+    }
+
+    Ok((sources, total))
+}
 
 /// Build per-tensor diff Sources from two .safetensors files.
 ///

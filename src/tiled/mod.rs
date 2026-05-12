@@ -93,7 +93,7 @@ pub fn regen_html(tile_dir: &PathBuf) -> anyhow::Result<()> {
         })
         .collect();
 
-    html::write_leaflet_html(tile_dir, world_w, max_zoom, height, &entities)?;
+    html::write_leaflet_html(tile_dir, world_w, max_zoom, height, &entities, "arbvis", &[])?;
     log::info!(
         "Regenerated index.html in {} (zoom 0–{max_zoom}, {width_tiles}×{height_tiles} tiles, height={height})",
         tile_dir.display()
@@ -108,6 +108,8 @@ pub fn run_tiles(
     tile_dir: PathBuf,
     sort: bool,
     diff_mode: bool,
+    title: &str,
+    inputs: &[String],
 ) -> anyhow::Result<()> {
     // --sort is incompatible with safetensors dtype coloring.
     if sort && sources.iter().any(|s| s.safetensors.is_some()) {
@@ -373,7 +375,7 @@ pub fn run_tiles(
     )?;
 
     log::info!("Writing HTML viewer...");
-    html::write_leaflet_html(&tile_dir, world_w, max_zoom, height, &entities)?;
+    html::write_leaflet_html(&tile_dir, world_w, max_zoom, height, &entities, title, inputs)?;
 
     log::info!("Tiled output written to {}", tile_dir.display());
     Ok(())
@@ -386,6 +388,8 @@ pub fn run_tiles_hf_streaming(
     total: u64,
     hf_out: &HfOutputSpec,
     diff_mode: bool,
+    title: &str,
+    inputs: &[String],
 ) -> anyhow::Result<()> {
     let token = crate::hf_url::get_token()
         .context("HF token required for hf:// output; set HF_TOKEN or run `huggingface-cli login`")?;
@@ -544,7 +548,7 @@ pub fn run_tiles_hf_streaming(
 
     // Upload index.html and labels.json before committing.
     log::info!("Uploading index.html and labels.json...");
-    let (html_bytes, labels_bytes) = generate_leaflet_content(world_w, max_zoom, height, &entities);
+    let (html_bytes, labels_bytes) = generate_leaflet_content(world_w, max_zoom, height, &entities, title, inputs);
     session.upload_file(hf_out.index_html_path(), html_bytes)?;
     session.upload_file(hf_out.labels_json_path(), labels_bytes)?;
 

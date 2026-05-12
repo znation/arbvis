@@ -11,6 +11,18 @@ pub struct FileEntity {
     pub segments: Vec<(u32, u32, u32, u32)>,
 }
 
+/// Generate HTML viewer and labels JSON as byte vectors without writing to disk.
+pub fn generate_leaflet_content(
+    world_w: u32,
+    max_zoom: u32,
+    height: u32,
+    entities: &[FileEntity],
+) -> (Vec<u8>, Vec<u8>) {
+    let entities_json = build_labels_json(entities);
+    let html = build_html(world_w, max_zoom, height);
+    (html.into_bytes(), entities_json.into_bytes())
+}
+
 /// Write Leaflet.js viewer HTML and entity labels JSON to `dir`.
 pub fn write_leaflet_html(
     dir: &Path,
@@ -19,35 +31,41 @@ pub fn write_leaflet_html(
     height: u32,
     entities: &[FileEntity],
 ) -> anyhow::Result<()> {
-    // Write entity data to a separate file so the HTML loads instantly and the
-    // browser can fetch/process labels asynchronously after the map is visible.
-    let entities_json: String = {
-        let entries: Vec<String> = entities
-            .iter()
-            .map(|e| {
-                let escaped = e.name.replace('\\', "\\\\").replace('"', "\\\"");
-                let segs: Vec<String> = e
-                    .segments
-                    .iter()
-                    .map(|&(x0, y0, x1, y1)| format!("[{},{},{},{}]", x0, y0, x1, y1))
-                    .collect();
-                format!(
-                    "{{\"name\":\"{}\",\"x\":{},\"y\":{},\"hue\":{},\"size\":{},\"bbox\":[{}, {}, {}, {}],\"segs\":[{}]}}",
-                    escaped,
-                    e.pixel_x,
-                    e.pixel_y,
-                    e.hue,
-                    e.byte_size,
-                    e.bbox.0, e.bbox.1, e.bbox.2, e.bbox.3,
-                    segs.join(",")
-                )
-            })
-            .collect();
-        format!("[{}]", entries.join(","))
-    };
+    let entities_json = build_labels_json(entities);
     std::fs::write(dir.join("labels.json"), &entities_json)?;
 
-    let html = format!(
+    let html = build_html(world_w, max_zoom, height);
+    std::fs::write(dir.join("index.html"), html)?;
+    Ok(())
+}
+
+fn build_labels_json(entities: &[FileEntity]) -> String {
+    let entries: Vec<String> = entities
+        .iter()
+        .map(|e| {
+            let escaped = e.name.replace('\\', "\\\\").replace('"', "\\\"");
+            let segs: Vec<String> = e
+                .segments
+                .iter()
+                .map(|&(x0, y0, x1, y1)| format!("[{},{},{},{}]", x0, y0, x1, y1))
+                .collect();
+            format!(
+                "{{\"name\":\"{}\",\"x\":{},\"y\":{},\"hue\":{},\"size\":{},\"bbox\":[{}, {}, {}, {}],\"segs\":[{}]}}",
+                escaped,
+                e.pixel_x,
+                e.pixel_y,
+                e.hue,
+                e.byte_size,
+                e.bbox.0, e.bbox.1, e.bbox.2, e.bbox.3,
+                segs.join(",")
+            )
+        })
+        .collect();
+    format!("[{}]", entries.join(","))
+}
+
+fn build_html(world_w: u32, max_zoom: u32, height: u32) -> String {
+    format!(
         r#"<!DOCTYPE html>
 <html>
 <head>
@@ -202,7 +220,5 @@ pub fn write_leaflet_html(
         max_zoom = max_zoom,
         world_w = world_w,
         height = height,
-    );
-    std::fs::write(dir.join("index.html"), html)?;
-    Ok(())
+    )
 }

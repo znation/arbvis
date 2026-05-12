@@ -1,19 +1,28 @@
-use std::path::Path;
+use std::io::Cursor;
 
-use image::Rgb;
+use image::{ImageFormat, Rgb};
 
 use crate::data::Data;
 
-/// Render one 256×256 leaf tile and write it to `tile_path`.
+type TileResult = Result<(image::ImageBuffer<Rgb<u8>, Vec<u8>>, Vec<u8>), String>;
+
+fn encode_png(img: image::ImageBuffer<Rgb<u8>, Vec<u8>>) -> Result<(image::ImageBuffer<Rgb<u8>, Vec<u8>>, Vec<u8>), String> {
+    let mut cursor = Cursor::new(Vec::new());
+    img.write_to(&mut cursor, ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    Ok((img, cursor.into_inner()))
+}
+
+/// Render one 256×256 leaf tile, returning (pixels, png_bytes).
 ///
 /// Each tile at the highest zoom level covers a 256×256-pixel region that
 /// corresponds to a contiguous Hilbert sub-curve of exactly 65536 bytes.
-/// Source data is passed as pre-loaded slices (mmaps or owned buffers),
-/// so this function performs no file I/O beyond writing the output PNG.
+/// For local sources, byte access is zero-copy via `Deref`. For remote
+/// `Data::Http` sources, each source segment is fetched via a single HTTP
+/// range request.
 ///
 /// Uses u64 for Hilbert indices to support files > 16 GiB.
 pub fn render_leaf_tile(
-    tile_path: &Path,
     tx: u32,
     ty: u32,
     kh: u8,
@@ -23,7 +32,7 @@ pub fn render_leaf_tile(
     source_data: &[Data],
     cumulative_offsets: &[u64],
     pixel_lut: &[Rgb<u8>; 256],
-) -> Result<(), String> {
+) -> TileResult {
     const TILE: u32 = 256;
     const TILE_PIXELS: usize = (TILE as usize) * (TILE as usize);
     const TILE_AREA: u64 = TILE_PIXELS as u64;
@@ -32,13 +41,10 @@ pub fn render_leaf_tile(
     let sq_off = sq * square_pixels;
     let local_tx = tx % height_tiles;
 
-    // Each leaf tile is a level-(kh-8) Hilbert sub-square covering exactly
-    // TILE_PIXELS consecutive positions in the concatenated byte stream.
     let tile_order = kh - 8;
     let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
     let tile_pixel_start = sq_off + base;
 
-    // Copy the tile's bytes from the pre-loaded source buffers.
     let mut tile_buf = [0u8; TILE_PIXELS];
     let readable_end = (tile_pixel_start + TILE_AREA).min(total);
     if tile_pixel_start < readable_end {
@@ -47,12 +53,18 @@ pub fn render_leaf_tile(
         while pos < readable_end {
             let src_idx = cumulative_offsets.partition_point(|&c| c <= pos) - 1;
             let data = &source_data[src_idx];
-            let src_end = cumulative_offsets[src_idx] + data.len() as u64;
+            // Source end: next source's start, or total for the last source.
+            let src_end = if src_idx + 1 < cumulative_offsets.len() {
+                cumulative_offsets[src_idx + 1]
+            } else {
+                total
+            };
             let chunk_end = readable_end.min(src_end);
             let chunk_len = (chunk_end - pos) as usize;
-            let local_off = (pos - cumulative_offsets[src_idx]) as usize;
-            tile_buf[buf_off..buf_off + chunk_len]
-                .copy_from_slice(&data[local_off..local_off + chunk_len]);
+            let local_off = pos - cumulative_offsets[src_idx];
+            let fetched = data.fetch_range(local_off, chunk_len)
+                .map_err(|e| e.to_string())?;
+            tile_buf[buf_off..buf_off + chunk_len].copy_from_slice(&fetched);
             pos = chunk_end;
             buf_off += chunk_len;
         }
@@ -73,23 +85,16 @@ pub fn render_leaf_tile(
             img.put_pixel(px, py, color);
         }
     }
-    if let Some(parent) = tile_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    img.save(tile_path)
-        .map_err(|e| format!("{}: {}", tile_path.display(), e))?;
-    Ok(())
+    encode_png(img)
 }
 
 
 /// Render one 256×256 leaf tile using position-based dtype coloring (safetensors mode).
 ///
-/// Unlike `render_leaf_tile`, this function does not read file bytes at all — the color
-/// of each pixel is determined entirely by its byte position in the global stream via
+/// Does not read file bytes — color is determined entirely by byte position via
 /// `color_ranges`, a sorted list of `(start, end, color)` entries from
 /// `safetensors::build_color_ranges`.
 pub fn render_leaf_tile_dtype(
-    tile_path: &Path,
     tx: u32,
     ty: u32,
     kh: u8,
@@ -97,7 +102,7 @@ pub fn render_leaf_tile_dtype(
     square_pixels: u64,
     total: u64,
     color_ranges: &[(u64, u64, image::Rgb<u8>)],
-) -> Result<(), String> {
+) -> TileResult {
     const TILE: u32 = 256;
     const TILE_PIXELS: usize = (TILE as usize) * (TILE as usize);
     const TILE_AREA: u64 = TILE_PIXELS as u64;
@@ -111,9 +116,7 @@ pub fn render_leaf_tile_dtype(
     let tile_pixel_start = sq_off + base;
     let tile_pixel_end = (tile_pixel_start + TILE_AREA).min(total);
 
-    // Find the first color range overlapping this tile's byte span.
     let first_range = color_ranges.partition_point(|r| r.1 <= tile_pixel_start);
-    // Collect overlapping ranges into a small stack array (typically 1-3).
     let local_ranges: Vec<(u64, u64, image::Rgb<u8>)> = color_ranges[first_range..]
         .iter()
         .take_while(|r| r.0 < tile_pixel_end)
@@ -128,7 +131,6 @@ pub fn render_leaf_tile_dtype(
             let local_idx = xy2h_u64(lx as u64, ly as u64, kh);
             let pixel_idx = sq_off + local_idx;
             let color = if pixel_idx < total {
-                // Linear scan over the small local list (O(1) for typical tensors).
                 let mut found = image::Rgb([0u8, 0, 0]);
                 for &(start, end, c) in &local_ranges {
                     if pixel_idx >= start && pixel_idx < end {
@@ -143,23 +145,11 @@ pub fn render_leaf_tile_dtype(
             img.put_pixel(px, py, color);
         }
     }
-    if let Some(parent) = tile_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    img.save(tile_path)
-        .map_err(|e| format!("{}: {}", tile_path.display(), e))?;
-    Ok(())
+    encode_png(img)
 }
 
 /// Render one 256×256 leaf tile in sorted mode from pre-built per-source histograms.
-///
-/// Each element of `histograms` is `(prefix_sums, cumulative_byte_offset)` for one source.
-/// `prefix_sums[v]` = count of bytes with value < v in that source; `prefix_sums[256]` = total.
-/// The sorted pixel stream places source `i`'s bytes (sorted by value) at global positions
-/// `[cumulative_offset, cumulative_offset + prefix_sums[256])`, so tile_buf is filled with
-/// the correct byte value for each consecutive sorted position the tile covers.
 pub fn render_leaf_tile_sorted(
-    tile_path: &Path,
     tx: u32,
     ty: u32,
     kh: u8,
@@ -168,7 +158,7 @@ pub fn render_leaf_tile_sorted(
     total: u64,
     histograms: &[([u64; 257], u64)],
     pixel_lut: &[Rgb<u8>; 256],
-) -> Result<(), String> {
+) -> TileResult {
     const TILE: u32 = 256;
     const TILE_PIXELS: usize = (TILE as usize) * (TILE as usize);
     const TILE_AREA: u64 = TILE_PIXELS as u64;
@@ -220,23 +210,13 @@ pub fn render_leaf_tile_sorted(
             img.put_pixel(px, py, color);
         }
     }
-    if let Some(parent) = tile_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    img.save(tile_path)
-        .map_err(|e| format!("{}: {}", tile_path.display(), e))?;
-    Ok(())
+    encode_png(img)
 }
 
 /// x,y → Hilbert index using u64 intermediate arithmetic.
 /// Supports curve orders up to 32 (files up to ~4 EiB).
 fn xy2h_u64(x: u64, y: u64, order: u8) -> u64 {
     use fast_hilbert::xy2h;
-    // fast_hilbert's xy2h::<u32> handles up to order-16.
-    // For larger orders we'd need the u64 variant. Since kh is the order
-    // for xy2h calls, and kh <= 32 with u64, this is fine — fast_hilbert
-    // internally uses T=u32 but the x,y must fit in u32 (2^order - 1),
-    // which for order <= 32 means up to 2^32 - 1. We cast safely.
     assert!(
         x <= u32::MAX as u64 && y <= u32::MAX as u64,
         "xy2h coordinates overflow u32"

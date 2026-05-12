@@ -2,6 +2,7 @@ mod color;
 mod data;
 mod deploy;
 mod geometry;
+mod hf_upload;
 mod hf_url;
 mod label;
 mod safetensors;
@@ -14,6 +15,8 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
+
+use crate::data::InputSpec;
 
 /// Visualize binary files as Hilbert curve plots.
 ///
@@ -71,8 +74,15 @@ fn run(args: Args) -> anyhow::Result<()> {
 
     let format_safetensors = args.format.as_deref() == Some("safetensors");
 
-    // Intercept hf:// output paths: render to a local temp location first, upload after.
-    // _tiles_tempdir / _output_tempdir keep the directories alive until upload is done.
+    // Intercept hf:// tiles output: resolve inputs as HTTP specs and stream directly.
+    // For local tiles output: render to disk then optionally upload.
+    // _tiles_tempdir keeps the temp dir alive until upload is done.
+    let tiles_hf_out: Option<String> = match &args.tiles {
+        Some(p) if p.to_string_lossy().starts_with("hf://") => {
+            Some(p.to_string_lossy().into_owned())
+        }
+        _ => None,
+    };
     let (_tiles_tempdir, tiles_arg, tiles_upload) = match args.tiles {
         None => (None, None, None),
         Some(ref p) if p.to_string_lossy().starts_with("hf://") => {
@@ -154,7 +164,29 @@ fn run(args: Args) -> anyhow::Result<()> {
         }
     }
 
-    // Resolve any hf:// paths in the file list (including from --file-list).
+    // When tiles output is hf://, stream tiles directly to Hub (zero local disk).
+    if let Some(ref hf_out_url) = tiles_hf_out {
+        if args.sort {
+            anyhow::bail!("--sort is not supported with hf:// tile output");
+        }
+        let specs: Vec<InputSpec> = files
+            .iter()
+            .map(|p| {
+                let s = p.to_string_lossy();
+                if s.starts_with("hf://") {
+                    hf_url::resolve_to_http(p).map(InputSpec::Remote)
+                } else {
+                    Ok(InputSpec::Local(p.clone()))
+                }
+            })
+            .collect::<anyhow::Result<_>>()?;
+        let (sources, total) = data::prepare_sources_from_specs(&specs, format_safetensors)?;
+        let hf_out = hf_url::parse_hf_output(hf_out_url)?;
+        tiled::run_tiles_hf_streaming(sources, total, &hf_out, false)?;
+        return Ok(());
+    }
+
+    // Resolve any hf:// paths in the file list (downloading to local cache).
     let files: Vec<PathBuf> = files
         .into_iter()
         .map(resolve_input)
@@ -202,11 +234,5 @@ fn resolve_input(path: PathBuf) -> anyhow::Result<PathBuf> {
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
-    let has_output = args.output.is_some() || args.tiles.is_some() || args.space.is_some();
-
-    if has_output {
-        run(args)
-    } else {
-        show_image::run_context(move || run(args));
-    }
+    run(args)
 }

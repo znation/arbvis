@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ab_glyph::{FontRef, PxScale};
@@ -8,9 +8,8 @@ use std::io::IsTerminal;
 
 use image::{DynamicImage, Rgb};
 use indicatif::{ProgressBar, ProgressStyle};
+use minifb::{Window, WindowOptions};
 use rayon::prelude::*;
-use show_image::create_window;
-use show_image::event::WindowEvent;
 
 use crate::color::{build_diff_signed_lut, build_pixel_lut};
 use crate::data::{load_source_data, Histogram, Source};
@@ -56,38 +55,15 @@ pub fn run_single(
 
     let pixel_lut = if diff_mode { build_diff_signed_lut() } else { build_pixel_lut() };
 
-    let mut img: image::ImageBuffer<Rgb<u8>, Vec<u8>> = image::ImageBuffer::new(side, side);
-
-    let window = if output.is_none() {
-        Some(create_window("image", Default::default())?)
-    } else {
-        None
-    };
-
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let _event_thread = if let Some(ref w) = window {
-        let cancelled_c = Arc::clone(&cancelled);
-        let rx = w.event_channel()?;
-        Some(std::thread::spawn(move || {
-            while let Ok(event) = rx.recv() {
-                if matches!(event, WindowEvent::CloseRequested(_) | WindowEvent::Destroyed(_)) {
-                    cancelled_c.store(true, Ordering::Release);
-                    break;
-                }
-            }
-            cancelled_c.store(true, Ordering::Release);
-        }))
-    } else {
-        None
-    };
+    let img: image::ImageBuffer<Rgb<u8>, Vec<u8>> = image::ImageBuffer::new(side, side);
 
     let font = FontRef::try_from_slice(include_bytes!("DejaVuSans.ttf"))
         .expect("bundled DejaVuSans.ttf is valid");
     let scale = PxScale { x: 14.0, y: 14.0 };
 
     // pixel_file[y * side + x] = which file index painted this pixel
-    let mut pixel_file: Vec<Option<usize>> = vec![None; canvas_size];
-    let mut bboxes: Vec<Option<(u32, u32, u32, u32)>> = vec![None; num_files];
+    let pixel_file: Vec<Option<usize>> = vec![None; canvas_size];
+    let bboxes_init: Vec<Option<(u32, u32, u32, u32)>> = vec![None; num_files];
 
     // Both paths track the same amount of work (one pass over total bytes).
     let pb = if std::io::stderr().is_terminal() {
@@ -104,13 +80,10 @@ pub fn run_single(
         None
     };
 
-    // Compute per-source byte and pixel offsets (needed by both paths).
-    // For the non-sort path also split each source into ~4 MB chunks for
-    // fine-grained parallelism.
+    // Compute per-source byte and pixel offsets.
     let chunk_bytes = (4 * 1024 * 1024u64).max(stride);
     let mut src_byte_starts: Vec<u64> = Vec::with_capacity(sources.len());
     let mut src_pixel_starts: Vec<u64> = Vec::with_capacity(sources.len());
-    // Each chunk entry: (fi, src_global_start, chunk_b_start, chunk_b_end, chunk_pixel_start)
     let mut chunks_by_source: Vec<Vec<(usize, u64, u64, u64, u64)>> =
         if sort { vec![] } else { vec![vec![]; sources.len()] };
     {
@@ -136,52 +109,209 @@ pub fn run_single(
         }
     }
 
-    // Background display thread for interactive mode.
-    let stop_display = Arc::new(AtomicBool::new(false));
-    let display_thread = if let Some(ref w) = window {
-        let img_ptr = img.as_ptr() as usize;
-        let stop = Arc::clone(&stop_display);
-        let cancelled_disp = Arc::clone(&cancelled);
-        let w_c = w.clone();
-        let side_c = side;
-        Some(std::thread::spawn(move || {
-            while !stop.load(Ordering::Acquire) && !cancelled_disp.load(Ordering::Acquire) {
-                std::thread::sleep(Duration::from_millis(100));
-                let buf: Vec<u8> = unsafe {
-                    std::slice::from_raw_parts(
-                        img_ptr as *const u8,
-                        side_c as usize * side_c as usize * 3,
-                    )
-                }
-                .to_vec();
-                if let Some(ib) =
-                    image::ImageBuffer::<Rgb<u8>, _>::from_raw(side_c, side_c, buf)
-                {
-                    let _ = w_c.set_image("image-001", DynamicImage::ImageRgb8(ib));
+    if output.is_some() {
+        // ─── File output path: render directly ───────────────────────────────
+        let mut img = img;
+        let mut pixel_file = pixel_file;
+        let mut bboxes = bboxes_init;
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let img_base = img.as_mut_ptr() as usize;
+        let pf_base = pixel_file.as_mut_ptr() as usize;
+        let pb_shared: Option<Arc<ProgressBar>> = pb.map(|pb| {
+            pb.enable_steady_tick(Duration::from_millis(100));
+            Arc::new(pb)
+        });
+        let canvas_u = canvas_size as u64;
+
+        let chunk_results = render_chunks(
+            &sources, &chunks_by_source, sort, &src_byte_starts, &src_pixel_starts,
+            &cancelled, img_base, pf_base, canvas_u, canvas_size, side, k, stride,
+            &pixel_lut, &pb_shared,
+        )?;
+
+        for (fi, bbox) in chunk_results {
+            if let Some(b) = bbox {
+                bboxes[fi] = Some(match bboxes[fi] {
+                    None => b,
+                    Some((x0, y0, x1, y1)) => (x0.min(b.0), y0.min(b.1), x1.max(b.2), y1.max(b.3)),
+                });
+            }
+        }
+
+        if let Some(ref pb) = pb_shared {
+            pb.finish();
+        }
+
+        if let Some(path) = output {
+            if !files.is_empty() {
+                for (fi, _) in files.iter().enumerate() {
+                    if let Some(bbox) = bboxes[fi] {
+                        draw_file_label(fi, bbox, files, &mut img, &pixel_file, &font, scale, side);
+                    }
                 }
             }
-        }))
+            DynamicImage::ImageRgb8(img).save(&path)?;
+        }
+
     } else {
-        None
-    };
+        // ─── Interactive path: rendering in background, minifb on main thread ─
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let render_done = Arc::new(AtomicBool::new(false));
+        let bboxes_shared: Arc<Mutex<Vec<Option<(u32, u32, u32, u32)>>>> =
+            Arc::new(Mutex::new(bboxes_init));
 
-    // Each chunk writes exclusively to non-overlapping pixel ranges, so concurrent
-    // writes to `img` and `pixel_file` are race-free.
-    log::info!("Rendering {}×{} image ({} bytes)...", side, side, total);
-    let img_base = img.as_mut_ptr() as usize;
-    let pf_base = pixel_file.as_mut_ptr() as usize;
-    // Enable steady_tick after the log message so the bar doesn't interleave with it.
-    let pb_shared: Option<Arc<ProgressBar>> = pb.map(|pb| {
-        pb.enable_steady_tick(Duration::from_millis(100));
-        Arc::new(pb)
-    });
-    let canvas_u = canvas_size as u64;
-    let cancelled_proc = Arc::clone(&cancelled);
+        // Box the image and pixel_file so we can safely capture pointer addresses.
+        let mut img = Box::new(img);
+        let mut pixel_file = Box::new(pixel_file);
+        let img_ptr = img.as_mut_ptr() as usize;
+        let pf_ptr = pixel_file.as_mut_ptr() as usize;
 
+        let cancelled_bg = Arc::clone(&cancelled);
+        let done_bg = Arc::clone(&render_done);
+        let bboxes_bg = Arc::clone(&bboxes_shared);
+        let pb_shared: Option<Arc<ProgressBar>> = pb.map(|pb| {
+            pb.enable_steady_tick(Duration::from_millis(100));
+            Arc::new(pb)
+        });
+        let canvas_u = canvas_size as u64;
+
+        let bg_result: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
+        let bg_result_store = Arc::clone(&bg_result);
+
+        let bg_thread = std::thread::spawn(move || {
+            let result = render_chunks(
+                &sources, &chunks_by_source, sort, &src_byte_starts, &src_pixel_starts,
+                &cancelled_bg, img_ptr, pf_ptr, canvas_u, canvas_size, side, k, stride,
+                &pixel_lut, &pb_shared,
+            );
+
+            let chunk_results = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    *bg_result_store.lock().unwrap() = Some(Err(e));
+                    done_bg.store(true, Ordering::Release);
+                    return;
+                }
+            };
+
+            let mut bboxes = bboxes_bg.lock().unwrap();
+            for (fi, bbox) in chunk_results {
+                if let Some(b) = bbox {
+                    bboxes[fi] = Some(match bboxes[fi] {
+                        None => b,
+                        Some((x0, y0, x1, y1)) => (x0.min(b.0), y0.min(b.1), x1.max(b.2), y1.max(b.3)),
+                    });
+                }
+            }
+            if let Some(ref pb) = pb_shared {
+                pb.finish();
+            }
+
+            done_bg.store(true, Ordering::Release);
+        });
+
+        // minifb event loop on main thread.
+        let mut window = Window::new(
+            "arbvis — press Esc or close to quit",
+            side as usize,
+            side as usize,
+            WindowOptions::default(),
+        )
+        .map_err(|e| anyhow::anyhow!("failed to open preview window: {e}"))?;
+        window.set_target_fps(10);
+
+        loop {
+            let is_open = window.is_open()
+                && !window.is_key_down(minifb::Key::Escape);
+
+            if !is_open {
+                cancelled.store(true, Ordering::Release);
+                break;
+            }
+
+            // Copy Rgb pixels to 0x00RRGGBB u32 buffer (data race with render
+            // workers is intentional — stale pixels are acceptable in a live preview).
+            let pixels: Vec<u32> = unsafe {
+                let ptr = img_ptr as *const u8;
+                let n = side as usize * side as usize;
+                (0..n)
+                    .map(|i| {
+                        let r = *ptr.add(i * 3) as u32;
+                        let g = *ptr.add(i * 3 + 1) as u32;
+                        let b = *ptr.add(i * 3 + 2) as u32;
+                        (r << 16) | (g << 8) | b
+                    })
+                    .collect()
+            };
+            window.update_with_buffer(&pixels, side as usize, side as usize)
+                .map_err(|e| anyhow::anyhow!("window update error: {e}"))?;
+
+            if render_done.load(Ordering::Acquire) {
+                break;
+            }
+        }
+
+        bg_thread.join().expect("render thread panicked");
+
+        // Check for render errors.
+        if let Some(err) = bg_result.lock().unwrap().take() {
+            return err;
+        }
+
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        // Draw labels and show final image.
+        let mut img = *img;
+        let pixel_file = *pixel_file;
+        let bboxes = bboxes_shared.lock().unwrap();
+
+        if !files.is_empty() {
+            for (fi, _) in files.iter().enumerate() {
+                if let Some(bbox) = bboxes[fi] {
+                    draw_file_label(fi, bbox, files, &mut img, &pixel_file, &font, scale, side);
+                }
+            }
+        }
+        let final_pixels: Vec<u32> = img.pixels().map(|p| {
+            ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32)
+        }).collect();
+        window.update_with_buffer(&final_pixels, side as usize, side as usize)
+            .map_err(|e| anyhow::anyhow!("window update error: {e}"))?;
+
+        // Keep window open until user closes it.
+        while window.is_open() && !window.is_key_down(minifb::Key::Escape) {
+            window.update();
+        }
+    }
+
+    Ok(())
+}
+
+/// Run the parallel rendering across all sources, returning per-file bounding boxes.
+///
+/// Both interactive and file-output paths share this logic.
+#[allow(clippy::too_many_arguments)]
+fn render_chunks(
+    sources: &[Source],
+    chunks_by_source: &[Vec<(usize, u64, u64, u64, u64)>],
+    sort: bool,
+    src_byte_starts: &[u64],
+    src_pixel_starts: &[u64],
+    cancelled: &AtomicBool,
+    img_base: usize,
+    pf_base: usize,
+    canvas_u: u64,
+    canvas_size: usize,
+    side: u32,
+    k: u32,
+    stride: u64,
+    pixel_lut: &[Rgb<u8>; 256],
+    pb_shared: &Option<Arc<ProgressBar>>,
+) -> anyhow::Result<Vec<(usize, Option<(u32, u32, u32, u32)>)>> {
     let chunk_results: Vec<(usize, Option<(u32, u32, u32, u32)>)> = if sort {
-        // Sorted path: stream each source once to build a histogram, then render
-        // directly from the 256-entry count array. No sorted buffer is ever allocated;
-        // peak extra memory is O(1) regardless of file size.
         (0..sources.len())
             .into_par_iter()
             .map(|src_idx| -> anyhow::Result<(usize, Option<(u32, u32, u32, u32)>)> {
@@ -194,7 +324,7 @@ pub fn run_single(
                 let mut bbox: Option<(u32, u32, u32, u32)> = None;
 
                 for v in 0usize..=255 {
-                    if cancelled_proc.load(Ordering::Acquire) {
+                    if cancelled.load(Ordering::Acquire) {
                         break;
                     }
                     let n = hist.0[v];
@@ -222,9 +352,7 @@ pub fn run_single(
                         }
                         bbox = Some(match bbox {
                             None => (x, y, x, y),
-                            Some((x0, y0, x1, y1)) => {
-                                (x0.min(x), y0.min(y), x1.max(x), y1.max(y))
-                            }
+                            Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
                         });
                     }
                     cur_pixel += n_pixels;
@@ -234,8 +362,6 @@ pub fn run_single(
             })
             .collect::<anyhow::Result<_>>()?
     } else {
-        // Non-sort path: two-level parallelism — outer over sources (mmap on demand,
-        // drop after), inner over ~4 MB chunks for fine-grained work distribution.
         chunks_by_source
             .par_iter()
             .enumerate()
@@ -248,16 +374,16 @@ pub fn run_single(
                         .safetensors
                         .as_ref()
                         .map(|st| st.color_ranges.as_slice());
-                    // Dtype sources are colored by byte position, not value — skip file I/O.
                     let data = if dtype_ranges.is_none() {
-                        Some(load_source_data(&sources[src_idx])?)
+                        let agent = Arc::new(ureq::AgentBuilder::new().build());
+                        Some(load_source_data(&sources[src_idx], &agent, None)?)
                     } else {
                         None
                     };
                     let results = source_chunks
                         .par_iter()
                         .map(|&(fi, src_global_start, chunk_b_start, chunk_b_end, chunk_pixel_start)| {
-                            if chunk_pixel_start >= canvas_u || cancelled_proc.load(Ordering::Acquire) {
+                            if chunk_pixel_start >= canvas_u || cancelled.load(Ordering::Acquire) {
                                 return (fi, None);
                             }
 
@@ -265,7 +391,6 @@ pub fn run_single(
                             let mut bbox: Option<(u32, u32, u32, u32)> = None;
 
                             if let Some(ranges) = dtype_ranges {
-                                // Color from byte position only — no file read needed.
                                 let first = chunk_b_start
                                     + (stride - chunk_b_start % stride) % stride;
                                 for strided_b in (first..chunk_b_end).step_by(stride as usize) {
@@ -342,41 +467,17 @@ pub fn run_single(
             .collect()
     };
 
-    // Merge per-chunk bboxes into per-file bboxes.
-    for (fi, bbox) in chunk_results {
-        if let Some(b) = bbox {
-            bboxes[fi] = Some(match bboxes[fi] {
-                None => b,
-                Some((x0, y0, x1, y1)) => {
-                    (x0.min(b.0), y0.min(b.1), x1.max(b.2), y1.max(b.3))
-                }
-            });
-        }
-    }
-
-    // Stop background display thread before mutating img further.
-    stop_display.store(true, Ordering::Release);
-    if let Some(t) = display_thread {
-        let _ = t.join();
-    }
-
-    if cancelled.load(Ordering::Acquire) {
-        return Ok(());
-    }
-
-    if let Some(ref pb) = pb_shared {
-        pb.finish();
-    }
-
     // When multiple files are given, mark border pixels black.
-    if num_files > 1 {
-        let img_ptr = img.as_mut_ptr() as usize;
-        let pf = &pixel_file;
+    if sources.iter().map(|s| s.file_idx).collect::<std::collections::HashSet<_>>().len() > 1 {
         let side_u = side as usize;
-        (0..side as usize).into_par_iter().for_each(|y| {
+        // Reconstruct pixel_file reference from raw pointer for border pass
+        let pf_slice: &[Option<usize>] = unsafe {
+            std::slice::from_raw_parts(pf_base as *const Option<usize>, canvas_size)
+        };
+        (0..side_u).into_par_iter().for_each(|y| {
             for x in 0..side_u {
                 let idx = y * side_u + x;
-                if let Some(file_idx) = pf[idx] {
+                if let Some(file_idx) = pf_slice[idx] {
                     let is_border = [(0i32, 1i32), (0, -1), (1, 0), (-1, 0)]
                         .iter()
                         .any(|(dx, dy)| {
@@ -384,14 +485,14 @@ pub fn run_single(
                             let ny = y as i32 + *dy;
                             if nx >= 0 && nx < side_u as i32 && ny >= 0 && ny < side_u as i32 {
                                 let nidx = ny as usize * side_u + nx as usize;
-                                pf[nidx].map_or(false, |nf| nf != file_idx)
+                                pf_slice[nidx].map_or(false, |nf| nf != file_idx)
                             } else {
                                 false
                             }
                         });
                     if is_border {
                         unsafe {
-                            let p = (img_ptr as *mut u8).add(idx * 3);
+                            let p = (img_base as *mut u8).add(idx * 3);
                             p.write(0);
                             p.add(1).write(0);
                             p.add(2).write(0);
@@ -402,29 +503,5 @@ pub fn run_single(
         });
     }
 
-    if let Some(path) = output {
-        if !files.is_empty() {
-            for (fi, _) in files.iter().enumerate() {
-                if let Some(bbox) = bboxes[fi] {
-                    draw_file_label(fi, bbox, files, &mut img, &pixel_file, &font, scale, side);
-                }
-            }
-        }
-        DynamicImage::ImageRgb8(img).save(&path)?;
-    } else if let Some(w) = window {
-        if !files.is_empty() {
-            for (fi, _) in files.iter().enumerate() {
-                if let Some(bbox) = bboxes[fi] {
-                    draw_file_label(fi, bbox, files, &mut img, &pixel_file, &font, scale, side);
-                }
-            }
-        }
-        w.set_image("image-001", DynamicImage::ImageRgb8(img))?;
-        if cancelled.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        w.wait_until_destroyed()?;
-    }
-
-    Ok(())
+    Ok(chunk_results)
 }

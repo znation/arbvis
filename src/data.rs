@@ -1,13 +1,16 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use image::Rgb;
 use indicatif::ProgressBar;
 use memmap2::Mmap;
 
 use crate::safetensors::{self, TensorMeta};
+use crate::hf_url::RemoteFileSpec;
 
 pub struct SafetensorsInfo {
     pub tensors: Vec<TensorMeta>,
@@ -18,6 +21,12 @@ pub struct SafetensorsInfo {
 pub enum Data {
     Mapped(Mmap),
     Owned(Vec<u8>),
+    /// Remote file accessed via HTTP range requests — never loaded locally.
+    Http {
+        url: Arc<String>,
+        token: Option<Arc<String>>,
+        agent: Arc<ureq::Agent>,
+    },
 }
 
 impl std::ops::Deref for Data {
@@ -26,6 +35,38 @@ impl std::ops::Deref for Data {
         match self {
             Data::Mapped(m) => m,
             Data::Owned(v) => v,
+            Data::Http { .. } => panic!("bug: use fetch_range() for remote HTTP Data, not Deref"),
+        }
+    }
+}
+
+impl Data {
+    /// Return bytes `[start, start+len)` from this source.
+    /// For local sources: zero-copy borrow. For Http: one HTTP range request.
+    pub fn fetch_range(&self, start: u64, len: usize) -> anyhow::Result<Cow<'_, [u8]>> {
+        match self {
+            Data::Mapped(m) => {
+                Ok(Cow::Borrowed(&m[start as usize..start as usize + len]))
+            }
+            Data::Owned(v) => {
+                Ok(Cow::Borrowed(&v[start as usize..start as usize + len]))
+            }
+            Data::Http { url, token, agent } => {
+                use std::io::Read as _;
+                let range = format!("bytes={start}-{}", start + len as u64 - 1);
+                let mut req = agent.get(url.as_str()).set("Range", &range);
+                if let Some(t) = token {
+                    req = req.set("Authorization", &format!("Bearer {t}"));
+                }
+                let resp = req.call()
+                    .map_err(|e| anyhow::anyhow!("range request failed: {e}"))?;
+                let mut bytes = Vec::with_capacity(len);
+                resp.into_reader().read_to_end(&mut bytes)
+                    .map_err(|e| anyhow::anyhow!("range response read failed: {e}"))?;
+                anyhow::ensure!(bytes.len() == len,
+                    "range request returned {} bytes, expected {}", bytes.len(), len);
+                Ok(Cow::Owned(bytes))
+            }
         }
     }
 }
@@ -35,6 +76,14 @@ pub enum SourceKind {
     Buffered(Vec<u8>),
     File(PathBuf),
     Diff { original: PathBuf, modified: PathBuf },
+    /// Remote HF file, accessed via HTTP range requests per tile.
+    Http { cdn_url: String },
+}
+
+/// Input specification: local file path or resolved remote HF file.
+pub enum InputSpec {
+    Local(PathBuf),
+    Remote(RemoteFileSpec),
 }
 
 /// Metadata and storage descriptor for one input.
@@ -64,6 +113,11 @@ impl Source {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| original.to_string_lossy().into_owned()),
+            SourceKind::Http { cdn_url } => cdn_url
+                .rsplit('/')
+                .next()
+                .unwrap_or(cdn_url)
+                .to_string(),
         }
     }
 }
@@ -137,7 +191,12 @@ pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::R
 /// Load a source's bytes for random access: mmaps file sources, clones buffered sources.
 /// For diff sources, mmaps both files and returns the signed diff encoding used by the
 /// diff LUT: 127 = no change, 128–254 = byte grew (green), 0–126 = byte shrank (red).
-pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
+/// For Http sources, returns a `Data::Http` handle that fetches byte ranges on demand.
+pub fn load_source_data(
+    s: &Source,
+    agent: &Arc<ureq::Agent>,
+    token: Option<&Arc<String>>,
+) -> anyhow::Result<Data> {
     match &s.kind {
         SourceKind::File(p) => {
             let f = File::open(p)?;
@@ -160,7 +219,86 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
                 .collect();
             Ok(Data::Owned(diff))
         }
+        SourceKind::Http { cdn_url } => Ok(Data::Http {
+            url: Arc::new(cdn_url.clone()),
+            token: token.cloned(),
+            agent: agent.clone(),
+        }),
     }
+}
+
+/// Build sources from a mixed list of local paths and remote HF file specs.
+/// Remote specs are turned into `SourceKind::Http` entries (no download).
+pub fn prepare_sources_from_specs(
+    specs: &[InputSpec],
+    format_safetensors: bool,
+) -> anyhow::Result<(Vec<Source>, u64)> {
+    if specs.is_empty() {
+        log::info!("Reading stdin...");
+        let mut buf = Vec::new();
+        io::stdin().read_to_end(&mut buf)?;
+        let len = buf.len() as u64;
+        return Ok((
+            vec![Source {
+                file_idx: 0,
+                kind: SourceKind::Buffered(buf),
+                byte_size: len,
+                safetensors: None,
+                name_override: None,
+            }],
+            len,
+        ));
+    }
+
+    let mut sources = Vec::new();
+    let mut total = 0u64;
+
+    for spec in specs {
+        match spec {
+            InputSpec::Local(path) => {
+                let size = match std::fs::metadata(path) {
+                    Ok(m) => m.len(),
+                    Err(e) => {
+                        eprintln!("warning: {}: {} — skipping", path.display(), e);
+                        continue;
+                    }
+                };
+                let is_st = format_safetensors
+                    || path.extension().and_then(|e| e.to_str()) == Some("safetensors");
+                let safetensors_info = if is_st {
+                    match load_safetensors_info(path, size) {
+                        Ok(info) => Some(info),
+                        Err(e) => {
+                            eprintln!("warning: {}: failed to parse safetensors header: {} — treating as plain binary", path.display(), e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                total += size;
+                sources.push(Source {
+                    file_idx: sources.len(),
+                    kind: SourceKind::File(path.clone()),
+                    byte_size: size,
+                    safetensors: safetensors_info,
+                    name_override: None,
+                });
+            }
+            InputSpec::Remote(spec) => {
+                total += spec.size;
+                sources.push(Source {
+                    file_idx: sources.len(),
+                    kind: SourceKind::Http { cdn_url: spec.cdn_url.clone() },
+                    byte_size: spec.size,
+                    safetensors: None,
+                    name_override: None,
+                });
+            }
+        }
+    }
+
+    Ok((sources, total))
 }
 
 /// Read just the header of a safetensors file and return parsed metadata.
@@ -201,6 +339,12 @@ impl Histogram {
         let mut counts = [0u64; 256];
 
         match &s.kind {
+            SourceKind::Http { .. } => {
+                anyhow::bail!(
+                    "--sort is not supported for remote hf:// inputs: \
+                     building a histogram requires streaming the entire file over HTTP"
+                );
+            }
             SourceKind::File(p) => {
                 let mut f = File::open(p)?;
                 let mut remaining = s.byte_size;

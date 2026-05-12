@@ -4,6 +4,43 @@ use anyhow::Context;
 use hf_hub::api::sync::ApiBuilder;
 use hf_hub::{Repo, RepoType};
 
+/// A remote HF file that can be range-requested over HTTP without a full download.
+pub struct RemoteFileSpec {
+    pub cdn_url: String,
+    pub size: u64,
+    #[allow(dead_code)]
+    pub token: Option<String>,
+}
+
+/// Parsed destination for Xet-streaming output.
+#[derive(Clone)]
+pub struct HfOutputSpec {
+    pub endpoint: String,
+    pub repo_id: String,
+    pub repo_type_str: &'static str,  // "model", "dataset", or "space"
+    pub revision: String,
+    pub path_prefix: String,
+}
+
+impl HfOutputSpec {
+    /// Path in repo for a tile at zoom z, column x, row y.
+    pub fn tile_repo_path(&self, z: u32, x: u32, y: u32) -> String {
+        let p = &self.path_prefix;
+        if p.is_empty() { format!("tiles/{z}/{x}/{y}.png") }
+        else { format!("{p}/tiles/{z}/{x}/{y}.png") }
+    }
+    pub fn index_html_path(&self) -> String {
+        let p = &self.path_prefix;
+        if p.is_empty() { "index.html".to_string() }
+        else { format!("{p}/index.html") }
+    }
+    pub fn labels_json_path(&self) -> String {
+        let p = &self.path_prefix;
+        if p.is_empty() { "labels.json".to_string() }
+        else { format!("{p}/labels.json") }
+    }
+}
+
 struct HfUrl {
     repo_type: RepoType,
     repo_id: String,
@@ -125,10 +162,68 @@ pub fn upload_dir_to(hf_url_str: &str, local_dir: &Path) -> anyhow::Result<()> {
     crate::deploy::upload_dir(local_dir, &hf.repo_id, repo_type_name(hf.repo_type), &hf.path_in_repo)
 }
 
-fn repo_type_name(t: RepoType) -> &'static str {
+pub fn repo_type_name(t: RepoType) -> &'static str {
     match t {
         RepoType::Model => "model",
         RepoType::Dataset => "dataset",
         RepoType::Space => "space",
     }
+}
+
+/// Return the HF token from `$HF_TOKEN` env var or `~/.cache/huggingface/token`.
+pub fn get_token() -> Option<String> {
+    if let Ok(t) = std::env::var("HF_TOKEN") {
+        if !t.is_empty() { return Some(t); }
+    }
+    let home = std::env::var("HOME").ok()?;
+    let path = std::path::PathBuf::from(home).join(".cache/huggingface/token");
+    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Resolve an `hf://` path to a CDN URL + file size without downloading the file.
+///
+/// Uses a HEAD request to get `Content-Length`. The returned `cdn_url` supports
+/// `Range: bytes=N-M` requests, enabling per-tile streaming.
+pub fn resolve_to_http(path: &Path) -> anyhow::Result<RemoteFileSpec> {
+    let s = path.to_string_lossy();
+    let hf = parse(&s).with_context(|| format!("invalid hf:// URL: {s:?}"))?;
+
+    let api = make_api_builder()
+        .build()
+        .context("failed to initialise HF API client")?;
+    let repo = api.repo(Repo::with_revision(
+        hf.repo_id.clone(),
+        hf.repo_type,
+        hf.revision.clone(),
+    ));
+    let cdn_url = repo.url(&hf.path_in_repo);
+
+    let token = get_token();
+    let agent = ureq::AgentBuilder::new().build();
+    let mut req = agent.head(&cdn_url);
+    if let Some(ref t) = token {
+        req = req.set("Authorization", &format!("Bearer {t}"));
+    }
+    let resp = req.call()
+        .with_context(|| format!("HEAD request failed for {cdn_url}"))?;
+    let size = resp
+        .header("content-length")
+        .and_then(|v| v.parse::<u64>().ok())
+        .with_context(|| format!("missing Content-Length for {cdn_url}"))?;
+
+    log::info!("Remote file {}: {} bytes", hf.path_in_repo, size);
+    Ok(RemoteFileSpec { cdn_url, size, token })
+}
+
+/// Parse an `hf://` output URL into an `HfOutputSpec`.
+pub fn parse_hf_output(hf_url_str: &str) -> anyhow::Result<HfOutputSpec> {
+    let hf = parse(hf_url_str)
+        .with_context(|| format!("invalid hf:// output URL: {hf_url_str:?}"))?;
+    Ok(HfOutputSpec {
+        endpoint: "https://huggingface.co".to_string(),
+        repo_id: hf.repo_id,
+        repo_type_str: repo_type_name(hf.repo_type),
+        revision: hf.revision,
+        path_prefix: hf.path_in_repo,
+    })
 }

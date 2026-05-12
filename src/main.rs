@@ -57,9 +57,17 @@ struct Args {
     /// Auto-detected from .safetensors file extension when omitted.
     #[arg(long, value_name = "FORMAT")]
     format: Option<String>,
+
+    /// Regenerate index.html for an existing tiles directory without re-rendering tiles
+    #[arg(long, value_name = "TILES_DIR", conflicts_with_all = ["files", "diff", "output", "tiles", "space", "sort"])]
+    regen_html: Option<PathBuf>,
 }
 
 fn run(args: Args) -> anyhow::Result<()> {
+    if let Some(ref tile_dir) = args.regen_html {
+        return tiled::regen_html(tile_dir);
+    }
+
     let format_safetensors = args.format.as_deref() == Some("safetensors");
 
     if let Some(diff_args) = args.diff {

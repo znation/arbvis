@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
+
 use image;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
@@ -17,6 +19,83 @@ use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, r
 use crate::tiled::html::FileEntity;
 use crate::tiled::leaf::{render_leaf_tile, render_leaf_tile_dtype, render_leaf_tile_sorted};
 use crate::tiled::pyramid::build_pyramid;
+
+/// Regenerate `index.html` for an existing tiles directory without re-rendering tiles.
+///
+/// Infers `max_zoom`, `height`, and `world_w` from the tile directory structure,
+/// then re-reads `labels.json` and calls `write_leaflet_html` with the new template.
+pub fn regen_html(tile_dir: &PathBuf) -> anyhow::Result<()> {
+    let tiles_dir = tile_dir.join("tiles");
+
+    // Find max zoom level.
+    let max_zoom = std::fs::read_dir(&tiles_dir)
+        .with_context(|| format!("cannot read {}", tiles_dir.display()))?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
+        .max()
+        .ok_or_else(|| anyhow::anyhow!("no zoom levels found in {}", tiles_dir.display()))?;
+
+    let zoom_dir = tiles_dir.join(format!("{max_zoom}"));
+    let width_tiles = std::fs::read_dir(&zoom_dir)
+        .with_context(|| format!("cannot read {}", zoom_dir.display()))?
+        .filter(|e| e.as_ref().map(|e| e.path().is_dir()).unwrap_or(false))
+        .count() as u32;
+    let height_tiles = {
+        let first_x = std::fs::read_dir(&zoom_dir)?
+            .filter_map(|e| e.ok())
+            .find(|e| e.path().is_dir())
+            .ok_or_else(|| anyhow::anyhow!("no x-dirs found at zoom {max_zoom}"))?;
+        std::fs::read_dir(first_x.path())?.count() as u32
+    };
+    let height = height_tiles * 256;
+    let world_w = (width_tiles / height_tiles.max(1)) * 256;
+
+    // Parse labels.json into FileEntity objects.
+    let labels_path = tile_dir.join("labels.json");
+    let json_str = std::fs::read_to_string(&labels_path)
+        .with_context(|| format!("cannot read {}", labels_path.display()))?;
+    let values: Vec<serde_json::Value> = serde_json::from_str(&json_str)?;
+    let entities: Vec<html::FileEntity> = values
+        .into_iter()
+        .map(|v| {
+            let name = v["name"].as_str().unwrap_or("").to_string();
+            let pixel_x = v["x"].as_u64().unwrap_or(0) as u32;
+            let pixel_y = v["y"].as_u64().unwrap_or(0) as u32;
+            let hue = v["hue"].as_u64().unwrap_or(0) as u16;
+            let byte_size = v["size"].as_u64().unwrap_or(0);
+            let bbox = {
+                let b = v["bbox"].as_array();
+                if let Some(b) = b {
+                    let g = |i: usize| b.get(i).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                    (g(0), g(1), g(2), g(3))
+                } else {
+                    (0, 0, 0, 0)
+                }
+            };
+            let segments = {
+                if let Some(segs) = v["segs"].as_array() {
+                    segs.iter()
+                        .filter_map(|s| {
+                            let arr = s.as_array()?;
+                            let g = |i: usize| arr.get(i)?.as_u64().map(|x| x as u32);
+                            Some((g(0)?, g(1)?, g(2)?, g(3)?))
+                        })
+                        .collect()
+                } else {
+                    vec![]
+                }
+            };
+            html::FileEntity { name, pixel_x, pixel_y, hue, byte_size, bbox, segments }
+        })
+        .collect();
+
+    html::write_leaflet_html(tile_dir, world_w, max_zoom, height, &entities)?;
+    log::info!(
+        "Regenerated index.html in {} (zoom 0–{max_zoom}, {width_tiles}×{height_tiles} tiles, height={height})",
+        tile_dir.display()
+    );
+    Ok(())
+}
 
 /// Run the tiled/pyramidal output pipeline.
 pub fn run_tiles(

@@ -71,7 +71,6 @@ pub fn write_leaflet_html(
       white-space: nowrap;
       border-radius: 2px;
       pointer-events: none;
-      transform: translate(-50%, -50%);
     }}
   </style>
 </head>
@@ -141,7 +140,7 @@ pub fn write_leaflet_html(
             }});
           activeOverlays.addLayer(L.polyline(ll, {{
             color: 'hsl(' + l.hue + ',70%,60%)',
-            weight: 1,
+            weight: i < 3 ? 2 : 1,
             opacity: 0.9,
             fill: false,
             interactive: false,
@@ -152,7 +151,11 @@ pub fn write_leaflet_html(
         var pt = map.latLngToContainerPoint([lat, lng]);
         var tw = l.name.length * 7 + 12;
         var th = 22;
-        var lb = {{ x: pt.x - tw/2, y: pt.y - th/2, w: tw, h: th }};
+        var vw = map.getSize().x;
+        var vh = map.getSize().y;
+        var lx = Math.max(0, Math.min(pt.x - tw/2, vw - tw));
+        var ly = Math.max(0, Math.min(pt.y - th/2, vh - th));
+        var lb = {{ x: lx, y: ly, w: tw, h: th }};
         var overlaps = false;
         for (var j = 0; j < placed.length; j++) {{
           var p = placed[j];
@@ -164,12 +167,22 @@ pub fn write_leaflet_html(
         }}
         if (!overlaps) {{
           placed.push(lb);
+          // Small dot at the true centroid anchors the label visually when
+          // the label is clamped away from the centroid to stay on-screen.
+          activeOverlays.addLayer(L.circleMarker([lat, lng], {{
+            radius: 3,
+            color: 'hsl(' + l.hue + ',70%,60%)',
+            fillColor: 'hsl(' + l.hue + ',70%,60%)',
+            fillOpacity: 1,
+            weight: 0,
+            interactive: false,
+          }}));
           activeOverlays.addLayer(L.marker([lat, lng], {{
             icon: L.divIcon({{
               className: 'file-label',
               html: l.name,
-              iconSize: [0, 0],
-              iconAnchor: [0, 0]
+              iconSize: [tw, th],
+              iconAnchor: [pt.x - lx, pt.y - ly]
             }}),
             interactive: false
           }}));

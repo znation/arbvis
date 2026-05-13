@@ -12,7 +12,6 @@ mod tiled;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
@@ -122,13 +121,11 @@ fn run(args: Args) -> anyhow::Result<()> {
             if args.sort {
                 anyhow::bail!("--sort is not supported with repo-level hf:// diff inputs");
             }
-            let agent = Arc::new(ureq::AgentBuilder::new().build());
-            let token = hf_url::get_token().map(Arc::new);
             let orig_specs = hf_url::list_repo_as_http_specs(orig_str)
                 .with_context(|| format!("listing files in {orig_str}"))?;
             let mod_specs = hf_url::list_repo_as_http_specs(mod_str)
                 .with_context(|| format!("listing files in {mod_str}"))?;
-            data::prepare_diff_sources_from_http(&orig_specs, &mod_specs, agent, token)?
+            data::prepare_diff_sources_from_http(&orig_specs, &mod_specs)?
         } else {
             // At least one side is a local path or single-file hf:// URL.
             let diff_args: Vec<PathBuf> = raw_diff_args

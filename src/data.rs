@@ -3,72 +3,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::SystemTime;
-
-// Maximum concurrent outbound HTTP range requests across all rayon threads.
-const HTTP_CONCURRENCY: usize = 8;
-
-static HTTP_SEM: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
-
-fn http_semaphore() -> &'static (Mutex<usize>, Condvar) {
-    HTTP_SEM.get_or_init(|| (Mutex::new(HTTP_CONCURRENCY), Condvar::new()))
-}
-
-struct SemGuard<'a>(&'a (Mutex<usize>, Condvar));
-impl Drop for SemGuard<'_> {
-    fn drop(&mut self) {
-        let mut n = self.0.0.lock().unwrap();
-        *n += 1;
-        self.0.1.notify_one();
-    }
-}
-
-fn acquire_http_sem() -> SemGuard<'static> {
-    let sem = http_semaphore();
-    let mut n = sem.0.lock().unwrap();
-    while *n == 0 {
-        n = sem.1.wait(n).unwrap();
-    }
-    *n -= 1;
-    SemGuard(sem)
-}
-
-// Global earliest timestamp (ms since UNIX epoch) at which any HTTP request may proceed.
-// When any thread receives a 429 it pushes this forward; all others wait.
-static HTTP_BACKOFF_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn set_global_http_backoff(delay_ms: u64) {
-    let until = now_ms() + delay_ms;
-    HTTP_BACKOFF_UNTIL_MS.fetch_max(until, Ordering::Relaxed);
-}
-
-fn wait_global_http_backoff() {
-    loop {
-        let until = HTTP_BACKOFF_UNTIL_MS.load(Ordering::Relaxed);
-        let now = now_ms();
-        if now >= until { break; }
-        std::thread::sleep(std::time::Duration::from_millis((until - now).min(200)));
-    }
-}
-
-/// Deterministic per-call jitter: 0..base_ms extra, derived from subsecond nanos.
-fn jitter_ms(base_ms: u64) -> u64 {
-    if base_ms == 0 { return 0; }
-    let ns = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as u64;
-    ns % base_ms
-}
+use std::sync::Arc;
 
 use anyhow::Context;
 use image::Rgb;
@@ -76,7 +11,7 @@ use indicatif::ProgressBar;
 use memmap2::Mmap;
 
 use crate::safetensors::{self, TensorMeta};
-use crate::hf_url::RemoteFileSpec;
+use crate::hf_url::{RemoteFileSpec, RemoteRepo};
 
 pub struct SafetensorsInfo {
     pub tensors: Vec<TensorMeta>,
@@ -87,11 +22,11 @@ pub struct SafetensorsInfo {
 pub enum Data {
     Mapped(Mmap),
     Owned(Vec<u8>),
-    /// Remote file accessed via HTTP range requests — never loaded locally.
+    /// Remote file accessed via HF Hub range requests — never loaded locally.
     Http {
-        url: Arc<String>,
-        token: Option<Arc<String>>,
-        agent: Arc<ureq::Agent>,
+        repo: RemoteRepo,
+        filename: Arc<String>,
+        revision: Arc<String>,
     },
     /// Diff computed on demand per range — never stored in full.
     LazyDiff(Arc<dyn Fn(u64, usize) -> anyhow::Result<Vec<u8>> + Send + Sync>),
@@ -120,61 +55,9 @@ impl Data {
             Data::Owned(v) => {
                 Ok(Cow::Borrowed(&v[start as usize..start as usize + len]))
             }
-            Data::Http { url, token, agent } => {
-                use std::io::Read as _;
-                const MAX_RETRIES: u32 = 8;
-                let range = format!("bytes={start}-{}", start + len as u64 - 1);
-                let mut last_err = String::new();
-                for attempt in 0..=MAX_RETRIES {
-                    if attempt > 0 {
-                        log::warn!("range request retry {attempt}/{MAX_RETRIES} for {url}: {last_err}");
-                    }
-                    // Respect any global back-pressure set by a 429 on any thread.
-                    wait_global_http_backoff();
-                    let mut req = agent.get(url.as_str()).set("Range", &range);
-                    if let Some(t) = token {
-                        req = req.set("Authorization", &format!("Bearer {t}"));
-                    }
-                    // Hold semaphore only during the network call+read, not during sleep.
-                    let delay_ms = {
-                        let _sem = acquire_http_sem();
-                        match req.call() {
-                            Ok(resp) => {
-                                let mut bytes = Vec::with_capacity(len);
-                                match resp.into_reader().read_to_end(&mut bytes) {
-                                    Ok(_) if bytes.len() == len => return Ok(Cow::Owned(bytes)),
-                                    Ok(_) => {
-                                        last_err = format!("short read: {} bytes, expected {}", bytes.len(), len);
-                                        let base = 500u64 << attempt.min(5);
-                                        base + jitter_ms(base)
-                                    }
-                                    Err(e) => {
-                                        last_err = format!("read failed: {e}");
-                                        let base = 500u64 << attempt.min(5);
-                                        base + jitter_ms(base)
-                                    }
-                                }
-                            }
-                            Err(ureq::Error::Status(429, _)) => {
-                                last_err = "429 rate limited".to_string();
-                                // Push all threads back by the full base delay.
-                                let base = (5_000u64 << attempt.min(3)).min(60_000);
-                                set_global_http_backoff(base);
-                                // This thread sleeps base + jitter so threads stagger on wake.
-                                base + jitter_ms(base)
-                            }
-                            Err(e) => {
-                                last_err = format!("{e}");
-                                let base = 500u64 << attempt.min(5);
-                                base + jitter_ms(base)
-                            }
-                        }
-                    };
-                    if attempt < MAX_RETRIES {
-                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                    }
-                }
-                Err(anyhow::anyhow!("range request failed after {MAX_RETRIES} retries for {url}: {last_err}"))
+            Data::Http { repo, filename, revision } => {
+                let bytes = repo.fetch_range(filename, revision, start..start + len as u64)?;
+                Ok(Cow::Owned(bytes))
             }
             Data::LazyDiff(f) => Ok(Cow::Owned(f(start, len)?)),
         }
@@ -186,8 +69,8 @@ pub enum SourceKind {
     Buffered(Vec<u8>),
     File(PathBuf),
     Diff { original: PathBuf, modified: PathBuf },
-    /// Remote HF file, accessed via HTTP range requests per tile.
-    Http { cdn_url: String },
+    /// Remote HF file, accessed via hf-hub range requests per tile.
+    Http(RemoteFileSpec),
     /// Per-tensor diff computed lazily from two whole-file Data sources.
     /// `byte_size` (= nelem) output bytes are produced on demand.
     TensorDiff {
@@ -234,11 +117,7 @@ impl Source {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| original.to_string_lossy().into_owned()),
-            SourceKind::Http { cdn_url } => cdn_url
-                .rsplit('/')
-                .next()
-                .unwrap_or(cdn_url)
-                .to_string(),
+            SourceKind::Http(spec) => spec.filename.as_str().to_string(),
             SourceKind::TensorDiff { .. } => {
                 unreachable!("TensorDiff sources always have name_override set")
             }
@@ -321,11 +200,7 @@ pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::R
 /// Load a source's bytes for random access: mmaps file sources, clones buffered sources.
 /// For diff sources, returns a LazyDiff that computes bytes on demand per tile.
 /// For Http sources, returns a `Data::Http` handle that fetches byte ranges on demand.
-pub fn load_source_data(
-    s: &Source,
-    agent: &Arc<ureq::Agent>,
-    token: Option<&Arc<String>>,
-) -> anyhow::Result<Data> {
+pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
     match &s.kind {
         SourceKind::File(p) => {
             let f = File::open(p)?;
@@ -347,10 +222,10 @@ pub fn load_source_data(
                 }).collect())
             })))
         }
-        SourceKind::Http { cdn_url } => Ok(Data::Http {
-            url: Arc::new(cdn_url.clone()),
-            token: token.cloned(),
-            agent: agent.clone(),
+        SourceKind::Http(spec) => Ok(Data::Http {
+            repo: spec.repo.clone(),
+            filename: Arc::clone(&spec.filename),
+            revision: Arc::clone(&spec.revision),
         }),
         SourceKind::TensorDiff { orig, mod_, orig_start, mod_start, orig_dtype, mod_dtype, .. } => {
             let orig = Arc::clone(orig);
@@ -430,11 +305,12 @@ pub fn prepare_sources_from_specs(
                 });
             }
             InputSpec::Remote(spec) => {
-                total += spec.size;
+                let size = spec.size;
+                total += size;
                 sources.push(Source {
                     file_idx: sources.len(),
-                    kind: SourceKind::Http { cdn_url: spec.cdn_url.clone() },
-                    byte_size: spec.size,
+                    kind: SourceKind::Http(spec.clone()),
+                    byte_size: size,
                     safetensors: None,
                     name_override: None,
                 });
@@ -497,7 +373,7 @@ impl Histogram {
         let mut counts = [0u64; 256];
 
         match &s.kind {
-            SourceKind::Http { .. } => {
+            SourceKind::Http(_) => {
                 anyhow::bail!(
                     "--sort is not supported for remote hf:// inputs: \
                      building a histogram requires streaming the entire file over HTTP"
@@ -795,14 +671,12 @@ pub fn prepare_diff_sources(
 
 /// Build diff sources from two repos listed as HTTP specs (no download).
 ///
-/// Safetensors files are diffed lazily via HTTP range requests — no model weights
+/// Safetensors files are diffed lazily via range requests — no model weights
 /// are downloaded to disk or held in RAM. Small non-safetensors files (≤16 MB)
 /// are downloaded eagerly and binary-diffed; larger ones are skipped with a warning.
 pub fn prepare_diff_sources_from_http(
     orig_specs: &[(String, RemoteFileSpec)],
     mod_specs: &[(String, RemoteFileSpec)],
-    agent: Arc<ureq::Agent>,
-    token: Option<Arc<String>>,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     let is_st = |name: &str| name.ends_with(".safetensors");
 
@@ -819,7 +693,7 @@ pub fn prepare_diff_sources_from_http(
         } else if mod_st.is_empty() {
             eprintln!("warning: modified has no .safetensors files — skipping model weight diff");
         } else {
-            match build_multi_safetensors_diff_sources_from_http(&orig_st, &mod_st, &agent, token.as_ref()) {
+            match build_multi_safetensors_diff_sources_from_http(&orig_st, &mod_st) {
                 Ok((mut tensor_sources, bytes)) => {
                     let base_idx = sources.len();
                     for s in &mut tensor_sources { s.file_idx += base_idx; }
@@ -864,14 +738,14 @@ pub fn prepare_diff_sources_from_http(
             continue;
         }
         let orig_data = Data::Http {
-            url: Arc::new(orig_spec.cdn_url.clone()),
-            token: token.clone(),
-            agent: agent.clone(),
+            repo: orig_spec.repo.clone(),
+            filename: Arc::clone(&orig_spec.filename),
+            revision: Arc::clone(&orig_spec.revision),
         };
         let mod_data = Data::Http {
-            url: Arc::new(mod_spec.cdn_url.clone()),
-            token: token.clone(),
-            agent: agent.clone(),
+            repo: mod_spec.repo.clone(),
+            filename: Arc::clone(&mod_spec.filename),
+            revision: Arc::clone(&mod_spec.revision),
         };
         let ob = orig_data.fetch_range(0, orig_spec.size as usize)?;
         let mb = mod_data.fetch_range(0, mod_spec.size as usize)?;
@@ -1099,19 +973,17 @@ fn build_multi_safetensors_diff_sources(
 }
 
 /// Build per-tensor diff Sources from multiple remote .safetensors files on each side.
-/// Headers are fetched via HTTP range requests; tensor data is never downloaded.
+/// Headers are fetched via range requests; tensor data is never downloaded.
 fn build_multi_safetensors_diff_sources_from_http(
     orig_specs: &[&(String, RemoteFileSpec)],
     mod_specs:  &[&(String, RemoteFileSpec)],
-    agent: &Arc<ureq::Agent>,
-    token: Option<&Arc<String>>,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     let make_arcs = |specs: &[&(String, RemoteFileSpec)]| -> Vec<Arc<Data>> {
         specs.iter().map(|(_, spec)| {
             Arc::new(Data::Http {
-                url:   Arc::new(spec.cdn_url.clone()),
-                token: token.cloned(),
-                agent: agent.clone(),
+                repo: spec.repo.clone(),
+                filename: Arc::clone(&spec.filename),
+                revision: Arc::clone(&spec.revision),
             })
         }).collect()
     };

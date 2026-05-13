@@ -1,67 +1,135 @@
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
+use hf_hub::buckets::sync::BucketSyncDirection;
+use hf_hub::buckets::BucketUpload;
+use hf_hub::repository::AddSource;
+use hf_hub::{HFClientSync, RepoTypeDataset, RepoTypeModel, RepoTypeSpace};
 
 use crate::hf_url::HfOutputSpec;
 
-/// Upload a single local file to a Hugging Face repo via the `hf` CLI.
+/// Upload a single local file to a Hugging Face repo via hf-hub.
 ///
-/// `repo_type` must be one of `"model"`, `"dataset"`, or `"space"`.
+/// `repo_type` must be one of `"model"`, `"dataset"`, `"space"`, or `"bucket"`.
 pub fn upload_file(
     local: &Path,
     repo_id: &str,
     repo_type: &str,
     path_in_repo: &str,
 ) -> anyhow::Result<()> {
-    log::info!(
-        "Uploading {} → hf://{}/{} ...",
-        local.display(),
-        repo_id,
-        path_in_repo
-    );
-    hf(&[
-        "upload",
-        &format!("--repo-type={repo_type}"),
-        repo_id,
-        local.to_str().context("non-UTF-8 local path")?,
-        path_in_repo,
-    ])
+    log::info!("Uploading {} → hf://{}/{} ...", local.display(), repo_id, path_in_repo);
+    let client = crate::hf_url::client()?;
+    let (owner, name) = split_owner_name(repo_id)?;
+    let source = AddSource::file(PathBuf::from(local));
+    let dest = path_in_repo.to_string();
+
+    match repo_type {
+        "model" => {
+            client.model(owner, name)
+                .upload_file().source(source).path_in_repo(dest).send()?;
+        }
+        "dataset" => {
+            client.dataset(owner, name)
+                .upload_file().source(source).path_in_repo(dest).send()?;
+        }
+        "space" => {
+            client.space(owner, name)
+                .upload_file().source(source).path_in_repo(dest).send()?;
+        }
+        "bucket" => {
+            client.bucket(owner, name)
+                .upload_files()
+                .files(vec![BucketUpload::new(PathBuf::from(local), dest)])
+                .send()?;
+        }
+        other => bail!("unknown repo type {other:?}"),
+    }
+    Ok(())
 }
 
 /// Upload a local directory tree to a path prefix in a Hugging Face repo.
-///
-/// `repo_type` must be one of `"model"`, `"dataset"`, or `"space"`.
 pub fn upload_dir(
     local_dir: &Path,
     repo_id: &str,
     repo_type: &str,
     path_prefix: &str,
 ) -> anyhow::Result<()> {
-    log::info!(
-        "Uploading {}/ → hf://{}/{} ...",
-        local_dir.display(),
-        repo_id,
-        path_prefix
-    );
-    hf(&[
-        "upload",
-        &format!("--repo-type={repo_type}"),
-        repo_id,
-        local_dir.to_str().context("non-UTF-8 local path")?,
-        path_prefix,
-    ])
+    log::info!("Uploading {}/ → hf://{}/{} ...", local_dir.display(), repo_id, path_prefix);
+    let client = crate::hf_url::client()?;
+    let (owner, name) = split_owner_name(repo_id)?;
+    let folder = PathBuf::from(local_dir);
+    let prefix_opt = if path_prefix.is_empty() { None } else { Some(path_prefix.to_string()) };
+
+    match repo_type {
+        "model" => upload_folder_typed::<RepoTypeModel>(&client, owner, name, folder, prefix_opt)?,
+        "dataset" => upload_folder_typed::<RepoTypeDataset>(&client, owner, name, folder, prefix_opt)?,
+        "space" => upload_folder_typed::<RepoTypeSpace>(&client, owner, name, folder, prefix_opt)?,
+        "bucket" => {
+            let prefix = if path_prefix.is_empty() { None } else { Some(path_prefix.to_string()) };
+            client.bucket(owner, name)
+                .sync()
+                .local_path(folder)
+                .direction(BucketSyncDirection::Upload)
+                .maybe_prefix(prefix)
+                .send()?;
+        }
+        other => bail!("unknown repo type {other:?}"),
+    }
+    Ok(())
 }
 
-/// Create (or verify) the HF bucket dataset that backs a Space, and return an
-/// `HfOutputSpec` pointing at it. Used by the streaming path so tiles can be
-/// uploaded directly to the bucket without touching local disk.
+fn upload_folder_typed<T: hf_hub::RepoType>(
+    client: &HFClientSync,
+    owner: &str,
+    name: &str,
+    folder: PathBuf,
+    path_in_repo: Option<String>,
+) -> anyhow::Result<()>
+where
+    HFClientSync: TypedRepoFactory<T>,
+{
+    let repo = <HFClientSync as TypedRepoFactory<T>>::repo(client, owner, name);
+    repo.upload_folder()
+        .folder_path(folder)
+        .maybe_path_in_repo(path_in_repo)
+        .send()?;
+    Ok(())
+}
+
+trait TypedRepoFactory<T: hf_hub::RepoType> {
+    fn repo(client: &Self, owner: &str, name: &str) -> hf_hub::HFRepositorySync<T>;
+}
+impl TypedRepoFactory<RepoTypeModel> for HFClientSync {
+    fn repo(client: &Self, owner: &str, name: &str) -> hf_hub::HFRepositorySync<RepoTypeModel> {
+        client.model(owner, name)
+    }
+}
+impl TypedRepoFactory<RepoTypeDataset> for HFClientSync {
+    fn repo(client: &Self, owner: &str, name: &str) -> hf_hub::HFRepositorySync<RepoTypeDataset> {
+        client.dataset(owner, name)
+    }
+}
+impl TypedRepoFactory<RepoTypeSpace> for HFClientSync {
+    fn repo(client: &Self, owner: &str, name: &str) -> hf_hub::HFRepositorySync<RepoTypeSpace> {
+        client.space(owner, name)
+    }
+}
+
+/// Create (or verify) the HF bucket that backs a Space, and return an
+/// `HfOutputSpec` pointing at it.
 pub fn create_space_bucket(space_id: &str) -> anyhow::Result<(HfOutputSpec, String)> {
     let bucket_id = derive_bucket_id(space_id)?;
     eprintln!("Ensuring bucket {} exists...", bucket_id);
-    hf_idempotent(&["buckets", "create", &bucket_id])?;
+    let client = crate::hf_url::client()?;
+    let (owner, name) = split_owner_name(&bucket_id)?;
+    client
+        .create_bucket()
+        .namespace(owner.to_string())
+        .name(name.to_string())
+        .exist_ok(true)
+        .send()
+        .with_context(|| format!("creating bucket {bucket_id}"))?;
     let spec = HfOutputSpec {
-        endpoint: "https://huggingface.co".to_string(),
         repo_id: bucket_id.clone(),
         repo_type_str: "bucket",
         revision: "main".to_string(),
@@ -75,20 +143,28 @@ pub fn create_space_bucket(space_id: &str) -> anyhow::Result<(HfOutputSpec, Stri
 /// in the bucket (either synced from local disk or streamed directly).
 pub fn deploy_space_app(space_id: &str, bucket_id: &str, index_html: Vec<u8>) -> anyhow::Result<()> {
     eprintln!("Ensuring Space {} exists...", space_id);
-    hf_idempotent(&["repos", "create", space_id, "--repo-type=space", "--space-sdk=docker"])?;
+    let client = crate::hf_url::client()?;
+    client
+        .create_repository()
+        .repo_id(space_id.to_string())
+        .repo_type(RepoTypeSpace)
+        .space_sdk("docker")
+        .exist_ok(true)
+        .send()
+        .with_context(|| format!("creating space {space_id}"))?;
 
     eprintln!("Uploading Space files...");
     let tmp = tempfile::TempDir::new()?;
     write_space_files(tmp.path(), bucket_id, space_id)?;
     std::fs::write(tmp.path().join("index.html"), index_html)?;
 
-    hf_idempotent(&[
-        "upload",
-        space_id,
-        tmp.path().to_str().context("non-UTF-8 temp path")?,
-        ".",
-        "--repo-type=space",
-    ])?;
+    let (owner, name) = split_owner_name(space_id)?;
+    client
+        .space(owner, name)
+        .upload_folder()
+        .folder_path(tmp.path().to_path_buf())
+        .send()
+        .with_context(|| format!("uploading Space files to {space_id}"))?;
 
     eprintln!("Deployed to https://huggingface.co/spaces/{}", space_id);
     Ok(())
@@ -98,27 +174,28 @@ pub fn run_deploy(tiles_dir: &Path, space_id: &str) -> anyhow::Result<()> {
     validate_tiles_dir(tiles_dir)?;
 
     let (_, bucket_id) = create_space_bucket(space_id)?;
+    let client = crate::hf_url::client()?;
+    let (owner, name) = split_owner_name(&bucket_id)?;
+    let bucket = client.bucket(owner, name);
 
     eprintln!("Syncing tiles to bucket (this may take a while for large outputs)...");
     let tiles_path = tiles_dir.join("tiles");
-    let bucket_tiles_url = format!("hf://buckets/{}/tiles", bucket_id);
-    hf(&[
-        "buckets",
-        "sync",
-        tiles_path.to_str().context("non-UTF-8 tiles path")?,
-        &bucket_tiles_url,
-        "--delete",
-    ])?;
+    bucket
+        .sync()
+        .local_path(tiles_path)
+        .direction(BucketSyncDirection::Upload)
+        .prefix("tiles".to_string())
+        .delete(true)
+        .send()
+        .with_context(|| format!("syncing tiles to bucket {bucket_id}"))?;
 
     eprintln!("Uploading labels.json to bucket...");
     let labels_path = tiles_dir.join("labels.json");
-    let bucket_labels_url = format!("hf://buckets/{}/labels.json", bucket_id);
-    hf(&[
-        "buckets",
-        "cp",
-        labels_path.to_str().context("non-UTF-8 labels path")?,
-        &bucket_labels_url,
-    ])?;
+    bucket
+        .upload_files()
+        .files(vec![BucketUpload::new(labels_path, "labels.json".to_string())])
+        .send()
+        .with_context(|| format!("uploading labels.json to bucket {bucket_id}"))?;
 
     let index_html = std::fs::read(tiles_dir.join("index.html"))
         .context("failed to read index.html from tiles directory")?;
@@ -140,55 +217,16 @@ fn validate_tiles_dir(dir: &Path) -> anyhow::Result<()> {
 }
 
 fn derive_bucket_id(space_id: &str) -> anyhow::Result<String> {
-    let slash = space_id
-        .find('/')
-        .with_context(|| format!("--space must be namespace/repo, got {:?}", space_id))?;
-    let namespace = &space_id[..slash];
-    let repo = &space_id[slash + 1..];
+    let (namespace, repo) = split_owner_name(space_id)
+        .with_context(|| format!("--space must be namespace/repo, got {space_id:?}"))?;
     Ok(format!("{}/{}_bucket", namespace, repo))
 }
 
-fn hf(args: &[&str]) -> anyhow::Result<()> {
-    let status = Command::new("hf")
-        .args(args)
-        .stdin(Stdio::null())
-        .status()
-        .context("failed to run `hf` — is the Hugging Face CLI installed?")?;
-    if !status.success() {
-        bail!("`hf {}` exited with {}", args.join(" "), status);
-    }
-    Ok(())
-}
-
-// Like hf() but ignores failures whose stderr mentions "already exist".
-fn hf_idempotent(args: &[&str]) -> anyhow::Result<()> {
-    let output = Command::new("hf")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .context("failed to run `hf` — is the Hugging Face CLI installed?")?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let combined = format!("{}{}", stderr, stdout).to_lowercase();
-    if combined.contains("already exist")
-        || combined.contains("already exists")
-        || combined.contains("already created")
-        || combined.contains("409")
-    {
-        return Ok(());
-    }
-
-    bail!(
-        "`hf {}` exited with {}\nstderr: {}",
-        args.join(" "),
-        output.status,
-        stderr
-    );
+fn split_owner_name(repo_id: &str) -> anyhow::Result<(&str, &str)> {
+    let slash = repo_id
+        .find('/')
+        .with_context(|| format!("expected owner/name, got {repo_id:?}"))?;
+    Ok((&repo_id[..slash], &repo_id[slash + 1..]))
 }
 
 fn write_space_files(dir: &Path, bucket_id: &str, space_id: &str) -> anyhow::Result<()> {

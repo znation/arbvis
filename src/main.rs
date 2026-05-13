@@ -8,6 +8,7 @@ mod label;
 mod safetensors;
 mod single;
 mod tiled;
+mod xet;
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
@@ -69,6 +70,14 @@ struct Args {
     /// Title shown in the HTML info panel (default: "arbvis" or "arbvis diff")
     #[arg(long, value_name = "TITLE")]
     title: Option<String>,
+
+    /// Color regions by xorb ID for xet-backed files; hue = xorb, intensity = byte.
+    #[arg(long)]
+    show_xet_xorbs: bool,
+
+    /// Draw thin lines at xet chunk boundaries (can be combined with --show-xet-xorbs).
+    #[arg(long)]
+    show_xet_chunks: bool,
 }
 
 fn run(args: Args) -> anyhow::Result<()> {
@@ -77,6 +86,15 @@ fn run(args: Args) -> anyhow::Result<()> {
     }
 
     let format_safetensors = args.format.as_deref() == Some("safetensors");
+    let xet_vis = args.show_xet_xorbs || args.show_xet_chunks;
+    let show_xet_chunks = args.show_xet_chunks;
+
+    if xet_vis && args.sort {
+        anyhow::bail!("--show-xet-xorbs / --show-xet-chunks are incompatible with --sort");
+    }
+    if xet_vis && args.diff.is_some() {
+        anyhow::bail!("--show-xet-xorbs / --show-xet-chunks are incompatible with --diff");
+    }
 
     // Intercept hf:// tiles output: resolve inputs as HTTP specs and stream directly.
     // For local tiles output: render to disk then optionally upload.
@@ -139,18 +157,18 @@ fn run(args: Args) -> anyhow::Result<()> {
         if let Some(ref hf_out_url) = tiles_hf_out {
             if args.sort { anyhow::bail!("--sort is not supported with hf:// tile output"); }
             let hf_out = hf_url::parse_hf_output(hf_out_url)?;
-            let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, true, diff_title, &diff_input_strs)?;
+            let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, true, diff_title, &diff_input_strs, false)?;
             return Ok(());
         }
         if let Some(ref space_id) = args.space {
             if args.sort { anyhow::bail!("--sort is not supported with --space diff output"); }
             let bucket_spec = deploy::create_space_bucket(space_id)?;
-            let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, true, diff_title, &diff_input_strs)?;
+            let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, true, diff_title, &diff_input_strs, false)?;
             deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html)?;
             return Ok(());
         }
         if let Some(ref tile_dir) = tiles_arg {
-            tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, true, diff_title, &diff_input_strs)?;
+            tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, true, diff_title, &diff_input_strs, false)?;
             if let Some(ref url) = tiles_upload {
                 deploy::upload_dir_to(url, tile_dir)?;
             }
@@ -214,29 +232,57 @@ fn run(args: Args) -> anyhow::Result<()> {
                 }
             })
             .collect::<anyhow::Result<_>>()?;
-        let (sources, total) = data::prepare_sources_from_specs(&specs, format_safetensors)?;
+        let (mut sources, total) = data::prepare_sources_from_specs(&specs, format_safetensors)?;
+        if xet_vis {
+            data::populate_xet_terms(&mut sources)?;
+        }
         let hf_out = hf_url::parse_hf_output(hf_out_url)?;
         let stream_title = args.title.as_deref().unwrap_or("arbvis");
-        let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, false, stream_title, &input_strs)?;
+        let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, false, stream_title, &input_strs, show_xet_chunks)?;
         return Ok(());
     }
 
-    // Resolve any hf:// paths in the file list (downloading to local cache).
     let original_inputs: Vec<String> = files
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
-    let files: Vec<PathBuf> = files
-        .into_iter()
-        .map(resolve_input)
-        .collect::<anyhow::Result<_>>()?;
 
+    // With xet visualization, we keep hf:// inputs as remote specs (no
+    // download, so the file's xet_hash and per-tile byte ranges are
+    // available). Without xet, we download to the local cache as before.
     let tile_title = args.title.as_deref().unwrap_or("arbvis");
-    let (sources, total) = data::prepare_sources(&files, format_safetensors)?;
+    let (sources, total) = if xet_vis {
+        let specs: Vec<InputSpec> = files
+            .iter()
+            .map(|p| {
+                let s = p.to_string_lossy();
+                if s.starts_with("hf://") {
+                    if hf_url::is_repo_level(&s)? {
+                        anyhow::bail!(
+                            "--show-xet-xorbs / --show-xet-chunks with a repo-level hf:// URL is not yet supported; \
+                             pass a specific file path (e.g. hf://owner/repo/file.safetensors)"
+                        );
+                    }
+                    hf_url::resolve_to_http(p).map(InputSpec::Remote)
+                } else {
+                    Ok(InputSpec::Local(p.clone()))
+                }
+            })
+            .collect::<anyhow::Result<_>>()?;
+        let (mut sources, total) = data::prepare_sources_from_specs(&specs, format_safetensors)?;
+        data::populate_xet_terms(&mut sources)?;
+        (sources, total)
+    } else {
+        let files: Vec<PathBuf> = files
+            .into_iter()
+            .map(resolve_input)
+            .collect::<anyhow::Result<_>>()?;
+        data::prepare_sources(&files, format_safetensors)?
+    };
     let display_files: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
 
     if let Some(ref tile_dir) = tiles_arg {
-        tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, false, tile_title, &original_inputs)?;
+        tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, false, tile_title, &original_inputs, show_xet_chunks)?;
         if let Some(ref space_id) = args.space {
             deploy::run_deploy(tile_dir, space_id)?;
         }
@@ -249,7 +295,7 @@ fn run(args: Args) -> anyhow::Result<()> {
     if let Some(ref space_id) = args.space {
         if args.sort { anyhow::bail!("--sort is not supported with --space output"); }
         let bucket_spec = deploy::create_space_bucket(space_id)?;
-        let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, false, tile_title, &original_inputs)?;
+        let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, false, tile_title, &original_inputs, show_xet_chunks)?;
         deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html)?;
         return Ok(());
     }

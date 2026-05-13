@@ -12,6 +12,7 @@ use memmap2::Mmap;
 
 use crate::safetensors::{self, TensorMeta};
 use crate::hf_url::{RemoteFileSpec, RemoteRepo};
+use crate::xet::{self, XetTerm};
 
 pub struct SafetensorsInfo {
     pub tensors: Vec<TensorMeta>,
@@ -99,6 +100,11 @@ pub struct Source {
     pub safetensors: Option<SafetensorsInfo>,
     /// Override the display name (used when kind is Buffered but has a real filename).
     pub name_override: Option<String>,
+    /// Xet reconstruction terms for this source. `Some(vec)` when xet
+    /// visualization was requested and the source has a xet hash; `None`
+    /// when xet visualization is off; `Some(vec![])` when xet vis is on but
+    /// this source isn't xet-backed.
+    pub xet_terms: Option<Vec<XetTerm>>,
 }
 
 impl Source {
@@ -148,6 +154,7 @@ pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::R
                 byte_size: len,
                 safetensors: None,
                 name_override: None,
+                xet_terms: None,
             }],
             len,
         ));
@@ -192,6 +199,7 @@ pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::R
             byte_size: size,
             safetensors: safetensors_info,
             name_override: None,
+            xet_terms: None,
         });
     }
     Ok((sources, total))
@@ -264,6 +272,7 @@ pub fn prepare_sources_from_specs(
                 byte_size: len,
                 safetensors: None,
                 name_override: None,
+                xet_terms: None,
             }],
             len,
         ));
@@ -302,6 +311,7 @@ pub fn prepare_sources_from_specs(
                     byte_size: size,
                     safetensors: safetensors_info,
                     name_override: None,
+                    xet_terms: None,
                 });
             }
             InputSpec::Remote(spec) => {
@@ -313,12 +323,32 @@ pub fn prepare_sources_from_specs(
                     byte_size: size,
                     safetensors: None,
                     name_override: None,
+                    xet_terms: None,
                 });
             }
         }
     }
 
     Ok((sources, total))
+}
+
+/// Fetch xet reconstruction terms for any HTTP-backed sources.
+///
+/// Each source gets `xet_terms = Some(vec)` — empty for sources without a xet
+/// hash (local files, non-xet remote files), populated for xet-backed remote
+/// sources. Errors from the xet endpoints propagate up.
+pub fn populate_xet_terms(sources: &mut [Source]) -> anyhow::Result<()> {
+    for s in sources.iter_mut() {
+        match &s.kind {
+            SourceKind::Http(spec) => {
+                s.xet_terms = Some(xet::reconstruction_for(spec)?);
+            }
+            _ => {
+                s.xet_terms = Some(Vec::new());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Read just the header of a safetensors file and return parsed metadata.
@@ -540,6 +570,7 @@ pub fn prepare_diff_sources(
             byte_size: size_o,
             safetensors: None,
             name_override: None,
+            xet_terms: None,
         };
         return Ok((vec![source], size_o));
     }
@@ -650,6 +681,7 @@ pub fn prepare_diff_sources(
                         byte_size: size_o,
                         safetensors: None,
                         name_override: None,
+                        xet_terms: None,
                     });
                     total += size_o;
                 }
@@ -761,6 +793,7 @@ pub fn prepare_diff_sources_from_http(
             byte_size: size,
             safetensors: None,
             name_override: Some(fname.to_string()),
+            xet_terms: None,
         });
         total += size;
     }
@@ -949,6 +982,7 @@ fn build_multi_safetensors_diff_sources_inner(
             byte_size: nelem,
             safetensors: None,
             name_override: Some(orig_t.label()),
+            xet_terms: None,
         });
         total += nelem;
     }

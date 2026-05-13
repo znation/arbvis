@@ -20,9 +20,12 @@ use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, r
 use crate::hf_upload::HfTileSink;
 use crate::hf_url::HfOutputSpec;
 use crate::tiled::html::{FileEntity, generate_leaflet_content};
-use crate::tiled::leaf::{render_leaf_tile, render_leaf_tile_dtype, render_leaf_tile_sorted};
+use crate::tiled::leaf::{
+    render_leaf_tile, render_leaf_tile_dtype, render_leaf_tile_sorted, render_leaf_tile_xet,
+};
 use crate::tiled::pyramid::build_pyramid;
 use crate::tiled::pyramid_accum::{PyramidAccumulator, TileSink};
+use crate::xet::{TABLEAU_20, XorbMap};
 
 /// Regenerate `index.html` for an existing tiles directory without re-rendering tiles.
 ///
@@ -55,10 +58,26 @@ pub fn regen_html(tile_dir: &PathBuf) -> anyhow::Result<()> {
     let world_w = (width_tiles / height_tiles.max(1)) * 256;
 
     // Parse labels.json into FileEntity objects.
+    // Accepts both schemas: legacy bare array, and new `{files, chunks}` object.
     let labels_path = tile_dir.join("labels.json");
     let json_str = std::fs::read_to_string(&labels_path)
         .with_context(|| format!("cannot read {}", labels_path.display()))?;
-    let values: Vec<serde_json::Value> = serde_json::from_str(&json_str)?;
+    let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+    let (values, chunks_for_regen): (Vec<serde_json::Value>, Vec<(u32, u32, u32, u32)>) = match parsed {
+        serde_json::Value::Array(a) => (a, Vec::new()),
+        serde_json::Value::Object(ref o) => {
+            let files = o.get("files").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let chunks = o.get("chunks").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter().filter_map(|s| {
+                    let a = s.as_array()?;
+                    let g = |i: usize| a.get(i)?.as_u64().map(|x| x as u32);
+                    Some((g(0)?, g(1)?, g(2)?, g(3)?))
+                }).collect()
+            }).unwrap_or_default();
+            (files, chunks)
+        }
+        _ => anyhow::bail!("labels.json: unexpected JSON shape (expected array or object)"),
+    };
     let entities: Vec<html::FileEntity> = values
         .into_iter()
         .map(|v| {
@@ -93,7 +112,7 @@ pub fn regen_html(tile_dir: &PathBuf) -> anyhow::Result<()> {
         })
         .collect();
 
-    html::write_leaflet_html(tile_dir, world_w, max_zoom, height, &entities, "arbvis", &[])?;
+    html::write_leaflet_html(tile_dir, world_w, max_zoom, height, &entities, "arbvis", &[], &chunks_for_regen)?;
     log::info!(
         "Regenerated index.html in {} (zoom 0–{max_zoom}, {width_tiles}×{height_tiles} tiles, height={height})",
         tile_dir.display()
@@ -110,6 +129,7 @@ pub fn run_tiles(
     diff_mode: bool,
     title: &str,
     inputs: &[String],
+    show_xet_chunks: bool,
 ) -> anyhow::Result<()> {
     // --sort is incompatible with safetensors dtype coloring.
     if sort && sources.iter().any(|s| s.safetensors.is_some()) {
@@ -193,10 +213,27 @@ pub fn run_tiles(
         vec![]
     };
 
+    // Build the global xorb→Tableau-20 color map, if any source has xet terms.
+    // When non-empty, the xet renderer takes precedence over dtype/sort modes.
+    let xorb_map = XorbMap::build(
+        sources.iter().zip(cumulative_offsets.iter()).map(|(s, &off)| {
+            (s.xet_terms.as_deref(), off)
+        }),
+    );
+    let xet_mode = !xorb_map.is_empty();
+    let tableau: [image::Rgb<u8>; 20] = {
+        let mut arr = [image::Rgb([0u8, 0, 0]); 20];
+        for (i, c) in TABLEAU_20.iter().enumerate() {
+            arr[i] = image::Rgb(*c);
+        }
+        arr
+    };
+
     // Build combined dtype color ranges for the whole byte stream (safetensors mode).
     // Dtype coloring is only used when NOT in diff mode — in diff mode we keep the
     // black→magenta diff LUT but still generate per-tensor entity overlays.
-    let dtype_mode = !diff_mode && sources.iter().any(|s| s.safetensors.is_some());
+    // Xet xorb coloring takes precedence over dtype coloring.
+    let dtype_mode = !diff_mode && !xet_mode && sources.iter().any(|s| s.safetensors.is_some());
     let combined_dtype_ranges: Vec<(u64, u64, image::Rgb<u8>)> = if dtype_mode {
         let mut ranges = Vec::new();
         let mut cumulative: u64 = 0;
@@ -211,6 +248,27 @@ pub fn run_tiles(
         ranges
     } else {
         vec![]
+    };
+
+    // Build chunk-boundary segments from per-source xet_terms.
+    // Each term contributes one term-boundary polyline (its outer rectangle
+    // boundary in Hilbert pixel space). Reuses file_rects + outer_segments
+    // so chunk overlays behave identically to file overlays at zoom.
+    let chunk_segments: Vec<(u32, u32, u32, u32)> = if show_xet_chunks {
+        let mut segs = Vec::new();
+        for (src, &off) in sources.iter().zip(cumulative_offsets.iter()) {
+            let Some(terms) = src.xet_terms.as_deref() else { continue };
+            for t in terms {
+                if t.byte_len == 0 { continue; }
+                let start = off + t.file_offset;
+                let end = start + t.byte_len;
+                let rects = file_rects(start, end, total_pixels, square_pixels, num_squares, height, kh as u8);
+                segs.extend(outer_segments(&rects));
+            }
+        }
+        segs
+    } else {
+        Vec::new()
     };
 
     // Pre-compute entity metadata.
@@ -322,7 +380,13 @@ pub fn run_tiles(
     let first_err = (0..total_tiles).into_par_iter().find_map_any(|i| {
         let tx = (i % width_tiles as u64) as u32;
         let ty = (i / width_tiles as u64) as u32;
-        let result = if dtype_mode {
+        let result = if xet_mode {
+            render_leaf_tile_xet(
+                tx, ty, kh as u8, height_tiles, square_pixels, total,
+                &source_data, &cumulative_offsets, &pixel_lut,
+                &xorb_map.global_ranges, &tableau,
+            )
+        } else if dtype_mode {
             render_leaf_tile_dtype(
                 tx, ty, kh as u8, height_tiles, square_pixels, total,
                 &combined_dtype_ranges,
@@ -374,7 +438,7 @@ pub fn run_tiles(
     )?;
 
     log::info!("Writing HTML viewer...");
-    html::write_leaflet_html(&tile_dir, world_w, max_zoom, height, &entities, title, inputs)?;
+    html::write_leaflet_html(&tile_dir, world_w, max_zoom, height, &entities, title, inputs, &chunk_segments)?;
 
     log::info!("Tiled output written to {}", tile_dir.display());
     Ok(())
@@ -392,6 +456,7 @@ pub fn run_tiles_hf_streaming(
     diff_mode: bool,
     title: &str,
     inputs: &[String],
+    show_xet_chunks: bool,
 ) -> anyhow::Result<Vec<u8>> {
     crate::hf_url::require_token()?;
     let client = crate::hf_url::client()?;
@@ -430,7 +495,21 @@ pub fn run_tiles_hf_streaming(
         .map(load_source_data)
         .collect::<anyhow::Result<_>>()?;
 
-    let dtype_mode = !diff_mode && sources.iter().any(|s| s.safetensors.is_some());
+    let xorb_map = XorbMap::build(
+        sources.iter().zip(cumulative_offsets.iter()).map(|(s, &off)| {
+            (s.xet_terms.as_deref(), off)
+        }),
+    );
+    let xet_mode = !xorb_map.is_empty();
+    let tableau: [image::Rgb<u8>; 20] = {
+        let mut arr = [image::Rgb([0u8, 0, 0]); 20];
+        for (i, c) in TABLEAU_20.iter().enumerate() {
+            arr[i] = image::Rgb(*c);
+        }
+        arr
+    };
+
+    let dtype_mode = !diff_mode && !xet_mode && sources.iter().any(|s| s.safetensors.is_some());
     let combined_dtype_ranges: Vec<(u64, u64, image::Rgb<u8>)> = if dtype_mode {
         let mut ranges = Vec::new();
         let mut cumulative: u64 = 0;
@@ -445,6 +524,23 @@ pub fn run_tiles_hf_streaming(
         ranges
     } else {
         vec![]
+    };
+
+    let chunk_segments: Vec<(u32, u32, u32, u32)> = if show_xet_chunks {
+        let mut segs = Vec::new();
+        for (src, &off) in sources.iter().zip(cumulative_offsets.iter()) {
+            let Some(terms) = src.xet_terms.as_deref() else { continue };
+            for t in terms {
+                if t.byte_len == 0 { continue; }
+                let start = off + t.file_offset;
+                let end = start + t.byte_len;
+                let rects = file_rects(start, end, total_pixels, square_pixels, num_squares, height, kh as u8);
+                segs.extend(outer_segments(&rects));
+            }
+        }
+        segs
+    } else {
+        Vec::new()
     };
 
     // Pre-compute entity metadata.
@@ -521,7 +617,13 @@ pub fn run_tiles_hf_streaming(
     let first_err: Option<String> = (0..total_tiles).into_par_iter().find_map_any(|i| {
         let tx = (i % width_tiles as u64) as u32;
         let ty = (i / width_tiles as u64) as u32;
-        let result = if dtype_mode {
+        let result = if xet_mode {
+            render_leaf_tile_xet(
+                tx, ty, kh as u8, height_tiles, square_pixels, total,
+                &source_data, &cumulative_offsets, &pixel_lut,
+                &xorb_map.global_ranges, &tableau,
+            )
+        } else if dtype_mode {
             render_leaf_tile_dtype(tx, ty, kh as u8, height_tiles, square_pixels, total, &combined_dtype_ranges)
         } else {
             render_leaf_tile(tx, ty, kh as u8, height_tiles, square_pixels, total, &source_data, &cumulative_offsets, &pixel_lut)
@@ -547,7 +649,7 @@ pub fn run_tiles_hf_streaming(
 
     // Upload index.html and labels.json before committing.
     log::info!("Uploading index.html and labels.json...");
-    let (html_bytes, labels_bytes) = generate_leaflet_content(world_w, max_zoom, height, &entities, title, inputs);
+    let (html_bytes, labels_bytes) = generate_leaflet_content(world_w, max_zoom, height, &entities, title, inputs, &chunk_segments);
     sink.upload_tile(hf_out.index_html_path(), html_bytes.clone())?;
     sink.upload_tile(hf_out.labels_json_path(), labels_bytes)?;
 

@@ -16,6 +16,7 @@ use crate::data::{load_source_data, Histogram, Source};
 use crate::geometry::{sampled_in_range, hilbert_to_xy_u64};
 use crate::label::draw_file_label;
 use crate::safetensors::color_for_pos;
+use crate::xet::{TABLEAU_20, XorbMap};
 
 /// Render a single Hilbert-curve image (non-tiled mode).
 pub fn run_single(
@@ -54,6 +55,23 @@ pub fn run_single(
     } as u64;
 
     let pixel_lut = if diff_mode { build_diff_signed_lut() } else { build_pixel_lut() };
+
+    // Build xorb map (empty if no source has xet terms) and the Tableau-20
+    // table. When non-empty, render_chunks substitutes xorb-tinted pixels.
+    let xorb_map = XorbMap::build(
+        sources.iter().scan(0u64, |off, s| {
+            let cur = *off;
+            *off += s.byte_size;
+            Some((s.xet_terms.as_deref(), cur))
+        }),
+    );
+    let tableau: [Rgb<u8>; 20] = {
+        let mut arr = [Rgb([0u8, 0, 0]); 20];
+        for (i, c) in TABLEAU_20.iter().enumerate() {
+            arr[i] = Rgb(*c);
+        }
+        arr
+    };
 
     let img: image::ImageBuffer<Rgb<u8>, Vec<u8>> = image::ImageBuffer::new(side, side);
 
@@ -127,7 +145,7 @@ pub fn run_single(
         let chunk_results = render_chunks(
             &sources, &chunks_by_source, sort, &src_byte_starts, &src_pixel_starts,
             &cancelled, img_base, pf_base, canvas_u, canvas_size, side, k, stride,
-            &pixel_lut, &pb_shared,
+            &pixel_lut, &xorb_map, &tableau, &pb_shared,
         )?;
 
         for (fi, bbox) in chunk_results {
@@ -183,7 +201,7 @@ pub fn run_single(
             let result = render_chunks(
                 &sources, &chunks_by_source, sort, &src_byte_starts, &src_pixel_starts,
                 &cancelled_bg, img_ptr, pf_ptr, canvas_u, canvas_size, side, k, stride,
-                &pixel_lut, &pb_shared,
+                &pixel_lut, &xorb_map, &tableau, &pb_shared,
             );
 
             let chunk_results = match result {
@@ -309,8 +327,24 @@ fn render_chunks(
     k: u32,
     stride: u64,
     pixel_lut: &[Rgb<u8>; 256],
+    xorb_map: &XorbMap,
+    tableau: &[Rgb<u8>; 20],
     pb_shared: &Option<Arc<ProgressBar>>,
 ) -> anyhow::Result<Vec<(usize, Option<(u32, u32, u32, u32)>)>> {
+    let xet_mode = !xorb_map.is_empty();
+    let xet_color = |byte: u8, abs_byte: u64| -> Rgb<u8> {
+        if let Some(idx) = xorb_map.color_idx_at(abs_byte) {
+            let t = tableau[idx as usize];
+            let scale = byte as u16;
+            Rgb([
+                ((t[0] as u16 * scale + 127) / 255) as u8,
+                ((t[1] as u16 * scale + 127) / 255) as u8,
+                ((t[2] as u16 * scale + 127) / 255) as u8,
+            ])
+        } else {
+            pixel_lut[byte as usize]
+        }
+    };
     let chunk_results: Vec<(usize, Option<(u32, u32, u32, u32)>)> = if sort {
         (0..sources.len())
             .into_par_iter()
@@ -426,7 +460,11 @@ fn render_chunks(
                                 for &b in bytes {
                                     if cur_byte % stride == 0 {
                                         let (x, y) = hilbert_to_xy_u64(cur_pixel as u64, k as u8);
-                                        let color = pixel_lut[b as usize];
+                                        let color = if xet_mode {
+                                            xet_color(b, cur_byte)
+                                        } else {
+                                            pixel_lut[b as usize]
+                                        };
                                         let pixel_idx = y as usize * side as usize + x as usize;
                                         unsafe {
                                             let p = (img_base as *mut u8).add(pixel_idx * 3);

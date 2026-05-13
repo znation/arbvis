@@ -44,6 +44,25 @@ impl RemoteRepo {
         .map(|b| b.to_vec())
         .map_err(Into::into)
     }
+
+    /// `models`, `datasets`, or `spaces` — the URL segment used in
+    /// `/api/{api_segment}/{repo_id}/...` routes.
+    pub fn api_segment(&self) -> &'static str {
+        match self {
+            RemoteRepo::Model(_) => "models",
+            RemoteRepo::Dataset(_) => "datasets",
+            RemoteRepo::Space(_) => "spaces",
+        }
+    }
+
+    /// `owner/name` for the underlying repository.
+    pub fn repo_id(&self) -> String {
+        match self {
+            RemoteRepo::Model(r) => format!("{}/{}", r.owner(), r.name()),
+            RemoteRepo::Dataset(r) => format!("{}/{}", r.owner(), r.name()),
+            RemoteRepo::Space(r) => format!("{}/{}", r.owner(), r.name()),
+        }
+    }
 }
 
 /// A remote HF file accessed via range requests without a full download.
@@ -53,6 +72,8 @@ pub struct RemoteFileSpec {
     pub filename: Arc<String>,
     pub revision: Arc<String>,
     pub size: u64,
+    /// Xet Merkle hash, present iff this file is xet-backed.
+    pub xet_hash: Option<String>,
 }
 
 /// Parsed destination for streaming output (Hub repo or bucket).
@@ -160,26 +181,38 @@ pub fn client() -> anyhow::Result<HFClientSync> {
     HFClientSync::new().context("failed to initialise HF client")
 }
 
-/// Returns `Ok(())` if an HF token is resolvable from the standard locations.
+/// The HF endpoint (mirrors hf-hub's resolution: `HF_ENDPOINT` env override,
+/// else `https://huggingface.co`). Trailing slashes stripped.
+pub fn endpoint() -> String {
+    let raw = std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
+    raw.trim_end_matches('/').to_string()
+}
+
+/// Resolve the HF auth token, returning `None` if no token is available.
 ///
-/// hf-hub resolves the token internally and does not expose a public getter; this
-/// mirrors its precedence so the CLI can fail with a useful message *before*
-/// attempting a write operation that would otherwise fail with a confusing 401.
+/// hf-hub resolves the token internally and does not expose a public getter;
+/// this mirrors its precedence so we can sign our own requests against the
+/// xet endpoints (which hf-hub does not expose publicly).
 ///
 /// Precedence: `HF_TOKEN` env → `HF_TOKEN_PATH` file → `$HF_HOME/token` file (with
-/// `HF_HOME` defaulting to `~/.cache/huggingface`).
-pub fn require_token() -> anyhow::Result<()> {
+/// `HF_HOME` defaulting to `~/.cache/huggingface`). Returns `None` if
+/// `HF_HUB_DISABLE_IMPLICIT_TOKEN` is set.
+pub fn read_token() -> Option<String> {
     if std::env::var("HF_HUB_DISABLE_IMPLICIT_TOKEN").is_ok_and(|v| !v.is_empty()) {
-        anyhow::bail!(
-            "HF_HUB_DISABLE_IMPLICIT_TOKEN is set; set HF_TOKEN explicitly or unset this var"
-        );
+        return None;
     }
-    if std::env::var("HF_TOKEN").is_ok_and(|v| !v.is_empty()) {
-        return Ok(());
+    if let Ok(v) = std::env::var("HF_TOKEN") {
+        let t = v.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
     }
     if let Ok(p) = std::env::var("HF_TOKEN_PATH") {
-        if std::fs::read_to_string(&p).is_ok_and(|s| !s.trim().is_empty()) {
-            return Ok(());
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            let t = s.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
         }
     }
     let hf_home = std::env::var("HF_HOME").unwrap_or_else(|_| {
@@ -187,7 +220,26 @@ pub fn require_token() -> anyhow::Result<()> {
         format!("{home}/.cache/huggingface")
     });
     let token_file = PathBuf::from(&hf_home).join("token");
-    if std::fs::read_to_string(&token_file).is_ok_and(|s| !s.trim().is_empty()) {
+    if let Ok(s) = std::fs::read_to_string(&token_file) {
+        let t = s.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    None
+}
+
+/// Returns `Ok(())` if an HF token is resolvable, otherwise an error.
+///
+/// Used by CLI code that needs to fail with a useful message *before*
+/// attempting a write operation that would otherwise fail with a confusing 401.
+pub fn require_token() -> anyhow::Result<()> {
+    if std::env::var("HF_HUB_DISABLE_IMPLICIT_TOKEN").is_ok_and(|v| !v.is_empty()) {
+        anyhow::bail!(
+            "HF_HUB_DISABLE_IMPLICIT_TOKEN is set; set HF_TOKEN explicitly or unset this var"
+        );
+    }
+    if read_token().is_some() {
         return Ok(());
     }
     anyhow::bail!(
@@ -342,6 +394,7 @@ pub fn resolve_to_http(path: &Path) -> anyhow::Result<RemoteFileSpec> {
         filename: Arc::new(hf.path_in_repo),
         revision: Arc::new(hf.revision),
         size: meta.file_size,
+        xet_hash: meta.xet_hash,
     })
 }
 
@@ -366,7 +419,7 @@ pub fn list_repo_as_http_specs(url_str: &str) -> anyhow::Result<Vec<(String, Rem
     let mut specs = Vec::new();
     let revision = Arc::new(hf.revision);
     for entry in entries {
-        if let hf_hub::repository::RepoTreeEntry::File { path, size, .. } = entry {
+        if let hf_hub::repository::RepoTreeEntry::File { path, size, xet_hash, .. } = entry {
             log::info!("  {} — {} bytes", path, size);
             specs.push((
                 path.clone(),
@@ -375,6 +428,7 @@ pub fn list_repo_as_http_specs(url_str: &str) -> anyhow::Result<Vec<(String, Rem
                     filename: Arc::new(path),
                     revision: Arc::clone(&revision),
                     size,
+                    xet_hash,
                 },
             ));
         }

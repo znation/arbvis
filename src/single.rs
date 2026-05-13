@@ -375,8 +375,7 @@ fn render_chunks(
                         .as_ref()
                         .map(|st| st.color_ranges.as_slice());
                     let data = if dtype_ranges.is_none() {
-                        let agent = Arc::new(ureq::AgentBuilder::new().build());
-                        Some(load_source_data(&sources[src_idx], &agent, None)?)
+                        Some(load_source_data(&sources[src_idx])?)
                     } else {
                         None
                     };

@@ -17,12 +17,12 @@ use rayon::prelude::*;
 use crate::color::{build_diff_signed_lut, build_pixel_lut};
 use crate::data::{load_source_data, Data, Histogram, Source};
 use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, rects_centroid};
-use crate::hf_upload::{HfXetSession, HfXetTileSink};
+use crate::hf_upload::HfTileSink;
 use crate::hf_url::HfOutputSpec;
 use crate::tiled::html::{FileEntity, generate_leaflet_content};
 use crate::tiled::leaf::{render_leaf_tile, render_leaf_tile_dtype, render_leaf_tile_sorted};
 use crate::tiled::pyramid::build_pyramid;
-use crate::tiled::pyramid_accum::PyramidAccumulator;
+use crate::tiled::pyramid_accum::{PyramidAccumulator, TileSink};
 
 /// Regenerate `index.html` for an existing tiles directory without re-rendering tiles.
 ///
@@ -184,11 +184,10 @@ pub fn run_tiles(
     } else {
         vec![]
     };
-    let local_agent = Arc::new(ureq::AgentBuilder::new().build());
     let source_data: Vec<Data> = if !sort {
         sources
             .par_iter()
-            .map(|s| load_source_data(s, &local_agent, None))
+            .map(load_source_data)
             .collect::<anyhow::Result<_>>()?
     } else {
         vec![]
@@ -394,8 +393,8 @@ pub fn run_tiles_hf_streaming(
     title: &str,
     inputs: &[String],
 ) -> anyhow::Result<Vec<u8>> {
-    let token = crate::hf_url::get_token()
-        .context("HF token required for hf:// output; set HF_TOKEN or run `huggingface-cli login`")?;
+    crate::hf_url::require_token()?;
+    let client = crate::hf_url::client()?;
 
     // Geometry setup — identical to run_tiles().
     let mut s = 16u32;
@@ -426,11 +425,9 @@ pub fn run_tiles_hf_streaming(
         }
     }
 
-    let local_agent = Arc::new(ureq::AgentBuilder::new().build());
-    let arc_token = Arc::new(token.clone());
     let source_data: Vec<Data> = sources
         .par_iter()
-        .map(|src| load_source_data(src, &local_agent, Some(&arc_token)))
+        .map(load_source_data)
         .collect::<anyhow::Result<_>>()?;
 
     let dtype_mode = !diff_mode && sources.iter().any(|s| s.safetensors.is_some());
@@ -501,9 +498,8 @@ pub fn run_tiles_hf_streaming(
         }
     }
 
-    let session = Arc::new(HfXetSession::new(hf_out, token)?);
-    let sink = Arc::new(HfXetTileSink(session.clone()));
-    let pyramid = Arc::new(PyramidAccumulator::new(tile_size, max_zoom, sink, Arc::new(hf_out.clone())));
+    let sink = Arc::new(HfTileSink::new(client, hf_out.clone())?);
+    let pyramid = Arc::new(PyramidAccumulator::new(tile_size, max_zoom, sink.clone(), Arc::new(hf_out.clone())));
 
     let total_tiles = width_tiles as u64 * height_tiles as u64;
     log::info!("Rendering and uploading {} leaf tiles...", total_tiles);
@@ -535,7 +531,7 @@ pub fn run_tiles_hf_streaming(
             Err(e) => Some(e),
             Ok((img, png_bytes)) => {
                 let repo_path = hf_out.tile_repo_path(max_zoom, tx, ty);
-                if let Err(e) = session.upload_file(repo_path, png_bytes) {
+                if let Err(e) = sink.upload_tile(repo_path, png_bytes) {
                     return Some(e.to_string());
                 }
                 pyramid.contribute(max_zoom, tx, ty, &img);
@@ -552,15 +548,15 @@ pub fn run_tiles_hf_streaming(
     // Upload index.html and labels.json before committing.
     log::info!("Uploading index.html and labels.json...");
     let (html_bytes, labels_bytes) = generate_leaflet_content(world_w, max_zoom, height, &entities, title, inputs);
-    session.upload_file(hf_out.index_html_path(), html_bytes.clone())?;
-    session.upload_file(hf_out.labels_json_path(), labels_bytes)?;
+    sink.upload_tile(hf_out.index_html_path(), html_bytes.clone())?;
+    sink.upload_tile(hf_out.labels_json_path(), labels_bytes)?;
 
-    // Drop the pyramid Arc so session has only one reference remaining.
+    // Drop the pyramid Arc so sink has only one reference remaining.
     drop(pyramid);
 
     log::info!("Creating HF Hub commit...");
-    Arc::try_unwrap(session)
-        .map_err(|_| anyhow::anyhow!("unexpected extra Arc reference to upload session"))?
+    Arc::try_unwrap(sink)
+        .map_err(|_| anyhow::anyhow!("unexpected extra Arc reference to tile sink"))?
         .commit("Add arbvis visualization tiles")?;
 
     log::info!("Streaming output committed to hf://{}/{}", hf_out.repo_id, hf_out.path_prefix);

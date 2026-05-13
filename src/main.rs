@@ -12,7 +12,6 @@ mod tiled;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
@@ -116,19 +115,17 @@ fn run(args: Args) -> anyhow::Result<()> {
         let orig_str = &diff_input_strs[0];
         let mod_str  = &diff_input_strs[1];
 
-        let (sources, total) = if hf_url::is_repo_level(orig_str) && hf_url::is_repo_level(mod_str) {
+        let (sources, total) = if hf_url::is_repo_level(orig_str)? && hf_url::is_repo_level(mod_str)? {
             // Both are repo-level hf:// URLs: list files over API, diff lazily over HTTP.
             // No model weights are downloaded to disk or held in RAM.
             if args.sort {
                 anyhow::bail!("--sort is not supported with repo-level hf:// diff inputs");
             }
-            let agent = Arc::new(ureq::AgentBuilder::new().build());
-            let token = hf_url::get_token().map(Arc::new);
             let orig_specs = hf_url::list_repo_as_http_specs(orig_str)
                 .with_context(|| format!("listing files in {orig_str}"))?;
             let mod_specs = hf_url::list_repo_as_http_specs(mod_str)
                 .with_context(|| format!("listing files in {mod_str}"))?;
-            data::prepare_diff_sources_from_http(&orig_specs, &mod_specs, agent, token)?
+            data::prepare_diff_sources_from_http(&orig_specs, &mod_specs)?
         } else {
             // At least one side is a local path or single-file hf:// URL.
             let diff_args: Vec<PathBuf> = raw_diff_args
@@ -147,21 +144,21 @@ fn run(args: Args) -> anyhow::Result<()> {
         }
         if let Some(ref space_id) = args.space {
             if args.sort { anyhow::bail!("--sort is not supported with --space diff output"); }
-            let (bucket_spec, bucket_id) = deploy::create_space_bucket(space_id)?;
+            let bucket_spec = deploy::create_space_bucket(space_id)?;
             let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, true, diff_title, &diff_input_strs)?;
-            deploy::deploy_space_app(space_id, &bucket_id, html)?;
+            deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html)?;
             return Ok(());
         }
         if let Some(ref tile_dir) = tiles_arg {
             tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, true, diff_title, &diff_input_strs)?;
             if let Some(ref url) = tiles_upload {
-                hf_url::upload_dir_to(url, tile_dir)?;
+                deploy::upload_dir_to(url, tile_dir)?;
             }
             return Ok(());
         }
         single::run_single(&labels, output_arg.clone(), sources, total, args.sort, true)?;
         if let (Some(ref url), Some(ref local)) = (&output_upload, &output_arg) {
-            hf_url::upload_file_to(url, local)?;
+            deploy::upload_file_to(url, local)?;
         }
         return Ok(());
     }
@@ -244,22 +241,22 @@ fn run(args: Args) -> anyhow::Result<()> {
             deploy::run_deploy(tile_dir, space_id)?;
         }
         if let Some(ref url) = tiles_upload {
-            hf_url::upload_dir_to(url, tile_dir)?;
+            deploy::upload_dir_to(url, tile_dir)?;
         }
         return Ok(());
     }
 
     if let Some(ref space_id) = args.space {
         if args.sort { anyhow::bail!("--sort is not supported with --space output"); }
-        let (bucket_spec, bucket_id) = deploy::create_space_bucket(space_id)?;
+        let bucket_spec = deploy::create_space_bucket(space_id)?;
         let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, false, tile_title, &original_inputs)?;
-        deploy::deploy_space_app(space_id, &bucket_id, html)?;
+        deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html)?;
         return Ok(());
     }
 
     single::run_single(&display_files, output_arg.clone(), sources, total, args.sort, false)?;
     if let (Some(ref url), Some(ref local)) = (&output_upload, &output_arg) {
-        hf_url::upload_file_to(url, local)?;
+        deploy::upload_file_to(url, local)?;
     }
     Ok(())
 }

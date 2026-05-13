@@ -57,19 +57,32 @@ impl Data {
             }
             Data::Http { url, token, agent } => {
                 use std::io::Read as _;
+                const MAX_RETRIES: u32 = 5;
                 let range = format!("bytes={start}-{}", start + len as u64 - 1);
-                let mut req = agent.get(url.as_str()).set("Range", &range);
-                if let Some(t) = token {
-                    req = req.set("Authorization", &format!("Bearer {t}"));
+                let mut last_err = String::new();
+                for attempt in 0..=MAX_RETRIES {
+                    if attempt > 0 {
+                        let delay_ms = 100u64 << attempt.min(6);
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        log::warn!("range request retry {attempt}/{MAX_RETRIES} for {url}");
+                    }
+                    let mut req = agent.get(url.as_str()).set("Range", &range);
+                    if let Some(t) = token {
+                        req = req.set("Authorization", &format!("Bearer {t}"));
+                    }
+                    match req.call() {
+                        Ok(resp) => {
+                            let mut bytes = Vec::with_capacity(len);
+                            match resp.into_reader().read_to_end(&mut bytes) {
+                                Ok(_) if bytes.len() == len => return Ok(Cow::Owned(bytes)),
+                                Ok(_) => { last_err = format!("range request returned {} bytes, expected {}", bytes.len(), len); }
+                                Err(e) => { last_err = format!("range response read failed: {e}"); }
+                            }
+                        }
+                        Err(e) => { last_err = format!("{e}"); }
+                    }
                 }
-                let resp = req.call()
-                    .map_err(|e| anyhow::anyhow!("range request failed: {e}"))?;
-                let mut bytes = Vec::with_capacity(len);
-                resp.into_reader().read_to_end(&mut bytes)
-                    .map_err(|e| anyhow::anyhow!("range response read failed: {e}"))?;
-                anyhow::ensure!(bytes.len() == len,
-                    "range request returned {} bytes, expected {}", bytes.len(), len);
-                Ok(Cow::Owned(bytes))
+                Err(anyhow::anyhow!("range request failed after {MAX_RETRIES} retries for {url}: {last_err}"))
             }
             Data::LazyDiff(f) => Ok(Cow::Owned(f(start, len)?)),
         }

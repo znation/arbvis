@@ -3,7 +3,36 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+// Maximum concurrent outbound HTTP range requests across all rayon threads.
+// Prevents 429 rate-limiting from HF's CDN on large machines with many cores.
+const HTTP_CONCURRENCY: usize = 24;
+
+static HTTP_SEM: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+
+fn http_semaphore() -> &'static (Mutex<usize>, Condvar) {
+    HTTP_SEM.get_or_init(|| (Mutex::new(HTTP_CONCURRENCY), Condvar::new()))
+}
+
+struct SemGuard<'a>(&'a (Mutex<usize>, Condvar));
+impl Drop for SemGuard<'_> {
+    fn drop(&mut self) {
+        let mut n = self.0.0.lock().unwrap();
+        *n += 1;
+        self.0.1.notify_one();
+    }
+}
+
+fn acquire_http_sem() -> SemGuard<'static> {
+    let sem = http_semaphore();
+    let mut n = sem.0.lock().unwrap();
+    while *n == 0 {
+        n = sem.1.wait(n).unwrap();
+    }
+    *n -= 1;
+    SemGuard(sem)
+}
 
 use anyhow::Context;
 use image::Rgb;
@@ -57,29 +86,49 @@ impl Data {
             }
             Data::Http { url, token, agent } => {
                 use std::io::Read as _;
-                const MAX_RETRIES: u32 = 5;
+                const MAX_RETRIES: u32 = 8;
                 let range = format!("bytes={start}-{}", start + len as u64 - 1);
                 let mut last_err = String::new();
                 for attempt in 0..=MAX_RETRIES {
                     if attempt > 0 {
-                        let delay_ms = 100u64 << attempt.min(6);
-                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                        log::warn!("range request retry {attempt}/{MAX_RETRIES} for {url}");
+                        log::warn!("range request retry {attempt}/{MAX_RETRIES} for {url}: {last_err}");
                     }
                     let mut req = agent.get(url.as_str()).set("Range", &range);
                     if let Some(t) = token {
                         req = req.set("Authorization", &format!("Bearer {t}"));
                     }
-                    match req.call() {
-                        Ok(resp) => {
-                            let mut bytes = Vec::with_capacity(len);
-                            match resp.into_reader().read_to_end(&mut bytes) {
-                                Ok(_) if bytes.len() == len => return Ok(Cow::Owned(bytes)),
-                                Ok(_) => { last_err = format!("range request returned {} bytes, expected {}", bytes.len(), len); }
-                                Err(e) => { last_err = format!("range response read failed: {e}"); }
+                    // Hold semaphore only during the network call+read, not during sleep.
+                    let (call_ok, delay_ms) = {
+                        let _sem = acquire_http_sem();
+                        match req.call() {
+                            Ok(resp) => {
+                                let mut bytes = Vec::with_capacity(len);
+                                match resp.into_reader().read_to_end(&mut bytes) {
+                                    Ok(_) if bytes.len() == len => return Ok(Cow::Owned(bytes)),
+                                    Ok(_) => {
+                                        last_err = format!("short read: {} bytes, expected {}", bytes.len(), len);
+                                        (false, 500u64 << attempt.min(5))
+                                    }
+                                    Err(e) => {
+                                        last_err = format!("read failed: {e}");
+                                        (false, 500u64 << attempt.min(5))
+                                    }
+                                }
+                            }
+                            Err(ureq::Error::Status(429, _)) => {
+                                last_err = "429 rate limited".to_string();
+                                // Long backoff: 5s, 10s, 20s, 40s, … capped at 60s.
+                                (false, (5_000u64 << attempt.min(3)).min(60_000))
+                            }
+                            Err(e) => {
+                                last_err = format!("{e}");
+                                (false, 500u64 << attempt.min(5))
                             }
                         }
-                        Err(e) => { last_err = format!("{e}"); }
+                    };
+                    let _ = call_ok;
+                    if attempt < MAX_RETRIES {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                     }
                 }
                 Err(anyhow::anyhow!("range request failed after {MAX_RETRIES} retries for {url}: {last_err}"))

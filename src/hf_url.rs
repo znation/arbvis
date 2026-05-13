@@ -17,7 +17,7 @@ pub struct RemoteFileSpec {
 pub struct HfOutputSpec {
     pub endpoint: String,
     pub repo_id: String,
-    pub repo_type_str: &'static str,  // "model", "dataset", or "space"
+    pub repo_type_str: &'static str,  // "model", "dataset", "space", or "bucket"
     pub revision: String,
     pub path_prefix: String,
 }

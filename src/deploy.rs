@@ -63,7 +63,7 @@ pub fn create_space_bucket(space_id: &str) -> anyhow::Result<(HfOutputSpec, Stri
     let spec = HfOutputSpec {
         endpoint: "https://huggingface.co".to_string(),
         repo_id: bucket_id.clone(),
-        repo_type_str: "dataset",
+        repo_type_str: "bucket",
         revision: "main".to_string(),
         path_prefix: String::new(),
     };

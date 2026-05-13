@@ -56,7 +56,7 @@ struct HfUrl {
 ///   hf://models/{owner}/{repo}[@{rev}][/{path}]   → model
 ///   hf://datasets/{owner}/{repo}[@{rev}][/{path}] → dataset
 ///   hf://spaces/{owner}/{repo}[@{rev}][/{path}]   → space
-///   hf://buckets/{owner}/{bucket}[@{rev}][/{path}] → dataset (Xet bucket, best-effort)
+///   hf://buckets/{owner}/{bucket}[/{path}]         → bucket (Xet; no revision concept)
 ///
 /// When `path_in_repo` is empty the URL refers to the whole repo (no specific file).
 fn parse(raw: &str) -> anyhow::Result<HfUrl> {
@@ -333,10 +333,17 @@ pub fn list_repo_as_http_specs(url_str: &str) -> anyhow::Result<Vec<(String, Rem
 pub fn parse_hf_output(hf_url_str: &str) -> anyhow::Result<HfOutputSpec> {
     let hf = parse(hf_url_str)
         .with_context(|| format!("invalid hf:// output URL: {hf_url_str:?}"))?;
+    // `hf://buckets/` URLs need repo_type_str "bucket" so HfXetSession uses the
+    // correct token and batch endpoints; the generic parser maps them to Dataset.
+    let is_bucket = hf_url_str
+        .strip_prefix("hf://")
+        .map(|r| r.starts_with("buckets/"))
+        .unwrap_or(false);
+    let repo_type_str = if is_bucket { "bucket" } else { repo_type_name(hf.repo_type) };
     Ok(HfOutputSpec {
         endpoint: "https://huggingface.co".to_string(),
         repo_id: hf.repo_id,
-        repo_type_str: repo_type_name(hf.repo_type),
+        repo_type_str,
         revision: hf.revision,
         path_prefix: hf.path_in_repo,
     })

@@ -268,6 +268,67 @@ pub fn resolve_to_http(path: &Path) -> anyhow::Result<RemoteFileSpec> {
     Ok(RemoteFileSpec { cdn_url, size, token })
 }
 
+/// Returns true if the hf:// URL refers to an entire repo (no file path component).
+pub fn is_repo_level(url_str: &str) -> bool {
+    parse(url_str).map(|h| h.path_in_repo.is_empty()).unwrap_or(false)
+}
+
+/// List all files in a repo-level hf:// URL as HTTP specs without downloading.
+///
+/// Returns `Vec<(relative_filename, RemoteFileSpec)>`. Each spec contains the CDN
+/// URL and file size obtained via a HEAD request — no file content is transferred.
+pub fn list_repo_as_http_specs(url_str: &str) -> anyhow::Result<Vec<(String, RemoteFileSpec)>> {
+    let hf = parse(url_str)
+        .with_context(|| format!("invalid hf:// URL: {url_str:?}"))?;
+
+    let api = make_api_builder()
+        .build()
+        .context("failed to initialise HF API client")?;
+    let repo = api.repo(Repo::with_revision(
+        hf.repo_id.clone(),
+        hf.repo_type,
+        hf.revision.clone(),
+    ));
+
+    let info = repo
+        .info()
+        .with_context(|| format!("failed to list files for {}", hf.repo_id))?;
+
+    if info.siblings.is_empty() {
+        anyhow::bail!("repo {} has no files", hf.repo_id);
+    }
+
+    log::info!("Listing {} file(s) from {} ...", info.siblings.len(), hf.repo_id);
+
+    let token = get_token();
+    let agent = ureq::AgentBuilder::new().build();
+
+    let mut specs = Vec::with_capacity(info.siblings.len());
+    for sibling in &info.siblings {
+        let fname = &sibling.rfilename;
+        let cdn_url = repo.url(fname);
+
+        let mut req = agent.head(&cdn_url);
+        if let Some(ref t) = token {
+            req = req.set("Authorization", &format!("Bearer {t}"));
+        }
+        let resp = req.call()
+            .with_context(|| format!("HEAD request failed for {cdn_url}"))?;
+        let size = match resp.header("content-length").and_then(|v| v.parse::<u64>().ok()) {
+            Some(s) => s,
+            None => {
+                log::warn!("  {} — no Content-Length, skipping", fname);
+                continue;
+            }
+        };
+
+        log::info!("  {} — {} bytes", fname, size);
+        specs.push((fname.clone(), RemoteFileSpec { cdn_url, size, token: token.clone() }));
+    }
+
+    Ok(specs)
+}
+
 /// Parse an `hf://` output URL into an `HfOutputSpec`.
 pub fn parse_hf_output(hf_url_str: &str) -> anyhow::Result<HfOutputSpec> {
     let hf = parse(hf_url_str)

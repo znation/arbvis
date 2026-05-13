@@ -66,98 +66,26 @@ impl Dtype {
         }
     }
 
-    /// Decode a little-endian byte slice to a Vec<f32> for diff computation.
-    pub fn decode_to_f32(self, bytes: &[u8]) -> Vec<f32> {
-        let elem = self.element_size();
-        let n = bytes.len() / elem;
-        let mut out = Vec::with_capacity(n);
-        match self {
-            Dtype::F32 => {
-                for chunk in bytes.chunks_exact(4) {
-                    out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-                }
-            }
-            Dtype::F16 => {
-                for chunk in bytes.chunks_exact(2) {
-                    let v = half::f16::from_le_bytes([chunk[0], chunk[1]]);
-                    out.push(v.to_f32());
-                }
-            }
-            Dtype::BF16 => {
-                for chunk in bytes.chunks_exact(2) {
-                    let v = half::bf16::from_le_bytes([chunk[0], chunk[1]]);
-                    out.push(v.to_f32());
-                }
-            }
-            Dtype::F64 => {
-                for chunk in bytes.chunks_exact(8) {
-                    let v = f64::from_le_bytes([
-                        chunk[0], chunk[1], chunk[2], chunk[3],
-                        chunk[4], chunk[5], chunk[6], chunk[7],
-                    ]);
-                    out.push(v as f32);
-                }
-            }
-            Dtype::I8 => {
-                for &b in bytes {
-                    out.push((b as i8) as f32);
-                }
-            }
-            Dtype::U8 | Dtype::Bool => {
-                for &b in bytes {
-                    out.push(b as f32);
-                }
-            }
-            Dtype::I16 => {
-                for chunk in bytes.chunks_exact(2) {
-                    let v = i16::from_le_bytes([chunk[0], chunk[1]]);
-                    out.push(v as f32);
-                }
-            }
-            Dtype::U16 => {
-                for chunk in bytes.chunks_exact(2) {
-                    let v = u16::from_le_bytes([chunk[0], chunk[1]]);
-                    out.push(v as f32);
-                }
-            }
-            Dtype::I32 => {
-                for chunk in bytes.chunks_exact(4) {
-                    let v = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    out.push(v as f32);
-                }
-            }
-            Dtype::U32 => {
-                for chunk in bytes.chunks_exact(4) {
-                    let v = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    out.push(v as f32);
-                }
-            }
-            Dtype::I64 => {
-                for chunk in bytes.chunks_exact(8) {
-                    let v = i64::from_le_bytes([
-                        chunk[0], chunk[1], chunk[2], chunk[3],
-                        chunk[4], chunk[5], chunk[6], chunk[7],
-                    ]);
-                    out.push(v as f32);
-                }
-            }
-            Dtype::U64 => {
-                for chunk in bytes.chunks_exact(8) {
-                    let v = u64::from_le_bytes([
-                        chunk[0], chunk[1], chunk[2], chunk[3],
-                        chunk[4], chunk[5], chunk[6], chunk[7],
-                    ]);
-                    out.push(v as f32);
-                }
-            }
-            Dtype::F8E4M3 | Dtype::F8E5M2 | Dtype::Unknown => {
-                for &b in bytes {
-                    out.push(b as f32);
-                }
-            }
-        }
-        out
+    /// Compute the signed-relative diff between matched elements, returning one u8 per element pair.
+    /// `self` is the dtype for `orig`; `mod_dtype` is the dtype for `mod_`.
+    /// Encoding: 127 = no change, 128–254 = increased, 0–126 = decreased, 255 = non-finite.
+    /// No intermediate Vec<f32> is allocated.
+    pub fn diff_to_u8(self, orig: &[u8], mod_dtype: Dtype, mod_: &[u8], epsilon: f32) -> Vec<u8> {
+        let orig_elem = self.element_size();
+        let mod_elem = mod_dtype.element_size();
+        orig.chunks_exact(orig_elem)
+            .zip(mod_.chunks_exact(mod_elem))
+            .map(|(oc, mc)| {
+                let o = decode_element(self, oc);
+                let m = decode_element(mod_dtype, mc);
+                if !o.is_finite() || !m.is_finite() { return 255u8; }
+                let signed_rel = (m - o) / o.abs().max(epsilon);
+                let brightness = (signed_rel.abs().sqrt().min(1.0) * 127.0).round() as u8;
+                if signed_rel >= 0.0 { 127u8 + brightness } else { 127u8 - brightness }
+            })
+            .collect()
     }
+
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +120,25 @@ impl TensorMeta {
             Dtype::Unknown => "?",
         };
         format!("{} [{}, {}]", self.name, dtype_str, shape_str.join("×"))
+    }
+}
+
+/// Decode a single element from a little-endian byte slice.
+fn decode_element(dtype: Dtype, bytes: &[u8]) -> f32 {
+    match dtype {
+        Dtype::F32 => f32::from_le_bytes(bytes.try_into().unwrap()),
+        Dtype::F16 => half::f16::from_le_bytes(bytes.try_into().unwrap()).to_f32(),
+        Dtype::BF16 => half::bf16::from_le_bytes(bytes.try_into().unwrap()).to_f32(),
+        Dtype::F64 => f64::from_le_bytes(bytes.try_into().unwrap()) as f32,
+        Dtype::I8 => (bytes[0] as i8) as f32,
+        Dtype::U8 | Dtype::Bool => bytes[0] as f32,
+        Dtype::I16 => i16::from_le_bytes(bytes.try_into().unwrap()) as f32,
+        Dtype::U16 => u16::from_le_bytes(bytes.try_into().unwrap()) as f32,
+        Dtype::I32 => i32::from_le_bytes(bytes.try_into().unwrap()) as f32,
+        Dtype::U32 => u32::from_le_bytes(bytes.try_into().unwrap()) as f32,
+        Dtype::I64 => i64::from_le_bytes(bytes.try_into().unwrap()) as f32,
+        Dtype::U64 => u64::from_le_bytes(bytes.try_into().unwrap()) as f32,
+        Dtype::F8E4M3 | Dtype::F8E5M2 | Dtype::Unknown => bytes[0] as f32,
     }
 }
 

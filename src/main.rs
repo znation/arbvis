@@ -12,6 +12,7 @@ mod tiled;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
@@ -111,13 +112,31 @@ fn run(args: Args) -> anyhow::Result<()> {
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
-        let diff_args: Vec<PathBuf> = raw_diff_args
-            .into_iter()
-            .map(resolve_input)
-            .collect::<anyhow::Result<_>>()?;
         let diff_title = args.title.as_deref().unwrap_or("arbvis diff");
-        let (sources, total) =
-            data::prepare_diff_sources(&diff_args[0], &diff_args[1], format_safetensors)?;
+        let orig_str = &diff_input_strs[0];
+        let mod_str  = &diff_input_strs[1];
+
+        let (sources, total) = if hf_url::is_repo_level(orig_str) && hf_url::is_repo_level(mod_str) {
+            // Both are repo-level hf:// URLs: list files over API, diff lazily over HTTP.
+            // No model weights are downloaded to disk or held in RAM.
+            if args.sort {
+                anyhow::bail!("--sort is not supported with repo-level hf:// diff inputs");
+            }
+            let agent = Arc::new(ureq::AgentBuilder::new().build());
+            let token = hf_url::get_token().map(Arc::new);
+            let orig_specs = hf_url::list_repo_as_http_specs(orig_str)
+                .with_context(|| format!("listing files in {orig_str}"))?;
+            let mod_specs = hf_url::list_repo_as_http_specs(mod_str)
+                .with_context(|| format!("listing files in {mod_str}"))?;
+            data::prepare_diff_sources_from_http(&orig_specs, &mod_specs, agent, token)?
+        } else {
+            // At least one side is a local path or single-file hf:// URL.
+            let diff_args: Vec<PathBuf> = raw_diff_args
+                .into_iter()
+                .map(resolve_input)
+                .collect::<anyhow::Result<_>>()?;
+            data::prepare_diff_sources(&diff_args[0], &diff_args[1], format_safetensors)?
+        };
         let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
         if let Some(ref tile_dir) = tiles_arg {
             tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, true, diff_title, &diff_input_strs)?;

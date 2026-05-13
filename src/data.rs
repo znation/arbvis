@@ -3,11 +3,12 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::SystemTime;
 
 // Maximum concurrent outbound HTTP range requests across all rayon threads.
-// Prevents 429 rate-limiting from HF's CDN on large machines with many cores.
-const HTTP_CONCURRENCY: usize = 24;
+const HTTP_CONCURRENCY: usize = 8;
 
 static HTTP_SEM: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
 
@@ -32,6 +33,41 @@ fn acquire_http_sem() -> SemGuard<'static> {
     }
     *n -= 1;
     SemGuard(sem)
+}
+
+// Global earliest timestamp (ms since UNIX epoch) at which any HTTP request may proceed.
+// When any thread receives a 429 it pushes this forward; all others wait.
+static HTTP_BACKOFF_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn set_global_http_backoff(delay_ms: u64) {
+    let until = now_ms() + delay_ms;
+    HTTP_BACKOFF_UNTIL_MS.fetch_max(until, Ordering::Relaxed);
+}
+
+fn wait_global_http_backoff() {
+    loop {
+        let until = HTTP_BACKOFF_UNTIL_MS.load(Ordering::Relaxed);
+        let now = now_ms();
+        if now >= until { break; }
+        std::thread::sleep(std::time::Duration::from_millis((until - now).min(200)));
+    }
+}
+
+/// Deterministic per-call jitter: 0..base_ms extra, derived from subsecond nanos.
+fn jitter_ms(base_ms: u64) -> u64 {
+    if base_ms == 0 { return 0; }
+    let ns = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+    ns % base_ms
 }
 
 use anyhow::Context;
@@ -93,12 +129,14 @@ impl Data {
                     if attempt > 0 {
                         log::warn!("range request retry {attempt}/{MAX_RETRIES} for {url}: {last_err}");
                     }
+                    // Respect any global back-pressure set by a 429 on any thread.
+                    wait_global_http_backoff();
                     let mut req = agent.get(url.as_str()).set("Range", &range);
                     if let Some(t) = token {
                         req = req.set("Authorization", &format!("Bearer {t}"));
                     }
                     // Hold semaphore only during the network call+read, not during sleep.
-                    let (call_ok, delay_ms) = {
+                    let delay_ms = {
                         let _sem = acquire_http_sem();
                         match req.call() {
                             Ok(resp) => {
@@ -107,26 +145,31 @@ impl Data {
                                     Ok(_) if bytes.len() == len => return Ok(Cow::Owned(bytes)),
                                     Ok(_) => {
                                         last_err = format!("short read: {} bytes, expected {}", bytes.len(), len);
-                                        (false, 500u64 << attempt.min(5))
+                                        let base = 500u64 << attempt.min(5);
+                                        base + jitter_ms(base)
                                     }
                                     Err(e) => {
                                         last_err = format!("read failed: {e}");
-                                        (false, 500u64 << attempt.min(5))
+                                        let base = 500u64 << attempt.min(5);
+                                        base + jitter_ms(base)
                                     }
                                 }
                             }
                             Err(ureq::Error::Status(429, _)) => {
                                 last_err = "429 rate limited".to_string();
-                                // Long backoff: 5s, 10s, 20s, 40s, … capped at 60s.
-                                (false, (5_000u64 << attempt.min(3)).min(60_000))
+                                // Push all threads back by the full base delay.
+                                let base = (5_000u64 << attempt.min(3)).min(60_000);
+                                set_global_http_backoff(base);
+                                // This thread sleeps base + jitter so threads stagger on wake.
+                                base + jitter_ms(base)
                             }
                             Err(e) => {
                                 last_err = format!("{e}");
-                                (false, 500u64 << attempt.min(5))
+                                let base = 500u64 << attempt.min(5);
+                                base + jitter_ms(base)
                             }
                         }
                     };
-                    let _ = call_ok;
                     if attempt < MAX_RETRIES {
                         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                     }

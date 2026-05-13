@@ -3,6 +3,8 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context};
 
+use crate::hf_url::HfOutputSpec;
+
 /// Upload a single local file to a Hugging Face repo via the `hf` CLI.
 ///
 /// `repo_type` must be one of `"model"`, `"dataset"`, or `"space"`.
@@ -51,13 +53,51 @@ pub fn upload_dir(
     ])
 }
 
+/// Create (or verify) the HF bucket dataset that backs a Space, and return an
+/// `HfOutputSpec` pointing at it. Used by the streaming path so tiles can be
+/// uploaded directly to the bucket without touching local disk.
+pub fn create_space_bucket(space_id: &str) -> anyhow::Result<(HfOutputSpec, String)> {
+    let bucket_id = derive_bucket_id(space_id)?;
+    eprintln!("Ensuring bucket {} exists...", bucket_id);
+    hf_idempotent(&["buckets", "create", &bucket_id])?;
+    let spec = HfOutputSpec {
+        endpoint: "https://huggingface.co".to_string(),
+        repo_id: bucket_id.clone(),
+        repo_type_str: "dataset",
+        revision: "main".to_string(),
+        path_prefix: String::new(),
+    };
+    Ok((spec, bucket_id))
+}
+
+/// Deploy (or redeploy) the Space app files — app.py, README, Dockerfile,
+/// requirements.txt, and index.html. Assumes tiles and labels.json are already
+/// in the bucket (either synced from local disk or streamed directly).
+pub fn deploy_space_app(space_id: &str, bucket_id: &str, index_html: Vec<u8>) -> anyhow::Result<()> {
+    eprintln!("Ensuring Space {} exists...", space_id);
+    hf_idempotent(&["repos", "create", space_id, "--repo-type=space", "--space-sdk=docker"])?;
+
+    eprintln!("Uploading Space files...");
+    let tmp = tempfile::TempDir::new()?;
+    write_space_files(tmp.path(), bucket_id, space_id)?;
+    std::fs::write(tmp.path().join("index.html"), index_html)?;
+
+    hf_idempotent(&[
+        "upload",
+        space_id,
+        tmp.path().to_str().context("non-UTF-8 temp path")?,
+        ".",
+        "--repo-type=space",
+    ])?;
+
+    eprintln!("Deployed to https://huggingface.co/spaces/{}", space_id);
+    Ok(())
+}
+
 pub fn run_deploy(tiles_dir: &Path, space_id: &str) -> anyhow::Result<()> {
     validate_tiles_dir(tiles_dir)?;
 
-    let bucket_id = derive_bucket_id(space_id)?;
-
-    eprintln!("Ensuring bucket {} exists...", bucket_id);
-    hf_idempotent(&["buckets", "create", &bucket_id])?;
+    let (_, bucket_id) = create_space_bucket(space_id)?;
 
     eprintln!("Syncing tiles to bucket (this may take a while for large outputs)...");
     let tiles_path = tiles_dir.join("tiles");
@@ -80,27 +120,9 @@ pub fn run_deploy(tiles_dir: &Path, space_id: &str) -> anyhow::Result<()> {
         &bucket_labels_url,
     ])?;
 
-    eprintln!("Ensuring Space {} exists...", space_id);
-    hf_idempotent(&["repos", "create", space_id, "--repo-type=space", "--space-sdk=docker"])?;
-
-    eprintln!("Uploading Space files...");
-    let tmp = tempfile::TempDir::new()?;
-    write_space_files(tmp.path(), &bucket_id, space_id)?;
-
-    // Copy index.html into the same temp dir so all Space files go in one commit.
-    let index_path = tiles_dir.join("index.html");
-    std::fs::copy(&index_path, tmp.path().join("index.html"))?;
-
-    hf_idempotent(&[
-        "upload",
-        space_id,
-        tmp.path().to_str().context("non-UTF-8 temp path")?,
-        ".",
-        "--repo-type=space",
-    ])?;
-
-    eprintln!("Deployed to https://huggingface.co/spaces/{}", space_id);
-    Ok(())
+    let index_html = std::fs::read(tiles_dir.join("index.html"))
+        .context("failed to read index.html from tiles directory")?;
+    deploy_space_app(space_id, &bucket_id, index_html)
 }
 
 fn validate_tiles_dir(dir: &Path) -> anyhow::Result<()> {

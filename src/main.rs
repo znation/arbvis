@@ -138,20 +138,25 @@ fn run(args: Args) -> anyhow::Result<()> {
             data::prepare_diff_sources(&diff_args[0], &diff_args[1], format_safetensors)?
         };
         let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
-        if let Some(ref tile_dir) = tiles_arg {
-            tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, true, diff_title, &diff_input_strs)?;
-            if let Some(ref space_id) = args.space {
-                deploy::run_deploy(tile_dir, space_id)?;
-            }
-            if let Some(ref url) = tiles_upload {
-                hf_url::upload_dir_to(url, tile_dir)?;
-            }
+        // Stream directly to HF — no tiles written to local disk.
+        if let Some(ref hf_out_url) = tiles_hf_out {
+            if args.sort { anyhow::bail!("--sort is not supported with hf:// tile output"); }
+            let hf_out = hf_url::parse_hf_output(hf_out_url)?;
+            let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, true, diff_title, &diff_input_strs)?;
             return Ok(());
         }
         if let Some(ref space_id) = args.space {
-            let tile_dir = derive_space_tile_dir(space_id);
+            if args.sort { anyhow::bail!("--sort is not supported with --space diff output"); }
+            let (bucket_spec, bucket_id) = deploy::create_space_bucket(space_id)?;
+            let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, true, diff_title, &diff_input_strs)?;
+            deploy::deploy_space_app(space_id, &bucket_id, html)?;
+            return Ok(());
+        }
+        if let Some(ref tile_dir) = tiles_arg {
             tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, true, diff_title, &diff_input_strs)?;
-            deploy::run_deploy(&tile_dir, space_id)?;
+            if let Some(ref url) = tiles_upload {
+                hf_url::upload_dir_to(url, tile_dir)?;
+            }
             return Ok(());
         }
         single::run_single(&labels, output_arg.clone(), sources, total, args.sort, true)?;
@@ -215,7 +220,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         let (sources, total) = data::prepare_sources_from_specs(&specs, format_safetensors)?;
         let hf_out = hf_url::parse_hf_output(hf_out_url)?;
         let stream_title = args.title.as_deref().unwrap_or("arbvis");
-        tiled::run_tiles_hf_streaming(sources, total, &hf_out, false, stream_title, &input_strs)?;
+        let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, false, stream_title, &input_strs)?;
         return Ok(());
     }
 
@@ -245,9 +250,10 @@ fn run(args: Args) -> anyhow::Result<()> {
     }
 
     if let Some(ref space_id) = args.space {
-        let tile_dir = derive_space_tile_dir(space_id);
-        tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, false, tile_title, &original_inputs)?;
-        deploy::run_deploy(&tile_dir, space_id)?;
+        if args.sort { anyhow::bail!("--sort is not supported with --space output"); }
+        let (bucket_spec, bucket_id) = deploy::create_space_bucket(space_id)?;
+        let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, false, tile_title, &original_inputs)?;
+        deploy::deploy_space_app(space_id, &bucket_id, html)?;
         return Ok(());
     }
 
@@ -256,11 +262,6 @@ fn run(args: Args) -> anyhow::Result<()> {
         hf_url::upload_file_to(url, local)?;
     }
     Ok(())
-}
-
-fn derive_space_tile_dir(space_id: &str) -> PathBuf {
-    let repo = space_id.split('/').last().unwrap_or(space_id);
-    PathBuf::from(repo)
 }
 
 /// Resolve an input path: download from HF if it starts with `hf://`.

@@ -383,6 +383,9 @@ pub fn run_tiles(
 
 /// Run the tiled/pyramidal output pipeline, streaming tiles directly to HuggingFace Hub
 /// via LFS pre-upload + single commit. Zero local disk required.
+///
+/// Returns the generated `index.html` bytes so callers that also deploy a Space can
+/// upload them there without re-generating.
 pub fn run_tiles_hf_streaming(
     sources: Vec<Source>,
     total: u64,
@@ -390,7 +393,7 @@ pub fn run_tiles_hf_streaming(
     diff_mode: bool,
     title: &str,
     inputs: &[String],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<u8>> {
     let token = crate::hf_url::get_token()
         .context("HF token required for hf:// output; set HF_TOKEN or run `huggingface-cli login`")?;
 
@@ -549,7 +552,7 @@ pub fn run_tiles_hf_streaming(
     // Upload index.html and labels.json before committing.
     log::info!("Uploading index.html and labels.json...");
     let (html_bytes, labels_bytes) = generate_leaflet_content(world_w, max_zoom, height, &entities, title, inputs);
-    session.upload_file(hf_out.index_html_path(), html_bytes)?;
+    session.upload_file(hf_out.index_html_path(), html_bytes.clone())?;
     session.upload_file(hf_out.labels_json_path(), labels_bytes)?;
 
     // Drop the pyramid Arc so session has only one reference remaining.
@@ -561,5 +564,5 @@ pub fn run_tiles_hf_streaming(
         .commit("Add arbvis visualization tiles")?;
 
     log::info!("Streaming output committed to hf://{}/{}", hf_out.repo_id, hf_out.path_prefix);
-    Ok(())
+    Ok(html_bytes)
 }

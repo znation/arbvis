@@ -252,23 +252,23 @@ fn run(args: Args) -> anyhow::Result<()> {
     // available). Without xet, we download to the local cache as before.
     let tile_title = args.title.as_deref().unwrap_or("arbvis");
     let (sources, total) = if xet_vis {
-        let specs: Vec<InputSpec> = files
-            .iter()
-            .map(|p| {
-                let s = p.to_string_lossy();
-                if s.starts_with("hf://") {
-                    if hf_url::is_repo_level(&s)? {
-                        anyhow::bail!(
-                            "--show-xet-xorbs / --show-xet-chunks with a repo-level hf:// URL is not yet supported; \
-                             pass a specific file path (e.g. hf://owner/repo/file.safetensors)"
-                        );
+        let mut specs: Vec<InputSpec> = Vec::new();
+        for p in &files {
+            let s = p.to_string_lossy();
+            if s.starts_with("hf://") {
+                if hf_url::is_repo_level(&s)? {
+                    for (_, spec) in hf_url::list_repo_as_http_specs(&s)
+                        .with_context(|| format!("listing files in {s}"))?
+                    {
+                        specs.push(InputSpec::Remote(spec));
                     }
-                    hf_url::resolve_to_http(p).map(InputSpec::Remote)
                 } else {
-                    Ok(InputSpec::Local(p.clone()))
+                    specs.push(hf_url::resolve_to_http(p).map(InputSpec::Remote)?);
                 }
-            })
-            .collect::<anyhow::Result<_>>()?;
+            } else {
+                specs.push(InputSpec::Local(p.clone()));
+            }
+        }
         let (mut sources, total) = data::prepare_sources_from_specs(&specs, format_safetensors)?;
         data::populate_xet_terms(&mut sources)?;
         (sources, total)

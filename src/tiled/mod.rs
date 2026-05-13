@@ -393,8 +393,8 @@ pub fn run_tiles_hf_streaming(
     title: &str,
     inputs: &[String],
 ) -> anyhow::Result<Vec<u8>> {
-    let client = crate::hf_url::client()
-        .context("HF token required for hf:// output; set HF_TOKEN or run `huggingface-cli login`")?;
+    crate::hf_url::require_token()?;
+    let client = crate::hf_url::client()?;
 
     // Geometry setup — identical to run_tiles().
     let mut s = 16u32;

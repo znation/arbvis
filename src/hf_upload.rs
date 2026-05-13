@@ -7,130 +7,115 @@ use hf_hub::repository::CommitOperation;
 use hf_hub::HFClientSync;
 use tempfile::TempDir;
 
-use crate::hf_url::HfOutputSpec;
+use crate::hf_url::{self, HfOutputSpec, RepoKind};
 use crate::tiled::pyramid_accum::TileSink;
 
 /// Sink for streaming tile output to the Hub.
 ///
-/// - For git-backed repos (model / dataset / space): each tile becomes an in-memory
-///   `CommitOperation::Add` accumulated under a mutex; finalised in a single
-///   `create_commit()` call. No tile bytes touch local disk.
-/// - For buckets: each tile is written into a `TempDir` because hf-hub's bucket
-///   upload API requires on-disk source paths to drive its xet upload + batch
-///   register flow. The tempdir is deleted on `commit()` return.
+/// Both code paths stage tiles to a `TempDir` as they are rendered, then hand
+/// the disk-backed paths to hf-hub at commit time. This bounds steady-state RAM
+/// to O(in-flight tiles) regardless of pyramid size; the bytes for already-
+/// rendered tiles live only on local disk.
+///
+/// Why disk staging rather than upload-as-you-go: hf-hub 1.0.0-rc.1 exposes
+/// neither a public "upload bytes now, reference by hash at commit time" seam
+/// for git-backed repos (its `xet_upload` is `pub(crate)`) nor a per-file
+/// streaming entry point for buckets (`upload_files` takes a `Vec<BucketUpload>`
+/// of on-disk paths). To go below disk too — pyramids larger than local free
+/// disk — needs an upstream hf-hub feature; until then the tempdir is the floor.
 pub struct HfTileSink {
     client: HFClientSync,
     spec: HfOutputSpec,
-    state: SinkState,
+    tempdir: TempDir,
+    /// Tiles staged to `tempdir`, indexed by repo path. Recorded in a single
+    /// mutex so the commit/upload step can iterate without re-walking the
+    /// directory (and so an empty render is observable as `staged.is_empty()`).
+    staged: Mutex<Vec<StagedTile>>,
 }
 
-enum SinkState {
-    Repo { ops: Mutex<Vec<CommitOperation>> },
-    Bucket { tempdir: TempDir },
+struct StagedTile {
+    repo_path: String,
+    local_path: PathBuf,
 }
 
 impl HfTileSink {
     pub fn new(client: HFClientSync, spec: HfOutputSpec) -> anyhow::Result<Self> {
-        let state = if spec.repo_type_str == "bucket" {
-            SinkState::Bucket { tempdir: tempfile::tempdir().context("creating tile tempdir")? }
-        } else {
-            SinkState::Repo { ops: Mutex::new(Vec::new()) }
-        };
-        Ok(Self { client, spec, state })
+        let tempdir = tempfile::Builder::new()
+            .prefix("arbvis-tiles-")
+            .tempdir()
+            .context("creating tile staging tempdir")?;
+        Ok(Self { client, spec, tempdir, staged: Mutex::new(Vec::new()) })
     }
 
-    /// Finalize: push everything to the Hub in one commit (or bucket sync).
+    /// Finalize: push everything to the Hub in one commit (or bucket upload).
     pub fn commit(self, summary: &str) -> anyhow::Result<()> {
-        let (owner, name) = split_owner_name(&self.spec.repo_id)?;
-        match self.state {
-            SinkState::Repo { ops } => {
-                let ops = ops.into_inner().unwrap();
-                log::info!("Committing {} files to hf://{}", ops.len(), self.spec.repo_id);
-                match self.spec.repo_type_str {
-                    "model" => {
+        let staged = self
+            .staged
+            .into_inner()
+            .expect("tile sink mutex poisoned");
+
+        if staged.is_empty() {
+            log::info!("No tiles staged; skipping commit to hf://{}", self.spec.repo_id);
+            return Ok(());
+        }
+
+        let (owner, name) = hf_url::split_owner_name(&self.spec.repo_id)?;
+        log::info!("Committing {} files to hf://{}", staged.len(), self.spec.repo_id);
+
+        match self.spec.kind {
+            RepoKind::Bucket => {
+                let uploads: Vec<BucketUpload> = staged
+                    .into_iter()
+                    .map(|t| BucketUpload::new(t.local_path, t.repo_path))
+                    .collect();
+                self.client.bucket(owner, name)
+                    .upload_files()
+                    .files(uploads)
+                    .send()?;
+            }
+            kind => {
+                let ops: Vec<CommitOperation> = staged
+                    .into_iter()
+                    .map(|t| CommitOperation::add_file(t.repo_path, t.local_path))
+                    .collect();
+                let revision = self.spec.revision.clone();
+                let message = summary.to_string();
+                match kind {
+                    RepoKind::Model => {
                         self.client.model(owner, name)
-                            .create_commit()
-                            .operations(ops)
-                            .commit_message(summary.to_string())
-                            .revision(self.spec.revision.clone())
-                            .send()?;
+                            .create_commit().operations(ops).commit_message(message).revision(revision).send()?;
                     }
-                    "dataset" => {
+                    RepoKind::Dataset => {
                         self.client.dataset(owner, name)
-                            .create_commit()
-                            .operations(ops)
-                            .commit_message(summary.to_string())
-                            .revision(self.spec.revision.clone())
-                            .send()?;
+                            .create_commit().operations(ops).commit_message(message).revision(revision).send()?;
                     }
-                    "space" => {
+                    RepoKind::Space => {
                         self.client.space(owner, name)
-                            .create_commit()
-                            .operations(ops)
-                            .commit_message(summary.to_string())
-                            .revision(self.spec.revision.clone())
-                            .send()?;
+                            .create_commit().operations(ops).commit_message(message).revision(revision).send()?;
                     }
-                    other => anyhow::bail!("unknown repo type {other:?}"),
+                    RepoKind::Bucket => unreachable!(),
                 }
             }
-            SinkState::Bucket { tempdir } => {
-                let bucket = self.client.bucket(owner, name);
-                let entries = collect_bucket_entries(tempdir.path(), tempdir.path())?;
-                log::info!("Uploading {} files to bucket {}", entries.len(), self.spec.repo_id);
-                bucket.upload_files().files(entries).send()?;
-            }
         }
+        // tempdir drops here — staged tile files are removed from disk.
+        drop(self.tempdir);
         Ok(())
     }
 }
 
 impl TileSink for HfTileSink {
     fn upload_tile(&self, repo_path: String, png_bytes: Vec<u8>) -> anyhow::Result<()> {
-        match &self.state {
-            SinkState::Repo { ops } => {
-                ops.lock().unwrap().push(CommitOperation::add_bytes(repo_path, png_bytes));
-                Ok(())
-            }
-            SinkState::Bucket { tempdir } => {
-                let path = tempdir.path().join(&repo_path);
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(&path, &png_bytes)?;
-                Ok(())
-            }
+        let local_path = self.tempdir.path().join(&repo_path);
+        if let Some(parent) = local_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating tile dir {}", parent.display()))?;
         }
+        std::fs::write(&local_path, &png_bytes)
+            .with_context(|| format!("writing tile {}", local_path.display()))?;
+        self.staged
+            .lock()
+            .expect("tile sink mutex poisoned")
+            .push(StagedTile { repo_path, local_path });
+        Ok(())
     }
-}
-
-fn split_owner_name(repo_id: &str) -> anyhow::Result<(&str, &str)> {
-    let slash = repo_id
-        .find('/')
-        .with_context(|| format!("expected owner/name, got {repo_id:?}"))?;
-    Ok((&repo_id[..slash], &repo_id[slash + 1..]))
-}
-
-fn collect_bucket_entries(root: &std::path::Path, dir: &std::path::Path) -> anyhow::Result<Vec<BucketUpload>> {
-    let mut out = Vec::new();
-    walk_files(root, dir, &mut out)?;
-    Ok(out)
-}
-
-fn walk_files(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<BucketUpload>) -> anyhow::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            walk_files(root, &path, out)?;
-        } else if path.is_file() {
-            let rel = path
-                .strip_prefix(root)
-                .with_context(|| format!("path outside root: {}", path.display()))?
-                .to_string_lossy()
-                .replace(std::path::MAIN_SEPARATOR, "/");
-            out.push(BucketUpload::new(PathBuf::from(&path), rel));
-        }
-    }
-    Ok(())
 }

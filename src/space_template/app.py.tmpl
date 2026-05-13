@@ -1,0 +1,38 @@
+import os
+from fastapi import FastAPI, Response
+from fastapi.responses import FileResponse
+from huggingface_hub import HfFileSystem
+from huggingface_hub.errors import EntryNotFoundError
+
+BUCKET_ID = "__BUCKET_ID__"
+
+app = FastAPI()
+_fs = None
+
+
+def fs():
+    global _fs
+    if _fs is None:
+        _fs = HfFileSystem(token=os.environ.get("HF_TOKEN"))
+    return _fs
+
+
+@app.get("/")
+def index():
+    return FileResponse("index.html")
+
+
+@app.get("/labels.json")
+def labels():
+    data = fs().read_bytes(f"hf://buckets/{BUCKET_ID}/labels.json")
+    return Response(content=data, media_type="application/json")
+
+
+@app.get("/tiles/{z}/{x}/{y_png}")
+def tile(z: int, x: int, y_png: str):
+    path = f"hf://buckets/{BUCKET_ID}/tiles/{z}/{x}/{y_png}"
+    try:
+        data = fs().read_bytes(path)
+    except (FileNotFoundError, EntryNotFoundError):
+        return Response(status_code=404)
+    return Response(content=data, media_type="image/png")

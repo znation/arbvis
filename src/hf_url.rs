@@ -3,14 +3,30 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use hf_hub::{
-    HFClientSync, HFRepositorySync, RepoTypeDataset, RepoTypeModel, RepoTypeSpace,
+    HFBucketSync, HFClientSync, HFRepositorySync, RepoTypeDataset, RepoTypeModel, RepoTypeSpace,
 };
+
+/// Repo kind parsed from an `hf://` URL. Carried as a typed value rather than a
+/// string so the four upload/download dispatch sites in this crate can match
+/// exhaustively and the compiler enforces consistency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepoKind {
+    Model,
+    Dataset,
+    Space,
+    Bucket,
+}
 
 /// Typed repo handle bundling the kind, revision, and the in-process client.
 ///
 /// Carries the type marker as an enum so `Data::Http` can dispatch range
 /// downloads against the right `HFRepositorySync<T>` without leaking generics
 /// through the rest of the codebase.
+///
+/// Buckets are intentionally absent from this enum: the bucket HTTP API has no
+/// range-read primitive in hf-hub 1.0, so any caller building a `RemoteRepo`
+/// for read access is doing range I/O and bucket URLs are rejected upstream
+/// (see [`make_remote_repo`]).
 #[derive(Clone)]
 pub enum RemoteRepo {
     Model(HFRepositorySync<RepoTypeModel>),
@@ -20,12 +36,13 @@ pub enum RemoteRepo {
 
 impl RemoteRepo {
     pub fn fetch_range(&self, filename: &str, revision: &str, range: std::ops::Range<u64>) -> anyhow::Result<Vec<u8>> {
-        let bytes = match self {
+        match self {
             RemoteRepo::Model(r) => r.download_file_to_bytes().filename(filename).revision(revision).range(range).send(),
             RemoteRepo::Dataset(r) => r.download_file_to_bytes().filename(filename).revision(revision).range(range).send(),
             RemoteRepo::Space(r) => r.download_file_to_bytes().filename(filename).revision(revision).range(range).send(),
-        }?;
-        Ok(bytes.to_vec())
+        }
+        .map(|b| b.to_vec())
+        .map_err(Into::into)
     }
 }
 
@@ -42,7 +59,7 @@ pub struct RemoteFileSpec {
 #[derive(Clone)]
 pub struct HfOutputSpec {
     pub repo_id: String,
-    pub repo_type_str: &'static str, // "model", "dataset", "space", or "bucket"
+    pub kind: RepoKind,
     pub revision: String,
     pub path_prefix: String,
 }
@@ -65,30 +82,12 @@ impl HfOutputSpec {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ParsedRepoKind {
-    Model,
-    Dataset,
-    Space,
-    Bucket,
-}
-
-impl ParsedRepoKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            ParsedRepoKind::Model => "model",
-            ParsedRepoKind::Dataset => "dataset",
-            ParsedRepoKind::Space => "space",
-            ParsedRepoKind::Bucket => "bucket",
-        }
-    }
-}
-
-struct HfUrl {
-    kind: ParsedRepoKind,
-    repo_id: String,
-    revision: String,
-    path_in_repo: String,
+#[derive(Debug)]
+pub(crate) struct HfUrl {
+    pub(crate) kind: RepoKind,
+    pub(crate) repo_id: String,
+    pub(crate) revision: String,
+    pub(crate) path_in_repo: String,
 }
 
 /// Parse an `hf://` URL into its components.
@@ -99,8 +98,11 @@ struct HfUrl {
 ///   hf://models/{owner}/{repo}[@{rev}][/{path}]   → model
 ///   hf://datasets/{owner}/{repo}[@{rev}][/{path}] → dataset
 ///   hf://spaces/{owner}/{repo}[@{rev}][/{path}]   → space
-///   hf://buckets/{owner}/{bucket}[/{path}]         → bucket (Xet; no revision concept)
-fn parse(raw: &str) -> anyhow::Result<HfUrl> {
+///   hf://buckets/{owner}/{bucket}[/{path}]         → bucket (no revision concept)
+///
+/// Empty path segments — including a trailing slash — are stripped so that
+/// `hf://owner/repo/path/` parses with `path_in_repo = "path"`, not `"path/"`.
+pub(crate) fn parse(raw: &str) -> anyhow::Result<HfUrl> {
     let rest = raw
         .strip_prefix("hf://")
         .ok_or_else(|| anyhow::anyhow!("expected hf:// prefix, got {raw:?}"))?;
@@ -109,29 +111,40 @@ fn parse(raw: &str) -> anyhow::Result<HfUrl> {
         anyhow::bail!("empty hf:// URL");
     }
 
-    let segs: Vec<&str> = rest.split('/').collect();
+    // Drop empty segments so `a//b` and trailing/leading slashes don't change parsing.
+    let segs: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
 
     let (kind, segs) = match segs.first().copied() {
-        Some("models") => (ParsedRepoKind::Model, &segs[1..]),
-        Some("datasets") => (ParsedRepoKind::Dataset, &segs[1..]),
-        Some("spaces") => (ParsedRepoKind::Space, &segs[1..]),
-        Some("buckets") => (ParsedRepoKind::Bucket, &segs[1..]),
-        _ => (ParsedRepoKind::Model, &segs[..]),
+        Some("models") => (RepoKind::Model, &segs[1..]),
+        Some("datasets") => (RepoKind::Dataset, &segs[1..]),
+        Some("spaces") => (RepoKind::Space, &segs[1..]),
+        Some("buckets") => (RepoKind::Bucket, &segs[1..]),
+        _ => (RepoKind::Model, &segs[..]),
     };
 
     if segs.len() < 2 {
         anyhow::bail!(
-            "hf:// URL must have the form hf://[type/]owner/repo[@@rev][/path], got {raw:?}"
+            "hf:// URL must have the form hf://[type/]owner/repo[@rev][/path], got {raw:?}"
         );
     }
 
     let owner = segs[0];
 
     let (repo_name, revision) = if let Some(at) = segs[1].find('@') {
-        (&segs[1][..at], segs[1][at + 1..].to_string())
+        let rev = &segs[1][at + 1..];
+        if rev.is_empty() {
+            anyhow::bail!(
+                "hf:// URL has an empty revision after '@': {raw:?}; either omit the '@' or specify a branch/commit"
+            );
+        }
+        (&segs[1][..at], rev.to_string())
     } else {
         (segs[1], "main".to_string())
     };
+
+    if owner.is_empty() || repo_name.is_empty() {
+        anyhow::bail!("hf:// URL is missing owner or repo name: {raw:?}");
+    }
 
     let repo_id = format!("{owner}/{repo_name}");
     let path_in_repo = if segs.len() >= 3 { segs[2..].join("/") } else { String::new() };
@@ -147,22 +160,69 @@ pub fn client() -> anyhow::Result<HFClientSync> {
     HFClientSync::new().context("failed to initialise HF client")
 }
 
-fn split_owner_name(repo_id: &str) -> anyhow::Result<(&str, &str)> {
-    let slash = repo_id.find('/').with_context(|| format!("expected owner/name, got {repo_id:?}"))?;
+/// Returns `Ok(())` if an HF token is resolvable from the standard locations.
+///
+/// hf-hub resolves the token internally and does not expose a public getter; this
+/// mirrors its precedence so the CLI can fail with a useful message *before*
+/// attempting a write operation that would otherwise fail with a confusing 401.
+///
+/// Precedence: `HF_TOKEN` env → `HF_TOKEN_PATH` file → `$HF_HOME/token` file (with
+/// `HF_HOME` defaulting to `~/.cache/huggingface`).
+pub fn require_token() -> anyhow::Result<()> {
+    if std::env::var("HF_HUB_DISABLE_IMPLICIT_TOKEN").is_ok_and(|v| !v.is_empty()) {
+        anyhow::bail!(
+            "HF_HUB_DISABLE_IMPLICIT_TOKEN is set; set HF_TOKEN explicitly or unset this var"
+        );
+    }
+    if std::env::var("HF_TOKEN").is_ok_and(|v| !v.is_empty()) {
+        return Ok(());
+    }
+    if let Ok(p) = std::env::var("HF_TOKEN_PATH") {
+        if std::fs::read_to_string(&p).is_ok_and(|s| !s.trim().is_empty()) {
+            return Ok(());
+        }
+    }
+    let hf_home = std::env::var("HF_HOME").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/.cache/huggingface")
+    });
+    let token_file = PathBuf::from(&hf_home).join("token");
+    if std::fs::read_to_string(&token_file).is_ok_and(|s| !s.trim().is_empty()) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "HF token required for hf:// output; set HF_TOKEN or run `hf auth login`"
+    )
+}
+
+pub fn split_owner_name(repo_id: &str) -> anyhow::Result<(&str, &str)> {
+    let slash = repo_id
+        .find('/')
+        .with_context(|| format!("expected owner/name, got {repo_id:?}"))?;
     Ok((&repo_id[..slash], &repo_id[slash + 1..]))
 }
 
 fn make_remote_repo(client: &HFClientSync, hf: &HfUrl) -> anyhow::Result<RemoteRepo> {
     let (owner, name) = split_owner_name(&hf.repo_id)?;
-    Ok(match hf.kind {
-        ParsedRepoKind::Model => RemoteRepo::Model(client.model(owner, name)),
-        // Buckets don't have a single read-side equivalent in the typed API; fall
-        // back to a dataset handle (this preserves the prior 0.5 behavior).
-        ParsedRepoKind::Dataset | ParsedRepoKind::Bucket => {
-            RemoteRepo::Dataset(client.dataset(owner, name))
-        }
-        ParsedRepoKind::Space => RemoteRepo::Space(client.space(owner, name)),
-    })
+    match hf.kind {
+        RepoKind::Model => Ok(RemoteRepo::Model(client.model(owner, name))),
+        RepoKind::Dataset => Ok(RemoteRepo::Dataset(client.dataset(owner, name))),
+        RepoKind::Space => Ok(RemoteRepo::Space(client.space(owner, name))),
+        // hf-hub 1.0 exposes neither a range-read nor a bytes-stream API for
+        // buckets — only whole-file `download_files` and HEAD-style metadata.
+        // The Data::Http path requires range reads, so reject up front rather
+        // than silently routing bucket URLs through dataset APIs.
+        RepoKind::Bucket => anyhow::bail!(
+            "bucket URLs do not support range/streaming reads (hf://buckets/{}/...). \
+             Download the file first or use a model/dataset/space URL.",
+            hf.repo_id
+        ),
+    }
+}
+
+fn make_bucket(client: &HFClientSync, hf: &HfUrl) -> anyhow::Result<HFBucketSync> {
+    let (owner, name) = split_owner_name(&hf.repo_id)?;
+    Ok(client.bucket(owner, name))
 }
 
 /// If `path` starts with `hf://`, download and return its local cache path.
@@ -176,6 +236,11 @@ pub fn resolve(path: &Path) -> anyhow::Result<PathBuf> {
 
     let hf = parse(&s).with_context(|| format!("invalid hf:// URL: {s:?}"))?;
     let cli = client()?;
+
+    if hf.kind == RepoKind::Bucket {
+        return resolve_bucket(&cli, &hf);
+    }
+
     let repo = make_remote_repo(&cli, &hf)?;
 
     if hf.path_in_repo.is_empty() {
@@ -198,6 +263,60 @@ pub fn resolve(path: &Path) -> anyhow::Result<PathBuf> {
     }
     .with_context(|| format!("fetching hf://{}/{}", hf.repo_id, hf.path_in_repo))?;
 
+    log::info!("Cached at {}", local.display());
+    Ok(local)
+}
+
+/// Download a bucket file or full bucket tree to a fresh temp directory and return
+/// the local path. Buckets have no in-cache `snapshot_download` equivalent, so the
+/// caller is handed a tempdir whose lifetime is the same as the process; this
+/// matches the existing semantics for repo-level downloads where the cache dir
+/// outlives the call.
+fn resolve_bucket(cli: &HFClientSync, hf: &HfUrl) -> anyhow::Result<PathBuf> {
+    use hf_hub::buckets::{BucketDownload, BucketTreeEntry};
+
+    let bucket = make_bucket(cli, hf)?;
+    let dest_root = tempfile::Builder::new()
+        .prefix("arbvis-bucket-")
+        .tempdir()
+        .context("creating bucket download tempdir")?
+        .keep();
+
+    if hf.path_in_repo.is_empty() {
+        log::info!("Resolving bucket {} ...", hf.repo_id);
+        let entries = bucket
+            .list_tree()
+            .recursive(true)
+            .send()
+            .with_context(|| format!("listing bucket {}", hf.repo_id))?;
+        let downloads: Vec<BucketDownload> = entries
+            .into_iter()
+            .filter_map(|e| match e {
+                BucketTreeEntry::File { path, .. } => {
+                    let local = dest_root.join(&path);
+                    Some(BucketDownload::new(path, local))
+                }
+                BucketTreeEntry::Directory { .. } => None,
+            })
+            .collect();
+        if downloads.is_empty() {
+            anyhow::bail!("bucket {} has no files", hf.repo_id);
+        }
+        bucket
+            .download_files()
+            .files(downloads)
+            .send()
+            .with_context(|| format!("downloading bucket {}", hf.repo_id))?;
+        return Ok(dest_root);
+    }
+
+    log::info!("Fetching {} from bucket {} ...", hf.path_in_repo, hf.repo_id);
+    let local = dest_root.join(&hf.path_in_repo);
+    bucket
+        .download_files()
+        .files(vec![BucketDownload::new(hf.path_in_repo.clone(), local.clone())])
+        .send()
+        .with_context(|| format!("fetching hf://buckets/{}/{}", hf.repo_id, hf.path_in_repo))?;
     log::info!("Cached at {}", local.display());
     Ok(local)
 }
@@ -227,8 +346,8 @@ pub fn resolve_to_http(path: &Path) -> anyhow::Result<RemoteFileSpec> {
 }
 
 /// Returns true if the hf:// URL refers to an entire repo (no file path component).
-pub fn is_repo_level(url_str: &str) -> bool {
-    parse(url_str).map(|h| h.path_in_repo.is_empty()).unwrap_or(false)
+pub fn is_repo_level(url_str: &str) -> anyhow::Result<bool> {
+    Ok(parse(url_str)?.path_in_repo.is_empty())
 }
 
 /// List all files in a repo-level hf:// URL as `RemoteFileSpec`s without downloading.
@@ -267,25 +386,119 @@ pub fn list_repo_as_http_specs(url_str: &str) -> anyhow::Result<Vec<(String, Rem
     Ok(specs)
 }
 
-/// Parse an `hf://` output URL and upload a single local file to the target repo.
-pub fn upload_file_to(hf_url_str: &str, local: &Path) -> anyhow::Result<()> {
-    let hf = parse(hf_url_str)?;
-    crate::deploy::upload_file(local, &hf.repo_id, hf.kind.as_str(), &hf.path_in_repo)
-}
-
-/// Parse an `hf://` output URL and upload a local directory tree to the target repo.
-pub fn upload_dir_to(hf_url_str: &str, local_dir: &Path) -> anyhow::Result<()> {
-    let hf = parse(hf_url_str)?;
-    crate::deploy::upload_dir(local_dir, &hf.repo_id, hf.kind.as_str(), &hf.path_in_repo)
-}
-
 /// Parse an `hf://` output URL into an `HfOutputSpec`.
 pub fn parse_hf_output(hf_url_str: &str) -> anyhow::Result<HfOutputSpec> {
     let hf = parse(hf_url_str).with_context(|| format!("invalid hf:// output URL: {hf_url_str:?}"))?;
     Ok(HfOutputSpec {
         repo_id: hf.repo_id,
-        repo_type_str: hf.kind.as_str(),
+        kind: hf.kind,
         revision: hf.revision,
         path_prefix: hf.path_in_repo,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(s: &str) -> anyhow::Result<HfUrl> {
+        parse(s)
+    }
+
+    #[test]
+    fn parse_owner_repo_default_model() {
+        let u = p("hf://alice/foo").unwrap();
+        assert_eq!(u.kind, RepoKind::Model);
+        assert_eq!(u.repo_id, "alice/foo");
+        assert_eq!(u.revision, "main");
+        assert_eq!(u.path_in_repo, "");
+    }
+
+    #[test]
+    fn parse_owner_repo_with_revision() {
+        let u = p("hf://alice/foo@dev").unwrap();
+        assert_eq!(u.revision, "dev");
+        assert_eq!(u.path_in_repo, "");
+    }
+
+    #[test]
+    fn parse_owner_repo_with_file() {
+        let u = p("hf://alice/foo/path/to/file.bin").unwrap();
+        assert_eq!(u.repo_id, "alice/foo");
+        assert_eq!(u.revision, "main");
+        assert_eq!(u.path_in_repo, "path/to/file.bin");
+    }
+
+    #[test]
+    fn parse_typed_prefixes() {
+        assert_eq!(p("hf://models/a/b").unwrap().kind, RepoKind::Model);
+        assert_eq!(p("hf://datasets/a/b").unwrap().kind, RepoKind::Dataset);
+        assert_eq!(p("hf://spaces/a/b").unwrap().kind, RepoKind::Space);
+        assert_eq!(p("hf://buckets/a/b").unwrap().kind, RepoKind::Bucket);
+    }
+
+    #[test]
+    fn parse_dataset_with_revision_and_path() {
+        let u = p("hf://datasets/alice/foo@v1/path/to/file").unwrap();
+        assert_eq!(u.kind, RepoKind::Dataset);
+        assert_eq!(u.repo_id, "alice/foo");
+        assert_eq!(u.revision, "v1");
+        assert_eq!(u.path_in_repo, "path/to/file");
+    }
+
+    #[test]
+    fn parse_trailing_slash_strips_to_repo_level() {
+        let u = p("hf://alice/foo/").unwrap();
+        assert_eq!(u.path_in_repo, "");
+    }
+
+    #[test]
+    fn parse_trailing_slash_on_path() {
+        let u = p("hf://alice/foo/path/").unwrap();
+        assert_eq!(u.path_in_repo, "path");
+    }
+
+    #[test]
+    fn parse_duplicate_slashes_collapse() {
+        let u = p("hf://alice/foo//path//file").unwrap();
+        assert_eq!(u.path_in_repo, "path/file");
+    }
+
+    #[test]
+    fn parse_empty_revision_rejected() {
+        let err = p("hf://alice/foo@").unwrap_err().to_string();
+        assert!(err.contains("empty revision"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn parse_missing_prefix_rejected() {
+        assert!(p("alice/foo").is_err());
+        assert!(p("https://huggingface.co/alice/foo").is_err());
+    }
+
+    #[test]
+    fn parse_empty_url_rejected() {
+        assert!(p("hf://").is_err());
+    }
+
+    #[test]
+    fn parse_missing_repo_rejected() {
+        assert!(p("hf://alice").is_err());
+        assert!(p("hf://datasets/alice").is_err());
+    }
+
+    #[test]
+    fn is_repo_level_returns_error_on_bad_url() {
+        assert!(is_repo_level("not-an-hf-url").is_err());
+        assert!(is_repo_level("hf://a/b").unwrap());
+        assert!(!is_repo_level("hf://a/b/file").unwrap());
+    }
+
+    #[test]
+    fn bucket_url_parses_without_revision() {
+        let u = p("hf://buckets/alice/foo/data/x").unwrap();
+        assert_eq!(u.kind, RepoKind::Bucket);
+        assert_eq!(u.repo_id, "alice/foo");
+        assert_eq!(u.path_in_repo, "data/x");
+    }
 }

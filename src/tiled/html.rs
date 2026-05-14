@@ -16,13 +16,14 @@ pub fn generate_leaflet_content(
     world_w: u32,
     max_zoom: u32,
     height: u32,
+    tile_size: u32,
     entities: &[FileEntity],
     title: &str,
     inputs: &[String],
     chunk_segments: &[(u32, u32, u32, u32)],
 ) -> (Vec<u8>, Vec<u8>) {
     let entities_json = build_labels_json(entities, chunk_segments);
-    let html = build_html(world_w, max_zoom, height, title, inputs);
+    let html = build_html(world_w, max_zoom, height, tile_size, title, inputs);
     (html.into_bytes(), entities_json.into_bytes())
 }
 
@@ -32,6 +33,7 @@ pub fn write_leaflet_html(
     world_w: u32,
     max_zoom: u32,
     height: u32,
+    tile_size: u32,
     entities: &[FileEntity],
     title: &str,
     inputs: &[String],
@@ -40,7 +42,7 @@ pub fn write_leaflet_html(
     let entities_json = build_labels_json(entities, chunk_segments);
     std::fs::write(dir.join("labels.json"), &entities_json)?;
 
-    let html = build_html(world_w, max_zoom, height, title, inputs);
+    let html = build_html(world_w, max_zoom, height, tile_size, title, inputs);
     std::fs::write(dir.join("index.html"), html)?;
     Ok(())
 }
@@ -212,7 +214,7 @@ fn build_info_html(title: &str, inputs: &[String]) -> String {
     )
 }
 
-fn build_html(world_w: u32, max_zoom: u32, height: u32, title: &str, inputs: &[String]) -> String {
+fn build_html(world_w: u32, max_zoom: u32, height: u32, tile_size: u32, title: &str, inputs: &[String]) -> String {
     let info_html = build_info_html(title, inputs);
     let viewer_max_zoom = max_zoom + 3;
     format!(
@@ -272,13 +274,13 @@ fn build_html(world_w: u32, max_zoom: u32, height: u32, title: &str, inputs: &[S
       preferCanvas: true,
     }});
     L.tileLayer('tiles/{{z}}/{{x}}/{{y}}.png', {{
-      tileSize: 256,
+      tileSize: {tile_size},
       maxNativeZoom: {max_zoom},
-      bounds: [[-256, 0], [0, {world_w}]],
+      bounds: [[-{tile_size}, 0], [0, {world_w}]],
       noWrap: true,
       attribution: '<a href="https://github.com/znation/arbvis">arbvis</a>'
     }}).addTo(map);
-    map.fitBounds([[-256, 0], [0, {world_w}]]);
+    map.fitBounds([[-{tile_size}, 0], [0, {world_w}]]);
 
     var HEIGHT = {height};
 
@@ -286,7 +288,7 @@ fn build_html(world_w: u32, max_zoom: u32, height: u32, title: &str, inputs: &[S
 
     function drawChunks(chunks) {{
       if (!chunks || chunks.length === 0) return;
-      var scale = (256 / HEIGHT) * Math.pow(2, map.getZoom());
+      var scale = ({tile_size} / HEIGHT) * Math.pow(2, map.getZoom());
       var minWorld = 2 / scale;
       var lls = [];
       for (var i = 0; i < chunks.length; i++) {{
@@ -294,8 +296,8 @@ fn build_html(world_w: u32, max_zoom: u32, height: u32, title: &str, inputs: &[S
         var len = Math.max(Math.abs(s[2] - s[0]), Math.abs(s[3] - s[1]));
         if (len < minWorld) continue;
         lls.push([
-          [-(s[1] / HEIGHT) * 256, (s[0] / HEIGHT) * 256],
-          [-(s[3] / HEIGHT) * 256, (s[2] / HEIGHT) * 256],
+          [-(s[1] / HEIGHT) * {tile_size}, (s[0] / HEIGHT) * {tile_size}],
+          [-(s[3] / HEIGHT) * {tile_size}, (s[2] / HEIGHT) * {tile_size}],
         ]);
       }}
       if (lls.length > 0) {{
@@ -313,10 +315,10 @@ fn build_html(world_w: u32, max_zoom: u32, height: u32, title: &str, inputs: &[S
       var bounds = map.getBounds();
       var sw = bounds.getSouthWest();
       var ne = bounds.getNorthEast();
-      var minX = sw.lng * HEIGHT / 256;
-      var minY = -ne.lat * HEIGHT / 256;
-      var maxX = ne.lng * HEIGHT / 256;
-      var maxY = -sw.lat * HEIGHT / 256;
+      var minX = sw.lng * HEIGHT / {tile_size};
+      var minY = -ne.lat * HEIGHT / {tile_size};
+      var maxX = ne.lng * HEIGHT / {tile_size};
+      var maxY = -sw.lat * HEIGHT / {tile_size};
 
       var visible = [];
       for (var i = 0; i < labels.length; i++) {{
@@ -339,7 +341,7 @@ fn build_html(world_w: u32, max_zoom: u32, height: u32, title: &str, inputs: &[S
       for (var i = 0; i < visible.length; i++) {{
         var l = visible[i];
         if (l.segs && l.segs.length > 0) {{
-          var scale = (256 / HEIGHT) * Math.pow(2, map.getZoom());
+          var scale = ({tile_size} / HEIGHT) * Math.pow(2, map.getZoom());
           var minWorld = 2 / scale;
           var ll = l.segs
             .filter(function(s) {{
@@ -348,8 +350,8 @@ fn build_html(world_w: u32, max_zoom: u32, height: u32, title: &str, inputs: &[S
             }})
             .map(function(s) {{
               return [
-                [-(s[1] / HEIGHT) * 256, (s[0] / HEIGHT) * 256],
-                [-(s[3] / HEIGHT) * 256, (s[2] / HEIGHT) * 256],
+                [-(s[1] / HEIGHT) * {tile_size}, (s[0] / HEIGHT) * {tile_size}],
+                [-(s[3] / HEIGHT) * {tile_size}, (s[2] / HEIGHT) * {tile_size}],
               ];
             }});
           activeOverlays.addLayer(L.polyline(ll, {{
@@ -360,8 +362,8 @@ fn build_html(world_w: u32, max_zoom: u32, height: u32, title: &str, inputs: &[S
             interactive: false,
           }}));
         }}
-        var lat = -(l.y / HEIGHT) * 256;
-        var lng =  (l.x / HEIGHT) * 256;
+        var lat = -(l.y / HEIGHT) * {tile_size};
+        var lng =  (l.x / HEIGHT) * {tile_size};
         var pt = map.latLngToContainerPoint([lat, lng]);
         var tw = l.name.length * 7 + 12;
         var th = 22;

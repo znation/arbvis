@@ -24,15 +24,17 @@ use crate::throttle::{Throttle, MAX_FETCH_WORKERS};
 use crate::tiled::html::{FileEntity, generate_leaflet_content};
 use crate::tiled::leaf::{
     load_tile_bytes, render_leaf_tile_dtype, render_leaf_tile_from_buf, render_leaf_tile_sorted,
-    render_leaf_tile_xet_from_buf, TILE_PIXELS,
+    render_leaf_tile_xet_from_buf, TILE, TILE_LOG2, TILE_PIXELS,
 };
 use crate::tiled::pyramid::build_pyramid;
 use crate::tiled::pyramid_accum::{PyramidAccumulator, TileSink};
 use crate::xet::{TABLEAU_20, XorbMap};
 
 /// Channel capacity for the fetch→process queue, per CPU core. Keeps memory
-/// bounded — each in-flight tile holds a 64 KiB byte buffer plus a 192 KiB
-/// RGB pixel buffer, so a 16-CPU machine caps at ~16 × 2 × 256 KiB ≈ 8 MiB.
+/// bounded — each in-flight tile holds a `TILE_PIXELS`-byte buffer plus a
+/// `3 * TILE_PIXELS`-byte RGB pixel buffer. At `TILE = 512` that's 256 KiB +
+/// 768 KiB = 1 MiB per tile, so a 16-CPU machine caps at ~16 × 2 × 1 MiB ≈
+/// 32 MiB.
 const CHANNEL_CAPACITY_PER_CPU: usize = 2;
 
 fn channel_cap() -> usize {
@@ -199,8 +201,8 @@ pub fn regen_html(tile_dir: &PathBuf) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("no x-dirs found at zoom {max_zoom}"))?;
         std::fs::read_dir(first_x.path())?.count() as u32
     };
-    let height = height_tiles * 256;
-    let world_w = (width_tiles / height_tiles.max(1)) * 256;
+    let height = height_tiles * TILE;
+    let world_w = (width_tiles / height_tiles.max(1)) * TILE;
 
     let labels_path = tile_dir.join("labels.json");
     let json_str = std::fs::read_to_string(&labels_path)
@@ -255,7 +257,7 @@ pub fn regen_html(tile_dir: &PathBuf) -> anyhow::Result<()> {
         })
         .collect();
 
-    html::write_leaflet_html(tile_dir, world_w, max_zoom, height, &entities, "arbvis", &[], &chunks_for_regen)?;
+    html::write_leaflet_html(tile_dir, world_w, max_zoom, height, TILE, &entities, "arbvis", &[], &chunks_for_regen)?;
     log::info!(
         "Regenerated index.html in {} (zoom 0–{max_zoom}, {width_tiles}×{height_tiles} tiles, height={height})",
         tile_dir.display()
@@ -298,7 +300,7 @@ async fn build_tile_plan(
         );
     }
 
-    let mut s = 16u32;
+    let mut s = 2 * TILE_LOG2 as u32;
     while (1u64 << s) < total {
         s += 1;
     }
@@ -306,11 +308,11 @@ async fn build_tile_plan(
     let kw = (s + 1) / 2;
     let height = 1u32 << kh;
     let width = 1u32 << kw;
-    let tile_size = 256u32;
-    let max_zoom = kh - 8;
+    let tile_size = TILE;
+    let max_zoom = kh - TILE_LOG2 as u32;
     let width_tiles = width / tile_size;
     let height_tiles = height / tile_size;
-    let world_w = 256u32 << (kw - kh);
+    let world_w = TILE << (kw - kh);
     let square_pixels: u64 = (height as u64) * (height as u64);
     let total_pixels: u64 = width as u64 * height as u64;
     let num_squares = 1u32 << (kw - kh);
@@ -744,7 +746,7 @@ pub async fn run_tiles(
     let plan = build_tile_plan(sources, total, sort, diff_mode, show_xet_chunks).await?;
 
     let max_zoom = plan.max_zoom;
-    let tile_size = 256u32;
+    let tile_size = TILE;
     let width_tiles = plan.width_tiles;
     let height_tiles = plan.height_tiles;
     let world_w = plan.world_w;
@@ -779,7 +781,7 @@ pub async fn run_tiles(
     .map_err(|e| anyhow::anyhow!("pyramid join failure: {e}"))??;
 
     log::info!("Writing HTML viewer...");
-    html::write_leaflet_html(&tile_dir, world_w, max_zoom, height, &plan.entities, title, inputs, &plan.chunk_segments)?;
+    html::write_leaflet_html(&tile_dir, world_w, max_zoom, height, TILE, &plan.entities, title, inputs, &plan.chunk_segments)?;
 
     log::info!("Tiled output written to {}", tile_dir.display());
     Ok(())
@@ -799,7 +801,7 @@ pub async fn run_tiles_hf_streaming(
     let client = crate::hf_url::client()?;
 
     let plan = build_tile_plan(sources, total, false, diff_mode, show_xet_chunks).await?;
-    let tile_size = 256u32;
+    let tile_size = TILE;
     let max_zoom = plan.max_zoom;
     let world_w = plan.world_w;
     let height = plan.height;
@@ -826,7 +828,7 @@ pub async fn run_tiles_hf_streaming(
     pyramid.drain().await;
 
     log::info!("Uploading index.html and labels.json...");
-    let (html_bytes, labels_bytes) = generate_leaflet_content(world_w, max_zoom, height, &plan.entities, title, inputs, &plan.chunk_segments);
+    let (html_bytes, labels_bytes) = generate_leaflet_content(world_w, max_zoom, height, TILE, &plan.entities, title, inputs, &plan.chunk_segments);
     sink.upload_tile(hf_out.index_html_path(), html_bytes.clone())?;
     sink.upload_tile(hf_out.labels_json_path(), labels_bytes)?;
 

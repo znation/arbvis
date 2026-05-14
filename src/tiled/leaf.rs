@@ -4,7 +4,8 @@ use image::{ImageFormat, Rgb};
 
 use crate::data::Data;
 
-const TILE: u32 = 256;
+pub const TILE: u32 = 512;
+pub const TILE_LOG2: u8 = TILE.trailing_zeros() as u8;
 pub const TILE_PIXELS: usize = (TILE as usize) * (TILE as usize);
 const TILE_AREA: u64 = TILE_PIXELS as u64;
 
@@ -22,12 +23,12 @@ pub fn tile_pixel_start(tx: u32, ty: u32, kh: u8, height_tiles: u32, square_pixe
     let sq = (tx / height_tiles) as u64;
     let sq_off = sq * square_pixels;
     let local_tx = tx % height_tiles;
-    let tile_order = kh - 8;
+    let tile_order = kh - TILE_LOG2;
     let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
     sq_off + base
 }
 
-/// Async load stage: populate a 256×256 = 65 536-byte tile buffer for tile `(tx, ty)`.
+/// Async load stage: populate a `TILE×TILE`-byte tile buffer for tile `(tx, ty)`.
 ///
 /// Walks the per-tile Hilbert byte range across source boundaries and issues
 /// one async `fetch_range` per source overlap (≤ 2 in practice). Local sources
@@ -86,7 +87,7 @@ pub fn render_leaf_tile_from_buf(
     let sq = (tx / height_tiles) as u64;
     let sq_off = sq * square_pixels;
     let local_tx = tx % height_tiles;
-    let tile_order = kh - 8;
+    let tile_order = kh - TILE_LOG2;
     let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
 
     let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
@@ -107,7 +108,7 @@ pub fn render_leaf_tile_from_buf(
     encode_png(img)
 }
 
-/// Render one 256×256 leaf tile using position-based dtype coloring (safetensors mode).
+/// Render one `TILE×TILE` leaf tile using position-based dtype coloring (safetensors mode).
 ///
 /// Does not read file bytes — color is determined entirely by byte position via
 /// `color_ranges`, a sorted list of `(start, end, color)` entries from
@@ -125,7 +126,7 @@ pub fn render_leaf_tile_dtype(
     let sq_off = sq * square_pixels;
     let local_tx = tx % height_tiles;
 
-    let tile_order = kh - 8;
+    let tile_order = kh - TILE_LOG2;
     let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
     let tile_pixel_start = sq_off + base;
     let tile_pixel_end = (tile_pixel_start + TILE_AREA).min(total);
@@ -182,7 +183,7 @@ pub fn render_leaf_tile_xet_from_buf(
     let sq = (tx / height_tiles) as u64;
     let sq_off = sq * square_pixels;
     let local_tx = tx % height_tiles;
-    let tile_order = kh - 8;
+    let tile_order = kh - TILE_LOG2;
     let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
 
     let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
@@ -235,7 +236,7 @@ fn xorb_color_idx(ranges: &[(u64, u64, u8)], pixel_idx: u64) -> Option<u8> {
     None
 }
 
-/// Render one 256×256 leaf tile in sorted mode from pre-built per-source histograms.
+/// Render one `TILE×TILE` leaf tile in sorted mode from pre-built per-source histograms.
 pub fn render_leaf_tile_sorted(
     tx: u32,
     ty: u32,
@@ -250,7 +251,7 @@ pub fn render_leaf_tile_sorted(
     let sq_off = sq * square_pixels;
     let local_tx = tx % height_tiles;
 
-    let tile_order = kh - 8;
+    let tile_order = kh - TILE_LOG2;
     let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
     let tile_pixel_start = sq_off + base;
     let tile_pixel_end = (tile_pixel_start + TILE_AREA).min(total);

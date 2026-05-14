@@ -1,15 +1,120 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::Context;
 use hf_hub::buckets::BucketUpload;
+use hf_hub::progress::{ProgressEvent, ProgressHandler, UploadEvent};
 use hf_hub::repository::CommitOperation;
 use hf_hub::HFClient;
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
 use tempfile::TempDir;
 
 use crate::hf_url::{self, HfOutputSpec, RepoKind};
+use crate::progress::{counter_style, status_style};
 use crate::throttle::with_throttle;
 use crate::tiled::pyramid_accum::TileSink;
+
+/// Three-bar indicatif progress display fed by hf-hub upload events.
+///
+/// Bar layout:
+/// - status line: current phase (`uploading` / `committing` / `done`) + file count
+/// - logical bytes: `bytes_completed / total_bytes` from `UploadEvent::Progress`
+/// - transfer bytes: post-dedup network bytes actually sent (often ≪ logical bytes)
+///
+/// `total_bytes` is unknown until the `Start` event arrives, so the bars are
+/// constructed with placeholder lengths and set on `Start`.
+struct UploadProgressBars {
+    status: ProgressBar,
+    logical: ProgressBar,
+    transfer: ProgressBar,
+}
+
+impl UploadProgressBars {
+    /// Build the bars and attach them to `multi`. Returns `None` when stderr
+    /// isn't a TTY so non-interactive runs stay log-only.
+    fn new() -> Option<Self> {
+        if !std::io::stderr().is_terminal() {
+            return None;
+        }
+        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
+        let status = multi.add(ProgressBar::new(0).with_style(status_style()));
+        let logical = multi.add(ProgressBar::new(0).with_style(counter_style()));
+        let transfer = multi.add(ProgressBar::new(0).with_style(counter_style()));
+        status.set_message("hf upload: waiting for Start");
+        logical.set_message("logical bytes");
+        transfer.set_message("transfer bytes (post-dedup)");
+        for pb in [&status, &logical, &transfer] {
+            pb.enable_steady_tick(Duration::from_millis(100));
+        }
+        Some(Self { status, logical, transfer })
+    }
+
+    fn finish(&self) {
+        self.status.finish();
+        self.logical.finish();
+        self.transfer.finish();
+    }
+}
+
+/// Adapter from `hf_hub::progress::ProgressHandler` to `UploadProgressBars`.
+///
+/// `ProgressHandler::on_progress` requires `&self` (no `&mut`) so the bars are
+/// held behind a `Mutex` even though indicatif's bars are themselves `Sync` —
+/// the lock keeps the three updates consistent within one event.
+struct UploadProgressLogger {
+    bars: Mutex<Option<UploadProgressBars>>,
+}
+
+impl UploadProgressLogger {
+    fn new(bars: Option<UploadProgressBars>) -> Self {
+        Self { bars: Mutex::new(bars) }
+    }
+
+    /// Stop the spinners and release the terminal lines. Safe to call when no
+    /// bars were created (non-TTY runs).
+    fn finish_bars(&self) {
+        if let Some(bars) = self.bars.lock().expect("upload progress mutex poisoned").as_ref() {
+            bars.finish();
+        }
+    }
+}
+
+impl ProgressHandler for UploadProgressLogger {
+    fn on_progress(&self, event: &ProgressEvent) {
+        let guard = self.bars.lock().expect("upload progress mutex poisoned");
+        let Some(bars) = guard.as_ref() else { return; };
+        match event {
+            ProgressEvent::Upload(UploadEvent::Start { total_files, total_bytes }) => {
+                bars.logical.set_length(*total_bytes);
+                bars.transfer.set_length(*total_bytes);
+                bars.status.set_message(format!(
+                    "hf upload: {total_files} files, {total_bytes} bytes (uploading)",
+                ));
+            }
+            ProgressEvent::Upload(UploadEvent::Progress {
+                bytes_completed,
+                total_bytes,
+                transfer_bytes_completed,
+                transfer_bytes,
+                ..
+            }) => {
+                bars.logical.set_length(*total_bytes);
+                bars.logical.set_position(*bytes_completed);
+                bars.transfer.set_length(*transfer_bytes);
+                bars.transfer.set_position(*transfer_bytes_completed);
+            }
+            ProgressEvent::Upload(UploadEvent::Committing) => {
+                bars.status.set_message("hf upload: committing (server-side)");
+            }
+            ProgressEvent::Upload(UploadEvent::Complete) => {
+                bars.status.set_message("hf upload: complete");
+            }
+            ProgressEvent::Download(_) => {}
+        }
+    }
+}
 
 /// Sink for streaming tile output to the Hub.
 ///
@@ -63,6 +168,8 @@ impl HfTileSink {
         let (owner, name) = hf_url::split_owner_name(&self.spec.repo_id)?;
         log::info!("Committing {} files to hf://{}", staged.len(), self.spec.repo_id);
 
+        let logger = std::sync::Arc::new(UploadProgressLogger::new(UploadProgressBars::new()));
+
         match self.spec.kind {
             RepoKind::Bucket => {
                 let uploads: Vec<BucketUpload> = staged
@@ -73,6 +180,7 @@ impl HfTileSink {
                     self.client.bucket(owner, name)
                         .upload_files()
                         .files(uploads.clone())
+                        .progress(logger.clone())
                         .send()
                         .await
                 }).await?;
@@ -93,6 +201,7 @@ impl HfTileSink {
                             .operations(ops.clone())
                             .commit_message(message.clone())
                             .revision(revision.clone())
+                            .progress(logger.clone())
                             .send()
                             .await
                             .map(|_| ()),
@@ -102,6 +211,7 @@ impl HfTileSink {
                             .operations(ops.clone())
                             .commit_message(message.clone())
                             .revision(revision.clone())
+                            .progress(logger.clone())
                             .send()
                             .await
                             .map(|_| ()),
@@ -111,6 +221,7 @@ impl HfTileSink {
                             .operations(ops.clone())
                             .commit_message(message.clone())
                             .revision(revision.clone())
+                            .progress(logger.clone())
                             .send()
                             .await
                             .map(|_| ()),
@@ -119,6 +230,8 @@ impl HfTileSink {
                 }).await?;
             }
         }
+
+        logger.finish_bars();
         // tempdir drops here — staged tile files are removed from disk.
         drop(self.tempdir);
         Ok(())

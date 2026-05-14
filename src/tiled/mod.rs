@@ -204,18 +204,10 @@ pub fn regen_html(tile_dir: &PathBuf) -> anyhow::Result<()> {
     let json_str = std::fs::read_to_string(&labels_path)
         .with_context(|| format!("cannot read {}", labels_path.display()))?;
     let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-    let (values, chunks_for_regen): (Vec<serde_json::Value>, Vec<(u32, u32, u32, u32)>) = match parsed {
-        serde_json::Value::Array(a) => (a, Vec::new()),
+    let values: Vec<serde_json::Value> = match parsed {
+        serde_json::Value::Array(a) => a,
         serde_json::Value::Object(ref o) => {
-            let files = o.get("files").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-            let chunks = o.get("chunks").and_then(|v| v.as_array()).map(|arr| {
-                arr.iter().filter_map(|s| {
-                    let a = s.as_array()?;
-                    let g = |i: usize| a.get(i)?.as_u64().map(|x| x as u32);
-                    Some((g(0)?, g(1)?, g(2)?, g(3)?))
-                }).collect()
-            }).unwrap_or_default();
-            (files, chunks)
+            o.get("files").and_then(|v| v.as_array()).cloned().unwrap_or_default()
         }
         _ => anyhow::bail!("labels.json: unexpected JSON shape (expected array or object)"),
     };
@@ -253,7 +245,7 @@ pub fn regen_html(tile_dir: &PathBuf) -> anyhow::Result<()> {
         })
         .collect();
 
-    html::write_leaflet_html(tile_dir, world_w, max_zoom, height, TILE, &entities, "arbvis", &[], &chunks_for_regen)?;
+    html::write_leaflet_html(tile_dir, world_w, max_zoom, height, TILE, &entities, "arbvis", &[])?;
     log::info!(
         "Regenerated index.html in {} (zoom 0–{max_zoom}, {width_tiles}×{height_tiles} tiles, height={height})",
         tile_dir.display()
@@ -277,7 +269,6 @@ struct TilePlan {
     source_data: Arc<Vec<Data>>,
     cumulative_offsets: Arc<Vec<u64>>,
     entities: Vec<FileEntity>,
-    chunk_segments: Vec<(u32, u32, u32, u32)>,
 }
 
 async fn build_tile_plan(
@@ -285,7 +276,6 @@ async fn build_tile_plan(
     total: u64,
     diff_mode: bool,
     show_xet_xorbs: bool,
-    show_xet_chunks: bool,
 ) -> anyhow::Result<TilePlan> {
     let mut s = 2 * TILE_LOG2 as u32;
     while (1u64 << s) < total {
@@ -326,10 +316,8 @@ async fn build_tile_plan(
         v
     };
 
-    // The xorb_map drives leaf coloring (LeafMode::Xet). Only build it when
-    // the user explicitly asked for xorb coloring — otherwise `--show-xet-chunks`
-    // alone would silently swap dtype/plain coloring for xorb tinting just
-    // because xet_terms got populated for the chunk overlay.
+    // The xorb_map drives leaf coloring (LeafMode::Xet) — only build it when
+    // the user explicitly asked for xorb coloring.
     let xorb_map = if show_xet_xorbs {
         XorbMap::build(
             sources.iter().zip(cumulative_offsets.iter()).map(|(s, &off)| {
@@ -363,23 +351,6 @@ async fn build_tile_plan(
         ranges
     } else {
         vec![]
-    };
-
-    let chunk_segments: Vec<(u32, u32, u32, u32)> = if show_xet_chunks {
-        let mut segs = Vec::new();
-        for (src, &off) in sources.iter().zip(cumulative_offsets.iter()) {
-            let Some(terms) = src.xet_terms.as_deref() else { continue };
-            for t in terms {
-                if t.byte_len == 0 { continue; }
-                let start = off + t.file_offset;
-                let end = start + t.byte_len;
-                let rects = file_rects(start, end, total_pixels, square_pixels, num_squares, height, kh as u8);
-                segs.extend(outer_segments(&rects));
-            }
-        }
-        segs
-    } else {
-        Vec::new()
     };
 
     let mut entities: Vec<FileEntity> = Vec::new();
@@ -458,7 +429,6 @@ async fn build_tile_plan(
         source_data: Arc::new(source_data),
         cumulative_offsets: Arc::new(cumulative_offsets),
         entities,
-        chunk_segments,
     })
 }
 
@@ -691,9 +661,8 @@ pub async fn run_tiles(
     title: &str,
     inputs: &[String],
     show_xet_xorbs: bool,
-    show_xet_chunks: bool,
 ) -> anyhow::Result<()> {
-    let plan = build_tile_plan(sources, total, diff_mode, show_xet_xorbs, show_xet_chunks).await?;
+    let plan = build_tile_plan(sources, total, diff_mode, show_xet_xorbs).await?;
 
     let max_zoom = plan.max_zoom;
     let tile_size = TILE;
@@ -729,7 +698,7 @@ pub async fn run_tiles(
     .map_err(|e| anyhow::anyhow!("pyramid join failure: {e}"))??;
 
     log::info!("Writing HTML viewer...");
-    html::write_leaflet_html(&tile_dir, world_w, max_zoom, height, TILE, &plan.entities, title, inputs, &plan.chunk_segments)?;
+    html::write_leaflet_html(&tile_dir, world_w, max_zoom, height, TILE, &plan.entities, title, inputs)?;
 
     log::info!("Tiled output written to {}", tile_dir.display());
     Ok(())
@@ -744,12 +713,11 @@ pub async fn run_tiles_hf_streaming(
     title: &str,
     inputs: &[String],
     show_xet_xorbs: bool,
-    show_xet_chunks: bool,
 ) -> anyhow::Result<Vec<u8>> {
     crate::hf_url::require_token()?;
     let client = crate::hf_url::client()?;
 
-    let plan = build_tile_plan(sources, total, diff_mode, show_xet_xorbs, show_xet_chunks).await?;
+    let plan = build_tile_plan(sources, total, diff_mode, show_xet_xorbs).await?;
     let tile_size = TILE;
     let max_zoom = plan.max_zoom;
     let world_w = plan.world_w;
@@ -777,7 +745,7 @@ pub async fn run_tiles_hf_streaming(
     pyramid.drain().await;
 
     log::info!("Uploading index.html and labels.json...");
-    let (html_bytes, labels_bytes) = generate_leaflet_content(world_w, max_zoom, height, TILE, &plan.entities, title, inputs, &plan.chunk_segments);
+    let (html_bytes, labels_bytes) = generate_leaflet_content(world_w, max_zoom, height, TILE, &plan.entities, title, inputs);
     sink.upload_tile(hf_out.index_html_path(), html_bytes.clone())?;
     sink.upload_tile(hf_out.labels_json_path(), labels_bytes)?;
 

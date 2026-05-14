@@ -50,9 +50,6 @@ pub fn run_single(
     let pixel_lut = if diff_mode { build_diff_signed_lut() } else { build_pixel_lut() };
 
     // Build xorb map only when xorb coloring was explicitly requested.
-    // (Without this gate, --show-xet-chunks alone — which has no single-mode
-    // overlay anyway — would still flip the file from dtype/plain to xorb
-    // coloring, because xet_terms get populated either way.)
     let xorb_map = if show_xet_xorbs {
         XorbMap::build(
             sources.iter().scan(0u64, |off, s| {

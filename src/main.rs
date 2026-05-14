@@ -67,10 +67,6 @@ struct Args {
     /// Color regions by xorb ID for xet-backed files; hue = xorb, intensity = byte.
     #[arg(long)]
     show_xet_xorbs: bool,
-
-    /// Draw thin lines at xet chunk boundaries (can be combined with --show-xet-xorbs).
-    #[arg(long)]
-    show_xet_chunks: bool,
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
@@ -78,12 +74,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
         return tiled::regen_html(tile_dir);
     }
 
-    let xet_vis = args.show_xet_xorbs || args.show_xet_chunks;
+    let xet_vis = args.show_xet_xorbs;
     let show_xet_xorbs = args.show_xet_xorbs;
-    let show_xet_chunks = args.show_xet_chunks;
 
     if xet_vis && args.diff.is_some() {
-        anyhow::bail!("--show-xet-xorbs / --show-xet-chunks are incompatible with --diff");
+        anyhow::bail!("--show-xet-xorbs is incompatible with --diff");
     }
 
     // Intercept hf:// tiles output: resolve inputs as HTTP specs and stream directly.
@@ -143,17 +138,17 @@ async fn run(args: Args) -> anyhow::Result<()> {
         // Stream directly to HF — no tiles written to local disk.
         if let Some(ref hf_out_url) = tiles_hf_out {
             let hf_out = hf_url::parse_hf_output(hf_out_url)?;
-            let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, true, diff_title, &diff_input_strs, false, false).await?;
+            let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, true, diff_title, &diff_input_strs, false).await?;
             return Ok(());
         }
         if let Some(ref space_id) = args.space {
             let bucket_spec = deploy::create_space_bucket(space_id).await?;
-            let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, true, diff_title, &diff_input_strs, false, false).await?;
+            let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, true, diff_title, &diff_input_strs, false).await?;
             deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html).await?;
             return Ok(());
         }
         if let Some(ref tile_dir) = tiles_arg {
-            tiled::run_tiles(sources, total, tile_dir.clone(), true, diff_title, &diff_input_strs, false, false).await?;
+            tiled::run_tiles(sources, total, tile_dir.clone(), true, diff_title, &diff_input_strs, false).await?;
             if let Some(ref url) = tiles_upload {
                 deploy::upload_dir_to(url, tile_dir).await?;
             }
@@ -231,7 +226,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         data::materialize_http_sources(&mut sources).await?;
         let hf_out = hf_url::parse_hf_output(hf_out_url)?;
         let stream_title = args.title.as_deref().unwrap_or("arbvis");
-        let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, false, stream_title, &input_strs, show_xet_xorbs, show_xet_chunks).await?;
+        let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, false, stream_title, &input_strs, show_xet_xorbs).await?;
         return Ok(());
     }
 
@@ -281,7 +276,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let display_files: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
 
     if let Some(ref tile_dir) = tiles_arg {
-        tiled::run_tiles(sources, total, tile_dir.clone(), false, tile_title, &original_inputs, show_xet_xorbs, show_xet_chunks).await?;
+        tiled::run_tiles(sources, total, tile_dir.clone(), false, tile_title, &original_inputs, show_xet_xorbs).await?;
         if let Some(ref space_id) = args.space {
             deploy::run_deploy(tile_dir, space_id).await?;
         }
@@ -293,7 +288,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
 
     if let Some(ref space_id) = args.space {
         let bucket_spec = deploy::create_space_bucket(space_id).await?;
-        let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, false, tile_title, &original_inputs, show_xet_xorbs, show_xet_chunks).await?;
+        let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, false, tile_title, &original_inputs, show_xet_xorbs).await?;
         deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html).await?;
         return Ok(());
     }

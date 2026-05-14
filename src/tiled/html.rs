@@ -20,9 +20,8 @@ pub fn generate_leaflet_content(
     entities: &[FileEntity],
     title: &str,
     inputs: &[String],
-    chunk_segments: &[(u32, u32, u32, u32)],
 ) -> (Vec<u8>, Vec<u8>) {
-    let entities_json = build_labels_json(entities, chunk_segments);
+    let entities_json = build_labels_json(entities);
     let html = build_html(world_w, max_zoom, height, tile_size, title, inputs);
     (html.into_bytes(), entities_json.into_bytes())
 }
@@ -37,9 +36,8 @@ pub fn write_leaflet_html(
     entities: &[FileEntity],
     title: &str,
     inputs: &[String],
-    chunk_segments: &[(u32, u32, u32, u32)],
 ) -> anyhow::Result<()> {
-    let entities_json = build_labels_json(entities, chunk_segments);
+    let entities_json = build_labels_json(entities);
     std::fs::write(dir.join("labels.json"), &entities_json)?;
 
     let html = build_html(world_w, max_zoom, height, tile_size, title, inputs);
@@ -72,24 +70,10 @@ fn entities_to_json(entities: &[FileEntity]) -> String {
     format!("[{}]", entries.join(","))
 }
 
-fn chunks_to_json(chunks: &[(u32, u32, u32, u32)]) -> String {
-    let entries: Vec<String> = chunks
-        .iter()
-        .map(|&(x0, y0, x1, y1)| format!("[{},{},{},{}]", x0, y0, x1, y1))
-        .collect();
-    format!("[{}]", entries.join(","))
-}
-
-/// New schema (object form): `{ "files": [...], "chunks": [...] }`.
-///
-/// The old bare-array schema is still readable by the regen path — it
-/// detects the array form and treats `chunks` as empty.
-fn build_labels_json(entities: &[FileEntity], chunks: &[(u32, u32, u32, u32)]) -> String {
-    format!(
-        "{{\"files\":{},\"chunks\":{}}}",
-        entities_to_json(entities),
-        chunks_to_json(chunks),
-    )
+/// Schema: `{ "files": [...] }`. The old bare-array schema is still readable
+/// by the regen path.
+fn build_labels_json(entities: &[FileEntity]) -> String {
+    format!("{{\"files\":{}}}", entities_to_json(entities))
 }
 
 /// Convert an `hf://` path to its huggingface.co web URL, or return `None` for
@@ -286,31 +270,6 @@ fn build_html(world_w: u32, max_zoom: u32, height: u32, tile_size: u32, title: &
 
     var activeOverlays = L.layerGroup().addTo(map);
 
-    function drawChunks(chunks) {{
-      if (!chunks || chunks.length === 0) return;
-      var scale = ({tile_size} / HEIGHT) * Math.pow(2, map.getZoom());
-      var minWorld = 2 / scale;
-      var lls = [];
-      for (var i = 0; i < chunks.length; i++) {{
-        var s = chunks[i];
-        var len = Math.max(Math.abs(s[2] - s[0]), Math.abs(s[3] - s[1]));
-        if (len < minWorld) continue;
-        lls.push([
-          [-(s[1] / HEIGHT) * {tile_size}, (s[0] / HEIGHT) * {tile_size}],
-          [-(s[3] / HEIGHT) * {tile_size}, (s[2] / HEIGHT) * {tile_size}],
-        ]);
-      }}
-      if (lls.length > 0) {{
-        activeOverlays.addLayer(L.polyline(lls, {{
-          color: '#cccccc',
-          weight: 0.5,
-          opacity: 0.4,
-          fill: false,
-          interactive: false,
-        }}));
-      }}
-    }}
-
     function updateLabels(labels) {{
       var bounds = map.getBounds();
       var sw = bounds.getSouthWest();
@@ -409,13 +368,10 @@ fn build_html(world_w: u32, max_zoom: u32, height: u32, tile_size: u32, title: &
     fetch('labels.json')
       .then(function(r) {{ return r.json(); }})
       .then(function(data) {{
-        // New schema: {{ files: [...], chunks: [...] }}.
-        // Legacy schema: bare array of file entities.
+        // New schema: {{ files: [...] }}. Legacy schema: bare array of file entities.
         var files = Array.isArray(data) ? data : (data.files || []);
-        var chunks = Array.isArray(data) ? [] : (data.chunks || []);
         function redraw() {{
           updateLabels(files);
-          drawChunks(chunks);
         }}
         redraw();
         map.on('zoomend moveend', redraw);

@@ -252,14 +252,26 @@ impl Throttle {
         splitmix64(n.wrapping_mul(0x9E37_79B9_7F4A_7C15))
     }
 
-    #[cfg(test)]
+    /// Current AIMD-allowed concurrent HTTP request ceiling. Used by the UI
+    /// layer to render a throttle status line.
+    #[inline]
     pub fn active_limit(&self) -> usize {
-        self.active_limit.load(Ordering::SeqCst)
+        self.active_limit.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
+    /// Current in-flight HTTP requests (≤ [`Self::active_limit`] except briefly
+    /// after a scale-down, when in-flight may exceed the new limit until
+    /// outstanding permits drop).
+    #[inline]
     pub fn in_flight(&self) -> usize {
-        self.in_flight.load(Ordering::SeqCst)
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Configured ceiling on the AIMD `active_limit`. Constant for the
+    /// lifetime of the process — used as the `len` for a throttle progress bar.
+    #[inline]
+    pub fn max_workers(&self) -> usize {
+        self.max_workers
     }
 }
 

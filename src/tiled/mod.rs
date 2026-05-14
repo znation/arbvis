@@ -5,19 +5,21 @@ pub mod pyramid_accum;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use async_channel::{bounded, Receiver, Sender};
 
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use crate::color::{build_diff_signed_lut, build_pixel_lut};
 use crate::data::{load_source_data, Data, Histogram, Source};
 use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, rects_centroid};
 use crate::hf_upload::HfTileSink;
 use crate::hf_url::HfOutputSpec;
+use crate::progress::{counter_style, queue_style, status_style};
 use crate::throttle::{Throttle, MAX_FETCH_WORKERS};
 use crate::tiled::html::{FileEntity, generate_leaflet_content};
 use crate::tiled::leaf::{
@@ -39,6 +41,91 @@ fn channel_cap() -> usize {
 
 fn num_cpus_for_processing() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get())
+}
+
+/// Seven stacked indicatif bars covering the four pipeline stages. The monitor
+/// task in [`drive_pipeline`] refreshes the throttle line, the three queue
+/// lines, and the fetched/rendered counters every 500 ms; the writer stage
+/// increments `written` directly.
+///
+/// All bars share a single `MultiProgress` so they redraw atomically. When
+/// stderr is not a TTY (non-interactive runs) construction returns `None`
+/// and no bars are drawn.
+struct PipelineProgress {
+    multi: MultiProgress,
+    throttle: ProgressBar,
+    coord_q: ProgressBar,
+    fetched: ProgressBar,
+    fetched_q: ProgressBar,
+    rendered: ProgressBar,
+    encoded_q: ProgressBar,
+    written: ProgressBar,
+}
+
+impl PipelineProgress {
+    fn new(total_tiles: u64, queue_cap: usize, throttle_max: usize) -> Option<Self> {
+        if !std::io::stderr().is_terminal() {
+            return None;
+        }
+        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
+        let add = |bar: ProgressBar| multi.add(bar);
+
+        let throttle = add(ProgressBar::new(throttle_max as u64))
+            .with_style(status_style())
+            .with_message("HTTP workers: 0/0 (in flight: 0)");
+        let coord_q = add(ProgressBar::new(queue_cap as u64))
+            .with_style(queue_style())
+            .with_message("coord queue");
+        let fetched = add(ProgressBar::new(total_tiles))
+            .with_style(counter_style())
+            .with_message("tiles fetched");
+        let fetched_q = add(ProgressBar::new(queue_cap as u64))
+            .with_style(queue_style())
+            .with_message("fetch → render queue");
+        let rendered = add(ProgressBar::new(total_tiles))
+            .with_style(counter_style())
+            .with_message("tiles rendered");
+        let encoded_q = add(ProgressBar::new(queue_cap as u64))
+            .with_style(queue_style())
+            .with_message("render → write queue");
+        let written = add(ProgressBar::new(total_tiles))
+            .with_style(counter_style())
+            .with_message("tiles written");
+
+        // 100 ms tick keeps the spinner alive and ETA fresh even when a stage
+        // is briefly idle (e.g. waiting on a slow HTTP response).
+        for pb in [&throttle, &coord_q, &fetched, &fetched_q, &rendered, &encoded_q, &written] {
+            pb.enable_steady_tick(Duration::from_millis(100));
+        }
+
+        Some(Self {
+            multi,
+            throttle,
+            coord_q,
+            fetched,
+            fetched_q,
+            rendered,
+            encoded_q,
+            written,
+        })
+    }
+
+    fn finish_all(&self) {
+        for pb in [
+            &self.throttle,
+            &self.coord_q,
+            &self.fetched,
+            &self.fetched_q,
+            &self.rendered,
+            &self.encoded_q,
+            &self.written,
+        ] {
+            pb.finish();
+        }
+        // Drop the MultiProgress via clear to release the terminal so any
+        // subsequent log lines render cleanly.
+        let _ = self.multi.clear();
+    }
 }
 
 /// Per-tile data flowing through the pipeline.
@@ -421,7 +508,7 @@ async fn build_tile_plan(
 /// The caller's `on_tile` closure is invoked sequentially (the pipeline keeps
 /// a single write task draining the encoded-tile channel) so it can mutate
 /// shared state freely.
-async fn drive_pipeline<W>(plan: &TilePlan, pb: Option<Arc<ProgressBar>>, mut on_tile: W) -> anyhow::Result<()>
+async fn drive_pipeline<W>(plan: &TilePlan, mut on_tile: W) -> anyhow::Result<()>
 where
     W: FnMut(EncodedTile) -> anyhow::Result<()> + Send,
 {
@@ -432,6 +519,48 @@ where
 
     let width_tiles = plan.width_tiles;
     let height_tiles = plan.height_tiles;
+
+    let progress: Option<Arc<PipelineProgress>> =
+        PipelineProgress::new(plan.total_tiles, cap, MAX_FETCH_WORKERS).map(Arc::new);
+    let fetched_count = Arc::new(AtomicU64::new(0));
+    let rendered_count = Arc::new(AtomicU64::new(0));
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Monitor task: poll throttle state + channel lengths + counters every
+    // 500 ms and update the UI. Pattern lifted from
+    // xetcas/sizzle_sync/src/commands/reconstructions.rs:1087.
+    let monitor_handle = {
+        let progress = progress.clone();
+        let coord_rx = coord_rx.clone();
+        let fetched_rx = fetched_rx.clone();
+        let encoded_rx = encoded_rx.clone();
+        let fetched_count = fetched_count.clone();
+        let rendered_count = rendered_count.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Some(prog) = progress.as_ref() {
+                    let throttle = Throttle::global();
+                    prog.throttle.set_position(throttle.active_limit() as u64);
+                    prog.throttle.set_message(format!(
+                        "HTTP workers: {}/{} (in flight: {})",
+                        throttle.active_limit(),
+                        throttle.max_workers(),
+                        throttle.in_flight(),
+                    ));
+                    prog.coord_q.set_position(coord_rx.len() as u64);
+                    prog.fetched_q.set_position(fetched_rx.len() as u64);
+                    prog.encoded_q.set_position(encoded_rx.len() as u64);
+                    prog.fetched.set_position(fetched_count.load(Ordering::Relaxed));
+                    prog.rendered.set_position(rendered_count.load(Ordering::Relaxed));
+                }
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+    };
 
     // Stage 1: coord enumerator.
     let coord_task = tokio::spawn(async move {
@@ -455,6 +584,7 @@ where
         let fetched_tx = fetched_tx.clone();
         let source_data = plan.source_data.clone();
         let cumulative_offsets = plan.cumulative_offsets.clone();
+        let fetched_count = fetched_count.clone();
         let kh = plan.kh;
         let height_tiles = plan.height_tiles;
         let square_pixels = plan.square_pixels;
@@ -485,6 +615,7 @@ where
                 } else {
                     None
                 };
+                fetched_count.fetch_add(1, Ordering::Relaxed);
                 if fetched_tx.send(FetchedTile { tx, ty, tile_buf }).await.is_err() {
                     break;
                 }
@@ -503,6 +634,7 @@ where
     for _ in 0..num_proc {
         let fetched_rx = fetched_rx.clone();
         let encoded_tx = encoded_tx.clone();
+        let rendered_count = rendered_count.clone();
         let mode = plan.mode.clone();
         let kh = plan.kh;
         let height_tiles = plan.height_tiles;
@@ -520,6 +652,7 @@ where
                     Ok(Err(e)) => return Err::<(), anyhow::Error>(anyhow::anyhow!("{e}")),
                     Err(e) => return Err(anyhow::anyhow!("render join failure: {e}")),
                 };
+                rendered_count.fetch_add(1, Ordering::Relaxed);
                 if encoded_tx.send(encoded).await.is_err() {
                     break;
                 }
@@ -533,10 +666,15 @@ where
     // Stage 4: writer (in this task). Drain the encoded channel.
     while let Ok(tile) = encoded_rx.recv().await {
         on_tile(tile)?;
-        if let Some(ref pb) = pb {
-            pb.inc(1);
+        if let Some(prog) = progress.as_ref() {
+            prog.written.inc(1);
         }
     }
+
+    // Stop the monitor before awaiting stage handles so the bars don't keep
+    // ticking after work finishes.
+    shutdown.store(true, Ordering::Relaxed);
+    let _ = monitor_handle.await;
 
     // Surface the first error from any stage.
     let _ = coord_task.await;
@@ -545,6 +683,10 @@ where
     }
     for h in process_handles {
         if let Ok(Err(e)) = h.await { return Err(e); }
+    }
+
+    if let Some(prog) = progress.as_ref() {
+        prog.finish_all();
     }
 
     Ok(())
@@ -607,23 +749,9 @@ pub async fn run_tiles(
     std::fs::create_dir_all(tile_dir.join(format!("tiles/{max_zoom}")))?;
 
     log::info!("Rendering {} leaf tiles...", total_tiles);
-    let pb: Option<Arc<ProgressBar>> = if std::io::stderr().is_terminal() {
-        let pb = ProgressBar::new(total_tiles);
-        pb.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} tiles ({eta})",
-            )
-            .unwrap()
-            .progress_chars("=>-"),
-        );
-        pb.enable_steady_tick(Duration::from_millis(100));
-        Some(Arc::new(pb))
-    } else {
-        None
-    };
 
     let tile_dir_for_write = tile_dir.clone();
-    drive_pipeline(&plan, pb.clone(), move |t: EncodedTile| {
+    drive_pipeline(&plan, move |t: EncodedTile| {
         let path = tile_dir_for_write.join(format!("tiles/{max_zoom}/{}/{}.png", t.tx, t.ty));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -634,10 +762,6 @@ pub async fn run_tiles(
         Ok(())
     })
     .await?;
-
-    if let Some(ref pb) = pb {
-        pb.finish();
-    }
 
     log::info!("Building tile pyramid ({} zoom levels)...", max_zoom);
     let tiles_path = tile_dir.join("tiles");
@@ -678,25 +802,11 @@ pub async fn run_tiles_hf_streaming(
     let pyramid = Arc::new(PyramidAccumulator::new(tile_size, max_zoom, sink.clone(), Arc::new(hf_out.clone())));
 
     log::info!("Rendering and uploading {} leaf tiles...", total_tiles);
-    let pb: Option<Arc<ProgressBar>> = if std::io::stderr().is_terminal() {
-        let pb = ProgressBar::new(total_tiles);
-        pb.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} tiles ({eta})",
-            )
-            .unwrap()
-            .progress_chars("=>-"),
-        );
-        pb.enable_steady_tick(Duration::from_millis(100));
-        Some(Arc::new(pb))
-    } else {
-        None
-    };
 
     let sink_for_write = sink.clone();
     let pyramid_for_write = pyramid.clone();
     let hf_out_for_write = hf_out.clone();
-    drive_pipeline(&plan, pb.clone(), move |t: EncodedTile| {
+    drive_pipeline(&plan, move |t: EncodedTile| {
         let repo_path = hf_out_for_write.tile_repo_path(max_zoom, t.tx, t.ty);
         sink_for_write.upload_tile(repo_path, t.png_bytes)?;
         pyramid_for_write.contribute(max_zoom, t.tx, t.ty, &t.image);
@@ -704,9 +814,9 @@ pub async fn run_tiles_hf_streaming(
     })
     .await?;
 
-    if let Some(ref pb) = pb {
-        pb.finish();
-    }
+    // Await any in-flight pyramid encode/upload tasks before commit so every
+    // staged file is on disk by the time hf-hub takes the snapshot.
+    pyramid.drain().await;
 
     log::info!("Uploading index.html and labels.json...");
     let (html_bytes, labels_bytes) = generate_leaflet_content(world_w, max_zoom, height, &plan.entities, title, inputs, &plan.chunk_segments);

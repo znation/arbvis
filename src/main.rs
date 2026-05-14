@@ -5,6 +5,7 @@ mod geometry;
 mod hf_upload;
 mod hf_url;
 mod label;
+mod progress;
 mod safetensors;
 mod single;
 mod throttle;

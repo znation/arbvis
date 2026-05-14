@@ -4,15 +4,36 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use std::io::IsTerminal;
+
 use anyhow::Context;
 use futures::future::BoxFuture;
+use futures::stream::{self, StreamExt};
 use image::Rgb;
 use indicatif::ProgressBar;
 use memmap2::Mmap;
 
+use crate::progress::counter_style;
 use crate::safetensors::{self, TensorMeta};
 use crate::hf_url::{RemoteFileSpec, RemoteRepo};
 use crate::xet::{self, XetTerm};
+
+/// Bounded concurrency for setup-time HTTP loops (xet reconstruction,
+/// safetensors header fetches, non-safetensors diff downloads). The global
+/// AIMD throttle still caps the *actual* in-flight count; this just lets the
+/// runtime have enough simultaneous awaiting tasks to keep the throttle full.
+const SETUP_FETCH_CONCURRENCY: usize = 16;
+
+fn setup_progress(label: &str, total: u64) -> Option<ProgressBar> {
+    if !std::io::stderr().is_terminal() {
+        return None;
+    }
+    let pb = ProgressBar::new(total)
+        .with_style(counter_style())
+        .with_message(label.to_string());
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    Some(pb)
+}
 
 /// Async fetcher closure used by [`Data::LazyDiff`]. Captures its inputs by
 /// `Arc` so the returned future is `'static` and can be sent across tasks.
@@ -353,15 +374,57 @@ pub fn prepare_sources_from_specs(
 /// hash (local files, non-xet remote files), populated for xet-backed remote
 /// sources. Errors from the xet endpoints propagate up.
 pub async fn populate_xet_terms(sources: &mut [Source]) -> anyhow::Result<()> {
-    for s in sources.iter_mut() {
-        match &s.kind {
-            SourceKind::Http(spec) => {
-                s.xet_terms = Some(xet::reconstruction_for(spec).await?);
+    // Fetch xet reconstructions concurrently — each Http source needs two
+    // throttled HTTP round-trips (`xet-read-token` + `reconstructions/{hash}`)
+    // and the global throttle caps the real concurrency, so let the runtime
+    // have plenty of awaiting tasks.
+    let pb = setup_progress("xet reconstruction", sources.len() as u64);
+    let pb_for_close = pb.clone();
+
+    // Decouple the per-source future from the borrow on `sources` by snapshotting
+    // the index + http spec, then writing results back by index.
+    let jobs: Vec<(usize, Option<RemoteFileSpec>)> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let spec = if let SourceKind::Http(spec) = &s.kind {
+                Some(spec.clone())
+            } else {
+                None
+            };
+            (i, spec)
+        })
+        .collect();
+
+    let pb_for_workers = pb.clone();
+    let mut results: Vec<(usize, anyhow::Result<Vec<XetTerm>>)> = stream::iter(jobs)
+        .map(|(i, maybe_spec)| {
+            let pb = pb_for_workers.clone();
+            async move {
+                let terms = match maybe_spec {
+                    Some(spec) => xet::reconstruction_for(&spec).await,
+                    None => Ok(Vec::new()),
+                };
+                if let Some(pb) = pb.as_ref() {
+                    pb.inc(1);
+                }
+                (i, terms)
             }
-            _ => {
-                s.xet_terms = Some(Vec::new());
-            }
-        }
+        })
+        .buffer_unordered(SETUP_FETCH_CONCURRENCY)
+        .collect()
+        .await;
+
+    if let Some(pb) = pb_for_close.as_ref() {
+        pb.finish();
+    }
+
+    // Stable order: write each result back to its original index. The first
+    // error wins; later sources still get `xet_terms = None` so the caller
+    // can distinguish "didn't fetch" from "fetched but empty".
+    results.sort_by_key(|(i, _)| *i);
+    for (i, r) in results {
+        sources[i].xet_terms = Some(r?);
     }
     Ok(())
 }
@@ -768,6 +831,10 @@ pub async fn prepare_diff_sources_from_http(
     let mut sorted: Vec<&str> = orig_non.keys().copied().collect();
     sorted.sort();
 
+    // Build the (orig_spec, mod_spec, fname) jobs we'll actually download. The
+    // filter step is sync so it's cheap to do up-front; the download step is
+    // then parallelized via buffer_unordered.
+    let mut diff_jobs: Vec<(String, RemoteFileSpec, RemoteFileSpec)> = Vec::new();
     for fname in sorted {
         let orig_spec = &orig_non[fname];
         let mod_spec = match mod_non.get(fname) {
@@ -784,30 +851,55 @@ pub async fn prepare_diff_sources_from_http(
                 MAX_EAGER_SIZE / 1024 / 1024);
             continue;
         }
-        let orig_data = Data::Http {
-            repo: orig_spec.repo.clone(),
-            filename: Arc::clone(&orig_spec.filename),
-            revision: Arc::clone(&orig_spec.revision),
-        };
-        let mod_data = Data::Http {
-            repo: mod_spec.repo.clone(),
-            filename: Arc::clone(&mod_spec.filename),
-            revision: Arc::clone(&mod_spec.revision),
-        };
-        let ob = orig_data.fetch_range(0, orig_spec.size as usize).await?;
-        let mb = mod_data.fetch_range(0, mod_spec.size as usize).await?;
-        let diff: Vec<u8> = ob.iter().zip(mb.iter()).map(|(&a, &b)| {
-            let delta = b as i16 - a as i16;
-            let brightness = (delta.unsigned_abs() as f32 / 255.0 * 127.0).round() as u8;
-            if delta >= 0 { 127u8 + brightness } else { 127u8 - brightness }
-        }).collect();
+        diff_jobs.push((fname.to_string(), (*orig_spec).clone(), (*mod_spec).clone()));
+    }
+
+    let pb = setup_progress("non-safetensors diffs", diff_jobs.len() as u64);
+    let pb_for_workers = pb.clone();
+    let diffs: Vec<anyhow::Result<(String, Vec<u8>)>> = stream::iter(diff_jobs)
+        .map(|(fname, orig_spec, mod_spec)| {
+            let pb = pb_for_workers.clone();
+            async move {
+                let orig_data = Data::Http {
+                    repo: orig_spec.repo.clone(),
+                    filename: Arc::clone(&orig_spec.filename),
+                    revision: Arc::clone(&orig_spec.revision),
+                };
+                let mod_data = Data::Http {
+                    repo: mod_spec.repo.clone(),
+                    filename: Arc::clone(&mod_spec.filename),
+                    revision: Arc::clone(&mod_spec.revision),
+                };
+                let ob = orig_data.fetch_range(0, orig_spec.size as usize).await?;
+                let mb = mod_data.fetch_range(0, mod_spec.size as usize).await?;
+                let diff: Vec<u8> = ob.iter().zip(mb.iter()).map(|(&a, &b)| {
+                    let delta = b as i16 - a as i16;
+                    let brightness = (delta.unsigned_abs() as f32 / 255.0 * 127.0).round() as u8;
+                    if delta >= 0 { 127u8 + brightness } else { 127u8 - brightness }
+                }).collect();
+                if let Some(pb) = pb.as_ref() {
+                    pb.inc(1);
+                }
+                Ok((fname, diff))
+            }
+        })
+        .buffer_unordered(SETUP_FETCH_CONCURRENCY)
+        .collect()
+        .await;
+    if let Some(pb) = pb.as_ref() {
+        pb.finish();
+    }
+    // Re-sort by filename so the Source order is deterministic.
+    let mut diffs: Vec<(String, Vec<u8>)> = diffs.into_iter().collect::<anyhow::Result<Vec<_>>>()?;
+    diffs.sort_by(|a, b| a.0.cmp(&b.0));
+    for (fname, diff) in diffs {
         let size = diff.len() as u64;
         sources.push(Source {
             file_idx: sources.len(),
             kind: SourceKind::Buffered(diff),
             byte_size: size,
             safetensors: None,
-            name_override: Some(fname.to_string()),
+            name_override: Some(fname),
             xet_terms: None,
         });
         total += size;
@@ -945,21 +1037,56 @@ async fn build_multi_safetensors_diff_sources_inner(
     orig_data: &[Arc<Data>],
     mod_data:  &[Arc<Data>],
 ) -> anyhow::Result<(Vec<Source>, u64)> {
-    // Build tensor maps: full name → (data_index, TensorMeta).
+    // Two HTTP range requests per file (8-byte preamble + variable header).
+    // For sharded models this is dozens of files per side; serializing them
+    // wastes the throttle. Fetch both sides concurrently with bounded
+    // parallelism.
+    let total = (orig_data.len() + mod_data.len()) as u64;
+    let pb = setup_progress("safetensors headers", total);
+
+    async fn fetch_all(
+        data: &[Arc<Data>],
+        side: &'static str,
+        pb: &Option<ProgressBar>,
+    ) -> anyhow::Result<Vec<(usize, Vec<safetensors::TensorMeta>)>> {
+        let pb = pb.clone();
+        let mut out: Vec<(usize, anyhow::Result<Vec<safetensors::TensorMeta>>)> =
+            stream::iter(data.iter().enumerate())
+                .map(|(i, d)| {
+                    let pb = pb.clone();
+                    let d = Arc::clone(d);
+                    async move {
+                        let r = fetch_safetensors_header(&d)
+                            .await
+                            .map(|(t, _)| t)
+                            .with_context(|| format!("reading safetensors header for {side} file {i}"));
+                        if let Some(pb) = pb.as_ref() {
+                            pb.inc(1);
+                        }
+                        (i, r)
+                    }
+                })
+                .buffer_unordered(SETUP_FETCH_CONCURRENCY)
+                .collect()
+                .await;
+        out.sort_by_key(|(i, _)| *i);
+        out.into_iter().map(|(i, r)| r.map(|t| (i, t))).collect()
+    }
+
+    let orig_headers = fetch_all(orig_data, "orig", &pb).await?;
+    let mod_headers = fetch_all(mod_data, "mod", &pb).await?;
+    if let Some(pb) = pb.as_ref() {
+        pb.finish();
+    }
+
     let mut orig_map: HashMap<String, (usize, safetensors::TensorMeta)> = HashMap::new();
-    for (i, data) in orig_data.iter().enumerate() {
-        let (tensors, _) = fetch_safetensors_header(data)
-            .await
-            .with_context(|| format!("reading safetensors header for orig file {i}"))?;
+    for (i, tensors) in orig_headers {
         for t in tensors {
             orig_map.entry(t.name.clone()).or_insert((i, t));
         }
     }
     let mut mod_map: HashMap<String, (usize, safetensors::TensorMeta)> = HashMap::new();
-    for (i, data) in mod_data.iter().enumerate() {
-        let (tensors, _) = fetch_safetensors_header(data)
-            .await
-            .with_context(|| format!("reading safetensors header for mod file {i}"))?;
+    for (i, tensors) in mod_headers {
         for t in tensors {
             mod_map.entry(t.name.clone()).or_insert((i, t));
         }

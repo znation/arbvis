@@ -642,10 +642,11 @@ pub fn run_tiles_hf_streaming(
         }
     });
 
-    if let Some(ref pb) = pb { pb.finish(); }
     if let Some(e) = first_err {
+        if let Some(ref pb) = pb { pb.abandon(); }
         return Err(anyhow::anyhow!("{e}"));
     }
+    if let Some(ref pb) = pb { pb.finish(); }
 
     // Upload index.html and labels.json before committing.
     log::info!("Uploading index.html and labels.json...");

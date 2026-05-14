@@ -91,6 +91,17 @@ impl Data {
             Data::LazyDiff(f) => f(start, len).await,
         }
     }
+
+    /// Whether `fetch_range` resolves without issuing an HTTP request.
+    ///
+    /// `LazyDiff` is conservatively treated as non-local because its inner
+    /// fetcher may wrap an `Http` source. The tile load stage uses this to
+    /// skip the AIMD HTTP throttle when nothing in flight could hit the Hub —
+    /// otherwise mmap reads would be artificially capped at the throttle's
+    /// initial 4-way concurrency.
+    pub fn is_local(&self) -> bool {
+        matches!(self, Data::Mapped(_) | Data::Owned(_))
+    }
 }
 
 /// How a source's bytes are stored.

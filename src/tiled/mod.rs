@@ -77,7 +77,7 @@ impl PipelineProgress {
         // 500 ms with current in-flight count.
         let throttle = add(ProgressBar::new(throttle_max as u64))
             .with_style(status_style())
-            .with_message("HTTP workers: 0/0 (in flight: 0)");
+            .with_message("HTTP throttle: 0/0 (in flight: 0)");
         // Queue bars: pos = current depth, len = channel capacity.
         let coord_q = add(ProgressBar::new(queue_cap as u64))
             .with_style(queue_style())
@@ -473,7 +473,7 @@ where
                     let throttle = Throttle::global();
                     prog.throttle.set_position(throttle.active_limit() as u64);
                     prog.throttle.set_message(format!(
-                        "HTTP workers: {}/{} (in flight: {})",
+                        "HTTP throttle: {}/{} (in flight: {})",
                         throttle.active_limit(),
                         throttle.max_workers(),
                         throttle.in_flight(),
@@ -504,12 +504,15 @@ where
         // closing coord_tx (drop on scope end) signals load workers to drain.
     });
 
-    // Stage 2: load workers. Spawn up to MAX_FETCH_WORKERS; each acquires a
-    // throttle permit before reading source bytes (which is HTTP for
-    // `Data::Http`, mmap for `Data::Mapped`/`Owned`). Workers above the
-    // throttle's `active_limit` park on the throttle's Notify, not on the
-    // channel.
+    // Stage 2: load workers. Spawn up to MAX_FETCH_WORKERS. When any source
+    // is remote (`Data::Http`/`LazyDiff`), each load acquires the AIMD HTTP
+    // throttle before reading source bytes; workers above `active_limit` park
+    // on the throttle's Notify. When every source is local (mmap or in-memory
+    // — typical after `materialize_http_sources`), the throttle is bypassed
+    // so 128-way mmap parallelism isn't capped at the throttle's initial
+    // 4-way limit.
     let needs_bytes = plan.mode.needs_bytes();
+    let any_remote_source = plan.source_data.iter().any(|d| !d.is_local());
     let mut load_handles = Vec::new();
     for _ in 0..MAX_FETCH_WORKERS {
         let coord_rx = coord_rx.clone();
@@ -524,8 +527,11 @@ where
         load_handles.push(tokio::spawn(async move {
             while let Ok((tx, ty)) = coord_rx.recv().await {
                 let tile_buf = if needs_bytes {
-                    let throttle = Throttle::global();
-                    let permit = throttle.acquire().await;
+                    let permit = if any_remote_source {
+                        Some(Throttle::global().acquire().await)
+                    } else {
+                        None
+                    };
                     let result = load_tile_bytes(
                         tx, ty, kh, height_tiles, square_pixels, total,
                         &source_data, &cumulative_offsets,
@@ -533,7 +539,9 @@ where
                     drop(permit);
                     match result {
                         Ok(buf) => {
-                            throttle.record_success();
+                            if any_remote_source {
+                                Throttle::global().record_success();
+                            }
                             Some(buf)
                         }
                         Err(e) => {

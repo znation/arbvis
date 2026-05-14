@@ -1,10 +1,39 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use hf_hub::{
     HFBucketSync, HFClientSync, HFRepositorySync, RepoTypeDataset, RepoTypeModel, RepoTypeSpace,
 };
+
+/// Process-wide "don't issue new range requests until this instant" state.
+/// When any thread is rate-limited it extends this deadline; all threads check
+/// it before each fetch attempt so they pause in lockstep rather than each
+/// independently retrying and immediately hitting the limit again.
+static RATE_LIMIT_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Monotone counter used to stagger thread wakeup times by up to 1 s so
+/// threads don't thundering-herd the CAS bridge the moment a pause expires.
+static JITTER_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn wait_for_global_rate_limit() {
+    loop {
+        let deadline = *RATE_LIMIT_UNTIL.lock().unwrap();
+        let Some(until) = deadline else { return };
+        let now = Instant::now();
+        if now >= until { return; }
+        let jitter = Duration::from_millis(JITTER_NONCE.fetch_add(37, Ordering::Relaxed) % 1000);
+        std::thread::sleep(until - now + jitter);
+    }
+}
+
+fn extend_global_rate_limit(delay: Duration) {
+    let until = Instant::now() + delay;
+    let mut guard = RATE_LIMIT_UNTIL.lock().unwrap();
+    *guard = Some(guard.map_or(until, |existing| existing.max(until)));
+}
 
 /// Repo kind parsed from an `hf://` URL. Carried as a typed value rather than a
 /// string so the four upload/download dispatch sites in this crate can match
@@ -37,9 +66,12 @@ pub enum RemoteRepo {
 impl RemoteRepo {
     pub fn fetch_range(&self, filename: &str, revision: &str, range: std::ops::Range<u64>) -> anyhow::Result<Vec<u8>> {
         const MAX_RETRIES: u32 = 5;
-        const BASE_DELAY_SECS: u64 = 2;
+        const DEFAULT_PAUSE_SECS: u64 = 30;
 
         for attempt in 0..=MAX_RETRIES {
+            // Block if another thread already recorded a rate-limit pause.
+            wait_for_global_rate_limit();
+
             let result = match self {
                 RemoteRepo::Model(r) => r.download_file_to_bytes().filename(filename).revision(revision).range(range.clone()).send(),
                 RemoteRepo::Dataset(r) => r.download_file_to_bytes().filename(filename).revision(revision).range(range.clone()).send(),
@@ -48,17 +80,16 @@ impl RemoteRepo {
             match result {
                 Ok(b) => return Ok(b.to_vec()),
                 Err(hf_hub::HFError::RateLimited { retry_after, .. }) if attempt < MAX_RETRIES => {
-                    let delay = retry_after.unwrap_or_else(|| {
-                        std::time::Duration::from_secs(BASE_DELAY_SECS * (1 << attempt))
-                    });
+                    let delay = retry_after.unwrap_or(Duration::from_secs(DEFAULT_PAUSE_SECS));
                     log::warn!(
-                        "rate limited fetching {filename} bytes {}..{}; retrying in {:.1}s ({}/{})",
-                        range.start, range.end,
+                        "rate limited on {filename}; pausing all requests for {:.0}s ({}/{})",
                         delay.as_secs_f32(),
                         attempt + 1,
                         MAX_RETRIES,
                     );
-                    std::thread::sleep(delay);
+                    // Extend the shared deadline so every thread waits, not just this one.
+                    extend_global_rate_limit(delay);
+                    // Don't sleep here — the loop's wait_for_global_rate_limit() handles it.
                 }
                 Err(e) => return Err(e.into()),
             }

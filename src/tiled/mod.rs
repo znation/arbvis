@@ -23,7 +23,7 @@ use crate::progress::{counter_style, queue_style, status_style};
 use crate::throttle::{Throttle, MAX_FETCH_WORKERS};
 use crate::tiled::html::{FileEntity, generate_leaflet_content};
 use crate::tiled::leaf::{
-    fetch_tile_bytes, render_leaf_tile_dtype, render_leaf_tile_from_buf, render_leaf_tile_sorted,
+    load_tile_bytes, render_leaf_tile_dtype, render_leaf_tile_from_buf, render_leaf_tile_sorted,
     render_leaf_tile_xet_from_buf, TILE_PIXELS,
 };
 use crate::tiled::pyramid::build_pyramid;
@@ -55,8 +55,8 @@ struct PipelineProgress {
     multi: MultiProgress,
     throttle: ProgressBar,
     coord_q: ProgressBar,
-    fetched: ProgressBar,
-    fetched_q: ProgressBar,
+    loaded: ProgressBar,
+    loaded_q: ProgressBar,
     rendered: ProgressBar,
     encoded_q: ProgressBar,
     written: ProgressBar,
@@ -70,18 +70,23 @@ impl PipelineProgress {
         let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
         let add = |bar: ProgressBar| multi.add(bar);
 
+        // Throttle bar: pos = current AIMD `active_limit`, len = `max_workers`
+        // ceiling (128). The message refreshes from the monitor task every
+        // 500 ms with current in-flight count.
         let throttle = add(ProgressBar::new(throttle_max as u64))
             .with_style(status_style())
             .with_message("HTTP workers: 0/0 (in flight: 0)");
+        // Queue bars: pos = current depth, len = channel capacity.
         let coord_q = add(ProgressBar::new(queue_cap as u64))
             .with_style(queue_style())
-            .with_message("coord queue");
-        let fetched = add(ProgressBar::new(total_tiles))
+            .with_message("tile coord queue");
+        // Counter bars: pos = tiles completed at this stage, len = total tiles.
+        let loaded = add(ProgressBar::new(total_tiles))
             .with_style(counter_style())
-            .with_message("tiles fetched");
-        let fetched_q = add(ProgressBar::new(queue_cap as u64))
+            .with_message("tile bytes loaded");
+        let loaded_q = add(ProgressBar::new(queue_cap as u64))
             .with_style(queue_style())
-            .with_message("fetch → render queue");
+            .with_message("load → render queue");
         let rendered = add(ProgressBar::new(total_tiles))
             .with_style(counter_style())
             .with_message("tiles rendered");
@@ -94,7 +99,7 @@ impl PipelineProgress {
 
         // 100 ms tick keeps the spinner alive and ETA fresh even when a stage
         // is briefly idle (e.g. waiting on a slow HTTP response).
-        for pb in [&throttle, &coord_q, &fetched, &fetched_q, &rendered, &encoded_q, &written] {
+        for pb in [&throttle, &coord_q, &loaded, &loaded_q, &rendered, &encoded_q, &written] {
             pb.enable_steady_tick(Duration::from_millis(100));
         }
 
@@ -102,8 +107,8 @@ impl PipelineProgress {
             multi,
             throttle,
             coord_q,
-            fetched,
-            fetched_q,
+            loaded,
+            loaded_q,
             rendered,
             encoded_q,
             written,
@@ -114,8 +119,8 @@ impl PipelineProgress {
         for pb in [
             &self.throttle,
             &self.coord_q,
-            &self.fetched,
-            &self.fetched_q,
+            &self.loaded,
+            &self.loaded_q,
             &self.rendered,
             &self.encoded_q,
             &self.written,
@@ -128,8 +133,8 @@ impl PipelineProgress {
     }
 }
 
-/// Per-tile data flowing through the pipeline.
-struct FetchedTile {
+/// Per-tile data flowing through the pipeline after the load stage.
+struct LoadedTile {
     tx: u32,
     ty: u32,
     /// `Some` when the mode needs raw byte data (plain or xet); `None` for
@@ -327,11 +332,12 @@ async fn build_tile_plan(
             let pb = ProgressBar::new(total);
             pb.set_style(
                 ProgressStyle::with_template(
-                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} scanning ({eta})",
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg} ({eta})",
                 )
                 .unwrap()
                 .progress_chars("=>-"),
             );
+            pb.set_message("bytes scanned (sort histogram)");
             pb.enable_steady_tick(Duration::from_millis(100));
             Some(Arc::new(pb))
         } else {
@@ -501,9 +507,9 @@ async fn build_tile_plan(
     })
 }
 
-/// Drive the three-stage tile pipeline:
-///   coord enumerator → N fetch workers (throttled) → num_cpus process workers
-///   → write closure (caller-supplied).
+/// Drive the four-stage tile pipeline:
+///   coord enumerator → N load workers (throttled when HTTP) → num_cpus render
+///   workers → write closure (caller-supplied).
 ///
 /// The caller's `on_tile` closure is invoked sequentially (the pipeline keeps
 /// a single write task draining the encoded-tile channel) so it can mutate
@@ -514,7 +520,7 @@ where
 {
     let cap = channel_cap();
     let (coord_tx, coord_rx): (Sender<(u32, u32)>, Receiver<(u32, u32)>) = bounded(cap);
-    let (fetched_tx, fetched_rx): (Sender<FetchedTile>, Receiver<FetchedTile>) = bounded(cap);
+    let (loaded_tx, loaded_rx): (Sender<LoadedTile>, Receiver<LoadedTile>) = bounded(cap);
     let (encoded_tx, encoded_rx): (Sender<EncodedTile>, Receiver<EncodedTile>) = bounded(cap);
 
     let width_tiles = plan.width_tiles;
@@ -522,19 +528,18 @@ where
 
     let progress: Option<Arc<PipelineProgress>> =
         PipelineProgress::new(plan.total_tiles, cap, MAX_FETCH_WORKERS).map(Arc::new);
-    let fetched_count = Arc::new(AtomicU64::new(0));
+    let loaded_count = Arc::new(AtomicU64::new(0));
     let rendered_count = Arc::new(AtomicU64::new(0));
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Monitor task: poll throttle state + channel lengths + counters every
-    // 500 ms and update the UI. Pattern lifted from
-    // xetcas/sizzle_sync/src/commands/reconstructions.rs:1087.
+    // 500 ms and update the UI.
     let monitor_handle = {
         let progress = progress.clone();
         let coord_rx = coord_rx.clone();
-        let fetched_rx = fetched_rx.clone();
+        let loaded_rx = loaded_rx.clone();
         let encoded_rx = encoded_rx.clone();
-        let fetched_count = fetched_count.clone();
+        let loaded_count = loaded_count.clone();
         let rendered_count = rendered_count.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
@@ -549,9 +554,9 @@ where
                         throttle.in_flight(),
                     ));
                     prog.coord_q.set_position(coord_rx.len() as u64);
-                    prog.fetched_q.set_position(fetched_rx.len() as u64);
+                    prog.loaded_q.set_position(loaded_rx.len() as u64);
                     prog.encoded_q.set_position(encoded_rx.len() as u64);
-                    prog.fetched.set_position(fetched_count.load(Ordering::Relaxed));
+                    prog.loaded.set_position(loaded_count.load(Ordering::Relaxed));
                     prog.rendered.set_position(rendered_count.load(Ordering::Relaxed));
                 }
                 if shutdown.load(Ordering::Relaxed) {
@@ -571,30 +576,32 @@ where
                 }
             }
         }
-        // closing coord_tx (drop on scope end) signals fetch workers to drain.
+        // closing coord_tx (drop on scope end) signals load workers to drain.
     });
 
-    // Stage 2: fetch workers. Spawn up to MAX_FETCH_WORKERS; each acquires a
-    // throttle permit before issuing HTTP. Workers above the throttle's
-    // `active_limit` park on the throttle's Notify, not on the channel.
+    // Stage 2: load workers. Spawn up to MAX_FETCH_WORKERS; each acquires a
+    // throttle permit before reading source bytes (which is HTTP for
+    // `Data::Http`, mmap for `Data::Mapped`/`Owned`). Workers above the
+    // throttle's `active_limit` park on the throttle's Notify, not on the
+    // channel.
     let needs_bytes = plan.mode.needs_bytes();
-    let mut fetch_handles = Vec::new();
+    let mut load_handles = Vec::new();
     for _ in 0..MAX_FETCH_WORKERS {
         let coord_rx = coord_rx.clone();
-        let fetched_tx = fetched_tx.clone();
+        let loaded_tx = loaded_tx.clone();
         let source_data = plan.source_data.clone();
         let cumulative_offsets = plan.cumulative_offsets.clone();
-        let fetched_count = fetched_count.clone();
+        let loaded_count = loaded_count.clone();
         let kh = plan.kh;
         let height_tiles = plan.height_tiles;
         let square_pixels = plan.square_pixels;
         let total = plan.total;
-        fetch_handles.push(tokio::spawn(async move {
+        load_handles.push(tokio::spawn(async move {
             while let Ok((tx, ty)) = coord_rx.recv().await {
                 let tile_buf = if needs_bytes {
                     let throttle = Throttle::global();
                     let permit = throttle.acquire().await;
-                    let result = fetch_tile_bytes(
+                    let result = load_tile_bytes(
                         tx, ty, kh, height_tiles, square_pixels, total,
                         &source_data, &cumulative_offsets,
                     ).await;
@@ -608,31 +615,31 @@ where
                             // The throttle's per-call retry already covers
                             // transient HTTP issues; anything reaching here
                             // is a permanent failure or unrecoverable error.
-                            log::error!("fetch_tile_bytes({tx},{ty}) failed: {e}");
+                            log::error!("load_tile_bytes({tx},{ty}) failed: {e}");
                             return Err::<(), anyhow::Error>(e);
                         }
                     }
                 } else {
                     None
                 };
-                fetched_count.fetch_add(1, Ordering::Relaxed);
-                if fetched_tx.send(FetchedTile { tx, ty, tile_buf }).await.is_err() {
+                loaded_count.fetch_add(1, Ordering::Relaxed);
+                if loaded_tx.send(LoadedTile { tx, ty, tile_buf }).await.is_err() {
                     break;
                 }
             }
             Ok(())
         }));
     }
-    drop(fetched_tx); // close when all fetch workers exit
+    drop(loaded_tx); // close when all load workers exit
     drop(coord_rx);
 
-    // Stage 3: process workers (= num_cpus). Each pulls a FetchedTile, runs
-    // the CPU-bound render+PNG encode inside `spawn_blocking`, and sends the
-    // encoded result to the write channel.
+    // Stage 3: render workers (= num_cpus). Each pulls a LoadedTile, runs
+    // the CPU-bound pixel math + PNG encode inside `spawn_blocking`, and
+    // sends the encoded result to the write channel.
     let num_proc = num_cpus_for_processing();
     let mut process_handles = Vec::new();
     for _ in 0..num_proc {
-        let fetched_rx = fetched_rx.clone();
+        let loaded_rx = loaded_rx.clone();
         let encoded_tx = encoded_tx.clone();
         let rendered_count = rendered_count.clone();
         let mode = plan.mode.clone();
@@ -641,7 +648,7 @@ where
         let square_pixels = plan.square_pixels;
         let total = plan.total;
         process_handles.push(tokio::spawn(async move {
-            while let Ok(tile) = fetched_rx.recv().await {
+            while let Ok(tile) = loaded_rx.recv().await {
                 let mode = mode.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     render_one(tile, &mode, kh, height_tiles, square_pixels, total)
@@ -661,7 +668,7 @@ where
         }));
     }
     drop(encoded_tx);
-    drop(fetched_rx);
+    drop(loaded_rx);
 
     // Stage 4: writer (in this task). Drain the encoded channel.
     while let Ok(tile) = encoded_rx.recv().await {
@@ -678,7 +685,7 @@ where
 
     // Surface the first error from any stage.
     let _ = coord_task.await;
-    for h in fetch_handles {
+    for h in load_handles {
         if let Ok(Err(e)) = h.await { return Err(e); }
     }
     for h in process_handles {
@@ -693,14 +700,14 @@ where
 }
 
 fn render_one(
-    tile: FetchedTile,
+    tile: LoadedTile,
     mode: &LeafMode,
     kh: u8,
     height_tiles: u32,
     square_pixels: u64,
     total: u64,
 ) -> Result<EncodedTile, String> {
-    let FetchedTile { tx, ty, tile_buf } = tile;
+    let LoadedTile { tx, ty, tile_buf } = tile;
     let (image, png_bytes) = match mode {
         LeafMode::Plain { pixel_lut } => {
             let buf = tile_buf.as_deref().expect("plain mode needs tile_buf");

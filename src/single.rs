@@ -88,11 +88,12 @@ pub fn run_single(
         let pb = ProgressBar::new(total);
         pb.set_style(
             ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg} ({eta})",
             )
             .unwrap()
             .progress_chars("=>-"),
         );
+        pb.set_message("source bytes rendered");
         Some(pb)
     } else {
         None

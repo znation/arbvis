@@ -27,13 +27,14 @@ pub fn tile_pixel_start(tx: u32, ty: u32, kh: u8, height_tiles: u32, square_pixe
     sq_off + base
 }
 
-/// Async fetch stage: populate a 256×256 = 65 536-byte tile buffer for tile `(tx, ty)`.
+/// Async load stage: populate a 256×256 = 65 536-byte tile buffer for tile `(tx, ty)`.
 ///
 /// Walks the per-tile Hilbert byte range across source boundaries and issues
 /// one async `fetch_range` per source overlap (≤ 2 in practice). Local sources
-/// resolve immediately; HTTP sources await an actual HTTP request, throttled
-/// by [`crate::throttle::Throttle::global`].
-pub async fn fetch_tile_bytes(
+/// (`Data::Mapped` / `Data::Owned`) resolve via a memcpy off the mmap; HTTP
+/// sources await an actual HTTP request, throttled by
+/// [`crate::throttle::Throttle::global`].
+pub async fn load_tile_bytes(
     tx: u32,
     ty: u32,
     kh: u8,

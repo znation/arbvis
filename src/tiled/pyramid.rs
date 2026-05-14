@@ -34,11 +34,12 @@ pub fn build_pyramid(
         let pb = ProgressBar::new(total_pyramid_tiles);
         pb.set_style(
             ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} tiles ({eta})",
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg} ({eta})",
             )
             .unwrap()
             .progress_chars("##-"),
         );
+        pb.set_message("pyramid tiles built");
         pb.enable_steady_tick(Duration::from_millis(100));
         Some(Arc::new(pb))
     } else {

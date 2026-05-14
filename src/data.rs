@@ -951,7 +951,7 @@ pub async fn prepare_diff_sources_from_http(
         diff_jobs.push((fname.to_string(), (*orig_spec).clone(), (*mod_spec).clone()));
     }
 
-    let pb = setup_progress("source files (non-safetensors diff downloads)", diff_jobs.len() as u64);
+    let pb = setup_progress("file pairs (non-safetensors diff downloads)", diff_jobs.len() as u64);
     let pb_for_workers = pb.clone();
     let diffs: Vec<anyhow::Result<(String, Vec<u8>)>> = stream::iter(diff_jobs)
         .map(|(fname, orig_spec, mod_spec)| {

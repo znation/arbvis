@@ -29,10 +29,18 @@ fn wait_for_global_rate_limit() {
     }
 }
 
-fn extend_global_rate_limit(delay: Duration) {
-    let until = Instant::now() + delay;
+/// Extend the global rate-limit deadline by `delay` from now.
+/// Returns `true` if this call is the first in a new rate-limit wave
+/// (deadline was unset or already expired), so the caller should log a warning.
+/// Returns `false` when another thread already has an active deadline — the
+/// caller should stay quiet to avoid a wall of identical log lines.
+fn extend_global_rate_limit(delay: Duration) -> bool {
+    let now = Instant::now();
+    let until = now + delay;
     let mut guard = RATE_LIMIT_UNTIL.lock().unwrap();
+    let is_new_wave = guard.map_or(true, |existing| existing <= now);
     *guard = Some(guard.map_or(until, |existing| existing.max(until)));
+    is_new_wave
 }
 
 /// Repo kind parsed from an `hf://` URL. Carried as a typed value rather than a
@@ -81,14 +89,17 @@ impl RemoteRepo {
                 Ok(b) => return Ok(b.to_vec()),
                 Err(hf_hub::HFError::RateLimited { retry_after, .. }) if attempt < MAX_RETRIES => {
                     let delay = retry_after.unwrap_or(Duration::from_secs(DEFAULT_PAUSE_SECS));
-                    log::warn!(
-                        "rate limited on {filename}; pausing all requests for {:.0}s ({}/{})",
-                        delay.as_secs_f32(),
-                        attempt + 1,
-                        MAX_RETRIES,
-                    );
-                    // Extend the shared deadline so every thread waits, not just this one.
-                    extend_global_rate_limit(delay);
+                    // Only the first thread in each rate-limit wave logs at WARN; the rest are
+                    // silent (their in-flight requests all returned 429 simultaneously, and
+                    // logging all of them is pure noise).
+                    if extend_global_rate_limit(delay) {
+                        log::warn!(
+                            "rate limited; pausing all requests for {:.0}s ({}/{})",
+                            delay.as_secs_f32(),
+                            attempt + 1,
+                            MAX_RETRIES,
+                        );
+                    }
                     // Don't sleep here — the loop's wait_for_global_rate_limit() handles it.
                 }
                 Err(e) => return Err(e.into()),

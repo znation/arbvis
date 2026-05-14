@@ -101,7 +101,7 @@ pub enum SourceKind {
     /// Remote HF file, accessed via hf-hub range requests per tile.
     Http(RemoteFileSpec),
     /// Per-tensor diff computed lazily from two whole-file Data sources.
-    /// `byte_size` (= nelem) output bytes are produced on demand.
+    /// `byte_size` output bytes are produced on demand.
     TensorDiff {
         orig: Arc<Data>,
         mod_: Arc<Data>,
@@ -109,7 +109,6 @@ pub enum SourceKind {
         mod_start: u64,
         orig_dtype: safetensors::Dtype,
         mod_dtype: safetensors::Dtype,
-        nelem: u64,
     },
 }
 
@@ -164,12 +163,11 @@ impl Source {
 /// Files are opened lazily (one at a time) to avoid exhausting OS fd limits.
 /// Stdin is buffered into memory upfront since its size is unknown.
 ///
-/// For .safetensors files (or when `format_safetensors` is true): the header is
-/// parsed and attached as SafetensorsInfo for dtype coloring. The file is kept as
-/// a single Source (one per file) so that inter-tensor borders are not drawn and
-/// the Hilbert curve flows smoothly across the whole file with color transitions
-/// only at tensor boundaries.
-pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::Result<(Vec<Source>, u64)> {
+/// For .safetensors files: the header is parsed and attached as SafetensorsInfo
+/// for dtype coloring. The file is kept as a single Source (one per file) so that
+/// inter-tensor borders are not drawn and the Hilbert curve flows smoothly across
+/// the whole file with color transitions only at tensor boundaries.
+pub fn prepare_sources(files: &[PathBuf]) -> anyhow::Result<(Vec<Source>, u64)> {
     if files.is_empty() {
         log::info!("Reading stdin...");
         let mut buf = Vec::new();
@@ -205,8 +203,7 @@ pub fn prepare_sources(files: &[PathBuf], format_safetensors: bool) -> anyhow::R
             }
         };
 
-        let is_st = format_safetensors
-            || path.extension().and_then(|e| e.to_str()) == Some("safetensors");
+        let is_st = path.extension().and_then(|e| e.to_str()) == Some("safetensors");
 
         let safetensors_info = if is_st {
             match load_safetensors_info(path, size) {
@@ -267,7 +264,7 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
             filename: Arc::clone(&spec.filename),
             revision: Arc::clone(&spec.revision),
         }),
-        SourceKind::TensorDiff { orig, mod_, orig_start, mod_start, orig_dtype, mod_dtype, .. } => {
+        SourceKind::TensorDiff { orig, mod_, orig_start, mod_start, orig_dtype, mod_dtype } => {
             let orig = Arc::clone(orig);
             let mod_ = Arc::clone(mod_);
             let orig_start = *orig_start;
@@ -294,7 +291,6 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
 /// Remote specs are turned into `SourceKind::Http` entries (no download).
 pub fn prepare_sources_from_specs(
     specs: &[InputSpec],
-    format_safetensors: bool,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     if specs.is_empty() {
         log::info!("Reading stdin...");
@@ -327,8 +323,7 @@ pub fn prepare_sources_from_specs(
                         continue;
                     }
                 };
-                let is_st = format_safetensors
-                    || path.extension().and_then(|e| e.to_str()) == Some("safetensors");
+                let is_st = path.extension().and_then(|e| e.to_str()) == Some("safetensors");
                 let safetensors_info = if is_st {
                     match load_safetensors_info(path, size) {
                         Ok(info) => Some(info),
@@ -560,119 +555,6 @@ async fn fetch_safetensors_header(data: &Data) -> anyhow::Result<(Vec<safetensor
     safetensors::parse_header(&header_bytes)
 }
 
-/// Byte-value frequency histogram for a source.
-///
-/// Enables O(1)-memory sorted rendering: rather than sorting bytes and storing
-/// the result, the renderer derives the sorted layout from the 256-entry count
-/// array alone (see `prefix_sums`).
-pub struct Histogram(pub [u64; 256]);
-
-impl Histogram {
-    /// Build a histogram by streaming through the source.
-    ///
-    /// For file sources the file is read in 4 MB chunks so peak extra memory
-    /// is bounded regardless of file size. An optional progress bar is
-    /// incremented by the number of bytes processed in each chunk.
-    pub async fn build(s: &Source, pb: Option<&ProgressBar>) -> anyhow::Result<Self> {
-        const CHUNK: usize = 4 * 1024 * 1024;
-        let mut counts = [0u64; 256];
-
-        match &s.kind {
-            SourceKind::Http(_) => {
-                anyhow::bail!(
-                    "--sort is not supported for remote hf:// inputs: \
-                     building a histogram requires streaming the entire file over HTTP"
-                );
-            }
-            SourceKind::File(p) => {
-                let mut f = File::open(p)?;
-                let mut remaining = s.byte_size;
-                let mut buf = vec![0u8; CHUNK];
-                while remaining > 0 {
-                    let to_read = (remaining as usize).min(CHUNK);
-                    let n = f.read(&mut buf[..to_read])?;
-                    if n == 0 {
-                        break;
-                    }
-                    for &b in &buf[..n] {
-                        counts[b as usize] += 1;
-                    }
-                    remaining -= n as u64;
-                    if let Some(pb) = pb {
-                        pb.inc(n as u64);
-                    }
-                }
-            }
-            SourceKind::Buffered(v) => {
-                for chunk in v.chunks(CHUNK) {
-                    for &b in chunk {
-                        counts[b as usize] += 1;
-                    }
-                    if let Some(pb) = pb {
-                        pb.inc(chunk.len() as u64);
-                    }
-                }
-            }
-            SourceKind::Diff { original, modified } => {
-                let mut f_o = File::open(original)?;
-                let mut f_m = File::open(modified)?;
-                let mut buf_o = vec![0u8; CHUNK];
-                let mut buf_m = vec![0u8; CHUNK];
-                loop {
-                    let n = f_o.read(&mut buf_o)?;
-                    if n == 0 {
-                        break;
-                    }
-                    f_m.read_exact(&mut buf_m[..n])?;
-                    for i in 0..n {
-                        counts[buf_o[i].abs_diff(buf_m[i]) as usize] += 1;
-                    }
-                    if let Some(pb) = pb {
-                        pb.inc(n as u64);
-                    }
-                }
-            }
-            SourceKind::TensorDiff { orig, mod_, orig_start, mod_start, orig_dtype, mod_dtype, nelem } => {
-                const CHUNK_ELEMS: u64 = 512 * 1024;
-                const EPSILON: f32 = 1e-6;
-                let orig_elem = orig_dtype.element_size() as u64;
-                let mod_elem = mod_dtype.element_size() as u64;
-                let mut elem = 0u64;
-                while elem < *nelem {
-                    let batch = CHUNK_ELEMS.min(*nelem - elem);
-                    let ob = orig.fetch_range(
-                        orig_start + elem * orig_elem,
-                        (batch * orig_elem) as usize,
-                    ).await?;
-                    let mb = mod_.fetch_range(
-                        mod_start + elem * mod_elem,
-                        (batch * mod_elem) as usize,
-                    ).await?;
-                    for b in orig_dtype.diff_to_u8(&ob, *mod_dtype, &mb, EPSILON) {
-                        counts[b as usize] += 1;
-                    }
-                    if let Some(pb) = pb {
-                        pb.inc(batch);
-                    }
-                    elem += batch;
-                }
-            }
-        }
-
-        Ok(Histogram(counts))
-    }
-
-    /// Prefix sums: `prefix[v]` = number of bytes with value strictly less than `v`.
-    /// `prefix[256]` = total byte count.
-    pub fn prefix_sums(&self) -> [u64; 257] {
-        let mut prefix = [0u64; 257];
-        for i in 0..256 {
-            prefix[i + 1] = prefix[i] + self.0[i];
-        }
-        prefix
-    }
-}
-
 /// Recursively collect all files under `root`, sorted by path.
 fn collect_files_recursive(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -708,7 +590,6 @@ fn collect_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
 pub async fn prepare_diff_sources(
     original: &Path,
     modified: &Path,
-    format_safetensors: bool,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     let orig_is_file = original.is_file();
     let mod_is_file = modified.is_file();
@@ -716,7 +597,7 @@ pub async fn prepare_diff_sources(
     let mod_is_dir = modified.is_dir();
 
     let is_st = |p: &Path| -> bool {
-        format_safetensors || p.extension().and_then(|e| e.to_str()) == Some("safetensors")
+        p.extension().and_then(|e| e.to_str()) == Some("safetensors")
     };
 
     if orig_is_file && mod_is_file {
@@ -1218,7 +1099,6 @@ async fn build_multi_safetensors_diff_sources_inner(
                 mod_start:  mod_t.file_start,
                 orig_dtype: orig_t.dtype,
                 mod_dtype:  mod_t.dtype,
-                nelem,
             },
             byte_size: nelem,
             safetensors: None,

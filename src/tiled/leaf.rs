@@ -236,67 +236,6 @@ fn xorb_color_idx(ranges: &[(u64, u64, u8)], pixel_idx: u64) -> Option<u8> {
     None
 }
 
-/// Render one `TILE×TILE` leaf tile in sorted mode from pre-built per-source histograms.
-pub fn render_leaf_tile_sorted(
-    tx: u32,
-    ty: u32,
-    kh: u8,
-    height_tiles: u32,
-    square_pixels: u64,
-    total: u64,
-    histograms: &[([u64; 257], u64)],
-    pixel_lut: &[Rgb<u8>; 256],
-) -> TileResult {
-    let sq = (tx / height_tiles) as u64;
-    let sq_off = sq * square_pixels;
-    let local_tx = tx % height_tiles;
-
-    let tile_order = kh - TILE_LOG2;
-    let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
-    let tile_pixel_start = sq_off + base;
-    let tile_pixel_end = (tile_pixel_start + TILE_AREA).min(total);
-
-    let mut tile_buf = [0u8; TILE_PIXELS];
-
-    if tile_pixel_start < tile_pixel_end {
-        for (prefix, src_offset) in histograms {
-            let src_end = src_offset + prefix[256];
-            if *src_offset >= tile_pixel_end || src_end <= tile_pixel_start {
-                continue;
-            }
-            for v in 0usize..256 {
-                let range_start = src_offset + prefix[v];
-                let range_end = src_offset + prefix[v + 1];
-                if range_end <= tile_pixel_start || range_start >= tile_pixel_end {
-                    continue;
-                }
-                let fill_start = range_start.max(tile_pixel_start);
-                let fill_end = range_end.min(tile_pixel_end);
-                let buf_start = (fill_start - tile_pixel_start) as usize;
-                let buf_end = (fill_end - tile_pixel_start) as usize;
-                tile_buf[buf_start..buf_end].fill(v as u8);
-            }
-        }
-    }
-
-    let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
-    for py in 0..TILE {
-        let ly = ty * TILE + py;
-        for px in 0..TILE {
-            let lx = local_tx * TILE + px;
-            let local_idx = xy2h_u64(lx as u64, ly as u64, kh);
-            let pixel_idx = sq_off + local_idx;
-            let color = if pixel_idx < total {
-                pixel_lut[tile_buf[(local_idx - base) as usize] as usize]
-            } else {
-                Rgb([0u8, 0, 0])
-            };
-            img.put_pixel(px, py, color);
-        }
-    }
-    encode_png(img)
-}
-
 /// x,y → Hilbert index using u64 intermediate arithmetic.
 /// Supports curve orders up to 32 (files up to ~4 EiB).
 fn xy2h_u64(x: u64, y: u64, order: u8) -> u64 {

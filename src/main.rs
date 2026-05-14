@@ -47,10 +47,6 @@ struct Args {
     #[arg(short, long, conflicts_with = "output")]
     tiles: Option<PathBuf>,
 
-    /// Sort bytes by value within each file before rendering (loads files into memory)
-    #[arg(short = 's', long)]
-    sort: bool,
-
     /// Visualize abs(modified - original) byte differences; ORIGINAL and MODIFIED are files or directories
     #[arg(long, num_args = 2, value_names = ["ORIGINAL", "MODIFIED"])]
     diff: Option<Vec<PathBuf>>,
@@ -60,13 +56,8 @@ struct Args {
     #[arg(long, conflicts_with = "output")]
     space: Option<String>,
 
-    /// Treat inputs as a specific format (currently only "safetensors" is supported).
-    /// Auto-detected from .safetensors file extension when omitted.
-    #[arg(long, value_name = "FORMAT")]
-    format: Option<String>,
-
     /// Regenerate index.html for an existing tiles directory without re-rendering tiles
-    #[arg(long, value_name = "TILES_DIR", conflicts_with_all = ["files", "diff", "output", "tiles", "space", "sort"])]
+    #[arg(long, value_name = "TILES_DIR", conflicts_with_all = ["files", "diff", "output", "tiles", "space"])]
     regen_html: Option<PathBuf>,
 
     /// Title shown in the HTML info panel (default: "arbvis" or "arbvis diff")
@@ -87,13 +78,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
         return tiled::regen_html(tile_dir);
     }
 
-    let format_safetensors = args.format.as_deref() == Some("safetensors");
     let xet_vis = args.show_xet_xorbs || args.show_xet_chunks;
     let show_xet_chunks = args.show_xet_chunks;
 
-    if xet_vis && args.sort {
-        anyhow::bail!("--show-xet-xorbs / --show-xet-chunks are incompatible with --sort");
-    }
     if xet_vis && args.diff.is_some() {
         anyhow::bail!("--show-xet-xorbs / --show-xet-chunks are incompatible with --diff");
     }
@@ -138,9 +125,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
         let (sources, total) = if hf_url::is_repo_level(orig_str)? && hf_url::is_repo_level(mod_str)? {
             // Both are repo-level hf:// URLs: list files over API, diff lazily over HTTP.
             // No model weights are downloaded to disk or held in RAM.
-            if args.sort {
-                anyhow::bail!("--sort is not supported with repo-level hf:// diff inputs");
-            }
             let orig_specs = hf_url::list_repo_as_http_specs(orig_str).await
                 .with_context(|| format!("listing files in {orig_str}"))?;
             let mod_specs = hf_url::list_repo_as_http_specs(mod_str).await
@@ -152,25 +136,23 @@ async fn run(args: Args) -> anyhow::Result<()> {
             for p in raw_diff_args {
                 diff_args.push(resolve_input(p).await?);
             }
-            data::prepare_diff_sources(&diff_args[0], &diff_args[1], format_safetensors).await?
+            data::prepare_diff_sources(&diff_args[0], &diff_args[1]).await?
         };
         let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
         // Stream directly to HF — no tiles written to local disk.
         if let Some(ref hf_out_url) = tiles_hf_out {
-            if args.sort { anyhow::bail!("--sort is not supported with hf:// tile output"); }
             let hf_out = hf_url::parse_hf_output(hf_out_url)?;
             let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, true, diff_title, &diff_input_strs, false).await?;
             return Ok(());
         }
         if let Some(ref space_id) = args.space {
-            if args.sort { anyhow::bail!("--sort is not supported with --space diff output"); }
             let bucket_spec = deploy::create_space_bucket(space_id).await?;
             let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, true, diff_title, &diff_input_strs, false).await?;
             deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html).await?;
             return Ok(());
         }
         if let Some(ref tile_dir) = tiles_arg {
-            tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, true, diff_title, &diff_input_strs, false).await?;
+            tiled::run_tiles(sources, total, tile_dir.clone(), true, diff_title, &diff_input_strs, false).await?;
             if let Some(ref url) = tiles_upload {
                 deploy::upload_dir_to(url, tile_dir).await?;
             }
@@ -181,10 +163,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
         let labels = labels.clone();
         let sources_owned = sources;
         let output_arg_owned = output_arg.clone();
-        let sort = args.sort;
         let diff_mode = true;
         tokio::task::spawn_blocking(move || {
-            single::run_single(&labels, output_arg_owned, sources_owned, total, sort, diff_mode)
+            single::run_single(&labels, output_arg_owned, sources_owned, total, diff_mode)
         })
         .await
         .map_err(|e| anyhow::anyhow!("run_single join failure: {e}"))??;
@@ -227,9 +208,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
 
     // When tiles output is hf://, stream tiles directly to Hub (zero local disk).
     if let Some(ref hf_out_url) = tiles_hf_out {
-        if args.sort {
-            anyhow::bail!("--sort is not supported with hf:// tile output");
-        }
         let input_strs: Vec<String> = files
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
@@ -243,7 +221,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 specs.push(InputSpec::Local(p.clone()));
             }
         }
-        let (mut sources, total) = data::prepare_sources_from_specs(&specs, format_safetensors)?;
+        let (mut sources, total) = data::prepare_sources_from_specs(&specs)?;
         if xet_vis {
             data::populate_xet_terms(&mut sources).await?;
         }
@@ -283,7 +261,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 specs.push(InputSpec::Local(p.clone()));
             }
         }
-        let (mut sources, total) = data::prepare_sources_from_specs(&specs, format_safetensors)?;
+        let (mut sources, total) = data::prepare_sources_from_specs(&specs)?;
         // Capture xet term metadata while the source is still remote, then
         // materialize each file to local cache. Per-range hf-hub xet calls
         // are too expensive for the tile workload — one whole-file download
@@ -297,12 +275,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
         for p in files {
             resolved.push(resolve_input(p).await?);
         }
-        data::prepare_sources(&resolved, format_safetensors)?
+        data::prepare_sources(&resolved)?
     };
     let display_files: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
 
     if let Some(ref tile_dir) = tiles_arg {
-        tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, false, tile_title, &original_inputs, show_xet_chunks).await?;
+        tiled::run_tiles(sources, total, tile_dir.clone(), false, tile_title, &original_inputs, show_xet_chunks).await?;
         if let Some(ref space_id) = args.space {
             deploy::run_deploy(tile_dir, space_id).await?;
         }
@@ -313,7 +291,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
     }
 
     if let Some(ref space_id) = args.space {
-        if args.sort { anyhow::bail!("--sort is not supported with --space output"); }
         let bucket_spec = deploy::create_space_bucket(space_id).await?;
         let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, false, tile_title, &original_inputs, show_xet_chunks).await?;
         deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html).await?;
@@ -325,9 +302,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let display_files_owned = display_files.clone();
     let sources_owned = sources;
     let output_arg_owned = output_arg.clone();
-    let sort = args.sort;
     tokio::task::spawn_blocking(move || {
-        single::run_single(&display_files_owned, output_arg_owned, sources_owned, total, sort, false)
+        single::run_single(&display_files_owned, output_arg_owned, sources_owned, total, false)
     })
     .await
     .map_err(|e| anyhow::anyhow!("run_single join failure: {e}"))??;

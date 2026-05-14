@@ -12,10 +12,10 @@ use std::time::Duration;
 use anyhow::Context;
 use async_channel::{bounded, Receiver, Sender};
 
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
 
 use crate::color::{build_diff_signed_lut, build_pixel_lut};
-use crate::data::{load_source_data, Data, Histogram, Source};
+use crate::data::{load_source_data, Data, Source};
 use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, rects_centroid};
 use crate::hf_upload::HfTileSink;
 use crate::hf_url::HfOutputSpec;
@@ -23,7 +23,7 @@ use crate::progress::{counter_style, queue_style, status_style};
 use crate::throttle::{Throttle, MAX_FETCH_WORKERS};
 use crate::tiled::html::{FileEntity, generate_leaflet_content};
 use crate::tiled::leaf::{
-    load_tile_bytes, render_leaf_tile_dtype, render_leaf_tile_from_buf, render_leaf_tile_sorted,
+    load_tile_bytes, render_leaf_tile_dtype, render_leaf_tile_from_buf,
     render_leaf_tile_xet_from_buf, TILE, TILE_LOG2, TILE_PIXELS,
 };
 use crate::tiled::pyramid::build_pyramid;
@@ -140,7 +140,7 @@ struct LoadedTile {
     tx: u32,
     ty: u32,
     /// `Some` when the mode needs raw byte data (plain or xet); `None` for
-    /// dtype/sort modes that don't read bytes.
+    /// dtype mode which doesn't read bytes.
     tile_buf: Option<Box<[u8; TILE_PIXELS]>>,
 }
 
@@ -164,10 +164,6 @@ enum LeafMode {
     },
     Dtype {
         ranges: Arc<Vec<(u64, u64, image::Rgb<u8>)>>,
-    },
-    Sort {
-        pixel_lut: Arc<[image::Rgb<u8>; 256]>,
-        histograms: Arc<Vec<([u64; 257], u64)>>,
     },
 }
 
@@ -282,24 +278,14 @@ struct TilePlan {
     cumulative_offsets: Arc<Vec<u64>>,
     entities: Vec<FileEntity>,
     chunk_segments: Vec<(u32, u32, u32, u32)>,
-    /// Indicates the fetch stage is a no-op for this mode (dtype/sort).
-    histograms_for_sort: Option<Arc<Vec<([u64; 257], u64)>>>,
 }
 
 async fn build_tile_plan(
     sources: Vec<Source>,
     total: u64,
-    sort: bool,
     diff_mode: bool,
     show_xet_chunks: bool,
 ) -> anyhow::Result<TilePlan> {
-    if sort && sources.iter().any(|s| s.safetensors.is_some()) {
-        anyhow::bail!(
-            "--sort is incompatible with safetensors files: sort reorders bytes by value, \
-             which destroys positional dtype information"
-        );
-    }
-
     let mut s = 2 * TILE_LOG2 as u32;
     while (1u64 << s) < total {
         s += 1;
@@ -328,49 +314,15 @@ async fn build_tile_plan(
         }
     }
 
-    // For the sort path: stream each source to build histograms.
-    let histograms: Vec<([u64; 257], u64)> = if sort {
-        let sort_pb: Option<Arc<ProgressBar>> = if std::io::stderr().is_terminal() {
-            let pb = ProgressBar::new(total);
-            pb.set_style(
-                ProgressStyle::with_template(
-                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg} ({eta})",
-                )
-                .unwrap()
-                .progress_chars("=>-"),
-            );
-            pb.set_message("bytes scanned (sort histogram)");
-            pb.enable_steady_tick(Duration::from_millis(100));
-            Some(Arc::new(pb))
-        } else {
-            None
-        };
-        // Histograms are built sequentially under async to avoid contention on
-        // the progress bar Arc; each Histogram::build is mostly I/O anyway.
-        let mut result = Vec::with_capacity(sources.len());
-        for (s, &off) in sources.iter().zip(cumulative_offsets.iter()) {
-            let hist = Histogram::build(s, sort_pb.as_deref()).await?;
-            result.push((hist.prefix_sums(), off));
-        }
-        if let Some(ref pb) = sort_pb {
-            pb.finish();
-        }
-        result
-    } else {
-        vec![]
-    };
-
-    // For non-sort: open all source Data handles. `load_source_data` is sync
-    // (mmap for local, lightweight handle clone for HTTP/LazyDiff) so a plain
-    // loop is fine.
-    let source_data: Vec<Data> = if !sort {
+    // Open all source Data handles. `load_source_data` is sync (mmap for
+    // local, lightweight handle clone for HTTP/LazyDiff) so a plain loop is
+    // fine.
+    let source_data: Vec<Data> = {
         let mut v = Vec::with_capacity(sources.len());
         for s in &sources {
             v.push(load_source_data(s)?);
         }
         v
-    } else {
-        vec![]
     };
 
     let xorb_map = XorbMap::build(
@@ -471,8 +423,6 @@ async fn build_tile_plan(
         }
     }
 
-    let histograms_arc = if sort { Some(Arc::new(histograms)) } else { None };
-
     let mode = if xet_mode {
         LeafMode::Xet {
             pixel_lut: pixel_lut.clone(),
@@ -481,11 +431,6 @@ async fn build_tile_plan(
         }
     } else if dtype_mode {
         LeafMode::Dtype { ranges: Arc::new(combined_dtype_ranges) }
-    } else if sort {
-        LeafMode::Sort {
-            pixel_lut: pixel_lut.clone(),
-            histograms: histograms_arc.clone().unwrap(),
-        }
     } else {
         LeafMode::Plain { pixel_lut: pixel_lut.clone() }
     };
@@ -505,7 +450,6 @@ async fn build_tile_plan(
         cumulative_offsets: Arc::new(cumulative_offsets),
         entities,
         chunk_segments,
-        histograms_for_sort: histograms_arc,
     })
 }
 
@@ -725,9 +669,6 @@ fn render_one(
         LeafMode::Dtype { ranges } => {
             render_leaf_tile_dtype(tx, ty, kh, height_tiles, square_pixels, total, ranges)?
         }
-        LeafMode::Sort { pixel_lut, histograms } => {
-            render_leaf_tile_sorted(tx, ty, kh, height_tiles, square_pixels, total, histograms, pixel_lut)?
-        }
     };
     Ok(EncodedTile { tx, ty, image, png_bytes })
 }
@@ -737,13 +678,12 @@ pub async fn run_tiles(
     sources: Vec<Source>,
     total: u64,
     tile_dir: PathBuf,
-    sort: bool,
     diff_mode: bool,
     title: &str,
     inputs: &[String],
     show_xet_chunks: bool,
 ) -> anyhow::Result<()> {
-    let plan = build_tile_plan(sources, total, sort, diff_mode, show_xet_chunks).await?;
+    let plan = build_tile_plan(sources, total, diff_mode, show_xet_chunks).await?;
 
     let max_zoom = plan.max_zoom;
     let tile_size = TILE;
@@ -752,8 +692,6 @@ pub async fn run_tiles(
     let world_w = plan.world_w;
     let height = plan.height;
     let total_tiles = plan.total_tiles;
-
-    let _ = plan.histograms_for_sort.clone(); // alive for lifetime of plan
 
     std::fs::create_dir_all(tile_dir.join(format!("tiles/{max_zoom}")))?;
 
@@ -800,7 +738,7 @@ pub async fn run_tiles_hf_streaming(
     crate::hf_url::require_token()?;
     let client = crate::hf_url::client()?;
 
-    let plan = build_tile_plan(sources, total, false, diff_mode, show_xet_chunks).await?;
+    let plan = build_tile_plan(sources, total, diff_mode, show_xet_chunks).await?;
     let tile_size = TILE;
     let max_zoom = plan.max_zoom;
     let world_w = plan.world_w;

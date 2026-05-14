@@ -12,7 +12,7 @@ use minifb::{Window, WindowOptions};
 use rayon::prelude::*;
 
 use crate::color::{build_diff_signed_lut, build_pixel_lut};
-use crate::data::{load_source_data, Histogram, Source};
+use crate::data::{load_source_data, Source};
 use crate::geometry::{sampled_in_range, hilbert_to_xy_u64};
 use crate::label::draw_file_label;
 use crate::safetensors::color_for_pos;
@@ -24,16 +24,8 @@ pub fn run_single(
     output: Option<PathBuf>,
     sources: Vec<Source>,
     total: u64,
-    sort: bool,
     diff_mode: bool,
 ) -> anyhow::Result<()> {
-    if sort && sources.iter().any(|s| s.safetensors.is_some()) {
-        anyhow::bail!(
-            "--sort is incompatible with safetensors files: sort reorders bytes by value, \
-             which destroys positional dtype information"
-        );
-    }
-
     let num_files = files.len().max(1);
     let total_usize = (total as usize).max(1);
 
@@ -101,27 +93,20 @@ pub fn run_single(
 
     // Compute per-source byte and pixel offsets.
     let chunk_bytes = (4 * 1024 * 1024u64).max(stride);
-    let mut src_byte_starts: Vec<u64> = Vec::with_capacity(sources.len());
-    let mut src_pixel_starts: Vec<u64> = Vec::with_capacity(sources.len());
-    let mut chunks_by_source: Vec<Vec<(usize, u64, u64, u64, u64)>> =
-        if sort { vec![] } else { vec![vec![]; sources.len()] };
+    let mut chunks_by_source: Vec<Vec<(usize, u64, u64, u64, u64)>> = vec![vec![]; sources.len()];
     {
         let mut b = 0u64;
         let mut p = 0u64;
         for (src_idx, s) in sources.iter().enumerate() {
-            src_byte_starts.push(b);
-            src_pixel_starts.push(p);
-            if !sort {
-                let fi = s.file_idx;
-                let src_end = b + s.byte_size;
-                let mut cb = b;
-                let mut cp = p;
-                while cb < src_end {
-                    let ce = (cb + chunk_bytes).min(src_end);
-                    chunks_by_source[src_idx].push((fi, b, cb, ce, cp));
-                    cp += sampled_in_range(cb, ce, stride);
-                    cb = ce;
-                }
+            let fi = s.file_idx;
+            let src_end = b + s.byte_size;
+            let mut cb = b;
+            let mut cp = p;
+            while cb < src_end {
+                let ce = (cb + chunk_bytes).min(src_end);
+                chunks_by_source[src_idx].push((fi, b, cb, ce, cp));
+                cp += sampled_in_range(cb, ce, stride);
+                cb = ce;
             }
             p += sampled_in_range(b, b + s.byte_size, stride);
             b += s.byte_size;
@@ -144,7 +129,7 @@ pub fn run_single(
         let canvas_u = canvas_size as u64;
 
         let chunk_results = render_chunks(
-            &sources, &chunks_by_source, sort, &src_byte_starts, &src_pixel_starts,
+            &sources, &chunks_by_source,
             &cancelled, img_base, pf_base, canvas_u, canvas_size, side, k, stride,
             &pixel_lut, &xorb_map, &tableau, &pb_shared,
         )?;
@@ -200,7 +185,7 @@ pub fn run_single(
 
         let bg_thread = std::thread::spawn(move || {
             let result = render_chunks(
-                &sources, &chunks_by_source, sort, &src_byte_starts, &src_pixel_starts,
+                &sources, &chunks_by_source,
                 &cancelled_bg, img_ptr, pf_ptr, canvas_u, canvas_size, side, k, stride,
                 &pixel_lut, &xorb_map, &tableau, &pb_shared,
             );
@@ -316,9 +301,6 @@ pub fn run_single(
 fn render_chunks(
     sources: &[Source],
     chunks_by_source: &[Vec<(usize, u64, u64, u64, u64)>],
-    sort: bool,
-    src_byte_starts: &[u64],
-    src_pixel_starts: &[u64],
     cancelled: &AtomicBool,
     img_base: usize,
     pf_base: usize,
@@ -346,96 +328,75 @@ fn render_chunks(
             pixel_lut[byte as usize]
         }
     };
-    let chunk_results: Vec<(usize, Option<(u32, u32, u32, u32)>)> = if sort {
-        (0..sources.len())
-            .into_par_iter()
-            .map(|src_idx| -> anyhow::Result<(usize, Option<(u32, u32, u32, u32)>)> {
-                let source = &sources[src_idx];
-                // single mode never has HTTP sources (errors upstream), so
-                // Histogram::build's async path is dead code and a blocking
-                // executor here is safe (we're on a rayon worker thread).
-                let hist = futures::executor::block_on(Histogram::build(source, pb_shared.as_deref()))?;
-                let prefix = hist.prefix_sums();
-                let fi = source.file_idx;
-                let src_byte_start = src_byte_starts[src_idx];
-                let mut cur_pixel = src_pixel_starts[src_idx];
-                let mut bbox: Option<(u32, u32, u32, u32)> = None;
-
-                for v in 0usize..=255 {
-                    if cancelled.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let n = hist.0[v];
-                    if n == 0 {
-                        continue;
-                    }
-                    let global_byte_start = src_byte_start + prefix[v];
-                    let global_byte_end = src_byte_start + prefix[v + 1];
-                    let n_pixels = sampled_in_range(global_byte_start, global_byte_end, stride);
-                    let color = pixel_lut[v];
-
-                    for p_off in 0..n_pixels {
-                        let p = cur_pixel + p_off;
-                        if p >= canvas_u {
-                            break;
-                        }
-                        let (x, y) = hilbert_to_xy_u64(p, k as u8);
-                        let pixel_idx = y as usize * side as usize + x as usize;
-                        unsafe {
-                            let ptr = (img_base as *mut u8).add(pixel_idx * 3);
-                            ptr.write(color[0]);
-                            ptr.add(1).write(color[1]);
-                            ptr.add(2).write(color[2]);
-                            (pf_base as *mut Option<usize>).add(pixel_idx).write(Some(fi));
-                        }
-                        bbox = Some(match bbox {
-                            None => (x, y, x, y),
-                            Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
-                        });
-                    }
-                    cur_pixel += n_pixels;
+    let chunk_results: Vec<(usize, Option<(u32, u32, u32, u32)>)> = chunks_by_source
+        .par_iter()
+        .enumerate()
+        .map(
+            |(src_idx, source_chunks)| -> anyhow::Result<Vec<(usize, Option<(u32, u32, u32, u32)>)>> {
+                if source_chunks.is_empty() {
+                    return Ok(vec![]);
                 }
+                let dtype_ranges = sources[src_idx]
+                    .safetensors
+                    .as_ref()
+                    .map(|st| st.color_ranges.as_slice());
+                let data = if dtype_ranges.is_none() {
+                    Some(load_source_data(&sources[src_idx])?)
+                } else {
+                    None
+                };
+                let results = source_chunks
+                    .par_iter()
+                    .map(|&(fi, src_global_start, chunk_b_start, chunk_b_end, chunk_pixel_start)| {
+                        if chunk_pixel_start >= canvas_u || cancelled.load(Ordering::Acquire) {
+                            return (fi, None);
+                        }
 
-                Ok((fi, bbox))
-            })
-            .collect::<anyhow::Result<_>>()?
-    } else {
-        chunks_by_source
-            .par_iter()
-            .enumerate()
-            .map(
-                |(src_idx, source_chunks)| -> anyhow::Result<Vec<(usize, Option<(u32, u32, u32, u32)>)>> {
-                    if source_chunks.is_empty() {
-                        return Ok(vec![]);
-                    }
-                    let dtype_ranges = sources[src_idx]
-                        .safetensors
-                        .as_ref()
-                        .map(|st| st.color_ranges.as_slice());
-                    let data = if dtype_ranges.is_none() {
-                        Some(load_source_data(&sources[src_idx])?)
-                    } else {
-                        None
-                    };
-                    let results = source_chunks
-                        .par_iter()
-                        .map(|&(fi, src_global_start, chunk_b_start, chunk_b_end, chunk_pixel_start)| {
-                            if chunk_pixel_start >= canvas_u || cancelled.load(Ordering::Acquire) {
-                                return (fi, None);
-                            }
+                        let mut cur_pixel = chunk_pixel_start as usize;
+                        let mut bbox: Option<(u32, u32, u32, u32)> = None;
 
-                            let mut cur_pixel = chunk_pixel_start as usize;
-                            let mut bbox: Option<(u32, u32, u32, u32)> = None;
-
-                            if let Some(ranges) = dtype_ranges {
-                                let first = chunk_b_start
-                                    + (stride - chunk_b_start % stride) % stride;
-                                for strided_b in (first..chunk_b_end).step_by(stride as usize) {
-                                    if cur_pixel >= canvas_size {
-                                        break;
+                        if let Some(ranges) = dtype_ranges {
+                            let first = chunk_b_start
+                                + (stride - chunk_b_start % stride) % stride;
+                            for strided_b in (first..chunk_b_end).step_by(stride as usize) {
+                                if cur_pixel >= canvas_size {
+                                    break;
+                                }
+                                let (x, y) = hilbert_to_xy_u64(cur_pixel as u64, k as u8);
+                                let color = color_for_pos(strided_b - src_global_start, ranges);
+                                let pixel_idx = y as usize * side as usize + x as usize;
+                                unsafe {
+                                    let p = (img_base as *mut u8).add(pixel_idx * 3);
+                                    p.write(color[0]);
+                                    p.add(1).write(color[1]);
+                                    p.add(2).write(color[2]);
+                                    (pf_base as *mut Option<usize>)
+                                        .add(pixel_idx)
+                                        .write(Some(fi));
+                                }
+                                bbox = Some(match bbox {
+                                    None => (x, y, x, y),
+                                    Some((x0, y0, x1, y1)) => {
+                                        (x0.min(x), y0.min(y), x1.max(x), y1.max(y))
                                     }
+                                });
+                                cur_pixel += 1;
+                            }
+                        } else {
+                            let data = data.as_ref().unwrap();
+                            let local_start = (chunk_b_start - src_global_start) as usize;
+                            let local_end = (chunk_b_end - src_global_start) as usize;
+                            let bytes = &data[local_start..local_end];
+                            let mut cur_byte = chunk_b_start;
+
+                            for &b in bytes {
+                                if cur_byte % stride == 0 {
                                     let (x, y) = hilbert_to_xy_u64(cur_pixel as u64, k as u8);
-                                    let color = color_for_pos(strided_b - src_global_start, ranges);
+                                    let color = if xet_mode {
+                                        xet_color(b, cur_byte)
+                                    } else {
+                                        pixel_lut[b as usize]
+                                    };
                                     let pixel_idx = y as usize * side as usize + x as usize;
                                     unsafe {
                                         let p = (img_base as *mut u8).add(pixel_idx * 3);
@@ -453,60 +414,26 @@ fn render_chunks(
                                         }
                                     });
                                     cur_pixel += 1;
-                                }
-                            } else {
-                                let data = data.as_ref().unwrap();
-                                let local_start = (chunk_b_start - src_global_start) as usize;
-                                let local_end = (chunk_b_end - src_global_start) as usize;
-                                let bytes = &data[local_start..local_end];
-                                let mut cur_byte = chunk_b_start;
-
-                                for &b in bytes {
-                                    if cur_byte % stride == 0 {
-                                        let (x, y) = hilbert_to_xy_u64(cur_pixel as u64, k as u8);
-                                        let color = if xet_mode {
-                                            xet_color(b, cur_byte)
-                                        } else {
-                                            pixel_lut[b as usize]
-                                        };
-                                        let pixel_idx = y as usize * side as usize + x as usize;
-                                        unsafe {
-                                            let p = (img_base as *mut u8).add(pixel_idx * 3);
-                                            p.write(color[0]);
-                                            p.add(1).write(color[1]);
-                                            p.add(2).write(color[2]);
-                                            (pf_base as *mut Option<usize>)
-                                                .add(pixel_idx)
-                                                .write(Some(fi));
-                                        }
-                                        bbox = Some(match bbox {
-                                            None => (x, y, x, y),
-                                            Some((x0, y0, x1, y1)) => {
-                                                (x0.min(x), y0.min(y), x1.max(x), y1.max(y))
-                                            }
-                                        });
-                                        cur_pixel += 1;
-                                        if cur_pixel >= canvas_size {
-                                            break;
-                                        }
+                                    if cur_pixel >= canvas_size {
+                                        break;
                                     }
-                                    cur_byte += 1;
                                 }
+                                cur_byte += 1;
                             }
-                            if let Some(ref pb) = pb_shared {
-                                pb.inc(chunk_b_end - chunk_b_start);
-                            }
-                            (fi, bbox)
-                        })
-                        .collect();
-                    Ok(results)
-                },
-            )
-            .collect::<anyhow::Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect()
-    };
+                        }
+                        if let Some(ref pb) = pb_shared {
+                            pb.inc(chunk_b_end - chunk_b_start);
+                        }
+                        (fi, bbox)
+                    })
+                    .collect();
+                Ok(results)
+            },
+        )
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
 
     // When multiple files are given, mark border pixels black.
     if sources.iter().map(|s| s.file_idx).collect::<std::collections::HashSet<_>>().len() > 1 {

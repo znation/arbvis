@@ -368,6 +368,103 @@ pub fn prepare_sources_from_specs(
     Ok((sources, total))
 }
 
+/// Materialize every `SourceKind::Http` source as a local file via one
+/// whole-file download per source, then swap each source to `SourceKind::File`.
+///
+/// Why: `Data::Http::fetch_range` ultimately hits hf-hub's xet streaming API
+/// when the file is xet-backed. That code path has substantial *per-call*
+/// setup cost — it fetches a fresh CAS token, builds a `XetDownloadStreamGroup`,
+/// and opens a new stream — far more expensive than the ~65 KiB of payload
+/// transferred for a single tile. With tens of thousands of tiles per file,
+/// the per-call overhead dominates and the pipeline appears stalled.
+///
+/// One whole-file `download_file` per source amortises that overhead across
+/// the entire file (which the renderer will read every byte of anyway). After
+/// materialization, all tile reads are mmap'd `memcpy`s — no HTTP, no throttle.
+///
+/// `populate_xet_terms` must run *before* this so the xet term metadata is
+/// captured from the still-remote `RemoteFileSpec`.
+pub async fn materialize_http_sources(sources: &mut [Source]) -> anyhow::Result<()> {
+    use crate::hf_url::RemoteRepo;
+    use crate::throttle::with_throttle;
+
+    // Snapshot (index, spec) for Http sources so the futures don't borrow `sources`.
+    let jobs: Vec<(usize, RemoteFileSpec)> = sources
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| match &s.kind {
+            SourceKind::Http(spec) => Some((i, spec.clone())),
+            _ => None,
+        })
+        .collect();
+
+    if jobs.is_empty() {
+        return Ok(());
+    }
+
+    let pb = setup_progress("source files (downloading for xet view)", jobs.len() as u64);
+    let pb_for_workers = pb.clone();
+
+    let downloads: Vec<(usize, anyhow::Result<PathBuf>)> = stream::iter(jobs)
+        .map(|(i, spec)| {
+            let pb = pb_for_workers.clone();
+            async move {
+                let filename = (*spec.filename).clone();
+                let revision = (*spec.revision).clone();
+                let label = format!("download_file {filename}");
+                let result = with_throttle(&label, || async {
+                    match &spec.repo {
+                        RemoteRepo::Model(r) => {
+                            r.download_file()
+                                .filename(filename.clone())
+                                .revision(revision.clone())
+                                .send()
+                                .await
+                        }
+                        RemoteRepo::Dataset(r) => {
+                            r.download_file()
+                                .filename(filename.clone())
+                                .revision(revision.clone())
+                                .send()
+                                .await
+                        }
+                        RemoteRepo::Space(r) => {
+                            r.download_file()
+                                .filename(filename.clone())
+                                .revision(revision.clone())
+                                .send()
+                                .await
+                        }
+                    }
+                })
+                .await
+                .map_err(anyhow::Error::from);
+                if let Some(pb) = pb.as_ref() {
+                    pb.inc(1);
+                }
+                (i, result)
+            }
+        })
+        .buffer_unordered(SETUP_FETCH_CONCURRENCY)
+        .collect()
+        .await;
+
+    if let Some(pb) = pb.as_ref() {
+        pb.finish();
+    }
+
+    for (i, r) in downloads {
+        let path = r?;
+        // Preserve display name + xet_terms; only the storage kind changes.
+        let display = sources[i].name();
+        sources[i].kind = SourceKind::File(path);
+        if sources[i].name_override.is_none() {
+            sources[i].name_override = Some(display);
+        }
+    }
+    Ok(())
+}
+
 /// Fetch xet reconstruction terms for any HTTP-backed sources.
 ///
 /// Each source gets `xet_terms = Some(vec)` — empty for sources without a xet
@@ -378,7 +475,7 @@ pub async fn populate_xet_terms(sources: &mut [Source]) -> anyhow::Result<()> {
     // throttled HTTP round-trips (`xet-read-token` + `reconstructions/{hash}`)
     // and the global throttle caps the real concurrency, so let the runtime
     // have plenty of awaiting tasks.
-    let pb = setup_progress("xet reconstruction", sources.len() as u64);
+    let pb = setup_progress("source files (xet reconstruction)", sources.len() as u64);
     let pb_for_close = pb.clone();
 
     // Decouple the per-source future from the borrow on `sources` by snapshotting
@@ -854,7 +951,7 @@ pub async fn prepare_diff_sources_from_http(
         diff_jobs.push((fname.to_string(), (*orig_spec).clone(), (*mod_spec).clone()));
     }
 
-    let pb = setup_progress("non-safetensors diffs", diff_jobs.len() as u64);
+    let pb = setup_progress("source files (non-safetensors diff downloads)", diff_jobs.len() as u64);
     let pb_for_workers = pb.clone();
     let diffs: Vec<anyhow::Result<(String, Vec<u8>)>> = stream::iter(diff_jobs)
         .map(|(fname, orig_spec, mod_spec)| {
@@ -1042,7 +1139,7 @@ async fn build_multi_safetensors_diff_sources_inner(
     // wastes the throttle. Fetch both sides concurrently with bounded
     // parallelism.
     let total = (orig_data.len() + mod_data.len()) as u64;
-    let pb = setup_progress("safetensors headers", total);
+    let pb = setup_progress("source files (safetensors headers)", total);
 
     async fn fetch_all(
         data: &[Arc<Data>],
@@ -1156,6 +1253,12 @@ async fn build_multi_safetensors_diff_sources_from_http(
     orig_specs: &[&(String, RemoteFileSpec)],
     mod_specs:  &[&(String, RemoteFileSpec)],
 ) -> anyhow::Result<(Vec<Source>, u64)> {
+    // TODO: this path still wraps each side in `Data::Http`, which means per-tile
+    // tensor diffs go through hf-hub's xet range API with the same prohibitive
+    // setup cost noted on `materialize_http_sources`. The diff renderer reads
+    // every byte of both sides anyway, so a whole-file download per side would
+    // be strictly faster. Mirror the `materialize_http_sources` pattern here
+    // when this code path is exercised.
     let make_arcs = |specs: &[&(String, RemoteFileSpec)]| -> Vec<Arc<Data>> {
         specs.iter().map(|(_, spec)| {
             Arc::new(Data::Http {

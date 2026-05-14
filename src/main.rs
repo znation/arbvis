@@ -247,6 +247,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
         if xet_vis {
             data::populate_xet_terms(&mut sources).await?;
         }
+        // Materialize remote sources to local cache — see materialize_http_sources
+        // for why per-range hf-hub xet calls are too expensive for the tile workload.
+        data::materialize_http_sources(&mut sources).await?;
         let hf_out = hf_url::parse_hf_output(hf_out_url)?;
         let stream_title = args.title.as_deref().unwrap_or("arbvis");
         let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, false, stream_title, &input_strs, show_xet_chunks).await?;
@@ -281,7 +284,13 @@ async fn run(args: Args) -> anyhow::Result<()> {
             }
         }
         let (mut sources, total) = data::prepare_sources_from_specs(&specs, format_safetensors)?;
+        // Capture xet term metadata while the source is still remote, then
+        // materialize each file to local cache. Per-range hf-hub xet calls
+        // are too expensive for the tile workload — one whole-file download
+        // amortises the xet setup over the entire file (which we read every
+        // byte of anyway during render).
         data::populate_xet_terms(&mut sources).await?;
+        data::materialize_http_sources(&mut sources).await?;
         (sources, total)
     } else {
         let mut resolved: Vec<PathBuf> = Vec::with_capacity(files.len());

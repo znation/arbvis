@@ -8,6 +8,7 @@ use hf_hub::HFClientSync;
 use tempfile::TempDir;
 
 use crate::hf_url::{self, HfOutputSpec, RepoKind};
+use crate::throttle::with_throttle;
 use crate::tiled::pyramid_accum::TileSink;
 
 /// Sink for streaming tile output to the Hub.
@@ -68,10 +69,12 @@ impl HfTileSink {
                     .into_iter()
                     .map(|t| BucketUpload::new(t.local_path, t.repo_path))
                     .collect();
-                self.client.bucket(owner, name)
-                    .upload_files()
-                    .files(uploads)
-                    .send()?;
+                with_throttle(&format!("bucket upload {}", self.spec.repo_id), || {
+                    self.client.bucket(owner, name)
+                        .upload_files()
+                        .files(uploads.clone())
+                        .send()
+                })?;
             }
             kind => {
                 let ops: Vec<CommitOperation> = staged
@@ -80,21 +83,34 @@ impl HfTileSink {
                     .collect();
                 let revision = self.spec.revision.clone();
                 let message = summary.to_string();
-                match kind {
-                    RepoKind::Model => {
-                        self.client.model(owner, name)
-                            .create_commit().operations(ops).commit_message(message).revision(revision).send()?;
-                    }
-                    RepoKind::Dataset => {
-                        self.client.dataset(owner, name)
-                            .create_commit().operations(ops).commit_message(message).revision(revision).send()?;
-                    }
-                    RepoKind::Space => {
-                        self.client.space(owner, name)
-                            .create_commit().operations(ops).commit_message(message).revision(revision).send()?;
-                    }
+                let label = format!("create_commit {}", self.spec.repo_id);
+                with_throttle(&label, || match kind {
+                    RepoKind::Model => self
+                        .client.model(owner, name)
+                        .create_commit()
+                        .operations(ops.clone())
+                        .commit_message(message.clone())
+                        .revision(revision.clone())
+                        .send()
+                        .map(|_| ()),
+                    RepoKind::Dataset => self
+                        .client.dataset(owner, name)
+                        .create_commit()
+                        .operations(ops.clone())
+                        .commit_message(message.clone())
+                        .revision(revision.clone())
+                        .send()
+                        .map(|_| ()),
+                    RepoKind::Space => self
+                        .client.space(owner, name)
+                        .create_commit()
+                        .operations(ops.clone())
+                        .commit_message(message.clone())
+                        .revision(revision.clone())
+                        .send()
+                        .map(|_| ()),
                     RepoKind::Bucket => unreachable!(),
-                }
+                })?;
             }
         }
         // tempdir drops here — staged tile files are removed from disk.

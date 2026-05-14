@@ -22,6 +22,7 @@ use anyhow::{Context, anyhow};
 use serde::Deserialize;
 
 use crate::hf_url::{self, RemoteFileSpec};
+use crate::throttle::with_throttle;
 
 /// A flat byte-range view of one reconstruction term.
 ///
@@ -96,16 +97,18 @@ fn fetch_cas_token(
     );
     log::info!("Requesting xet CAS token for {repo_id}@{revision}");
     let client = reqwest::blocking::Client::new();
-    let resp = client
-        .get(&url)
-        .bearer_auth(&hf_token)
-        .send()
-        .with_context(|| format!("requesting xet-read-token at {url}"))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().unwrap_or_default();
-        anyhow::bail!("xet-read-token {url} returned {status}: {body}");
-    }
+    // `error_for_status()` converts non-2xx into a reqwest::Error carrying the
+    // status code so the throttle's classifier can detect 429/5xx and retry.
+    // Response body detail is lost on error, but the URL and status code are
+    // preserved.
+    let resp = with_throttle(&format!("xet-read-token {repo_id}"), || {
+        client
+            .get(&url)
+            .bearer_auth(&hf_token)
+            .send()
+            .and_then(|r| r.error_for_status())
+    })
+    .with_context(|| format!("requesting xet-read-token at {url}"))?;
     let parsed: XetReadTokenResponse = resp
         .json()
         .with_context(|| format!("parsing xet-read-token response from {url}"))?;
@@ -130,16 +133,14 @@ fn fetch_reconstruction_terms(
     let url = format!("{}/v2/reconstructions/{}", cas.cas_url, xet_hash_hex);
     log::info!("Fetching reconstruction terms: {url}");
     let client = reqwest::blocking::Client::new();
-    let resp = client
-        .get(&url)
-        .bearer_auth(&cas.access_token)
-        .send()
-        .with_context(|| format!("requesting reconstruction at {url}"))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().unwrap_or_default();
-        anyhow::bail!("reconstruction {url} returned {status}: {body}");
-    }
+    let resp = with_throttle(&format!("reconstruction {xet_hash_hex}"), || {
+        client
+            .get(&url)
+            .bearer_auth(&cas.access_token)
+            .send()
+            .and_then(|r| r.error_for_status())
+    })
+    .with_context(|| format!("requesting reconstruction at {url}"))?;
     let parsed: ReconstructionResponse = resp
         .json()
         .with_context(|| format!("parsing reconstruction response from {url}"))?;

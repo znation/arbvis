@@ -7,6 +7,7 @@ mod hf_url;
 mod label;
 mod safetensors;
 mod single;
+mod throttle;
 mod tiled;
 mod xet;
 

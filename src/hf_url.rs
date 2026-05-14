@@ -1,47 +1,12 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 use anyhow::Context;
 use hf_hub::{
     HFBucketSync, HFClientSync, HFRepositorySync, RepoTypeDataset, RepoTypeModel, RepoTypeSpace,
 };
 
-/// Process-wide "don't issue new range requests until this instant" state.
-/// When any thread is rate-limited it extends this deadline; all threads check
-/// it before each fetch attempt so they pause in lockstep rather than each
-/// independently retrying and immediately hitting the limit again.
-static RATE_LIMIT_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
-
-/// Monotone counter used to stagger thread wakeup times by up to 1 s so
-/// threads don't thundering-herd the CAS bridge the moment a pause expires.
-static JITTER_NONCE: AtomicU64 = AtomicU64::new(0);
-
-fn wait_for_global_rate_limit() {
-    loop {
-        let deadline = *RATE_LIMIT_UNTIL.lock().unwrap();
-        let Some(until) = deadline else { return };
-        let now = Instant::now();
-        if now >= until { return; }
-        let jitter = Duration::from_millis(JITTER_NONCE.fetch_add(37, Ordering::Relaxed) % 1000);
-        std::thread::sleep(until - now + jitter);
-    }
-}
-
-/// Extend the global rate-limit deadline by `delay` from now.
-/// Returns `true` if this call is the first in a new rate-limit wave
-/// (deadline was unset or already expired), so the caller should log a warning.
-/// Returns `false` when another thread already has an active deadline — the
-/// caller should stay quiet to avoid a wall of identical log lines.
-fn extend_global_rate_limit(delay: Duration) -> bool {
-    let now = Instant::now();
-    let until = now + delay;
-    let mut guard = RATE_LIMIT_UNTIL.lock().unwrap();
-    let is_new_wave = guard.map_or(true, |existing| existing <= now);
-    *guard = Some(guard.map_or(until, |existing| existing.max(until)));
-    is_new_wave
-}
+use crate::throttle::with_throttle;
 
 /// Repo kind parsed from an `hf://` URL. Carried as a typed value rather than a
 /// string so the four upload/download dispatch sites in this crate can match
@@ -73,49 +38,13 @@ pub enum RemoteRepo {
 
 impl RemoteRepo {
     pub fn fetch_range(&self, filename: &str, revision: &str, range: std::ops::Range<u64>) -> anyhow::Result<Vec<u8>> {
-        const MAX_RETRIES: u32 = 5;
-        const DEFAULT_PAUSE_SECS: u64 = 30;
-
-        for attempt in 0..=MAX_RETRIES {
-            // Block if another thread already recorded a rate-limit pause.
-            wait_for_global_rate_limit();
-
-            let result = match self {
-                RemoteRepo::Model(r) => r.download_file_to_bytes().filename(filename).revision(revision).range(range.clone()).send(),
-                RemoteRepo::Dataset(r) => r.download_file_to_bytes().filename(filename).revision(revision).range(range.clone()).send(),
-                RemoteRepo::Space(r) => r.download_file_to_bytes().filename(filename).revision(revision).range(range.clone()).send(),
-            };
-            match result {
-                Ok(b) => return Ok(b.to_vec()),
-                Err(hf_hub::HFError::RateLimited { retry_after, .. }) if attempt < MAX_RETRIES => {
-                    let delay = retry_after.unwrap_or(Duration::from_secs(DEFAULT_PAUSE_SECS));
-                    // Only the first thread in each rate-limit wave logs at WARN; the rest are
-                    // silent (their in-flight requests all returned 429 simultaneously, and
-                    // logging all of them is pure noise).
-                    if extend_global_rate_limit(delay) {
-                        log::warn!(
-                            "rate limited; pausing all requests for {:.0}s ({}/{})",
-                            delay.as_secs_f32(),
-                            attempt + 1,
-                            MAX_RETRIES,
-                        );
-                    }
-                    // Don't sleep here — the loop's wait_for_global_rate_limit() handles it.
-                }
-                Err(hf_hub::HFError::Request { ref source, .. }) if attempt < MAX_RETRIES => {
-                    let delay = Duration::from_secs(2u64.pow(attempt));
-                    log::warn!(
-                        "transient connection error on {filename}; retrying in {:.0}s ({}/{}): {source}",
-                        delay.as_secs_f32(),
-                        attempt + 1,
-                        MAX_RETRIES,
-                    );
-                    std::thread::sleep(delay);
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        unreachable!()
+        let label = format!("fetch_range {filename}");
+        let bytes = with_throttle(&label, || match self {
+            RemoteRepo::Model(r) => r.download_file_to_bytes().filename(filename).revision(revision).range(range.clone()).send(),
+            RemoteRepo::Dataset(r) => r.download_file_to_bytes().filename(filename).revision(revision).range(range.clone()).send(),
+            RemoteRepo::Space(r) => r.download_file_to_bytes().filename(filename).revision(revision).range(range.clone()).send(),
+        })?;
+        Ok(bytes.to_vec())
     }
 
     /// `models`, `datasets`, or `spaces` — the URL segment used in
@@ -370,22 +299,22 @@ pub fn resolve(path: &Path) -> anyhow::Result<PathBuf> {
 
     if hf.path_in_repo.is_empty() {
         log::info!("Resolving repo {} ...", hf.repo_id);
-        let dir = match &repo {
+        let dir = with_throttle(&format!("snapshot_download {}", hf.repo_id), || match &repo {
             RemoteRepo::Model(r) => r.snapshot_download().revision(hf.revision.clone()).send(),
             RemoteRepo::Dataset(r) => r.snapshot_download().revision(hf.revision.clone()).send(),
             RemoteRepo::Space(r) => r.snapshot_download().revision(hf.revision.clone()).send(),
-        }
+        })
         .with_context(|| format!("downloading {}", hf.repo_id))?;
         return Ok(dir);
     }
 
     log::info!("Fetching {} from {} ...", hf.path_in_repo, hf.repo_id);
 
-    let local = match &repo {
+    let local = with_throttle(&format!("download_file {}", hf.path_in_repo), || match &repo {
         RemoteRepo::Model(r) => r.download_file().filename(hf.path_in_repo.clone()).revision(hf.revision.clone()).send(),
         RemoteRepo::Dataset(r) => r.download_file().filename(hf.path_in_repo.clone()).revision(hf.revision.clone()).send(),
         RemoteRepo::Space(r) => r.download_file().filename(hf.path_in_repo.clone()).revision(hf.revision.clone()).send(),
-    }
+    })
     .with_context(|| format!("fetching hf://{}/{}", hf.repo_id, hf.path_in_repo))?;
 
     log::info!("Cached at {}", local.display());
@@ -409,11 +338,10 @@ fn resolve_bucket(cli: &HFClientSync, hf: &HfUrl) -> anyhow::Result<PathBuf> {
 
     if hf.path_in_repo.is_empty() {
         log::info!("Resolving bucket {} ...", hf.repo_id);
-        let entries = bucket
-            .list_tree()
-            .recursive(true)
-            .send()
-            .with_context(|| format!("listing bucket {}", hf.repo_id))?;
+        let entries = with_throttle(&format!("bucket list_tree {}", hf.repo_id), || {
+            bucket.list_tree().recursive(true).send()
+        })
+        .with_context(|| format!("listing bucket {}", hf.repo_id))?;
         let downloads: Vec<BucketDownload> = entries
             .into_iter()
             .filter_map(|e| match e {
@@ -427,21 +355,22 @@ fn resolve_bucket(cli: &HFClientSync, hf: &HfUrl) -> anyhow::Result<PathBuf> {
         if downloads.is_empty() {
             anyhow::bail!("bucket {} has no files", hf.repo_id);
         }
-        bucket
-            .download_files()
-            .files(downloads)
-            .send()
-            .with_context(|| format!("downloading bucket {}", hf.repo_id))?;
+        with_throttle(&format!("bucket download_files {}", hf.repo_id), || {
+            bucket.download_files().files(downloads.clone()).send()
+        })
+        .with_context(|| format!("downloading bucket {}", hf.repo_id))?;
         return Ok(dest_root);
     }
 
     log::info!("Fetching {} from bucket {} ...", hf.path_in_repo, hf.repo_id);
     let local = dest_root.join(&hf.path_in_repo);
-    bucket
-        .download_files()
-        .files(vec![BucketDownload::new(hf.path_in_repo.clone(), local.clone())])
-        .send()
-        .with_context(|| format!("fetching hf://buckets/{}/{}", hf.repo_id, hf.path_in_repo))?;
+    with_throttle(&format!("bucket download_files {}", hf.path_in_repo), || {
+        bucket
+            .download_files()
+            .files(vec![BucketDownload::new(hf.path_in_repo.clone(), local.clone())])
+            .send()
+    })
+    .with_context(|| format!("fetching hf://buckets/{}/{}", hf.repo_id, hf.path_in_repo))?;
     log::info!("Cached at {}", local.display());
     Ok(local)
 }
@@ -454,11 +383,11 @@ pub fn resolve_to_http(path: &Path) -> anyhow::Result<RemoteFileSpec> {
     let hf = parse(&s).with_context(|| format!("invalid hf:// URL: {s:?}"))?;
     let cli = client()?;
     let repo = make_remote_repo(&cli, &hf)?;
-    let meta = match &repo {
+    let meta = with_throttle(&format!("get_file_metadata {}", hf.path_in_repo), || match &repo {
         RemoteRepo::Model(r) => r.get_file_metadata().filepath(hf.path_in_repo.clone()).revision(hf.revision.clone()).send(),
         RemoteRepo::Dataset(r) => r.get_file_metadata().filepath(hf.path_in_repo.clone()).revision(hf.revision.clone()).send(),
         RemoteRepo::Space(r) => r.get_file_metadata().filepath(hf.path_in_repo.clone()).revision(hf.revision.clone()).send(),
-    }
+    })
     .with_context(|| format!("metadata for hf://{}/{}", hf.repo_id, hf.path_in_repo))?;
 
     log::info!("Remote file {}: {} bytes", hf.path_in_repo, meta.file_size);
@@ -482,11 +411,11 @@ pub fn list_repo_as_http_specs(url_str: &str) -> anyhow::Result<Vec<(String, Rem
     let cli = client()?;
     let repo = make_remote_repo(&cli, &hf)?;
 
-    let entries = match &repo {
+    let entries = with_throttle(&format!("list_tree {}", hf.repo_id), || match &repo {
         RemoteRepo::Model(r) => r.list_tree().revision(hf.revision.clone()).recursive(true).expand(true).send(),
         RemoteRepo::Dataset(r) => r.list_tree().revision(hf.revision.clone()).recursive(true).expand(true).send(),
         RemoteRepo::Space(r) => r.list_tree().revision(hf.revision.clone()).recursive(true).expand(true).send(),
-    }
+    })
     .with_context(|| format!("listing files for {}", hf.repo_id))?;
 
     let mut specs = Vec::new();

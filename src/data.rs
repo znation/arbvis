@@ -16,7 +16,7 @@ use memmap2::Mmap;
 use crate::progress::counter_style;
 use crate::safetensors::{self, TensorMeta};
 use crate::hf_url::{RemoteFileSpec, RemoteRepo};
-use crate::xet::{self, XetTerm};
+use crate::xet::{self, XetReader, XetTerm};
 
 /// Bounded concurrency for setup-time HTTP loops (xet reconstruction,
 /// safetensors header fetches, non-safetensors diff downloads). The global
@@ -55,6 +55,13 @@ pub enum Data {
         filename: Arc<String>,
         revision: Arc<String>,
     },
+    /// Remote xet-backed file accessed via direct CAS range requests. Each
+    /// `fetch_range` issues one or more HTTP GETs against signed xorb URLs
+    /// and decompresses the resulting chunk segments locally, bypassing
+    /// hf-hub's per-call xet stream-group rebuild. Decoded chunk segments
+    /// are cached inside the reader for spatial-locality wins (adjacent
+    /// tiles on the Hilbert curve share terms).
+    Xet(Arc<XetReader>),
     /// Diff computed on demand per range — never stored in full.
     /// Async-only: the inner closure returns a future so it can issue HTTP
     /// range requests (and await them) without blocking the runtime.
@@ -68,6 +75,7 @@ impl std::ops::Deref for Data {
             Data::Mapped(m) => m,
             Data::Owned(v) => v,
             Data::Http { .. } => panic!("bug: use fetch_range() for remote HTTP Data, not Deref"),
+            Data::Xet(_) => panic!("bug: use fetch_range() for Xet Data, not Deref"),
             Data::LazyDiff(_) => panic!("bug: use fetch_range() for LazyDiff Data, not Deref"),
         }
     }
@@ -88,17 +96,17 @@ impl Data {
             Data::Http { repo, filename, revision } => {
                 repo.fetch_range(filename, revision, start..start + len as u64).await
             }
+            Data::Xet(reader) => reader.fetch_range(start, len).await,
             Data::LazyDiff(f) => f(start, len).await,
         }
     }
 
     /// Whether `fetch_range` resolves without issuing an HTTP request.
     ///
-    /// `LazyDiff` is conservatively treated as non-local because its inner
-    /// fetcher may wrap an `Http` source. The tile load stage uses this to
-    /// skip the AIMD HTTP throttle when nothing in flight could hit the Hub —
-    /// otherwise mmap reads would be artificially capped at the throttle's
-    /// initial 4-way concurrency.
+    /// `Http`, `Xet`, and `LazyDiff` may all hit the network. The tile load
+    /// stage uses this to skip the AIMD HTTP throttle when nothing in flight
+    /// could hit the Hub — otherwise mmap reads would be artificially capped
+    /// at the throttle's initial 4-way concurrency.
     pub fn is_local(&self) -> bool {
         matches!(self, Data::Mapped(_) | Data::Owned(_))
     }
@@ -1140,27 +1148,61 @@ async fn build_multi_safetensors_diff_sources(
 
 /// Build per-tensor diff Sources from multiple remote .safetensors files on each side.
 /// Headers are fetched via range requests; tensor data is never downloaded.
+///
+/// Each xet-backed file gets a `Data::Xet` reader (one V2 reconstruction fetch
+/// per file, then direct-CAS range fetches afterward — see `XetReader`).
+/// Non-xet remote files fall back to `Data::Http` which routes through hf-hub.
 async fn build_multi_safetensors_diff_sources_from_http(
     orig_specs: &[&(String, RemoteFileSpec)],
     mod_specs:  &[&(String, RemoteFileSpec)],
 ) -> anyhow::Result<(Vec<Source>, u64)> {
-    // TODO: this path still wraps each side in `Data::Http`, which means per-tile
-    // tensor diffs go through hf-hub's xet range API with the same prohibitive
-    // setup cost noted on `materialize_http_sources`. The diff renderer reads
-    // every byte of both sides anyway, so a whole-file download per side would
-    // be strictly faster. Mirror the `materialize_http_sources` pattern here
-    // when this code path is exercised.
-    let make_arcs = |specs: &[&(String, RemoteFileSpec)]| -> Vec<Arc<Data>> {
-        specs.iter().map(|(_, spec)| {
-            Arc::new(Data::Http {
-                repo: spec.repo.clone(),
-                filename: Arc::clone(&spec.filename),
-                revision: Arc::clone(&spec.revision),
+    async fn make_arcs(specs: Vec<RemoteFileSpec>) -> anyhow::Result<Vec<Arc<Data>>> {
+        let total = specs.len() as u64;
+        let pb = setup_progress("source files (xet reconstruction for diff)", total);
+        let pb_for_workers = pb.clone();
+        let mut out: Vec<(usize, anyhow::Result<Arc<Data>>)> = stream::iter(specs.into_iter().enumerate())
+            .map(|(i, spec)| {
+                let pb = pb_for_workers.clone();
+                async move {
+                    let r: anyhow::Result<Arc<Data>> = if spec.xet_hash.is_some() {
+                        match XetReader::new(&spec).await {
+                            Ok(reader) => Ok(Arc::new(Data::Xet(reader))),
+                            Err(e) => {
+                                log::warn!(
+                                    "{}: XetReader build failed ({e}); falling back to hf-hub Data::Http",
+                                    spec.filename,
+                                );
+                                Ok(Arc::new(Data::Http {
+                                    repo: spec.repo.clone(),
+                                    filename: Arc::clone(&spec.filename),
+                                    revision: Arc::clone(&spec.revision),
+                                }))
+                            }
+                        }
+                    } else {
+                        Ok(Arc::new(Data::Http {
+                            repo: spec.repo.clone(),
+                            filename: Arc::clone(&spec.filename),
+                            revision: Arc::clone(&spec.revision),
+                        }))
+                    };
+                    if let Some(pb) = pb.as_ref() {
+                        pb.inc(1);
+                    }
+                    (i, r)
+                }
             })
-        }).collect()
-    };
-    let orig_data = make_arcs(orig_specs);
-    let mod_data  = make_arcs(mod_specs);
+            .buffer_unordered(SETUP_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+        if let Some(pb) = pb.as_ref() {
+            pb.finish();
+        }
+        out.sort_by_key(|(i, _)| *i);
+        out.into_iter().map(|(_, r)| r).collect::<anyhow::Result<Vec<_>>>()
+    }
+    let orig_data = make_arcs(orig_specs.iter().map(|(_, s)| s.clone()).collect()).await?;
+    let mod_data  = make_arcs(mod_specs.iter().map(|(_, s)| s.clone()).collect()).await?;
     build_multi_safetensors_diff_sources_inner(&orig_data, &mod_data).await
 }
 

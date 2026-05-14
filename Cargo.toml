@@ -21,6 +21,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 half = "2"
 hf-hub = "1.0.0-rc.1"
+# xet-core-structures is the chunk/xorb wire format used by hf-hub internally.
+# We pull it in directly so we can decode xorb byte segments after fetching
+# them from CAS URLs ourselves — bypassing hf-hub's per-call xet stream group
+# rebuild, which dominates wall time for per-tile range requests.
+xet-core-structures = "1.5"
+# Byte-bounded LRU cache for decompressed xorb chunk segments, hit per tile.
+lru = "0.12"
+bytes = "1"
 reqwest = { version = "0.13", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"

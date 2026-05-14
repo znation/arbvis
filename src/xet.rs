@@ -16,9 +16,11 @@
 //! two endpoints directly with `reqwest::blocking`.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, anyhow};
+use lru::LruCache;
 use serde::Deserialize;
 
 use crate::hf_url::{self, RemoteFileSpec};
@@ -44,18 +46,49 @@ struct XetReadTokenResponse {
     cas_url: String,
 }
 
+/// JSON wire form of `ChunkRange`/`HttpRange`/`FileRange` from xet-client's
+/// `cas_types::Range<Idx, Kind>` — the `_marker` field is `#[serde(skip)]`
+/// so only `start`/`end` go on the wire.
+#[derive(Deserialize, Clone, Copy)]
+struct WireRange<T> {
+    start: T,
+    end: T,
+}
+
 #[derive(Deserialize)]
 struct ReconstructionTerm {
     hash: String,
     #[serde(rename = "unpacked_length")]
     unpacked_length: u64,
-    // `range` (chunk index start/end within the xorb) is not used by the
-    // visualization — chunk boundaries are derived from term boundaries.
+    /// Chunk index `[start, end)` within the xorb. Captured so the reader can
+    /// map a file-byte range to the exact chunks it spans (vs. approximating
+    /// from term boundaries alone).
+    range: WireRange<u32>,
+}
+
+/// Per-xorb byte range fetch instructions: one signed URL covers some chunks,
+/// described by `chunks` (chunk index range) and `bytes` (packed-byte range
+/// inside the xorb, *inclusive end* — `HttpRange` semantics).
+#[derive(Deserialize)]
+struct WireXorbRangeDescriptor {
+    chunks: WireRange<u32>,
+    bytes: WireRange<u64>,
+}
+
+#[derive(Deserialize)]
+struct WireXorbMultiRangeFetch {
+    url: String,
+    ranges: Vec<WireXorbRangeDescriptor>,
 }
 
 #[derive(Deserialize)]
 struct ReconstructionResponse {
     terms: Vec<ReconstructionTerm>,
+    /// V2-only: per-xorb signed-URL fetch info. Absent on V1 responses; we
+    /// require V2 for the direct-CAS reader path, so callers that need it
+    /// should error if this field is missing.
+    #[serde(default)]
+    xorbs: HashMap<String, Vec<WireXorbMultiRangeFetch>>,
 }
 
 #[derive(Clone)]
@@ -129,10 +162,10 @@ async fn fetch_cas_token(
     Ok(token)
 }
 
-async fn fetch_reconstruction_terms(
+async fn fetch_reconstruction_response(
     cas: &CasToken,
     xet_hash_hex: &str,
-) -> anyhow::Result<Vec<XetTerm>> {
+) -> anyhow::Result<ReconstructionResponse> {
     let url = format!("{}/v2/reconstructions/{}", cas.cas_url, xet_hash_hex);
     log::info!("Fetching reconstruction terms: {url}");
     let client = reqwest::Client::new();
@@ -146,10 +179,16 @@ async fn fetch_reconstruction_terms(
     })
     .await
     .with_context(|| format!("requesting reconstruction at {url}"))?;
-    let parsed: ReconstructionResponse = resp
-        .json()
+    resp.json::<ReconstructionResponse>()
         .await
-        .with_context(|| format!("parsing reconstruction response from {url}"))?;
+        .with_context(|| format!("parsing reconstruction response from {url}"))
+}
+
+async fn fetch_reconstruction_terms(
+    cas: &CasToken,
+    xet_hash_hex: &str,
+) -> anyhow::Result<Vec<XetTerm>> {
+    let parsed = fetch_reconstruction_response(cas, xet_hash_hex).await?;
 
     let mut offset: u64 = 0;
     let mut out = Vec::with_capacity(parsed.terms.len());
@@ -275,6 +314,359 @@ impl XorbMap {
             }
         }
         None
+    }
+}
+
+// ─── XetReader: direct-CAS byte fetcher ──────────────────────────────────────
+//
+// hf-hub's `xet_download_stream` rebuilds a `XetDownloadStreamGroup` per call,
+// which dominates wall time for short range requests (see the comment on
+// `data::materialize_http_sources`). When we know the file is xet-backed we
+// can do the streaming ourselves: fetch the V2 reconstruction once, then for
+// each byte range translate into (xorb, chunk-range) lookups and HTTP GET the
+// pre-signed xorb URLs directly. Decoded chunk segments are cached so adjacent
+// tiles (which the Hilbert curve makes spatially coherent) reuse the same
+// decompression work.
+
+/// One term from the V2 reconstruction response, in the form we keep at
+/// runtime: cumulative file offset and exact chunk range within the xorb.
+struct ReaderTerm {
+    file_offset: u64,
+    byte_len: u64,
+    xorb_hash: String,
+    chunk_start: u32,
+    chunk_end: u32,
+}
+
+/// One signed-URL descriptor: a contiguous chunk range plus its packed-byte
+/// range inside the xorb (HTTP Range header is `bytes=byte_start-byte_end`,
+/// *inclusive end*).
+#[derive(Clone)]
+struct ReaderDescriptor {
+    chunk_start: u32,
+    chunk_end: u32,
+    byte_start: u64,
+    byte_end: u64,
+    url: Arc<String>,
+}
+
+/// All descriptors for one xorb, sorted by `chunk_start` for binary search.
+struct XorbInfo {
+    descriptors: Vec<ReaderDescriptor>,
+}
+
+/// Decoded descriptor payload kept in the LRU. `chunk_byte_indices[i]` is the
+/// start of chunk `chunk_start + i` within `data`, with a trailing entry equal
+/// to `data.len()` — semantics of `xet_core_structures::xorb_object::deserialize_chunks`.
+struct DecodedDescriptor {
+    data: Arc<Vec<u8>>,
+    chunk_byte_indices: Arc<Vec<u32>>,
+}
+
+/// Cache key: `(xorb_hash, descriptor.byte_start)` uniquely identifies a
+/// packed byte range within a xorb (sharing across files isn't exploited —
+/// each `XetReader` has its own cache).
+type CacheKey = (String, u64);
+
+/// Byte-bounded LRU. `lru::LruCache` is capacity-bounded by entry *count*; we
+/// pair it with a running byte total and evict until under budget.
+struct DescriptorCache {
+    lru: LruCache<CacheKey, DecodedDescriptor>,
+    bytes: u64,
+    budget: u64,
+}
+
+impl DescriptorCache {
+    fn new(budget: u64) -> Self {
+        // Capacity here is a hard upper bound on entry count; pick something
+        // generous (1M entries) so the byte budget is the real limit.
+        Self {
+            lru: LruCache::new(NonZeroUsize::new(1_000_000).unwrap()),
+            bytes: 0,
+            budget,
+        }
+    }
+
+    fn get(&mut self, key: &CacheKey) -> Option<DecodedDescriptor> {
+        self.lru.get(key).map(|v| DecodedDescriptor {
+            data: Arc::clone(&v.data),
+            chunk_byte_indices: Arc::clone(&v.chunk_byte_indices),
+        })
+    }
+
+    fn put(&mut self, key: CacheKey, value: DecodedDescriptor) {
+        let added = value.data.len() as u64;
+        if let Some(old) = self.lru.push(key, value) {
+            self.bytes = self.bytes.saturating_sub(old.1.data.len() as u64);
+        }
+        self.bytes = self.bytes.saturating_add(added);
+        while self.bytes > self.budget {
+            match self.lru.pop_lru() {
+                Some((_, v)) => self.bytes = self.bytes.saturating_sub(v.data.len() as u64),
+                None => break,
+            }
+        }
+    }
+}
+
+/// Direct-CAS byte fetcher for one xet-backed remote file.
+///
+/// Holds the V2 reconstruction (terms + signed-URL fetch info) and a
+/// shared-by-clone HTTP client. `fetch_range` is the only public surface.
+pub struct XetReader {
+    terms: Vec<ReaderTerm>,          // sorted by file_offset
+    xorbs: HashMap<String, XorbInfo>,
+    file_size: u64,
+    filename: Arc<String>,
+    http: reqwest::Client,
+    cache: Mutex<DescriptorCache>,
+}
+
+/// Default per-reader cache budget — generous enough to keep hot regions of
+/// a multi-GB safetensors warm across a tile-render sweep, but bounded so
+/// many concurrent readers don't blow up RAM.
+const DEFAULT_CACHE_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+
+impl XetReader {
+    /// Build a reader for a xet-backed remote file. Errors if the file has
+    /// no xet hash (i.e. plain LFS / regular Hub file).
+    pub async fn new(spec: &RemoteFileSpec) -> anyhow::Result<Arc<Self>> {
+        let hash = spec
+            .xet_hash
+            .as_deref()
+            .ok_or_else(|| anyhow!("{}: not xet-backed, cannot build XetReader", spec.filename))?;
+        let cas = fetch_cas_token(spec.repo.api_segment(), &spec.repo.repo_id(), &spec.revision).await?;
+        let raw = fetch_reconstruction_response(&cas, hash).await?;
+
+        // Build the per-xorb descriptor lookup (sorted by chunk_start).
+        let mut xorbs: HashMap<String, XorbInfo> = HashMap::with_capacity(raw.xorbs.len());
+        for (xorb_hash, fetches) in raw.xorbs {
+            let mut descriptors: Vec<ReaderDescriptor> = Vec::new();
+            for fetch in fetches {
+                let url = Arc::new(fetch.url);
+                for desc in fetch.ranges {
+                    descriptors.push(ReaderDescriptor {
+                        chunk_start: desc.chunks.start,
+                        chunk_end: desc.chunks.end,
+                        byte_start: desc.bytes.start,
+                        byte_end: desc.bytes.end,
+                        url: Arc::clone(&url),
+                    });
+                }
+            }
+            descriptors.sort_by_key(|d| d.chunk_start);
+            xorbs.insert(xorb_hash, XorbInfo { descriptors });
+        }
+
+        // Compute cumulative file offsets per term; verify each term's xorb
+        // appears in `xorbs` (otherwise the fetch path would silently fail).
+        let mut terms: Vec<ReaderTerm> = Vec::with_capacity(raw.terms.len());
+        let mut offset: u64 = 0;
+        for t in raw.terms {
+            if t.unpacked_length == 0 {
+                continue;
+            }
+            if !xorbs.contains_key(&t.hash) {
+                anyhow::bail!(
+                    "reconstruction for {}: term references xorb {} with no fetch info",
+                    spec.filename,
+                    t.hash
+                );
+            }
+            terms.push(ReaderTerm {
+                file_offset: offset,
+                byte_len: t.unpacked_length,
+                xorb_hash: t.hash,
+                chunk_start: t.range.start,
+                chunk_end: t.range.end,
+            });
+            offset += t.unpacked_length;
+        }
+
+        if offset != spec.size {
+            log::warn!(
+                "{}: reconstruction unpacked_length total {} disagrees with file size {}",
+                spec.filename, offset, spec.size,
+            );
+        }
+
+        Ok(Arc::new(Self {
+            terms,
+            xorbs,
+            file_size: spec.size,
+            filename: Arc::clone(&spec.filename),
+            http: reqwest::Client::new(),
+            cache: Mutex::new(DescriptorCache::new(DEFAULT_CACHE_BUDGET_BYTES)),
+        }))
+    }
+
+    /// File-byte fetch. Walks terms overlapping `[start, start+len)`, then
+    /// for each term walks the xorb descriptors overlapping its chunk range,
+    /// fetching + decompressing (cached) and concatenating the requested
+    /// slice into `out`.
+    pub async fn fetch_range(&self, start: u64, len: usize) -> anyhow::Result<Vec<u8>> {
+        let end = start.saturating_add(len as u64);
+        if end > self.file_size {
+            anyhow::bail!(
+                "{}: range [{},{}) past file size {}",
+                self.filename, start, end, self.file_size,
+            );
+        }
+        let mut out = Vec::with_capacity(len);
+
+        // Binary search for the first term overlapping `start`.
+        let mut term_idx = self
+            .terms
+            .partition_point(|t| t.file_offset + t.byte_len <= start);
+
+        while term_idx < self.terms.len() {
+            let term = &self.terms[term_idx];
+            if term.file_offset >= end {
+                break;
+            }
+            self.append_term_range(term, start, end, &mut out).await?;
+            term_idx += 1;
+        }
+
+        if out.len() != len {
+            anyhow::bail!(
+                "{}: fetch_range[{},{}) produced {} bytes (expected {})",
+                self.filename, start, end, out.len(), len,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Append the slice of `term`'s data that overlaps `[req_start, req_end)`
+    /// (in file-byte coordinates) to `out`.
+    async fn append_term_range(
+        &self,
+        term: &ReaderTerm,
+        req_start: u64,
+        req_end: u64,
+        out: &mut Vec<u8>,
+    ) -> anyhow::Result<()> {
+        let term_end = term.file_offset + term.byte_len;
+        let need_start = req_start.max(term.file_offset);
+        let need_end = req_end.min(term_end);
+        // Bytes we want, in term-local coordinates `[0, term.byte_len)`.
+        let mut local_lo = (need_start - term.file_offset) as usize;
+        let local_hi = (need_end - term.file_offset) as usize;
+
+        let xorb = self
+            .xorbs
+            .get(&term.xorb_hash)
+            .ok_or_else(|| anyhow!("xorb {} missing from fetch map", term.xorb_hash))?;
+
+        // Walk descriptors overlapping [term.chunk_start, term.chunk_end). The
+        // descriptor list is sorted by chunk_start.
+        let first_desc = xorb
+            .descriptors
+            .partition_point(|d| d.chunk_end <= term.chunk_start);
+
+        // Cumulative byte length of the descriptor-prefix already consumed
+        // from this term — used to translate `local_lo`/`local_hi` (term-local)
+        // into descriptor-local byte offsets.
+        let mut consumed_term_bytes: usize = 0;
+
+        for desc in &xorb.descriptors[first_desc..] {
+            if desc.chunk_start >= term.chunk_end {
+                break;
+            }
+            // The slice of this descriptor's chunks that belongs to the term:
+            // `[desc_lo_chunk, desc_hi_chunk)` is an absolute xorb chunk range.
+            let desc_lo_chunk = desc.chunk_start.max(term.chunk_start);
+            let desc_hi_chunk = desc.chunk_end.min(term.chunk_end);
+
+            let decoded = self.load_descriptor(&term.xorb_hash, desc).await?;
+            let indices = &decoded.chunk_byte_indices;
+            let bytes = &decoded.data;
+
+            // Translate to indices into `decoded.chunk_byte_indices` (which is
+            // indexed from 0 = descriptor's first chunk).
+            let lo_idx = (desc_lo_chunk - desc.chunk_start) as usize;
+            let hi_idx = (desc_hi_chunk - desc.chunk_start) as usize;
+            if hi_idx >= indices.len() {
+                anyhow::bail!(
+                    "descriptor {}@{}: chunk index {} out of bounds (have {})",
+                    term.xorb_hash, desc.byte_start, hi_idx, indices.len(),
+                );
+            }
+            let desc_byte_lo = indices[lo_idx] as usize;
+            let desc_byte_hi = indices[hi_idx] as usize;
+            let desc_byte_len = desc_byte_hi - desc_byte_lo;
+
+            // This descriptor contributes `desc_byte_len` bytes to the term at
+            // term-local offset `[consumed_term_bytes, consumed_term_bytes + desc_byte_len)`.
+            let term_lo = consumed_term_bytes;
+            let term_hi = consumed_term_bytes + desc_byte_len;
+
+            if local_hi > term_lo && local_lo < term_hi {
+                let copy_lo = local_lo.max(term_lo);
+                let copy_hi = local_hi.min(term_hi);
+                let inner_lo = desc_byte_lo + (copy_lo - term_lo);
+                let inner_hi = desc_byte_lo + (copy_hi - term_lo);
+                out.extend_from_slice(&bytes[inner_lo..inner_hi]);
+                local_lo = copy_hi; // monotonically advances
+                if local_lo >= local_hi {
+                    return Ok(());
+                }
+            }
+
+            consumed_term_bytes = term_hi;
+        }
+        Ok(())
+    }
+
+    /// Fetch (or cache-hit) a descriptor's decoded chunk segment.
+    async fn load_descriptor(
+        &self,
+        xorb_hash: &str,
+        desc: &ReaderDescriptor,
+    ) -> anyhow::Result<DecodedDescriptor> {
+        let key = (xorb_hash.to_string(), desc.byte_start);
+        if let Some(hit) = self.cache.lock().unwrap().get(&key) {
+            return Ok(hit);
+        }
+
+        // HTTP Range header is INCLUSIVE on both ends (RFC 7233 §2.1) — match
+        // `HttpRange` semantics from xet-client's wire format.
+        //
+        // Deliberately bypass `with_throttle` here: the tile-load worker that
+        // ultimately drives this call already holds a `Throttle::global()`
+        // permit. Acquiring a second one inside would deadlock when every
+        // permit is held by a worker waiting on its nested fetch (and CAS
+        // doesn't rate-limit the way Hub does, so the outer permit is enough
+        // concurrency control). Network errors propagate; the load worker
+        // surfaces them and aborts the pipeline.
+        let range_header = format!("bytes={}-{}", desc.byte_start, desc.byte_end);
+        let bytes = self
+            .http
+            .get(desc.url.as_str())
+            .header(reqwest::header::RANGE, &range_header)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .with_context(|| format!("HTTP error fetching xorb range {} for {}", desc.byte_start, xorb_hash))?
+            .bytes()
+            .await
+            .with_context(|| format!("body read fetching xorb range {} for {}", desc.byte_start, xorb_hash))?;
+
+        // Decode packed chunks → uncompressed bytes + per-chunk start offsets.
+        let mut cursor = std::io::Cursor::new(bytes.as_ref());
+        let (data, chunk_byte_indices) = xet_core_structures::xorb_object::deserialize_chunks(&mut cursor)
+            .map_err(|e| anyhow!("decoding xorb {} bytes [{},{}]: {}", xorb_hash, desc.byte_start, desc.byte_end, e))?;
+
+        let decoded = DecodedDescriptor {
+            data: Arc::new(data),
+            chunk_byte_indices: Arc::new(chunk_byte_indices),
+        };
+        let copy = DecodedDescriptor {
+            data: Arc::clone(&decoded.data),
+            chunk_byte_indices: Arc::clone(&decoded.chunk_byte_indices),
+        };
+        self.cache.lock().unwrap().put(key, copy);
+        Ok(decoded)
     }
 }
 

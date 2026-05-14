@@ -10,7 +10,7 @@ use crate::hf_url::{self, HfOutputSpec, RepoKind};
 use crate::throttle::with_throttle;
 
 /// Upload a single local file to a Hugging Face repo via hf-hub.
-pub fn upload_file(
+pub async fn upload_file(
     local: &Path,
     repo_id: &str,
     kind: RepoKind,
@@ -23,40 +23,46 @@ pub fn upload_file(
     let dest = path_in_repo.to_string();
 
     let label = format!("upload_file {repo_id}/{path_in_repo}");
-    with_throttle(&label, || match kind {
-        RepoKind::Model => client
-            .model(owner, name)
-            .upload_file()
-            .source(source.clone())
-            .path_in_repo(dest.clone())
-            .send()
-            .map(|_| ()),
-        RepoKind::Dataset => client
-            .dataset(owner, name)
-            .upload_file()
-            .source(source.clone())
-            .path_in_repo(dest.clone())
-            .send()
-            .map(|_| ()),
-        RepoKind::Space => client
-            .space(owner, name)
-            .upload_file()
-            .source(source.clone())
-            .path_in_repo(dest.clone())
-            .send()
-            .map(|_| ()),
-        RepoKind::Bucket => client
-            .bucket(owner, name)
-            .upload_files()
-            .files(vec![BucketUpload::new(PathBuf::from(local), dest.clone())])
-            .send()
-            .map(|_| ()),
-    })?;
+    with_throttle(&label, || async {
+        match kind {
+            RepoKind::Model => client
+                .model(owner, name)
+                .upload_file()
+                .source(source.clone())
+                .path_in_repo(dest.clone())
+                .send()
+                .await
+                .map(|_| ()),
+            RepoKind::Dataset => client
+                .dataset(owner, name)
+                .upload_file()
+                .source(source.clone())
+                .path_in_repo(dest.clone())
+                .send()
+                .await
+                .map(|_| ()),
+            RepoKind::Space => client
+                .space(owner, name)
+                .upload_file()
+                .source(source.clone())
+                .path_in_repo(dest.clone())
+                .send()
+                .await
+                .map(|_| ()),
+            RepoKind::Bucket => client
+                .bucket(owner, name)
+                .upload_files()
+                .files(vec![BucketUpload::new(PathBuf::from(local), dest.clone())])
+                .send()
+                .await
+                .map(|_| ()),
+        }
+    }).await?;
     Ok(())
 }
 
 /// Upload a local directory tree to a path prefix in a Hugging Face repo.
-pub fn upload_dir(
+pub async fn upload_dir(
     local_dir: &Path,
     repo_id: &str,
     kind: RepoKind,
@@ -69,68 +75,76 @@ pub fn upload_dir(
     let prefix = if path_prefix.is_empty() { None } else { Some(path_prefix.to_string()) };
 
     let label = format!("upload_dir {repo_id}/{path_prefix}");
-    with_throttle(&label, || match kind {
-        RepoKind::Model => client
-            .model(owner, name)
-            .upload_folder()
-            .folder_path(folder.clone())
-            .maybe_path_in_repo(prefix.clone())
-            .send()
-            .map(|_| ()),
-        RepoKind::Dataset => client
-            .dataset(owner, name)
-            .upload_folder()
-            .folder_path(folder.clone())
-            .maybe_path_in_repo(prefix.clone())
-            .send()
-            .map(|_| ()),
-        RepoKind::Space => client
-            .space(owner, name)
-            .upload_folder()
-            .folder_path(folder.clone())
-            .maybe_path_in_repo(prefix.clone())
-            .send()
-            .map(|_| ()),
-        RepoKind::Bucket => client
-            .bucket(owner, name)
-            .sync()
-            .local_path(folder.clone())
-            .direction(BucketSyncDirection::Upload)
-            .maybe_prefix(prefix.clone())
-            .send()
-            .map(|_| ()),
-    })?;
+    with_throttle(&label, || async {
+        match kind {
+            RepoKind::Model => client
+                .model(owner, name)
+                .upload_folder()
+                .folder_path(folder.clone())
+                .maybe_path_in_repo(prefix.clone())
+                .send()
+                .await
+                .map(|_| ()),
+            RepoKind::Dataset => client
+                .dataset(owner, name)
+                .upload_folder()
+                .folder_path(folder.clone())
+                .maybe_path_in_repo(prefix.clone())
+                .send()
+                .await
+                .map(|_| ()),
+            RepoKind::Space => client
+                .space(owner, name)
+                .upload_folder()
+                .folder_path(folder.clone())
+                .maybe_path_in_repo(prefix.clone())
+                .send()
+                .await
+                .map(|_| ()),
+            RepoKind::Bucket => client
+                .bucket(owner, name)
+                .sync()
+                .local_path(folder.clone())
+                .direction(BucketSyncDirection::Upload)
+                .maybe_prefix(prefix.clone())
+                .send()
+                .await
+                .map(|_| ()),
+        }
+    }).await?;
     Ok(())
 }
 
 /// Parse an `hf://` output URL and upload a single local file to the target repo.
-pub fn upload_file_to(hf_url_str: &str, local: &Path) -> anyhow::Result<()> {
+pub async fn upload_file_to(hf_url_str: &str, local: &Path) -> anyhow::Result<()> {
     let spec = hf_url::parse_hf_output(hf_url_str)?;
-    upload_file(local, &spec.repo_id, spec.kind, &spec.path_prefix)
+    upload_file(local, &spec.repo_id, spec.kind, &spec.path_prefix).await
 }
 
 /// Parse an `hf://` output URL and upload a local directory tree to the target repo.
-pub fn upload_dir_to(hf_url_str: &str, local_dir: &Path) -> anyhow::Result<()> {
+pub async fn upload_dir_to(hf_url_str: &str, local_dir: &Path) -> anyhow::Result<()> {
     let spec = hf_url::parse_hf_output(hf_url_str)?;
-    upload_dir(local_dir, &spec.repo_id, spec.kind, &spec.path_prefix)
+    upload_dir(local_dir, &spec.repo_id, spec.kind, &spec.path_prefix).await
 }
 
 /// Create (or verify) the HF bucket that backs a Space, and return an
 /// `HfOutputSpec` pointing at it. The bucket id is `spec.repo_id`.
-pub fn create_space_bucket(space_id: &str) -> anyhow::Result<HfOutputSpec> {
+pub async fn create_space_bucket(space_id: &str) -> anyhow::Result<HfOutputSpec> {
     let bucket_id = derive_bucket_id(space_id)?;
     eprintln!("Ensuring bucket {} exists...", bucket_id);
     let client = hf_url::client()?;
     let (owner, name) = hf_url::split_owner_name(&bucket_id)?;
-    with_throttle(&format!("create_bucket {bucket_id}"), || {
+    with_throttle(&format!("create_bucket {bucket_id}"), || async {
         client
             .create_bucket()
             .namespace(owner.to_string())
             .name(name.to_string())
             .exist_ok(true)
             .send()
+            .await
             .map(|_| ())
     })
+    .await
     .with_context(|| format!("creating bucket {bucket_id}"))?;
     Ok(HfOutputSpec {
         repo_id: bucket_id,
@@ -143,10 +157,10 @@ pub fn create_space_bucket(space_id: &str) -> anyhow::Result<HfOutputSpec> {
 /// Deploy (or redeploy) the Space app files — app.py, README, Dockerfile,
 /// requirements.txt, and index.html. Assumes tiles and labels.json are already
 /// in the bucket (either synced from local disk or streamed directly).
-pub fn deploy_space_app(space_id: &str, bucket_id: &str, index_html: Vec<u8>) -> anyhow::Result<()> {
+pub async fn deploy_space_app(space_id: &str, bucket_id: &str, index_html: Vec<u8>) -> anyhow::Result<()> {
     eprintln!("Ensuring Space {} exists...", space_id);
     let client = hf_url::client()?;
-    with_throttle(&format!("create_repository {space_id}"), || {
+    with_throttle(&format!("create_repository {space_id}"), || async {
         client
             .create_repository()
             .repo_id(space_id.to_string())
@@ -154,8 +168,10 @@ pub fn deploy_space_app(space_id: &str, bucket_id: &str, index_html: Vec<u8>) ->
             .space_sdk("docker")
             .exist_ok(true)
             .send()
+            .await
             .map(|_| ())
     })
+    .await
     .with_context(|| format!("creating space {space_id}"))?;
 
     eprintln!("Uploading Space files...");
@@ -165,24 +181,26 @@ pub fn deploy_space_app(space_id: &str, bucket_id: &str, index_html: Vec<u8>) ->
 
     let (owner, name) = hf_url::split_owner_name(space_id)?;
     let folder = tmp.path().to_path_buf();
-    with_throttle(&format!("space upload_folder {space_id}"), || {
+    with_throttle(&format!("space upload_folder {space_id}"), || async {
         client
             .space(owner, name)
             .upload_folder()
             .folder_path(folder.clone())
             .send()
+            .await
             .map(|_| ())
     })
+    .await
     .with_context(|| format!("uploading Space files to {space_id}"))?;
 
     eprintln!("Deployed to https://huggingface.co/spaces/{}", space_id);
     Ok(())
 }
 
-pub fn run_deploy(tiles_dir: &Path, space_id: &str) -> anyhow::Result<()> {
+pub async fn run_deploy(tiles_dir: &Path, space_id: &str) -> anyhow::Result<()> {
     validate_tiles_dir(tiles_dir)?;
 
-    let bucket_spec = create_space_bucket(space_id)?;
+    let bucket_spec = create_space_bucket(space_id).await?;
     let bucket_id = &bucket_spec.repo_id;
     let client = hf_url::client()?;
     let (owner, name) = hf_url::split_owner_name(bucket_id)?;
@@ -190,7 +208,7 @@ pub fn run_deploy(tiles_dir: &Path, space_id: &str) -> anyhow::Result<()> {
 
     eprintln!("Syncing tiles to bucket (this may take a while for large outputs)...");
     let tiles_path = tiles_dir.join("tiles");
-    with_throttle(&format!("bucket sync {bucket_id}"), || {
+    with_throttle(&format!("bucket sync {bucket_id}"), || async {
         bucket
             .sync()
             .local_path(tiles_path.clone())
@@ -198,24 +216,28 @@ pub fn run_deploy(tiles_dir: &Path, space_id: &str) -> anyhow::Result<()> {
             .prefix("tiles".to_string())
             .delete(true)
             .send()
+            .await
             .map(|_| ())
     })
+    .await
     .with_context(|| format!("syncing tiles to bucket {bucket_id}"))?;
 
     eprintln!("Uploading labels.json to bucket...");
     let labels_path = tiles_dir.join("labels.json");
-    with_throttle(&format!("bucket upload labels {bucket_id}"), || {
+    with_throttle(&format!("bucket upload labels {bucket_id}"), || async {
         bucket
             .upload_files()
             .files(vec![BucketUpload::new(labels_path.clone(), "labels.json".to_string())])
             .send()
+            .await
             .map(|_| ())
     })
+    .await
     .with_context(|| format!("uploading labels.json to bucket {bucket_id}"))?;
 
     let index_html = std::fs::read(tiles_dir.join("index.html"))
         .context("failed to read index.html from tiles directory")?;
-    deploy_space_app(space_id, bucket_id, index_html)
+    deploy_space_app(space_id, bucket_id, index_html).await
 }
 
 fn validate_tiles_dir(dir: &Path) -> anyhow::Result<()> {

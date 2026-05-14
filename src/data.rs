@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read};
@@ -6,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
+use futures::future::BoxFuture;
 use image::Rgb;
 use indicatif::ProgressBar;
 use memmap2::Mmap;
@@ -13,6 +13,11 @@ use memmap2::Mmap;
 use crate::safetensors::{self, TensorMeta};
 use crate::hf_url::{RemoteFileSpec, RemoteRepo};
 use crate::xet::{self, XetTerm};
+
+/// Async fetcher closure used by [`Data::LazyDiff`]. Captures its inputs by
+/// `Arc` so the returned future is `'static` and can be sent across tasks.
+pub type LazyFetcher =
+    Arc<dyn Fn(u64, usize) -> BoxFuture<'static, anyhow::Result<Vec<u8>>> + Send + Sync>;
 
 pub struct SafetensorsInfo {
     pub tensors: Vec<TensorMeta>,
@@ -30,7 +35,9 @@ pub enum Data {
         revision: Arc<String>,
     },
     /// Diff computed on demand per range — never stored in full.
-    LazyDiff(Arc<dyn Fn(u64, usize) -> anyhow::Result<Vec<u8>> + Send + Sync>),
+    /// Async-only: the inner closure returns a future so it can issue HTTP
+    /// range requests (and await them) without blocking the runtime.
+    LazyDiff(LazyFetcher),
 }
 
 impl std::ops::Deref for Data {
@@ -47,20 +54,20 @@ impl std::ops::Deref for Data {
 
 impl Data {
     /// Return bytes `[start, start+len)` from this source.
-    /// For local sources: zero-copy borrow. For Http/LazyDiff: computed on demand.
-    pub fn fetch_range(&self, start: u64, len: usize) -> anyhow::Result<Cow<'_, [u8]>> {
+    ///
+    /// Async because `Http` and `LazyDiff` may issue HTTP range requests.
+    /// Local variants (`Mapped`, `Owned`) resolve synchronously inside the
+    /// future and incur a `Vec` allocation — the cost is dwarfed by the
+    /// surrounding render work. Callers that only handle local data should
+    /// use `Deref` for zero-copy slices.
+    pub async fn fetch_range(&self, start: u64, len: usize) -> anyhow::Result<Vec<u8>> {
         match self {
-            Data::Mapped(m) => {
-                Ok(Cow::Borrowed(&m[start as usize..start as usize + len]))
-            }
-            Data::Owned(v) => {
-                Ok(Cow::Borrowed(&v[start as usize..start as usize + len]))
-            }
+            Data::Mapped(m) => Ok(m[start as usize..start as usize + len].to_vec()),
+            Data::Owned(v) => Ok(v[start as usize..start as usize + len].to_vec()),
             Data::Http { repo, filename, revision } => {
-                let bytes = repo.fetch_range(filename, revision, start..start + len as u64)?;
-                Ok(Cow::Owned(bytes))
+                repo.fetch_range(filename, revision, start..start + len as u64).await
             }
-            Data::LazyDiff(f) => Ok(Cow::Owned(f(start, len)?)),
+            Data::LazyDiff(f) => f(start, len).await,
         }
     }
 }
@@ -221,13 +228,17 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
             let m_o = Arc::new(unsafe { Mmap::map(&f_o) }?);
             let m_m = Arc::new(unsafe { Mmap::map(&f_m) }?);
             Ok(Data::LazyDiff(Arc::new(move |start: u64, len: usize| {
-                let a = &m_o[start as usize..start as usize + len];
-                let b = &m_m[start as usize..start as usize + len];
-                Ok(a.iter().zip(b.iter()).map(|(&a, &b)| {
-                    let delta = b as i16 - a as i16;
-                    let brightness = (delta.unsigned_abs() as f32 / 255.0 * 127.0).round() as u8;
-                    if delta >= 0 { 127u8 + brightness } else { 127u8 - brightness }
-                }).collect())
+                let m_o = Arc::clone(&m_o);
+                let m_m = Arc::clone(&m_m);
+                Box::pin(async move {
+                    let a = &m_o[start as usize..start as usize + len];
+                    let b = &m_m[start as usize..start as usize + len];
+                    Ok(a.iter().zip(b.iter()).map(|(&a, &b)| {
+                        let delta = b as i16 - a as i16;
+                        let brightness = (delta.unsigned_abs() as f32 / 255.0 * 127.0).round() as u8;
+                        if delta >= 0 { 127u8 + brightness } else { 127u8 - brightness }
+                    }).collect())
+                })
             })))
         }
         SourceKind::Http(spec) => Ok(Data::Http {
@@ -244,11 +255,15 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
             let mod_dtype = *mod_dtype;
             const EPSILON: f32 = 1e-6;
             Ok(Data::LazyDiff(Arc::new(move |start: u64, len: usize| {
-                let orig_elem = orig_dtype.element_size() as u64;
-                let mod_elem = mod_dtype.element_size() as u64;
-                let ob = orig.fetch_range(orig_start + start * orig_elem, (len as u64 * orig_elem) as usize)?;
-                let mb = mod_.fetch_range(mod_start + start * mod_elem, (len as u64 * mod_elem) as usize)?;
-                Ok(orig_dtype.diff_to_u8(&ob, mod_dtype, &mb, EPSILON))
+                let orig = Arc::clone(&orig);
+                let mod_ = Arc::clone(&mod_);
+                Box::pin(async move {
+                    let orig_elem = orig_dtype.element_size() as u64;
+                    let mod_elem = mod_dtype.element_size() as u64;
+                    let ob = orig.fetch_range(orig_start + start * orig_elem, (len as u64 * orig_elem) as usize).await?;
+                    let mb = mod_.fetch_range(mod_start + start * mod_elem, (len as u64 * mod_elem) as usize).await?;
+                    Ok(orig_dtype.diff_to_u8(&ob, mod_dtype, &mb, EPSILON))
+                })
             })))
         }
     }
@@ -337,11 +352,11 @@ pub fn prepare_sources_from_specs(
 /// Each source gets `xet_terms = Some(vec)` — empty for sources without a xet
 /// hash (local files, non-xet remote files), populated for xet-backed remote
 /// sources. Errors from the xet endpoints propagate up.
-pub fn populate_xet_terms(sources: &mut [Source]) -> anyhow::Result<()> {
+pub async fn populate_xet_terms(sources: &mut [Source]) -> anyhow::Result<()> {
     for s in sources.iter_mut() {
         match &s.kind {
             SourceKind::Http(spec) => {
-                s.xet_terms = Some(xet::reconstruction_for(spec)?);
+                s.xet_terms = Some(xet::reconstruction_for(spec).await?);
             }
             _ => {
                 s.xet_terms = Some(Vec::new());
@@ -374,15 +389,15 @@ fn load_safetensors_info(path: &Path, file_size: u64) -> anyhow::Result<Safetens
 /// Fetch and parse the safetensors header from any Data source.
 /// For local sources (Mapped/Owned): zero-copy slice access.
 /// For remote sources (Http): two range requests (8 bytes, then full header).
-fn fetch_safetensors_header(data: &Data) -> anyhow::Result<(Vec<safetensors::TensorMeta>, u64)> {
-    let size_bytes = data.fetch_range(0, 8)?;
-    let header_size = u64::from_le_bytes(size_bytes.as_ref()[..8].try_into().unwrap());
+async fn fetch_safetensors_header(data: &Data) -> anyhow::Result<(Vec<safetensors::TensorMeta>, u64)> {
+    let size_bytes = data.fetch_range(0, 8).await?;
+    let header_size = u64::from_le_bytes(size_bytes[..8].try_into().unwrap());
     if header_size > 100 * 1024 * 1024 {
         anyhow::bail!("safetensors header_size={} exceeds 100 MB safety limit", header_size);
     }
     let total_header = 8 + header_size as usize;
-    let header_bytes = data.fetch_range(0, total_header)?;
-    safetensors::parse_header(header_bytes.as_ref())
+    let header_bytes = data.fetch_range(0, total_header).await?;
+    safetensors::parse_header(&header_bytes)
 }
 
 /// Byte-value frequency histogram for a source.
@@ -398,7 +413,7 @@ impl Histogram {
     /// For file sources the file is read in 4 MB chunks so peak extra memory
     /// is bounded regardless of file size. An optional progress bar is
     /// incremented by the number of bytes processed in each chunk.
-    pub fn build(s: &Source, pb: Option<&ProgressBar>) -> anyhow::Result<Self> {
+    pub async fn build(s: &Source, pb: Option<&ProgressBar>) -> anyhow::Result<Self> {
         const CHUNK: usize = 4 * 1024 * 1024;
         let mut counts = [0u64; 256];
 
@@ -468,11 +483,11 @@ impl Histogram {
                     let ob = orig.fetch_range(
                         orig_start + elem * orig_elem,
                         (batch * orig_elem) as usize,
-                    )?;
+                    ).await?;
                     let mb = mod_.fetch_range(
                         mod_start + elem * mod_elem,
                         (batch * mod_elem) as usize,
-                    )?;
+                    ).await?;
                     for b in orig_dtype.diff_to_u8(&ob, *mod_dtype, &mb, EPSILON) {
                         counts[b as usize] += 1;
                     }
@@ -530,7 +545,7 @@ fn collect_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
 /// (in which case a tensor-aligned diff buffer is computed).
 /// For directories: files are matched by relative path; pairs with mismatched sizes
 /// or no counterpart on the other side are skipped with a warning.
-pub fn prepare_diff_sources(
+pub async fn prepare_diff_sources(
     original: &Path,
     modified: &Path,
     format_safetensors: bool,
@@ -547,7 +562,7 @@ pub fn prepare_diff_sources(
     if orig_is_file && mod_is_file {
         // Safetensors diff: expand into per-tensor diff Sources (one per matched pair).
         if is_st(original) && is_st(modified) {
-            return build_safetensors_diff_sources(original, modified);
+            return build_safetensors_diff_sources(original, modified).await;
         }
 
         let size_o = std::fs::metadata(original)?.len();
@@ -593,7 +608,7 @@ pub fn prepare_diff_sources(
             } else if mod_st.is_empty() {
                 eprintln!("warning: modified has no .safetensors files — skipping model weight diff");
             } else {
-                match build_multi_safetensors_diff_sources(&orig_st, &mod_st) {
+                match build_multi_safetensors_diff_sources(&orig_st, &mod_st).await {
                     Ok((mut tensor_sources, bytes)) => {
                         let base_idx = sources.len();
                         for s in &mut tensor_sources {
@@ -706,7 +721,7 @@ pub fn prepare_diff_sources(
 /// Safetensors files are diffed lazily via range requests — no model weights
 /// are downloaded to disk or held in RAM. Small non-safetensors files (≤16 MB)
 /// are downloaded eagerly and binary-diffed; larger ones are skipped with a warning.
-pub fn prepare_diff_sources_from_http(
+pub async fn prepare_diff_sources_from_http(
     orig_specs: &[(String, RemoteFileSpec)],
     mod_specs: &[(String, RemoteFileSpec)],
 ) -> anyhow::Result<(Vec<Source>, u64)> {
@@ -725,7 +740,7 @@ pub fn prepare_diff_sources_from_http(
         } else if mod_st.is_empty() {
             eprintln!("warning: modified has no .safetensors files — skipping model weight diff");
         } else {
-            match build_multi_safetensors_diff_sources_from_http(&orig_st, &mod_st) {
+            match build_multi_safetensors_diff_sources_from_http(&orig_st, &mod_st).await {
                 Ok((mut tensor_sources, bytes)) => {
                     let base_idx = sources.len();
                     for s in &mut tensor_sources { s.file_idx += base_idx; }
@@ -779,8 +794,8 @@ pub fn prepare_diff_sources_from_http(
             filename: Arc::clone(&mod_spec.filename),
             revision: Arc::clone(&mod_spec.revision),
         };
-        let ob = orig_data.fetch_range(0, orig_spec.size as usize)?;
-        let mb = mod_data.fetch_range(0, mod_spec.size as usize)?;
+        let ob = orig_data.fetch_range(0, orig_spec.size as usize).await?;
+        let mb = mod_data.fetch_range(0, mod_spec.size as usize).await?;
         let diff: Vec<u8> = ob.iter().zip(mb.iter()).map(|(&a, &b)| {
             let delta = b as i16 - a as i16;
             let brightness = (delta.unsigned_abs() as f32 / 255.0 * 127.0).round() as u8;
@@ -926,7 +941,7 @@ fn find_matched_tensor_pairs(orig_names: &[String], mod_names: &[String]) -> Vec
 
 /// Core tensor diff builder: given two parallel lists of whole-file Data sources,
 /// build per-tensor TensorDiff Source entries without reading any tensor bytes.
-fn build_multi_safetensors_diff_sources_inner(
+async fn build_multi_safetensors_diff_sources_inner(
     orig_data: &[Arc<Data>],
     mod_data:  &[Arc<Data>],
 ) -> anyhow::Result<(Vec<Source>, u64)> {
@@ -934,6 +949,7 @@ fn build_multi_safetensors_diff_sources_inner(
     let mut orig_map: HashMap<String, (usize, safetensors::TensorMeta)> = HashMap::new();
     for (i, data) in orig_data.iter().enumerate() {
         let (tensors, _) = fetch_safetensors_header(data)
+            .await
             .with_context(|| format!("reading safetensors header for orig file {i}"))?;
         for t in tensors {
             orig_map.entry(t.name.clone()).or_insert((i, t));
@@ -942,6 +958,7 @@ fn build_multi_safetensors_diff_sources_inner(
     let mut mod_map: HashMap<String, (usize, safetensors::TensorMeta)> = HashMap::new();
     for (i, data) in mod_data.iter().enumerate() {
         let (tensors, _) = fetch_safetensors_header(data)
+            .await
             .with_context(|| format!("reading safetensors header for mod file {i}"))?;
         for t in tensors {
             mod_map.entry(t.name.clone()).or_insert((i, t));
@@ -991,7 +1008,7 @@ fn build_multi_safetensors_diff_sources_inner(
 }
 
 /// Build per-tensor diff Sources from multiple local .safetensors files on each side.
-fn build_multi_safetensors_diff_sources(
+async fn build_multi_safetensors_diff_sources(
     orig_files: &[PathBuf],
     mod_files: &[PathBuf],
 ) -> anyhow::Result<(Vec<Source>, u64)> {
@@ -1003,12 +1020,12 @@ fn build_multi_safetensors_diff_sources(
     };
     let orig_data = open_arcs(orig_files)?;
     let mod_data  = open_arcs(mod_files)?;
-    build_multi_safetensors_diff_sources_inner(&orig_data, &mod_data)
+    build_multi_safetensors_diff_sources_inner(&orig_data, &mod_data).await
 }
 
 /// Build per-tensor diff Sources from multiple remote .safetensors files on each side.
 /// Headers are fetched via range requests; tensor data is never downloaded.
-fn build_multi_safetensors_diff_sources_from_http(
+async fn build_multi_safetensors_diff_sources_from_http(
     orig_specs: &[&(String, RemoteFileSpec)],
     mod_specs:  &[&(String, RemoteFileSpec)],
 ) -> anyhow::Result<(Vec<Source>, u64)> {
@@ -1023,16 +1040,16 @@ fn build_multi_safetensors_diff_sources_from_http(
     };
     let orig_data = make_arcs(orig_specs);
     let mod_data  = make_arcs(mod_specs);
-    build_multi_safetensors_diff_sources_inner(&orig_data, &mod_data)
+    build_multi_safetensors_diff_sources_inner(&orig_data, &mod_data).await
 }
 
 /// Build per-tensor diff Sources from two single .safetensors files.
-fn build_safetensors_diff_sources(
+async fn build_safetensors_diff_sources(
     original: &Path,
     modified: &Path,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     build_multi_safetensors_diff_sources(
         &[original.to_path_buf()],
         &[modified.to_path_buf()],
-    )
+    ).await
 }

@@ -350,7 +350,10 @@ fn render_chunks(
             .into_par_iter()
             .map(|src_idx| -> anyhow::Result<(usize, Option<(u32, u32, u32, u32)>)> {
                 let source = &sources[src_idx];
-                let hist = Histogram::build(source, pb_shared.as_deref())?;
+                // single mode never has HTTP sources (errors upstream), so
+                // Histogram::build's async path is dead code and a blocking
+                // executor here is safe (we're on a rayon worker thread).
+                let hist = futures::executor::block_on(Histogram::build(source, pb_shared.as_deref()))?;
                 let prefix = hist.prefix_sums();
                 let fi = source.file_idx;
                 let src_byte_start = src_byte_starts[src_idx];

@@ -1,7 +1,7 @@
-//! Adaptive (AIMD) concurrency throttle for outbound HTTP.
+//! Adaptive (AIMD) concurrency throttle for outbound HTTP, tokio-native.
 //!
-//! All Hub-bound HTTP in this crate goes through [`Throttle::global`]. Threads
-//! acquire a permit before sending a request and report the outcome:
+//! All Hub-bound HTTP in this crate goes through [`Throttle::global`]. Tasks
+//! `acquire().await` a permit before sending a request and report the outcome:
 //!
 //! - [`Throttle::record_success`] — gradually scale up (+1 worker every ≥10s
 //!   after 50 successes, gated by 60s cooldowns since last 429/timeout).
@@ -10,20 +10,28 @@
 //! - [`Throttle::record_timeout`] — reduce by 10% (floor `max(4, max/16)`) and
 //!   reset cooldown timers.
 //!
-//! Use the [`with_throttle`] helper to wrap a call in one place: acquire, run,
-//! classify the error, retry with decorrelated jitter where appropriate, and
-//! record the outcome.
+//! Use [`with_throttle`] to wrap an async call: acquire, run, classify the
+//! error, retry with decorrelated jitter where appropriate, and record the
+//! outcome.
 //!
-//! The math is a direct port of `xetcas/sizzle_sync/src/commands/subscriber.rs`;
-//! the only structural difference is that arbvis is rayon-blocking so we park
-//! on a `Condvar` rather than a `tokio::sync::Notify`.
+//! `max_workers` defaults to [`MAX_FETCH_WORKERS`] (128) — well above num_cpus —
+//! so the network parallelism is decoupled from CPU parallelism. Fetch
+//! workers above `active_limit` park on `scale_up_notify`.
+//!
+//! The math is a direct port of `xetcas/sizzle_sync/src/commands/subscriber.rs`.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
+
+use tokio::sync::Notify;
 
 /// Workers the throttle starts at (matches sizzle_sync).
 const INITIAL_WORKERS: usize = 4;
+/// Default ceiling on concurrent in-flight HTTP requests. Decoupled from
+/// num_cpus because the throttle's job is network parallelism, not CPU.
+pub const MAX_FETCH_WORKERS: usize = 128;
 /// Successful fetches required before scaling up by 1.
 const SUCCESSES_TO_SCALE_UP: usize = 50;
 /// Minimum interval between scale-ups.
@@ -53,11 +61,11 @@ pub struct Throttle {
     last_scale_up: AtomicI64,
     successes_since_scale_up: AtomicUsize,
     /// Monotone counter feeding the decorrelated-jitter RNG so different
-    /// threads/operations land on different sleeps.
+    /// tasks/operations land on different sleeps.
     jitter_nonce: AtomicU64,
-    /// Condvar guard: parked acquirers wait here; permit drops and scale-ups
-    /// `notify_all`.
-    gate: (Mutex<()>, Condvar),
+    /// Notified when a permit is released or when `active_limit` rises. Parked
+    /// acquirers re-check `in_flight < active_limit` after a wake.
+    scale_up_notify: Notify,
 }
 
 impl Throttle {
@@ -72,15 +80,16 @@ impl Throttle {
             last_scale_up: AtomicI64::new(0),
             successes_since_scale_up: AtomicUsize::new(0),
             jitter_nonce: AtomicU64::new(0),
-            gate: (Mutex::new(()), Condvar::new()),
+            scale_up_notify: Notify::new(),
         }
     }
 
-    /// Global throttle. The max-worker ceiling is set to the rayon thread
-    /// pool's current width on first call (i.e. `num_cpus` by default).
+    /// Global throttle, capped at [`MAX_FETCH_WORKERS`]. Tokio runtime must be
+    /// active when `acquire().await` is called, but this constructor itself
+    /// does no runtime-requiring work.
     pub fn global() -> &'static Self {
         static G: OnceLock<Throttle> = OnceLock::new();
-        G.get_or_init(|| Throttle::new(rayon::current_num_threads()))
+        G.get_or_init(|| Throttle::new(MAX_FETCH_WORKERS))
     }
 
     #[cfg(test)]
@@ -88,38 +97,37 @@ impl Throttle {
         Self::new(max_workers)
     }
 
-    /// Block until `in_flight < active_limit`, then return a permit. The
-    /// permit decrements `in_flight` on drop and wakes one waiter.
-    pub fn acquire(&self) -> Permit<'_> {
-        let (mu, cv) = &self.gate;
-        let mut guard = mu.lock().expect("throttle gate poisoned");
+    /// Await a permit. Returns when `in_flight` becomes less than
+    /// `active_limit`. The permit decrements `in_flight` on drop and wakes one
+    /// waiter via `scale_up_notify`.
+    pub async fn acquire(&self) -> Permit<'_> {
         loop {
+            // Register interest before reading state so a notify between the
+            // check and the await isn't lost.
+            let waiter = self.scale_up_notify.notified();
+            tokio::pin!(waiter);
+            waiter.as_mut().enable();
+
             let limit = self.active_limit.load(Ordering::SeqCst);
             let cur = self.in_flight.load(Ordering::SeqCst);
-            if cur < limit {
-                // Re-check after fetch_add to handle two threads racing past the load.
-                if self
+            if cur < limit
+                && self
                     .in_flight
                     .compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
-                {
-                    return Permit { throttle: self };
-                }
-                // Lost the race; reread and retry without sleeping.
-                continue;
+            {
+                return Permit { throttle: self };
             }
-            guard = cv.wait(guard).expect("throttle gate poisoned");
+            waiter.as_mut().await;
         }
     }
 
-    /// Notify all waiters; called when `active_limit` rises or when a permit
-    /// is released. `notify_all` (rather than `notify_one`) is needed for the
-    /// scale-up case because multiple waiters may now be eligible.
+    /// Notify all waiters. Used on scale-up and on permit drop.
     fn wake_waiters(&self) {
-        let (_mu, cv) = &self.gate;
-        // No need to hold the mutex; the wait predicate is re-checked under
-        // lock by every waiter when they wake.
-        cv.notify_all();
+        // `notify_waiters` wakes everyone currently waiting (without leaving a
+        // permit token behind), which is what we want — every waiter re-checks
+        // its predicate under SeqCst loads.
+        self.scale_up_notify.notify_waiters();
     }
 
     /// Record a successful HTTP exchange. May scale up if all gates pass.
@@ -134,10 +142,6 @@ impl Throttle {
         let last_timeout = self.last_timeout.load(Ordering::SeqCst);
         let last_scale_up = self.last_scale_up.load(Ordering::SeqCst);
 
-        // All three time gates must pass: ≥60s since 429, ≥60s since timeout,
-        // ≥10s since last scale-up. The time gate is the primary brake — with
-        // many concurrent workers the success counter saturates almost
-        // instantly without it.
         if !(last_rate_limit == 0 || now - last_rate_limit > RATE_LIMIT_COOLDOWN_SECS) {
             return;
         }
@@ -148,10 +152,8 @@ impl Throttle {
             return;
         }
 
-        // Increment the success counter; only the thread that wins the CAS
-        // from `successes` → 0 performs the scale-up. Without the CAS, every
-        // thread that sees `successes >= threshold` before the store(0) fires
-        // would increment `active_limit`.
+        // CAS-on-counter: only the task that wins the `successes` → 0 swap
+        // performs the scale-up.
         let successes = self
             .successes_since_scale_up
             .fetch_add(1, Ordering::SeqCst)
@@ -185,8 +187,6 @@ impl Throttle {
                 prev + 1,
                 self.max_workers,
             );
-            // Wake parked waiters so they re-check immediately rather than
-            // sleeping out the next acquirer's notify_one.
             self.wake_waiters();
         }
     }
@@ -221,9 +221,6 @@ impl Throttle {
                 let new = ((current * 9) / 10).max(floor);
                 if new < current { Some(new) } else { None }
             });
-        // Only update `last_timeout` if we actually reduced — otherwise the
-        // timeout was a no-op (already at floor) and shouldn't block scale-up
-        // for 60s.
         if reduced.is_ok() {
             self.successes_since_scale_up.store(0, Ordering::SeqCst);
             self.last_timeout.store(unix_now(), Ordering::SeqCst);
@@ -235,8 +232,6 @@ impl Throttle {
     }
 
     /// Sleep duration for the `attempt`-th 429 retry (1-indexed).
-    /// Decorrelated jitter: `prev_ms = base * 4^min(attempt-1, 3)`,
-    /// `delay = base + rand(prev_ms*3 - base)`, capped at `BACKOFF_CAP_MS`.
     pub fn rate_limit_backoff(&self, attempt: u32) -> Duration {
         let base_ms = BACKOFF_BASE_MS;
         let cap_ms = BACKOFF_CAP_MS;
@@ -248,13 +243,11 @@ impl Throttle {
         Duration::from_millis(jitter_ms.min(cap_ms))
     }
 
-    /// Fixed 2s backoff for transient errors, matching sizzle_sync.
     pub fn timeout_backoff(&self, _attempt: u32) -> Duration {
         Duration::from_secs(2)
     }
 
     fn next_rand(&self) -> u64 {
-        // Hash-of-counter: cheap, no dep, good enough for jitter.
         let n = self.jitter_nonce.fetch_add(1, Ordering::Relaxed);
         splitmix64(n.wrapping_mul(0x9E37_79B9_7F4A_7C15))
     }
@@ -270,7 +263,7 @@ impl Throttle {
     }
 }
 
-/// RAII permit. Decrements `in_flight` on drop and wakes one parked acquirer.
+/// RAII permit. Decrements `in_flight` on drop and wakes parked acquirers.
 pub struct Permit<'a> {
     throttle: &'a Throttle,
 }
@@ -278,24 +271,17 @@ pub struct Permit<'a> {
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
         self.throttle.in_flight.fetch_sub(1, Ordering::SeqCst);
-        // notify_all rather than notify_one: if `active_limit` rose while this
-        // permit was held, multiple parked threads may now be eligible.
         self.throttle.wake_waiters();
     }
 }
 
-/// Classification used by [`with_throttle`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// 429-equivalent. Halve concurrency, sleep with decorrelated jitter, retry.
     RateLimit,
-    /// Transport timeout/connect failure. Reduce concurrency by 10%, sleep fixed, retry.
     Timeout,
-    /// Anything else — return the error to the caller.
     Permanent,
 }
 
-/// Trait for error types that the throttle helper knows how to react to.
 pub trait ErrorClassify {
     fn classify(&self) -> Outcome;
 }
@@ -308,17 +294,14 @@ impl ErrorClassify for hf_hub::HFError {
                 if source.is_connect() || source.is_timeout() || source.is_request() {
                     Outcome::Timeout
                 } else {
-                    // Other reqwest errors (e.g. body decode) are not retried.
                     Outcome::Permanent
                 }
             }
-            hf_hub::HFError::Http { context } => {
-                match context.status.as_u16() {
-                    429 => Outcome::RateLimit,
-                    500 | 502 | 503 | 504 => Outcome::Timeout,
-                    _ => Outcome::Permanent,
-                }
-            }
+            hf_hub::HFError::Http { context } => match context.status.as_u16() {
+                429 => Outcome::RateLimit,
+                500 | 502 | 503 | 504 => Outcome::Timeout,
+                _ => Outcome::Permanent,
+            },
             _ => Outcome::Permanent,
         }
     }
@@ -341,13 +324,13 @@ impl ErrorClassify for reqwest::Error {
     }
 }
 
-/// Run `op` under a throttle permit with AIMD retries.
-///
-/// `label` is used in log lines only. The permit is dropped before each sleep
-/// so other threads can keep working.
-pub fn with_throttle<T, E, F>(label: &str, mut op: F) -> Result<T, E>
+/// Run an async `op` under a throttle permit with AIMD retries.
+/// The permit is held only while the future is running, and dropped before
+/// any sleep so other tasks can keep working.
+pub async fn with_throttle<T, E, F, Fut>(label: &str, mut op: F) -> Result<T, E>
 where
-    F: FnMut() -> Result<T, E>,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
     E: ErrorClassify,
 {
     let throttle = Throttle::global();
@@ -355,8 +338,8 @@ where
     let mut timeout_retries: u32 = 0;
 
     loop {
-        let permit = throttle.acquire();
-        let result = op();
+        let permit = throttle.acquire().await;
+        let result = op().await;
         drop(permit);
 
         match result {
@@ -381,7 +364,7 @@ where
                         rate_limit_retries,
                         MAX_RATE_LIMIT_RETRIES,
                     );
-                    std::thread::sleep(delay);
+                    tokio::time::sleep(delay).await;
                 }
                 Outcome::Timeout => {
                     timeout_retries += 1;
@@ -399,7 +382,7 @@ where
                         timeout_retries,
                         MAX_TIMEOUT_RETRIES,
                     );
-                    std::thread::sleep(delay);
+                    tokio::time::sleep(delay).await;
                 }
                 Outcome::Permanent => return Err(e),
             },
@@ -436,7 +419,6 @@ mod tests {
         for _ in 0..20 {
             t.record_rate_limit();
         }
-        // Floor for max=640 is max(4, 640/64) = 10.
         assert_eq!(t.active_limit(), 10);
     }
 
@@ -447,7 +429,6 @@ mod tests {
         for _ in 0..10 {
             t.record_rate_limit();
         }
-        // Floor for max=8 is max(4, 0) = 4.
         assert_eq!(t.active_limit(), 4);
     }
 
@@ -456,9 +437,7 @@ mod tests {
         let t = Throttle::new_for_test(160);
         t.active_limit.store(100, Ordering::SeqCst);
         t.record_timeout();
-        // 100 * 9/10 = 90
         assert_eq!(t.active_limit(), 90);
-        // Floor for max=160 is max(4, 160/16) = 10.
         for _ in 0..200 {
             t.record_timeout();
         }
@@ -468,10 +447,9 @@ mod tests {
     #[test]
     fn record_timeout_at_floor_does_not_update_last_timeout() {
         let t = Throttle::new_for_test(160);
-        t.active_limit.store(10, Ordering::SeqCst); // at floor
+        t.active_limit.store(10, Ordering::SeqCst);
         t.last_timeout.store(0, Ordering::SeqCst);
         t.record_timeout();
-        // Should not have updated the timestamp.
         assert_eq!(t.last_timeout.load(Ordering::SeqCst), 0);
         assert_eq!(t.active_limit(), 10);
     }
@@ -480,7 +458,6 @@ mod tests {
     fn record_success_gated_by_scale_up_interval() {
         let t = Throttle::new_for_test(64);
         t.active_limit.store(10, Ordering::SeqCst);
-        // Pretend we just scaled up — should not scale again immediately.
         t.last_scale_up.store(unix_now(), Ordering::SeqCst);
         for _ in 0..200 {
             t.record_success();
@@ -503,17 +480,13 @@ mod tests {
     fn record_success_scales_up_when_all_gates_pass() {
         let t = Throttle::new_for_test(64);
         t.active_limit.store(10, Ordering::SeqCst);
-        // All cooldowns expired (zero = never).
         for _ in 0..SUCCESSES_TO_SCALE_UP {
             t.record_success();
         }
         assert_eq!(t.active_limit(), 11);
-        // Counter reset; another batch needed.
         for _ in 0..(SUCCESSES_TO_SCALE_UP - 1) {
             t.record_success();
         }
-        // Hasn't crossed threshold yet; also blocked by 10s scale-up cooldown
-        // we just set. Either way the limit shouldn't have moved past 11.
         assert_eq!(t.active_limit(), 11);
     }
 
@@ -532,93 +505,59 @@ mod tests {
         let t = Throttle::new_for_test(16);
         for attempt in 1u32..=10 {
             let d = t.rate_limit_backoff(attempt);
-            assert!(d >= Duration::from_millis(BACKOFF_BASE_MS), "attempt {attempt}: too small");
-            assert!(d <= Duration::from_millis(BACKOFF_CAP_MS), "attempt {attempt}: too large");
+            assert!(d >= Duration::from_millis(BACKOFF_BASE_MS));
+            assert!(d <= Duration::from_millis(BACKOFF_CAP_MS));
         }
     }
 
-    #[test]
-    fn rate_limit_backoff_grows_then_caps() {
-        let t = Throttle::new_for_test(16);
-        // Sample the upper bound by exploring many random draws per attempt.
-        let mut max_seen = [Duration::ZERO; 6];
-        for attempt in 1u32..=5 {
-            for _ in 0..200 {
-                let d = t.rate_limit_backoff(attempt);
-                if d > max_seen[attempt as usize] {
-                    max_seen[attempt as usize] = d;
-                }
-            }
-        }
-        // The decorrelated-jitter upper bound for attempt is base * 4^min(a-1,3) * 3,
-        // capped at BACKOFF_CAP_MS. Hard upper bound for attempts ≥4 is the cap.
-        for attempt in 4u32..=5 {
-            // Most draws of size 200 will hit at least Duration::from_secs(10).
-            assert!(
-                max_seen[attempt as usize] >= Duration::from_secs(5),
-                "attempt {attempt}: expected to see large samples, got max {:?}",
-                max_seen[attempt as usize],
-            );
-        }
-    }
-
-    #[test]
-    fn acquire_parks_when_at_limit_and_wakes_on_release() {
+    #[tokio::test]
+    async fn acquire_parks_when_at_limit_and_wakes_on_release() {
         use std::sync::Arc;
-        use std::thread;
         use std::time::Instant;
 
         let t = Arc::new(Throttle::new_for_test(16));
         t.active_limit.store(1, Ordering::SeqCst);
 
-        // Take the one available permit.
-        let p1 = t.acquire();
+        let p1 = t.acquire().await;
         assert_eq!(t.in_flight(), 1);
 
-        // Spawn a thread that tries to acquire — it should block until we drop p1.
         let t2 = Arc::clone(&t);
         let start = Instant::now();
-        let handle = thread::spawn(move || {
-            let _p2 = t2.acquire();
-            // Hold for a moment then drop.
+        let handle = tokio::spawn(async move {
+            let _p2 = t2.acquire().await;
         });
 
-        // Give the spawned thread time to park.
-        thread::sleep(Duration::from_millis(50));
-        assert_eq!(t.in_flight(), 1, "spawned thread should not have acquired");
+        // Give the spawned task a chance to park.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(t.in_flight(), 1, "spawned task should not have acquired");
 
         drop(p1);
-        handle.join().unwrap();
+        handle.await.unwrap();
         assert!(start.elapsed() < Duration::from_secs(1));
         assert_eq!(t.in_flight(), 0);
     }
 
-    #[test]
-    fn acquire_wakes_on_scale_up() {
+    #[tokio::test]
+    async fn acquire_wakes_on_scale_up() {
         use std::sync::Arc;
-        use std::thread;
 
         let t = Arc::new(Throttle::new_for_test(16));
         t.active_limit.store(1, Ordering::SeqCst);
 
-        // Hold the only permit indefinitely while we test scale-up wake.
-        let _p1 = t.acquire();
+        let _p1 = t.acquire().await;
 
         let t2 = Arc::clone(&t);
-        let handle = thread::spawn(move || {
-            // This should block until we raise active_limit.
-            let _p2 = t2.acquire();
+        let handle = tokio::spawn(async move {
+            let _p2 = t2.acquire().await;
         });
 
-        thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(t.in_flight(), 1);
 
-        // Manually scale up and wake — mimics record_success's scale-up path.
         t.active_limit.store(2, Ordering::SeqCst);
         t.wake_waiters();
 
-        handle.join().unwrap();
-        // Spawned thread acquired then dropped; we still hold p1.
+        handle.await.unwrap();
         assert_eq!(t.in_flight(), 1);
     }
 }

@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use anyhow::Context;
 use hf_hub::buckets::BucketUpload;
 use hf_hub::repository::CommitOperation;
-use hf_hub::HFClientSync;
+use hf_hub::HFClient;
 use tempfile::TempDir;
 
 use crate::hf_url::{self, HfOutputSpec, RepoKind};
@@ -25,7 +25,7 @@ use crate::tiled::pyramid_accum::TileSink;
 /// of on-disk paths). To go below disk too — pyramids larger than local free
 /// disk — needs an upstream hf-hub feature; until then the tempdir is the floor.
 pub struct HfTileSink {
-    client: HFClientSync,
+    client: HFClient,
     spec: HfOutputSpec,
     tempdir: TempDir,
     /// Tiles staged to `tempdir`, indexed by repo path. Recorded in a single
@@ -40,7 +40,7 @@ struct StagedTile {
 }
 
 impl HfTileSink {
-    pub fn new(client: HFClientSync, spec: HfOutputSpec) -> anyhow::Result<Self> {
+    pub fn new(client: HFClient, spec: HfOutputSpec) -> anyhow::Result<Self> {
         let tempdir = tempfile::Builder::new()
             .prefix("arbvis-tiles-")
             .tempdir()
@@ -49,7 +49,7 @@ impl HfTileSink {
     }
 
     /// Finalize: push everything to the Hub in one commit (or bucket upload).
-    pub fn commit(self, summary: &str) -> anyhow::Result<()> {
+    pub async fn commit(self, summary: &str) -> anyhow::Result<()> {
         let staged = self
             .staged
             .into_inner()
@@ -69,12 +69,13 @@ impl HfTileSink {
                     .into_iter()
                     .map(|t| BucketUpload::new(t.local_path, t.repo_path))
                     .collect();
-                with_throttle(&format!("bucket upload {}", self.spec.repo_id), || {
+                with_throttle(&format!("bucket upload {}", self.spec.repo_id), || async {
                     self.client.bucket(owner, name)
                         .upload_files()
                         .files(uploads.clone())
                         .send()
-                })?;
+                        .await
+                }).await?;
             }
             kind => {
                 let ops: Vec<CommitOperation> = staged
@@ -84,33 +85,38 @@ impl HfTileSink {
                 let revision = self.spec.revision.clone();
                 let message = summary.to_string();
                 let label = format!("create_commit {}", self.spec.repo_id);
-                with_throttle(&label, || match kind {
-                    RepoKind::Model => self
-                        .client.model(owner, name)
-                        .create_commit()
-                        .operations(ops.clone())
-                        .commit_message(message.clone())
-                        .revision(revision.clone())
-                        .send()
-                        .map(|_| ()),
-                    RepoKind::Dataset => self
-                        .client.dataset(owner, name)
-                        .create_commit()
-                        .operations(ops.clone())
-                        .commit_message(message.clone())
-                        .revision(revision.clone())
-                        .send()
-                        .map(|_| ()),
-                    RepoKind::Space => self
-                        .client.space(owner, name)
-                        .create_commit()
-                        .operations(ops.clone())
-                        .commit_message(message.clone())
-                        .revision(revision.clone())
-                        .send()
-                        .map(|_| ()),
-                    RepoKind::Bucket => unreachable!(),
-                })?;
+                with_throttle(&label, || async {
+                    match kind {
+                        RepoKind::Model => self
+                            .client.model(owner, name)
+                            .create_commit()
+                            .operations(ops.clone())
+                            .commit_message(message.clone())
+                            .revision(revision.clone())
+                            .send()
+                            .await
+                            .map(|_| ()),
+                        RepoKind::Dataset => self
+                            .client.dataset(owner, name)
+                            .create_commit()
+                            .operations(ops.clone())
+                            .commit_message(message.clone())
+                            .revision(revision.clone())
+                            .send()
+                            .await
+                            .map(|_| ()),
+                        RepoKind::Space => self
+                            .client.space(owner, name)
+                            .create_commit()
+                            .operations(ops.clone())
+                            .commit_message(message.clone())
+                            .revision(revision.clone())
+                            .send()
+                            .await
+                            .map(|_| ()),
+                        RepoKind::Bucket => unreachable!(),
+                    }
+                }).await?;
             }
         }
         // tempdir drops here — staged tile files are removed from disk.

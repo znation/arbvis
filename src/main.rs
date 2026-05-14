@@ -81,7 +81,7 @@ struct Args {
     show_xet_chunks: bool,
 }
 
-fn run(args: Args) -> anyhow::Result<()> {
+async fn run(args: Args) -> anyhow::Result<()> {
     if let Some(ref tile_dir) = args.regen_html {
         return tiled::regen_html(tile_dir);
     }
@@ -140,44 +140,55 @@ fn run(args: Args) -> anyhow::Result<()> {
             if args.sort {
                 anyhow::bail!("--sort is not supported with repo-level hf:// diff inputs");
             }
-            let orig_specs = hf_url::list_repo_as_http_specs(orig_str)
+            let orig_specs = hf_url::list_repo_as_http_specs(orig_str).await
                 .with_context(|| format!("listing files in {orig_str}"))?;
-            let mod_specs = hf_url::list_repo_as_http_specs(mod_str)
+            let mod_specs = hf_url::list_repo_as_http_specs(mod_str).await
                 .with_context(|| format!("listing files in {mod_str}"))?;
-            data::prepare_diff_sources_from_http(&orig_specs, &mod_specs)?
+            data::prepare_diff_sources_from_http(&orig_specs, &mod_specs).await?
         } else {
             // At least one side is a local path or single-file hf:// URL.
-            let diff_args: Vec<PathBuf> = raw_diff_args
-                .into_iter()
-                .map(resolve_input)
-                .collect::<anyhow::Result<_>>()?;
-            data::prepare_diff_sources(&diff_args[0], &diff_args[1], format_safetensors)?
+            let mut diff_args: Vec<PathBuf> = Vec::with_capacity(raw_diff_args.len());
+            for p in raw_diff_args {
+                diff_args.push(resolve_input(p).await?);
+            }
+            data::prepare_diff_sources(&diff_args[0], &diff_args[1], format_safetensors).await?
         };
         let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
         // Stream directly to HF — no tiles written to local disk.
         if let Some(ref hf_out_url) = tiles_hf_out {
             if args.sort { anyhow::bail!("--sort is not supported with hf:// tile output"); }
             let hf_out = hf_url::parse_hf_output(hf_out_url)?;
-            let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, true, diff_title, &diff_input_strs, false)?;
+            let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, true, diff_title, &diff_input_strs, false).await?;
             return Ok(());
         }
         if let Some(ref space_id) = args.space {
             if args.sort { anyhow::bail!("--sort is not supported with --space diff output"); }
-            let bucket_spec = deploy::create_space_bucket(space_id)?;
-            let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, true, diff_title, &diff_input_strs, false)?;
-            deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html)?;
+            let bucket_spec = deploy::create_space_bucket(space_id).await?;
+            let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, true, diff_title, &diff_input_strs, false).await?;
+            deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html).await?;
             return Ok(());
         }
         if let Some(ref tile_dir) = tiles_arg {
-            tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, true, diff_title, &diff_input_strs, false)?;
+            tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, true, diff_title, &diff_input_strs, false).await?;
             if let Some(ref url) = tiles_upload {
-                deploy::upload_dir_to(url, tile_dir)?;
+                deploy::upload_dir_to(url, tile_dir).await?;
             }
             return Ok(());
         }
-        single::run_single(&labels, output_arg.clone(), sources, total, args.sort, true)?;
+        // single::run_single is sync + rayon. Wrap it in spawn_blocking so the
+        // tokio runtime can keep driving any other tasks meanwhile.
+        let labels = labels.clone();
+        let sources_owned = sources;
+        let output_arg_owned = output_arg.clone();
+        let sort = args.sort;
+        let diff_mode = true;
+        tokio::task::spawn_blocking(move || {
+            single::run_single(&labels, output_arg_owned, sources_owned, total, sort, diff_mode)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("run_single join failure: {e}"))??;
         if let (Some(ref url), Some(ref local)) = (&output_upload, &output_arg) {
-            deploy::upload_file_to(url, local)?;
+            deploy::upload_file_to(url, local).await?;
         }
         return Ok(());
     }
@@ -189,7 +200,7 @@ fn run(args: Args) -> anyhow::Result<()> {
     // Only applies when --tiles is a local path (not hf://).
     if args.files.is_empty() && args.file_list.is_none() && tiles_upload.is_none() {
         if let (Some(ref tile_dir), Some(ref space_id)) = (&tiles_arg, &args.space) {
-            deploy::run_deploy(tile_dir, space_id)?;
+            deploy::run_deploy(tile_dir, space_id).await?;
             return Ok(());
         }
     }
@@ -222,24 +233,22 @@ fn run(args: Args) -> anyhow::Result<()> {
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
-        let specs: Vec<InputSpec> = files
-            .iter()
-            .map(|p| {
-                let s = p.to_string_lossy();
-                if s.starts_with("hf://") {
-                    hf_url::resolve_to_http(p).map(InputSpec::Remote)
-                } else {
-                    Ok(InputSpec::Local(p.clone()))
-                }
-            })
-            .collect::<anyhow::Result<_>>()?;
+        let mut specs: Vec<InputSpec> = Vec::with_capacity(files.len());
+        for p in &files {
+            let s = p.to_string_lossy();
+            if s.starts_with("hf://") {
+                specs.push(InputSpec::Remote(hf_url::resolve_to_http(p).await?));
+            } else {
+                specs.push(InputSpec::Local(p.clone()));
+            }
+        }
         let (mut sources, total) = data::prepare_sources_from_specs(&specs, format_safetensors)?;
         if xet_vis {
-            data::populate_xet_terms(&mut sources)?;
+            data::populate_xet_terms(&mut sources).await?;
         }
         let hf_out = hf_url::parse_hf_output(hf_out_url)?;
         let stream_title = args.title.as_deref().unwrap_or("arbvis");
-        let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, false, stream_title, &input_strs, show_xet_chunks)?;
+        let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, false, stream_title, &input_strs, show_xet_chunks).await?;
         return Ok(());
     }
 
@@ -258,64 +267,76 @@ fn run(args: Args) -> anyhow::Result<()> {
             let s = p.to_string_lossy();
             if s.starts_with("hf://") {
                 if hf_url::is_repo_level(&s)? {
-                    for (_, spec) in hf_url::list_repo_as_http_specs(&s)
-                        .with_context(|| format!("listing files in {s}"))?
-                    {
+                    let listed = hf_url::list_repo_as_http_specs(&s).await
+                        .with_context(|| format!("listing files in {s}"))?;
+                    for (_, spec) in listed {
                         specs.push(InputSpec::Remote(spec));
                     }
                 } else {
-                    specs.push(hf_url::resolve_to_http(p).map(InputSpec::Remote)?);
+                    specs.push(InputSpec::Remote(hf_url::resolve_to_http(p).await?));
                 }
             } else {
                 specs.push(InputSpec::Local(p.clone()));
             }
         }
         let (mut sources, total) = data::prepare_sources_from_specs(&specs, format_safetensors)?;
-        data::populate_xet_terms(&mut sources)?;
+        data::populate_xet_terms(&mut sources).await?;
         (sources, total)
     } else {
-        let files: Vec<PathBuf> = files
-            .into_iter()
-            .map(resolve_input)
-            .collect::<anyhow::Result<_>>()?;
-        data::prepare_sources(&files, format_safetensors)?
+        let mut resolved: Vec<PathBuf> = Vec::with_capacity(files.len());
+        for p in files {
+            resolved.push(resolve_input(p).await?);
+        }
+        data::prepare_sources(&resolved, format_safetensors)?
     };
     let display_files: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
 
     if let Some(ref tile_dir) = tiles_arg {
-        tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, false, tile_title, &original_inputs, show_xet_chunks)?;
+        tiled::run_tiles(sources, total, tile_dir.clone(), args.sort, false, tile_title, &original_inputs, show_xet_chunks).await?;
         if let Some(ref space_id) = args.space {
-            deploy::run_deploy(tile_dir, space_id)?;
+            deploy::run_deploy(tile_dir, space_id).await?;
         }
         if let Some(ref url) = tiles_upload {
-            deploy::upload_dir_to(url, tile_dir)?;
+            deploy::upload_dir_to(url, tile_dir).await?;
         }
         return Ok(());
     }
 
     if let Some(ref space_id) = args.space {
         if args.sort { anyhow::bail!("--sort is not supported with --space output"); }
-        let bucket_spec = deploy::create_space_bucket(space_id)?;
-        let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, false, tile_title, &original_inputs, show_xet_chunks)?;
-        deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html)?;
+        let bucket_spec = deploy::create_space_bucket(space_id).await?;
+        let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, false, tile_title, &original_inputs, show_xet_chunks).await?;
+        deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html).await?;
         return Ok(());
     }
 
-    single::run_single(&display_files, output_arg.clone(), sources, total, args.sort, false)?;
+    // single::run_single is sync + rayon. spawn_blocking keeps the tokio
+    // runtime responsive.
+    let display_files_owned = display_files.clone();
+    let sources_owned = sources;
+    let output_arg_owned = output_arg.clone();
+    let sort = args.sort;
+    tokio::task::spawn_blocking(move || {
+        single::run_single(&display_files_owned, output_arg_owned, sources_owned, total, sort, false)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("run_single join failure: {e}"))??;
     if let (Some(ref url), Some(ref local)) = (&output_upload, &output_arg) {
-        deploy::upload_file_to(url, local)?;
+        deploy::upload_file_to(url, local).await?;
     }
     Ok(())
 }
 
 /// Resolve an input path: download from HF if it starts with `hf://`.
-fn resolve_input(path: PathBuf) -> anyhow::Result<PathBuf> {
-    hf_url::resolve(&path).with_context(|| format!("resolving {}", path.display()))
+async fn resolve_input(path: PathBuf) -> anyhow::Result<PathBuf> {
+    let display = path.display().to_string();
+    hf_url::resolve(&path).await.with_context(|| format!("resolving {display}"))
 }
 
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
-    run(args)
+    run(args).await
 }

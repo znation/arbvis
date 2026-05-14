@@ -4,6 +4,10 @@ use image::{ImageFormat, Rgb};
 
 use crate::data::Data;
 
+const TILE: u32 = 256;
+pub const TILE_PIXELS: usize = (TILE as usize) * (TILE as usize);
+const TILE_AREA: u64 = TILE_PIXELS as u64;
+
 type TileResult = Result<(image::ImageBuffer<Rgb<u8>, Vec<u8>>, Vec<u8>), String>;
 
 fn encode_png(img: image::ImageBuffer<Rgb<u8>, Vec<u8>>) -> Result<(image::ImageBuffer<Rgb<u8>, Vec<u8>>, Vec<u8>), String> {
@@ -13,16 +17,23 @@ fn encode_png(img: image::ImageBuffer<Rgb<u8>, Vec<u8>>) -> Result<(image::Image
     Ok((img, cursor.into_inner()))
 }
 
-/// Render one 256×256 leaf tile, returning (pixels, png_bytes).
+/// Compute the starting Hilbert byte index for tile `(tx, ty)`.
+pub fn tile_pixel_start(tx: u32, ty: u32, kh: u8, height_tiles: u32, square_pixels: u64) -> u64 {
+    let sq = (tx / height_tiles) as u64;
+    let sq_off = sq * square_pixels;
+    let local_tx = tx % height_tiles;
+    let tile_order = kh - 8;
+    let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
+    sq_off + base
+}
+
+/// Async fetch stage: populate a 256×256 = 65 536-byte tile buffer for tile `(tx, ty)`.
 ///
-/// Each tile at the highest zoom level covers a 256×256-pixel region that
-/// corresponds to a contiguous Hilbert sub-curve of exactly 65536 bytes.
-/// For local sources, byte access is zero-copy via `Deref`. For remote
-/// `Data::Http` sources, each source segment is fetched via a single HTTP
-/// range request.
-///
-/// Uses u64 for Hilbert indices to support files > 16 GiB.
-pub fn render_leaf_tile(
+/// Walks the per-tile Hilbert byte range across source boundaries and issues
+/// one async `fetch_range` per source overlap (≤ 2 in practice). Local sources
+/// resolve immediately; HTTP sources await an actual HTTP request, throttled
+/// by [`crate::throttle::Throttle::global`].
+pub async fn fetch_tile_bytes(
     tx: u32,
     ty: u32,
     kh: u8,
@@ -31,44 +42,51 @@ pub fn render_leaf_tile(
     total: u64,
     source_data: &[Data],
     cumulative_offsets: &[u64],
+) -> anyhow::Result<Box<[u8; TILE_PIXELS]>> {
+    let mut tile_buf = Box::new([0u8; TILE_PIXELS]);
+    let tile_pixel_start = tile_pixel_start(tx, ty, kh, height_tiles, square_pixels);
+    let readable_end = (tile_pixel_start + TILE_AREA).min(total);
+    if tile_pixel_start >= readable_end {
+        return Ok(tile_buf);
+    }
+
+    let mut pos = tile_pixel_start;
+    let mut buf_off = 0usize;
+    while pos < readable_end {
+        let src_idx = cumulative_offsets.partition_point(|&c| c <= pos) - 1;
+        let data = &source_data[src_idx];
+        let src_end = if src_idx + 1 < cumulative_offsets.len() {
+            cumulative_offsets[src_idx + 1]
+        } else {
+            total
+        };
+        let chunk_end = readable_end.min(src_end);
+        let chunk_len = (chunk_end - pos) as usize;
+        let local_off = pos - cumulative_offsets[src_idx];
+        let fetched = data.fetch_range(local_off, chunk_len).await?;
+        tile_buf[buf_off..buf_off + chunk_len].copy_from_slice(&fetched);
+        pos = chunk_end;
+        buf_off += chunk_len;
+    }
+    Ok(tile_buf)
+}
+
+/// CPU-only render from a pre-filled tile buffer.
+pub fn render_leaf_tile_from_buf(
+    tx: u32,
+    ty: u32,
+    kh: u8,
+    height_tiles: u32,
+    square_pixels: u64,
+    total: u64,
+    tile_buf: &[u8; TILE_PIXELS],
     pixel_lut: &[Rgb<u8>; 256],
 ) -> TileResult {
-    const TILE: u32 = 256;
-    const TILE_PIXELS: usize = (TILE as usize) * (TILE as usize);
-    const TILE_AREA: u64 = TILE_PIXELS as u64;
-
     let sq = (tx / height_tiles) as u64;
     let sq_off = sq * square_pixels;
     let local_tx = tx % height_tiles;
-
     let tile_order = kh - 8;
     let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
-    let tile_pixel_start = sq_off + base;
-
-    let mut tile_buf = [0u8; TILE_PIXELS];
-    let readable_end = (tile_pixel_start + TILE_AREA).min(total);
-    if tile_pixel_start < readable_end {
-        let mut pos = tile_pixel_start;
-        let mut buf_off = 0usize;
-        while pos < readable_end {
-            let src_idx = cumulative_offsets.partition_point(|&c| c <= pos) - 1;
-            let data = &source_data[src_idx];
-            // Source end: next source's start, or total for the last source.
-            let src_end = if src_idx + 1 < cumulative_offsets.len() {
-                cumulative_offsets[src_idx + 1]
-            } else {
-                total
-            };
-            let chunk_end = readable_end.min(src_end);
-            let chunk_len = (chunk_end - pos) as usize;
-            let local_off = pos - cumulative_offsets[src_idx];
-            let fetched = data.fetch_range(local_off, chunk_len)
-                .map_err(|e| e.to_string())?;
-            tile_buf[buf_off..buf_off + chunk_len].copy_from_slice(&fetched);
-            pos = chunk_end;
-            buf_off += chunk_len;
-        }
-    }
 
     let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
     for py in 0..TILE {
@@ -88,7 +106,6 @@ pub fn render_leaf_tile(
     encode_png(img)
 }
 
-
 /// Render one 256×256 leaf tile using position-based dtype coloring (safetensors mode).
 ///
 /// Does not read file bytes — color is determined entirely by byte position via
@@ -103,10 +120,6 @@ pub fn render_leaf_tile_dtype(
     total: u64,
     color_ranges: &[(u64, u64, image::Rgb<u8>)],
 ) -> TileResult {
-    const TILE: u32 = 256;
-    const TILE_PIXELS: usize = (TILE as usize) * (TILE as usize);
-    const TILE_AREA: u64 = TILE_PIXELS as u64;
-
     let sq = (tx / height_tiles) as u64;
     let sq_off = sq * square_pixels;
     let local_tx = tx % height_tiles;
@@ -148,63 +161,28 @@ pub fn render_leaf_tile_dtype(
     encode_png(img)
 }
 
-/// Render one 256×256 leaf tile using xorb coloring.
+/// CPU-only render in xet/xorb mode from a pre-filled tile buffer.
 ///
-/// Each pixel's byte is read like in `render_leaf_tile`. Then the byte's
-/// absolute file offset is looked up in `xorb_ranges` to find its xorb's
-/// Tableau-20 color index. The final RGB color is the Tableau color scaled
-/// per-channel by `byte / 255.0` (so byte=0 → black, byte=255 → full xorb
-/// color, mid-range bytes → dimmer versions of the xorb hue).
-///
-/// Bytes outside any xorb range fall back to the default `pixel_lut`.
-pub fn render_leaf_tile_xet(
+/// Each pixel's byte is read from `tile_buf`. Its absolute file offset is
+/// looked up in `xorb_ranges` to find its xorb's Tableau-20 color index. The
+/// final RGB color is the Tableau color scaled per-channel by `byte / 255.0`.
+pub fn render_leaf_tile_xet_from_buf(
     tx: u32,
     ty: u32,
     kh: u8,
     height_tiles: u32,
     square_pixels: u64,
     total: u64,
-    source_data: &[Data],
-    cumulative_offsets: &[u64],
+    tile_buf: &[u8; TILE_PIXELS],
     pixel_lut: &[Rgb<u8>; 256],
     xorb_ranges: &[(u64, u64, u8)],
     tableau: &[Rgb<u8>; 20],
 ) -> TileResult {
-    const TILE: u32 = 256;
-    const TILE_PIXELS: usize = (TILE as usize) * (TILE as usize);
-    const TILE_AREA: u64 = TILE_PIXELS as u64;
-
     let sq = (tx / height_tiles) as u64;
     let sq_off = sq * square_pixels;
     let local_tx = tx % height_tiles;
-
     let tile_order = kh - 8;
     let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
-    let tile_pixel_start = sq_off + base;
-
-    let mut tile_buf = [0u8; TILE_PIXELS];
-    let readable_end = (tile_pixel_start + TILE_AREA).min(total);
-    if tile_pixel_start < readable_end {
-        let mut pos = tile_pixel_start;
-        let mut buf_off = 0usize;
-        while pos < readable_end {
-            let src_idx = cumulative_offsets.partition_point(|&c| c <= pos) - 1;
-            let data = &source_data[src_idx];
-            let src_end = if src_idx + 1 < cumulative_offsets.len() {
-                cumulative_offsets[src_idx + 1]
-            } else {
-                total
-            };
-            let chunk_end = readable_end.min(src_end);
-            let chunk_len = (chunk_end - pos) as usize;
-            let local_off = pos - cumulative_offsets[src_idx];
-            let fetched = data.fetch_range(local_off, chunk_len)
-                .map_err(|e| e.to_string())?;
-            tile_buf[buf_off..buf_off + chunk_len].copy_from_slice(&fetched);
-            pos = chunk_end;
-            buf_off += chunk_len;
-        }
-    }
 
     let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
     for py in 0..TILE {
@@ -218,7 +196,7 @@ pub fn render_leaf_tile_xet(
                 match xorb_color_idx(xorb_ranges, pixel_idx) {
                     Some(idx) => {
                         let t = tableau[idx as usize];
-                        let scale = byte as u16; // 0..=255
+                        let scale = byte as u16;
                         Rgb([
                             ((t[0] as u16 * scale + 127) / 255) as u8,
                             ((t[1] as u16 * scale + 127) / 255) as u8,
@@ -267,10 +245,6 @@ pub fn render_leaf_tile_sorted(
     histograms: &[([u64; 257], u64)],
     pixel_lut: &[Rgb<u8>; 256],
 ) -> TileResult {
-    const TILE: u32 = 256;
-    const TILE_PIXELS: usize = (TILE as usize) * (TILE as usize);
-    const TILE_AREA: u64 = TILE_PIXELS as u64;
-
     let sq = (tx / height_tiles) as u64;
     let sq_off = sq * square_pixels;
     let local_tx = tx % height_tiles;

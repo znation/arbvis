@@ -70,7 +70,7 @@ struct CasToken {
 static CAS_TOKEN_CACHE: Mutex<Option<HashMap<(String, String, String), CasToken>>> =
     Mutex::new(None);
 
-fn fetch_cas_token(
+async fn fetch_cas_token(
     api_segment: &str,
     repo_id: &str,
     revision: &str,
@@ -96,21 +96,24 @@ fn fetch_cas_token(
         revision,
     );
     log::info!("Requesting xet CAS token for {repo_id}@{revision}");
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::Client::new();
     // `error_for_status()` converts non-2xx into a reqwest::Error carrying the
     // status code so the throttle's classifier can detect 429/5xx and retry.
     // Response body detail is lost on error, but the URL and status code are
     // preserved.
-    let resp = with_throttle(&format!("xet-read-token {repo_id}"), || {
+    let resp = with_throttle(&format!("xet-read-token {repo_id}"), || async {
         client
             .get(&url)
             .bearer_auth(&hf_token)
             .send()
+            .await
             .and_then(|r| r.error_for_status())
     })
+    .await
     .with_context(|| format!("requesting xet-read-token at {url}"))?;
     let parsed: XetReadTokenResponse = resp
         .json()
+        .await
         .with_context(|| format!("parsing xet-read-token response from {url}"))?;
 
     let token = CasToken {
@@ -126,23 +129,26 @@ fn fetch_cas_token(
     Ok(token)
 }
 
-fn fetch_reconstruction_terms(
+async fn fetch_reconstruction_terms(
     cas: &CasToken,
     xet_hash_hex: &str,
 ) -> anyhow::Result<Vec<XetTerm>> {
     let url = format!("{}/v2/reconstructions/{}", cas.cas_url, xet_hash_hex);
     log::info!("Fetching reconstruction terms: {url}");
-    let client = reqwest::blocking::Client::new();
-    let resp = with_throttle(&format!("reconstruction {xet_hash_hex}"), || {
+    let client = reqwest::Client::new();
+    let resp = with_throttle(&format!("reconstruction {xet_hash_hex}"), || async {
         client
             .get(&url)
             .bearer_auth(&cas.access_token)
             .send()
+            .await
             .and_then(|r| r.error_for_status())
     })
+    .await
     .with_context(|| format!("requesting reconstruction at {url}"))?;
     let parsed: ReconstructionResponse = resp
         .json()
+        .await
         .with_context(|| format!("parsing reconstruction response from {url}"))?;
 
     let mut offset: u64 = 0;
@@ -166,7 +172,7 @@ fn fetch_reconstruction_terms(
 /// Returns `Ok(vec![])` if the file has no xet hash (e.g. plain LFS or
 /// regular file). Errors only on real failures (network, auth, malformed
 /// responses).
-pub fn reconstruction_for(spec: &RemoteFileSpec) -> anyhow::Result<Vec<XetTerm>> {
+pub async fn reconstruction_for(spec: &RemoteFileSpec) -> anyhow::Result<Vec<XetTerm>> {
     let Some(hash) = spec.xet_hash.as_deref() else {
         log::warn!(
             "{}: not xet-backed, skipping xet visualization for this source",
@@ -174,8 +180,8 @@ pub fn reconstruction_for(spec: &RemoteFileSpec) -> anyhow::Result<Vec<XetTerm>>
         );
         return Ok(Vec::new());
     };
-    let cas = fetch_cas_token(spec.repo.api_segment(), &spec.repo.repo_id(), &spec.revision)?;
-    fetch_reconstruction_terms(&cas, hash)
+    let cas = fetch_cas_token(spec.repo.api_segment(), &spec.repo.repo_id(), &spec.revision).await?;
+    fetch_reconstruction_terms(&cas, hash).await
 }
 
 /// Tableau-20 palette, https://vega.github.io/vega/docs/schemes/#tableau20

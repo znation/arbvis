@@ -102,6 +102,18 @@ impl RemoteRepo {
                     }
                     // Don't sleep here — the loop's wait_for_global_rate_limit() handles it.
                 }
+                Err(hf_hub::HFError::Request { ref source, .. })
+                    if attempt < MAX_RETRIES && (source.is_connect() || source.is_timeout()) =>
+                {
+                    let delay = Duration::from_secs(2u64.pow(attempt));
+                    log::warn!(
+                        "transient connection error on {filename}; retrying in {:.0}s ({}/{}): {source}",
+                        delay.as_secs_f32(),
+                        attempt + 1,
+                        MAX_RETRIES,
+                    );
+                    std::thread::sleep(delay);
+                }
                 Err(e) => return Err(e.into()),
             }
         }

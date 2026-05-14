@@ -79,6 +79,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     }
 
     let xet_vis = args.show_xet_xorbs || args.show_xet_chunks;
+    let show_xet_xorbs = args.show_xet_xorbs;
     let show_xet_chunks = args.show_xet_chunks;
 
     if xet_vis && args.diff.is_some() {
@@ -142,17 +143,17 @@ async fn run(args: Args) -> anyhow::Result<()> {
         // Stream directly to HF — no tiles written to local disk.
         if let Some(ref hf_out_url) = tiles_hf_out {
             let hf_out = hf_url::parse_hf_output(hf_out_url)?;
-            let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, true, diff_title, &diff_input_strs, false).await?;
+            let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, true, diff_title, &diff_input_strs, false, false).await?;
             return Ok(());
         }
         if let Some(ref space_id) = args.space {
             let bucket_spec = deploy::create_space_bucket(space_id).await?;
-            let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, true, diff_title, &diff_input_strs, false).await?;
+            let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, true, diff_title, &diff_input_strs, false, false).await?;
             deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html).await?;
             return Ok(());
         }
         if let Some(ref tile_dir) = tiles_arg {
-            tiled::run_tiles(sources, total, tile_dir.clone(), true, diff_title, &diff_input_strs, false).await?;
+            tiled::run_tiles(sources, total, tile_dir.clone(), true, diff_title, &diff_input_strs, false, false).await?;
             if let Some(ref url) = tiles_upload {
                 deploy::upload_dir_to(url, tile_dir).await?;
             }
@@ -165,7 +166,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         let output_arg_owned = output_arg.clone();
         let diff_mode = true;
         tokio::task::spawn_blocking(move || {
-            single::run_single(&labels, output_arg_owned, sources_owned, total, diff_mode)
+            single::run_single(&labels, output_arg_owned, sources_owned, total, diff_mode, false)
         })
         .await
         .map_err(|e| anyhow::anyhow!("run_single join failure: {e}"))??;
@@ -230,7 +231,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         data::materialize_http_sources(&mut sources).await?;
         let hf_out = hf_url::parse_hf_output(hf_out_url)?;
         let stream_title = args.title.as_deref().unwrap_or("arbvis");
-        let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, false, stream_title, &input_strs, show_xet_chunks).await?;
+        let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, false, stream_title, &input_strs, show_xet_xorbs, show_xet_chunks).await?;
         return Ok(());
     }
 
@@ -280,7 +281,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let display_files: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
 
     if let Some(ref tile_dir) = tiles_arg {
-        tiled::run_tiles(sources, total, tile_dir.clone(), false, tile_title, &original_inputs, show_xet_chunks).await?;
+        tiled::run_tiles(sources, total, tile_dir.clone(), false, tile_title, &original_inputs, show_xet_xorbs, show_xet_chunks).await?;
         if let Some(ref space_id) = args.space {
             deploy::run_deploy(tile_dir, space_id).await?;
         }
@@ -292,7 +293,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
 
     if let Some(ref space_id) = args.space {
         let bucket_spec = deploy::create_space_bucket(space_id).await?;
-        let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, false, tile_title, &original_inputs, show_xet_chunks).await?;
+        let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, false, tile_title, &original_inputs, show_xet_xorbs, show_xet_chunks).await?;
         deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html).await?;
         return Ok(());
     }
@@ -303,7 +304,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let sources_owned = sources;
     let output_arg_owned = output_arg.clone();
     tokio::task::spawn_blocking(move || {
-        single::run_single(&display_files_owned, output_arg_owned, sources_owned, total, false)
+        single::run_single(&display_files_owned, output_arg_owned, sources_owned, total, false, show_xet_xorbs)
     })
     .await
     .map_err(|e| anyhow::anyhow!("run_single join failure: {e}"))??;

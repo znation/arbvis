@@ -25,6 +25,7 @@ pub fn run_single(
     sources: Vec<Source>,
     total: u64,
     diff_mode: bool,
+    show_xet_xorbs: bool,
 ) -> anyhow::Result<()> {
     let num_files = files.len().max(1);
     let total_usize = (total as usize).max(1);
@@ -48,15 +49,21 @@ pub fn run_single(
 
     let pixel_lut = if diff_mode { build_diff_signed_lut() } else { build_pixel_lut() };
 
-    // Build xorb map (empty if no source has xet terms) and the Tableau-20
-    // table. When non-empty, render_chunks substitutes xorb-tinted pixels.
-    let xorb_map = XorbMap::build(
-        sources.iter().scan(0u64, |off, s| {
-            let cur = *off;
-            *off += s.byte_size;
-            Some((s.xet_terms.as_deref(), cur))
-        }),
-    );
+    // Build xorb map only when xorb coloring was explicitly requested.
+    // (Without this gate, --show-xet-chunks alone — which has no single-mode
+    // overlay anyway — would still flip the file from dtype/plain to xorb
+    // coloring, because xet_terms get populated either way.)
+    let xorb_map = if show_xet_xorbs {
+        XorbMap::build(
+            sources.iter().scan(0u64, |off, s| {
+                let cur = *off;
+                *off += s.byte_size;
+                Some((s.xet_terms.as_deref(), cur))
+            }),
+        )
+    } else {
+        XorbMap { global_ranges: Vec::new() }
+    };
     let tableau: [Rgb<u8>; 20] = {
         let mut arr = [Rgb([0u8, 0, 0]); 20];
         for (i, c) in TABLEAU_20.iter().enumerate() {

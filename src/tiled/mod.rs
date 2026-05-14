@@ -284,6 +284,7 @@ async fn build_tile_plan(
     sources: Vec<Source>,
     total: u64,
     diff_mode: bool,
+    show_xet_xorbs: bool,
     show_xet_chunks: bool,
 ) -> anyhow::Result<TilePlan> {
     let mut s = 2 * TILE_LOG2 as u32;
@@ -325,11 +326,19 @@ async fn build_tile_plan(
         v
     };
 
-    let xorb_map = XorbMap::build(
-        sources.iter().zip(cumulative_offsets.iter()).map(|(s, &off)| {
-            (s.xet_terms.as_deref(), off)
-        }),
-    );
+    // The xorb_map drives leaf coloring (LeafMode::Xet). Only build it when
+    // the user explicitly asked for xorb coloring — otherwise `--show-xet-chunks`
+    // alone would silently swap dtype/plain coloring for xorb tinting just
+    // because xet_terms got populated for the chunk overlay.
+    let xorb_map = if show_xet_xorbs {
+        XorbMap::build(
+            sources.iter().zip(cumulative_offsets.iter()).map(|(s, &off)| {
+                (s.xet_terms.as_deref(), off)
+            }),
+        )
+    } else {
+        XorbMap { global_ranges: Vec::new() }
+    };
     let xet_mode = !xorb_map.is_empty();
     let tableau: [image::Rgb<u8>; 20] = {
         let mut arr = [image::Rgb([0u8, 0, 0]); 20];
@@ -681,9 +690,10 @@ pub async fn run_tiles(
     diff_mode: bool,
     title: &str,
     inputs: &[String],
+    show_xet_xorbs: bool,
     show_xet_chunks: bool,
 ) -> anyhow::Result<()> {
-    let plan = build_tile_plan(sources, total, diff_mode, show_xet_chunks).await?;
+    let plan = build_tile_plan(sources, total, diff_mode, show_xet_xorbs, show_xet_chunks).await?;
 
     let max_zoom = plan.max_zoom;
     let tile_size = TILE;
@@ -733,12 +743,13 @@ pub async fn run_tiles_hf_streaming(
     diff_mode: bool,
     title: &str,
     inputs: &[String],
+    show_xet_xorbs: bool,
     show_xet_chunks: bool,
 ) -> anyhow::Result<Vec<u8>> {
     crate::hf_url::require_token()?;
     let client = crate::hf_url::client()?;
 
-    let plan = build_tile_plan(sources, total, diff_mode, show_xet_chunks).await?;
+    let plan = build_tile_plan(sources, total, diff_mode, show_xet_xorbs, show_xet_chunks).await?;
     let tile_size = TILE;
     let max_zoom = plan.max_zoom;
     let world_w = plan.world_w;

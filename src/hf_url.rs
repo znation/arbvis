@@ -36,13 +36,34 @@ pub enum RemoteRepo {
 
 impl RemoteRepo {
     pub fn fetch_range(&self, filename: &str, revision: &str, range: std::ops::Range<u64>) -> anyhow::Result<Vec<u8>> {
-        match self {
-            RemoteRepo::Model(r) => r.download_file_to_bytes().filename(filename).revision(revision).range(range).send(),
-            RemoteRepo::Dataset(r) => r.download_file_to_bytes().filename(filename).revision(revision).range(range).send(),
-            RemoteRepo::Space(r) => r.download_file_to_bytes().filename(filename).revision(revision).range(range).send(),
+        const MAX_RETRIES: u32 = 5;
+        const BASE_DELAY_SECS: u64 = 2;
+
+        for attempt in 0..=MAX_RETRIES {
+            let result = match self {
+                RemoteRepo::Model(r) => r.download_file_to_bytes().filename(filename).revision(revision).range(range.clone()).send(),
+                RemoteRepo::Dataset(r) => r.download_file_to_bytes().filename(filename).revision(revision).range(range.clone()).send(),
+                RemoteRepo::Space(r) => r.download_file_to_bytes().filename(filename).revision(revision).range(range.clone()).send(),
+            };
+            match result {
+                Ok(b) => return Ok(b.to_vec()),
+                Err(hf_hub::HFError::RateLimited { retry_after, .. }) if attempt < MAX_RETRIES => {
+                    let delay = retry_after.unwrap_or_else(|| {
+                        std::time::Duration::from_secs(BASE_DELAY_SECS * (1 << attempt))
+                    });
+                    log::warn!(
+                        "rate limited fetching {filename} bytes {}..{}; retrying in {:.1}s ({}/{})",
+                        range.start, range.end,
+                        delay.as_secs_f32(),
+                        attempt + 1,
+                        MAX_RETRIES,
+                    );
+                    std::thread::sleep(delay);
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
-        .map(|b| b.to_vec())
-        .map_err(Into::into)
+        unreachable!()
     }
 
     /// `models`, `datasets`, or `spaces` — the URL segment used in

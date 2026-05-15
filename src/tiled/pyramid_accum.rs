@@ -126,13 +126,13 @@ impl<S: TileSink> PyramidAccumulator<S> {
 
             let mut cursor = Cursor::new(Vec::new());
             if let Err(e) = img.write_to(&mut cursor, ImageFormat::Png) {
-                eprintln!("pyramid: PNG encode error at zoom {parent_z} ({parent_x},{parent_y}): {e}");
+                log::error!("pyramid: PNG encode error at zoom {parent_z} ({parent_x},{parent_y}): {e}");
                 return;
             }
             let png_bytes = cursor.into_inner();
             let repo_path = me.spec.tile_repo_path(parent_z, parent_x, parent_y);
             if let Err(e) = me.sink.upload_tile(repo_path, png_bytes) {
-                eprintln!("pyramid: upload error at zoom {parent_z} ({parent_x},{parent_y}): {e}");
+                log::error!("pyramid: upload error at zoom {parent_z} ({parent_x},{parent_y}): {e}");
                 return;
             }
 

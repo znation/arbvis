@@ -131,7 +131,7 @@ pub async fn upload_dir_to(hf_url_str: &str, local_dir: &Path) -> anyhow::Result
 /// `HfOutputSpec` pointing at it. The bucket id is `spec.repo_id`.
 pub async fn create_space_bucket(space_id: &str) -> anyhow::Result<HfOutputSpec> {
     let bucket_id = derive_bucket_id(space_id)?;
-    eprintln!("Ensuring bucket {} exists...", bucket_id);
+    log::info!("Ensuring bucket {} exists...", bucket_id);
     let client = hf_url::client()?;
     let (owner, name) = hf_url::split_owner_name(&bucket_id)?;
     with_throttle(&format!("create_bucket {bucket_id}"), || async {
@@ -158,7 +158,7 @@ pub async fn create_space_bucket(space_id: &str) -> anyhow::Result<HfOutputSpec>
 /// requirements.txt, and index.html. Assumes tiles and labels.json are already
 /// in the bucket (either synced from local disk or streamed directly).
 pub async fn deploy_space_app(space_id: &str, bucket_id: &str, index_html: Vec<u8>) -> anyhow::Result<()> {
-    eprintln!("Ensuring Space {} exists...", space_id);
+    log::info!("Ensuring Space {} exists...", space_id);
     let client = hf_url::client()?;
     with_throttle(&format!("create_repository {space_id}"), || async {
         client
@@ -174,7 +174,7 @@ pub async fn deploy_space_app(space_id: &str, bucket_id: &str, index_html: Vec<u
     .await
     .with_context(|| format!("creating space {space_id}"))?;
 
-    eprintln!("Uploading Space files...");
+    log::info!("Uploading Space files...");
     let tmp = tempfile::TempDir::new()?;
     write_space_files(tmp.path(), bucket_id, space_id)?;
     std::fs::write(tmp.path().join("index.html"), index_html)?;
@@ -193,7 +193,7 @@ pub async fn deploy_space_app(space_id: &str, bucket_id: &str, index_html: Vec<u
     .await
     .with_context(|| format!("uploading Space files to {space_id}"))?;
 
-    eprintln!("Deployed to https://huggingface.co/spaces/{}", space_id);
+    log::info!("Deployed to https://huggingface.co/spaces/{}", space_id);
     Ok(())
 }
 
@@ -206,7 +206,7 @@ pub async fn run_deploy(tiles_dir: &Path, space_id: &str) -> anyhow::Result<()> 
     let (owner, name) = hf_url::split_owner_name(bucket_id)?;
     let bucket = client.bucket(owner, name);
 
-    eprintln!("Syncing tiles to bucket (this may take a while for large outputs)...");
+    log::info!("Syncing tiles to bucket (this may take a while for large outputs)...");
     let tiles_path = tiles_dir.join("tiles");
     with_throttle(&format!("bucket sync {bucket_id}"), || async {
         bucket
@@ -222,7 +222,7 @@ pub async fn run_deploy(tiles_dir: &Path, space_id: &str) -> anyhow::Result<()> 
     .await
     .with_context(|| format!("syncing tiles to bucket {bucket_id}"))?;
 
-    eprintln!("Uploading labels.json to bucket...");
+    log::info!("Uploading labels.json to bucket...");
     let labels_path = tiles_dir.join("labels.json");
     with_throttle(&format!("bucket upload labels {bucket_id}"), || async {
         bucket

@@ -318,7 +318,19 @@ async fn resolve_input(path: PathBuf) -> anyhow::Result<PathBuf> {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Build env_logger but DON'T install it directly; wrap it in `LogWrapper`
+    // so every log line is printed via `MultiProgress::suspend(...)`, which
+    // pauses bar rendering, writes the line cleanly, and redraws the bars.
+    // Without this, concurrent progress bars and log output overwrite each
+    // other and the bar stack drifts down the screen line-by-line.
+    let env_logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).build();
+    let max_level = env_logger.filter();
+    indicatif_log_bridge::LogWrapper::new(progress::multi().clone(), env_logger)
+        .try_init()
+        .expect("global logger already set");
+    log::set_max_level(max_level);
+
     let args = Args::parse();
     run(args).await
 }

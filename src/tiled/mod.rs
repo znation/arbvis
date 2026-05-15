@@ -3,7 +3,6 @@ pub mod leaf;
 pub mod pyramid;
 pub mod pyramid_accum;
 
-use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,14 +11,14 @@ use std::time::Duration;
 use anyhow::Context;
 use async_channel::{bounded, Receiver, Sender};
 
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
+use indicatif::ProgressBar;
 
 use crate::color::{build_diff_signed_lut, build_pixel_lut};
 use crate::data::{load_source_data, Data, Source};
 use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, rects_centroid};
 use crate::hf_upload::HfTileSink;
 use crate::hf_url::HfOutputSpec;
-use crate::progress::{counter_style, queue_style, status_style};
+use crate::progress::{counter_style, multi, queue_style, status_style};
 use crate::throttle::{Throttle, MAX_FETCH_WORKERS};
 use crate::tiled::html::{FileEntity, generate_leaflet_content};
 use crate::tiled::leaf::{
@@ -54,7 +53,6 @@ fn num_cpus_for_processing() -> usize {
 /// stderr is not a TTY (non-interactive runs) construction returns `None`
 /// and no bars are drawn.
 struct PipelineProgress {
-    multi: MultiProgress,
     throttle: ProgressBar,
     coord_q: ProgressBar,
     loaded: ProgressBar,
@@ -65,12 +63,9 @@ struct PipelineProgress {
 }
 
 impl PipelineProgress {
-    fn new(total_tiles: u64, queue_cap: usize, throttle_max: usize) -> Option<Self> {
-        if !std::io::stderr().is_terminal() {
-            return None;
-        }
-        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
-        let add = |bar: ProgressBar| multi.add(bar);
+    fn new(total_tiles: u64, queue_cap: usize, throttle_max: usize) -> Self {
+        let m = multi();
+        let add = |bar: ProgressBar| m.add(bar);
 
         // Throttle bar: pos = current AIMD `active_limit`, len = `max_workers`
         // ceiling (128). The message refreshes from the monitor task every
@@ -105,8 +100,7 @@ impl PipelineProgress {
             pb.enable_steady_tick(Duration::from_millis(100));
         }
 
-        Some(Self {
-            multi,
+        Self {
             throttle,
             coord_q,
             loaded,
@@ -114,10 +108,14 @@ impl PipelineProgress {
             rendered,
             encoded_q,
             written,
-        })
+        }
     }
 
     fn finish_all(&self) {
+        // `finish_and_clear` removes each bar from the global `MultiProgress`
+        // (vs. `finish`, which leaves it visible). The global multi keeps
+        // running for subsequent phases (pyramid build, upload), so we want
+        // pipeline bars gone once the pipeline ends.
         for pb in [
             &self.throttle,
             &self.coord_q,
@@ -127,11 +125,8 @@ impl PipelineProgress {
             &self.encoded_q,
             &self.written,
         ] {
-            pb.finish();
+            pb.finish_and_clear();
         }
-        // Drop the MultiProgress via clear to release the terminal so any
-        // subsequent log lines render cleanly.
-        let _ = self.multi.clear();
     }
 }
 
@@ -451,8 +446,10 @@ where
     let width_tiles = plan.width_tiles;
     let height_tiles = plan.height_tiles;
 
-    let progress: Option<Arc<PipelineProgress>> =
-        PipelineProgress::new(plan.total_tiles, cap, MAX_FETCH_WORKERS).map(Arc::new);
+    // Bars are added to the global `progress::multi()`; in non-TTY runs that
+    // draws to a hidden target, so all updates here are no-ops but the rest
+    // of the pipeline code stays branchless.
+    let progress = Arc::new(PipelineProgress::new(plan.total_tiles, cap, MAX_FETCH_WORKERS));
     let loaded_count = Arc::new(AtomicU64::new(0));
     let rendered_count = Arc::new(AtomicU64::new(0));
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -469,21 +466,19 @@ where
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
             loop {
-                if let Some(prog) = progress.as_ref() {
-                    let throttle = Throttle::global();
-                    prog.throttle.set_position(throttle.active_limit() as u64);
-                    prog.throttle.set_message(format!(
-                        "HTTP throttle: {}/{} (in flight: {})",
-                        throttle.active_limit(),
-                        throttle.max_workers(),
-                        throttle.in_flight(),
-                    ));
-                    prog.coord_q.set_position(coord_rx.len() as u64);
-                    prog.loaded_q.set_position(loaded_rx.len() as u64);
-                    prog.encoded_q.set_position(encoded_rx.len() as u64);
-                    prog.loaded.set_position(loaded_count.load(Ordering::Relaxed));
-                    prog.rendered.set_position(rendered_count.load(Ordering::Relaxed));
-                }
+                let throttle = Throttle::global();
+                progress.throttle.set_position(throttle.active_limit() as u64);
+                progress.throttle.set_message(format!(
+                    "HTTP throttle: {}/{} (in flight: {})",
+                    throttle.active_limit(),
+                    throttle.max_workers(),
+                    throttle.in_flight(),
+                ));
+                progress.coord_q.set_position(coord_rx.len() as u64);
+                progress.loaded_q.set_position(loaded_rx.len() as u64);
+                progress.encoded_q.set_position(encoded_rx.len() as u64);
+                progress.loaded.set_position(loaded_count.load(Ordering::Relaxed));
+                progress.rendered.set_position(rendered_count.load(Ordering::Relaxed));
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
@@ -606,9 +601,7 @@ where
     // Stage 4: writer (in this task). Drain the encoded channel.
     while let Ok(tile) = encoded_rx.recv().await {
         on_tile(tile)?;
-        if let Some(prog) = progress.as_ref() {
-            prog.written.inc(1);
-        }
+        progress.written.inc(1);
     }
 
     // Stop the monitor before awaiting stage handles so the bars don't keep
@@ -625,9 +618,7 @@ where
         if let Ok(Err(e)) = h.await { return Err(e); }
     }
 
-    if let Some(prog) = progress.as_ref() {
-        prog.finish_all();
-    }
+    progress.finish_all();
 
     Ok(())
 }

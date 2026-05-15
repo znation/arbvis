@@ -8,7 +8,32 @@
 //! - [`status_style`]: no bar — just a status message and the elapsed time.
 //!   Used for the AIMD throttle indicator.
 
-use indicatif::ProgressStyle;
+use std::sync::OnceLock;
+
+use indicatif::{MultiProgress, ProgressDrawTarget, ProgressStyle};
+
+/// Process-wide `MultiProgress` that owns every progress bar across the run.
+///
+/// All bars (whether grouped under a `PipelineProgress`, standalone counters,
+/// or upload trackers) attach themselves to this `MultiProgress` so they
+/// share a single draw target and renderer. Log output is routed through it
+/// via `indicatif-log-bridge` (see `LogWrapper` in `main`), so any `log::*`
+/// call automatically suspends bar rendering, prints, and resumes — instead
+/// of overwriting bar lines.
+///
+/// The draw target is stderr; if stderr isn't a TTY, indicatif's hidden
+/// target is used so non-interactive runs stay log-only.
+pub fn multi() -> &'static MultiProgress {
+    static M: OnceLock<MultiProgress> = OnceLock::new();
+    M.get_or_init(|| {
+        use std::io::IsTerminal;
+        if std::io::stderr().is_terminal() {
+            MultiProgress::with_draw_target(ProgressDrawTarget::stderr())
+        } else {
+            MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+        }
+    })
+}
 
 pub fn counter_style() -> ProgressStyle {
     ProgressStyle::with_template(

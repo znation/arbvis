@@ -1,4 +1,3 @@
-use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -8,11 +7,11 @@ use hf_hub::buckets::BucketUpload;
 use hf_hub::progress::{ProgressEvent, ProgressHandler, UploadEvent};
 use hf_hub::repository::CommitOperation;
 use hf_hub::HFClient;
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
+use indicatif::ProgressBar;
 use tempfile::TempDir;
 
 use crate::hf_url::{self, HfOutputSpec, RepoKind};
-use crate::progress::{counter_style, status_style};
+use crate::progress::{counter_style, multi, status_style};
 use crate::throttle::with_throttle;
 use crate::tiled::pyramid_accum::TileSink;
 
@@ -32,29 +31,29 @@ struct UploadProgressBars {
 }
 
 impl UploadProgressBars {
-    /// Build the bars and attach them to `multi`. Returns `None` when stderr
-    /// isn't a TTY so non-interactive runs stay log-only.
-    fn new() -> Option<Self> {
-        if !std::io::stderr().is_terminal() {
-            return None;
-        }
-        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
-        let status = multi.add(ProgressBar::new(0).with_style(status_style()));
-        let logical = multi.add(ProgressBar::new(0).with_style(counter_style()));
-        let transfer = multi.add(ProgressBar::new(0).with_style(counter_style()));
+    /// Build the bars and attach them to the global `MultiProgress`. The
+    /// hidden draw target handles non-interactive runs automatically; we no
+    /// longer need an Option here.
+    fn new() -> Self {
+        let m = multi();
+        let status = m.add(ProgressBar::new(0).with_style(status_style()));
+        let logical = m.add(ProgressBar::new(0).with_style(counter_style()));
+        let transfer = m.add(ProgressBar::new(0).with_style(counter_style()));
         status.set_message("hf upload: waiting for Start");
         logical.set_message("logical bytes");
         transfer.set_message("transfer bytes (post-dedup)");
         for pb in [&status, &logical, &transfer] {
             pb.enable_steady_tick(Duration::from_millis(100));
         }
-        Some(Self { status, logical, transfer })
+        Self { status, logical, transfer }
     }
 
     fn finish(&self) {
-        self.status.finish();
-        self.logical.finish();
-        self.transfer.finish();
+        // Clear from the global multi so the upload bars don't linger after
+        // the run completes.
+        self.status.finish_and_clear();
+        self.logical.finish_and_clear();
+        self.transfer.finish_and_clear();
     }
 }
 
@@ -64,27 +63,25 @@ impl UploadProgressBars {
 /// held behind a `Mutex` even though indicatif's bars are themselves `Sync` —
 /// the lock keeps the three updates consistent within one event.
 struct UploadProgressLogger {
-    bars: Mutex<Option<UploadProgressBars>>,
+    bars: Mutex<UploadProgressBars>,
 }
 
 impl UploadProgressLogger {
-    fn new(bars: Option<UploadProgressBars>) -> Self {
+    fn new(bars: UploadProgressBars) -> Self {
         Self { bars: Mutex::new(bars) }
     }
 
     /// Stop the spinners and release the terminal lines. Safe to call when no
     /// bars were created (non-TTY runs).
     fn finish_bars(&self) {
-        if let Some(bars) = self.bars.lock().expect("upload progress mutex poisoned").as_ref() {
-            bars.finish();
-        }
+        self.bars.lock().expect("upload progress mutex poisoned").finish();
     }
 }
 
 impl ProgressHandler for UploadProgressLogger {
     fn on_progress(&self, event: &ProgressEvent) {
         let guard = self.bars.lock().expect("upload progress mutex poisoned");
-        let Some(bars) = guard.as_ref() else { return; };
+        let bars = &*guard;
         match event {
             ProgressEvent::Upload(UploadEvent::Start { total_files, total_bytes }) => {
                 bars.logical.set_length(*total_bytes);

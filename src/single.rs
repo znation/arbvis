@@ -4,8 +4,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ab_glyph::{FontRef, PxScale};
-use std::io::IsTerminal;
-
 use image::{DynamicImage, Rgb};
 use indicatif::{ProgressBar, ProgressStyle};
 use minifb::{Window, WindowOptions};
@@ -80,8 +78,10 @@ pub fn run_single(
     let bboxes_init: Vec<Option<(u32, u32, u32, u32)>> = vec![None; num_files];
 
     // Both paths track the same amount of work (one pass over total bytes).
-    let pb = if std::io::stderr().is_terminal() {
-        let pb = ProgressBar::new(total);
+    // Added to the global multi so log lines interleave cleanly (and so the
+    // hidden draw target kicks in automatically for non-TTY runs).
+    let pb = {
+        let pb = crate::progress::multi().add(ProgressBar::new(total));
         pb.set_style(
             ProgressStyle::with_template(
                 "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg} ({eta})",
@@ -91,8 +91,6 @@ pub fn run_single(
         );
         pb.set_message("source bytes rendered");
         Some(pb)
-    } else {
-        None
     };
 
     // Compute per-source byte and pixel offsets.
@@ -148,7 +146,7 @@ pub fn run_single(
         }
 
         if let Some(ref pb) = pb_shared {
-            pb.finish();
+            pb.finish_and_clear();
         }
 
         if let Some(path) = output {
@@ -213,7 +211,7 @@ pub fn run_single(
                 }
             }
             if let Some(ref pb) = pb_shared {
-                pb.finish();
+                pb.finish_and_clear();
             }
 
             done_bg.store(true, Ordering::Release);

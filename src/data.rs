@@ -4,8 +4,6 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use std::io::IsTerminal;
-
 use anyhow::Context;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt};
@@ -13,7 +11,7 @@ use image::Rgb;
 use indicatif::ProgressBar;
 use memmap2::Mmap;
 
-use crate::progress::counter_style;
+use crate::progress::{counter_style, multi};
 use crate::safetensors::{self, TensorMeta};
 use crate::hf_url::{RemoteFileSpec, RemoteRepo};
 use crate::xet::{self, XetReader, XetTerm};
@@ -24,11 +22,13 @@ use crate::xet::{self, XetReader, XetTerm};
 /// runtime have enough simultaneous awaiting tasks to keep the throttle full.
 const SETUP_FETCH_CONCURRENCY: usize = 16;
 
+/// Build a one-shot progress bar attached to the global `MultiProgress` so
+/// it interleaves cleanly with log output. Always returns `Some(...)`; the
+/// non-TTY case is handled by the hidden draw target on the global multi.
+/// `Option<ProgressBar>` is kept in the signature so existing call sites that
+/// pattern-match it continue to compile.
 fn setup_progress(label: &str, total: u64) -> Option<ProgressBar> {
-    if !std::io::stderr().is_terminal() {
-        return None;
-    }
-    let pb = ProgressBar::new(total)
+    let pb = multi().add(ProgressBar::new(total))
         .with_style(counter_style())
         .with_message(label.to_string());
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
@@ -217,7 +217,7 @@ pub fn prepare_sources(files: &[PathBuf]) -> anyhow::Result<(Vec<Source>, u64)> 
         let size = match std::fs::metadata(path) {
             Ok(m) => m.len(),
             Err(e) => {
-                eprintln!("warning: {}: {} — skipping", path.display(), e);
+                log::warn!("{}: {} — skipping", path.display(), e);
                 continue;
             }
         };
@@ -228,7 +228,7 @@ pub fn prepare_sources(files: &[PathBuf]) -> anyhow::Result<(Vec<Source>, u64)> 
             match load_safetensors_info(path, size) {
                 Ok(info) => Some(info),
                 Err(e) => {
-                    eprintln!("warning: {}: failed to parse safetensors header: {} — treating as plain binary", path.display(), e);
+                    log::warn!("{}: failed to parse safetensors header: {} — treating as plain binary", path.display(), e);
                     None
                 }
             }
@@ -338,7 +338,7 @@ pub fn prepare_sources_from_specs(
                 let size = match std::fs::metadata(path) {
                     Ok(m) => m.len(),
                     Err(e) => {
-                        eprintln!("warning: {}: {} — skipping", path.display(), e);
+                        log::warn!("{}: {} — skipping", path.display(), e);
                         continue;
                     }
                 };
@@ -347,7 +347,7 @@ pub fn prepare_sources_from_specs(
                     match load_safetensors_info(path, size) {
                         Ok(info) => Some(info),
                         Err(e) => {
-                            eprintln!("warning: {}: failed to parse safetensors header: {} — treating as plain binary", path.display(), e);
+                            log::warn!("{}: failed to parse safetensors header: {} — treating as plain binary", path.display(), e);
                             None
                         }
                     }
@@ -464,7 +464,7 @@ pub async fn materialize_http_sources(sources: &mut [Source]) -> anyhow::Result<
         .await;
 
     if let Some(pb) = pb.as_ref() {
-        pb.finish();
+        pb.finish_and_clear();
     }
 
     for (i, r) in downloads {
@@ -527,7 +527,7 @@ pub async fn populate_xet_terms(sources: &mut [Source]) -> anyhow::Result<()> {
         .await;
 
     if let Some(pb) = pb_for_close.as_ref() {
-        pb.finish();
+        pb.finish_and_clear();
     }
 
     // Stable order: write each result back to its original index. The first
@@ -586,7 +586,7 @@ fn collect_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("warning: {}: {} — skipping", dir.display(), e);
+            log::warn!("{}: {} — skipping", dir.display(), e);
             return;
         }
     };
@@ -664,9 +664,9 @@ pub async fn prepare_diff_sources(
         let mod_st: Vec<PathBuf> = mod_files.iter().filter(|p| is_st(p)).cloned().collect();
         if !orig_st.is_empty() || !mod_st.is_empty() {
             if orig_st.is_empty() {
-                eprintln!("warning: original has no .safetensors files — skipping model weight diff");
+                log::warn!("original has no .safetensors files — skipping model weight diff");
             } else if mod_st.is_empty() {
-                eprintln!("warning: modified has no .safetensors files — skipping model weight diff");
+                log::warn!("modified has no .safetensors files — skipping model weight diff");
             } else {
                 match build_multi_safetensors_diff_sources(&orig_st, &mod_st).await {
                     Ok((mut tensor_sources, bytes)) => {
@@ -677,7 +677,7 @@ pub async fn prepare_diff_sources(
                         sources.extend(tensor_sources);
                         total += bytes;
                     }
-                    Err(e) => eprintln!("warning: safetensors diff failed: {e} — skipping"),
+                    Err(e) => log::warn!("safetensors diff failed: {e} — skipping"),
                 }
             }
         }
@@ -704,8 +704,8 @@ pub async fn prepare_diff_sources(
 
         for rel in mod_map.keys() {
             if !orig_map.contains_key(rel) {
-                eprintln!(
-                    "warning: {} has no counterpart in original — skipping",
+                log::warn!(
+                    "{} has no counterpart in original — skipping",
                     modified.join(rel).display()
                 );
             }
@@ -718,8 +718,8 @@ pub async fn prepare_diff_sources(
             let orig_abs = &orig_map[rel];
             match mod_map.get(rel) {
                 None => {
-                    eprintln!(
-                        "warning: {} has no counterpart in modified — skipping",
+                    log::warn!(
+                        "{} has no counterpart in modified — skipping",
                         orig_abs.display()
                     );
                 }
@@ -727,20 +727,20 @@ pub async fn prepare_diff_sources(
                     let size_o = match std::fs::metadata(orig_abs) {
                         Ok(m) => m.len(),
                         Err(e) => {
-                            eprintln!("warning: {}: {} — skipping", orig_abs.display(), e);
+                            log::warn!("{}: {} — skipping", orig_abs.display(), e);
                             continue;
                         }
                     };
                     let size_m = match std::fs::metadata(mod_abs) {
                         Ok(m) => m.len(),
                         Err(e) => {
-                            eprintln!("warning: {}: {} — skipping", mod_abs.display(), e);
+                            log::warn!("{}: {} — skipping", mod_abs.display(), e);
                             continue;
                         }
                     };
                     if size_o != size_m {
-                        eprintln!(
-                            "warning: size mismatch ({} vs {} bytes) for {} — skipping",
+                        log::warn!(
+                            "size mismatch ({} vs {} bytes) for {} — skipping",
                             size_o,
                             size_m,
                             rel.display()
@@ -796,9 +796,9 @@ pub async fn prepare_diff_sources_from_http(
     // Safetensors diff — fully lazy, no download.
     if !orig_st.is_empty() || !mod_st.is_empty() {
         if orig_st.is_empty() {
-            eprintln!("warning: original has no .safetensors files — skipping model weight diff");
+            log::warn!("original has no .safetensors files — skipping model weight diff");
         } else if mod_st.is_empty() {
-            eprintln!("warning: modified has no .safetensors files — skipping model weight diff");
+            log::warn!("modified has no .safetensors files — skipping model weight diff");
         } else {
             match build_multi_safetensors_diff_sources_from_http(&orig_st, &mod_st).await {
                 Ok((mut tensor_sources, bytes)) => {
@@ -807,7 +807,7 @@ pub async fn prepare_diff_sources_from_http(
                     sources.extend(tensor_sources);
                     total += bytes;
                 }
-                Err(e) => eprintln!("warning: safetensors diff failed: {e} — skipping"),
+                Err(e) => log::warn!("safetensors diff failed: {e} — skipping"),
             }
         }
     }
@@ -821,7 +821,7 @@ pub async fn prepare_diff_sources_from_http(
 
     for (fname, _) in &mod_non {
         if !orig_non.contains_key(fname) {
-            eprintln!("warning: {fname} only in modified — skipping");
+            log::warn!("{fname} only in modified — skipping");
         }
     }
 
@@ -836,15 +836,15 @@ pub async fn prepare_diff_sources_from_http(
         let orig_spec = &orig_non[fname];
         let mod_spec = match mod_non.get(fname) {
             Some(s) => s,
-            None => { eprintln!("warning: {fname} only in original — skipping"); continue; }
+            None => { log::warn!("{fname} only in original — skipping"); continue; }
         };
         if orig_spec.size != mod_spec.size {
-            eprintln!("warning: size mismatch for {fname} ({} vs {} bytes) — skipping",
+            log::warn!("size mismatch for {fname} ({} vs {} bytes) — skipping",
                 orig_spec.size, mod_spec.size);
             continue;
         }
         if orig_spec.size > MAX_EAGER_SIZE {
-            eprintln!("warning: {fname} exceeds {} MB — skipping non-safetensors large file",
+            log::warn!("{fname} exceeds {} MB — skipping non-safetensors large file",
                 MAX_EAGER_SIZE / 1024 / 1024);
             continue;
         }
@@ -884,7 +884,7 @@ pub async fn prepare_diff_sources_from_http(
         .collect()
         .await;
     if let Some(pb) = pb.as_ref() {
-        pb.finish();
+        pb.finish_and_clear();
     }
     // Re-sort by filename so the Source order is deterministic.
     let mut diffs: Vec<(String, Vec<u8>)> = diffs.into_iter().collect::<anyhow::Result<Vec<_>>>()?;
@@ -1000,7 +1000,7 @@ fn find_matched_tensor_pairs(orig_names: &[String], mod_names: &[String]) -> Vec
     if strip_o == 0 && strip_m == 0 {
         for (stripped, &full) in &mod_by_stripped {
             if !orig_by_stripped.contains_key(stripped) && !full.is_empty() {
-                eprintln!("warning: safetensors diff: tensor '{full}' only in modified — skipping");
+                log::warn!("safetensors diff: tensor '{full}' only in modified — skipping");
             }
         }
     }
@@ -1020,7 +1020,7 @@ fn find_matched_tensor_pairs(orig_names: &[String], mod_names: &[String]) -> Vec
             }
             _ => {
                 if strip_o == 0 && strip_m == 0 {
-                    eprintln!("warning: safetensors diff: tensor '{orig_full}' only in original — skipping");
+                    log::warn!("safetensors diff: tensor '{orig_full}' only in original — skipping");
                 }
             }
         }
@@ -1073,7 +1073,7 @@ async fn build_multi_safetensors_diff_sources_inner(
     let orig_headers = fetch_all(orig_data, "orig", &pb).await?;
     let mod_headers = fetch_all(mod_data, "mod", &pb).await?;
     if let Some(pb) = pb.as_ref() {
-        pb.finish();
+        pb.finish_and_clear();
     }
 
     let mut orig_map: HashMap<String, (usize, safetensors::TensorMeta)> = HashMap::new();
@@ -1101,8 +1101,8 @@ async fn build_multi_safetensors_diff_sources_inner(
         let (mi, mod_t)  = &mod_map[&mod_full];
 
         if orig_t.shape != mod_t.shape {
-            eprintln!(
-                "warning: safetensors diff: tensor '{}' shape mismatch {:?} vs {:?} — skipping",
+            log::warn!(
+                "safetensors diff: tensor '{}' shape mismatch {:?} vs {:?} — skipping",
                 orig_full, orig_t.shape, mod_t.shape
             );
             continue;
@@ -1196,7 +1196,7 @@ async fn build_multi_safetensors_diff_sources_from_http(
             .collect()
             .await;
         if let Some(pb) = pb.as_ref() {
-            pb.finish();
+            pb.finish_and_clear();
         }
         out.sort_by_key(|(i, _)| *i);
         out.into_iter().map(|(_, r)| r).collect::<anyhow::Result<Vec<_>>>()

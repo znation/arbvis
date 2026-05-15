@@ -1,4 +1,3 @@
-use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,8 +29,8 @@ pub fn build_pyramid(
             nx * ny
         })
         .sum();
-    let pb: Option<Arc<ProgressBar>> = if std::io::stderr().is_terminal() {
-        let pb = ProgressBar::new(total_pyramid_tiles);
+    let pb: Option<Arc<ProgressBar>> = {
+        let pb = crate::progress::multi().add(ProgressBar::new(total_pyramid_tiles));
         pb.set_style(
             ProgressStyle::with_template(
                 "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg} ({eta})",
@@ -42,8 +41,6 @@ pub fn build_pyramid(
         pb.set_message("pyramid tiles built");
         pb.enable_steady_tick(Duration::from_millis(100));
         Some(Arc::new(pb))
-    } else {
-        None
     };
 
     let half = tile_size / 2;

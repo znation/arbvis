@@ -11,6 +11,9 @@ fast_hilbert = "2.0"
 image = "0.25"
 imageproc = "0.25"
 indicatif = "0.17"
+# Routes log::* output through indicatif's MultiProgress so log lines and
+# progress bars never overwrite each other.
+indicatif-log-bridge = "0.2"
 memmap2 = "0.9"
 minifb = "0.27"
 rayon = "1"

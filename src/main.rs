@@ -318,6 +318,17 @@ async fn resolve_input(path: PathBuf) -> anyhow::Result<PathBuf> {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
+    // anyhow only captures backtraces when this env var is set. Default it
+    // on so any error that bubbles up shows where it originated — we'd
+    // rather pay the per-`anyhow!()` backtrace cost than debug blind.
+    // SAFETY: this runs on the single main thread before any other thread
+    // could touch the environment. set_var has been marked unsafe on recent
+    // Rust toolchains.
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        // SAFETY: see comment above.
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1"); }
+    }
+
     // Build env_logger but DON'T install it directly; wrap it in `LogWrapper`
     // so every log line is printed via `MultiProgress::suspend(...)`, which
     // pauses bar rendering, writes the line cleanly, and redraws the bars.

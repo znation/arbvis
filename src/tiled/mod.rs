@@ -540,10 +540,19 @@ where
                             Some(buf)
                         }
                         Err(e) => {
-                            // The throttle's per-call retry already covers
-                            // transient HTTP issues; anything reaching here
-                            // is a permanent failure or unrecoverable error.
-                            log::error!("load_tile_bytes({tx},{ty}) failed: {e}");
+                            // Fatal: the throttle's per-call retry already
+                            // covered transient HTTP issues; anything reaching
+                            // here is a permanent failure. `{e:?}` (anyhow's
+                            // Debug) prints the full caused-by chain plus the
+                            // captured backtrace (RUST_BACKTRACE is set on by
+                            // main), so the user sees where it originated and
+                            // what wrapped it — not just the topmost context.
+                            log::error!("load_tile_bytes({tx},{ty}) failed:\n{e:?}");
+                            // Close the coord channel so the other 127
+                            // workers see Err once the ~20-entry buffer
+                            // drains, instead of grinding through tens of
+                            // thousands more tiles after a fatal error.
+                            coord_rx.close();
                             return Err::<(), anyhow::Error>(e);
                         }
                     }
@@ -559,6 +568,10 @@ where
         }));
     }
     drop(loaded_tx); // close when all load workers exit
+    // Keep one clone of `coord_rx` alive so the writer (stage 4) can `close()`
+    // it on a fatal error to cascade shutdown upstream. Without this clone
+    // we'd have dropped every receiver here and have no handle to close on.
+    let coord_rx_for_writer = coord_rx.clone();
     drop(coord_rx);
 
     // Stage 3: render workers (= num_cpus). Each pulls a LoadedTile, runs
@@ -584,8 +597,23 @@ where
                 .await;
                 let encoded = match result {
                     Ok(Ok(e)) => e,
-                    Ok(Err(e)) => return Err::<(), anyhow::Error>(anyhow::anyhow!("{e}")),
-                    Err(e) => return Err(anyhow::anyhow!("render join failure: {e}")),
+                    Ok(Err(e)) => {
+                        // `render_one` returns `Result<_, String>` so the
+                        // best we can do is wrap as anyhow + log the chain.
+                        let e = anyhow::anyhow!("render_one: {e}");
+                        log::error!("render worker failed:\n{e:?}");
+                        loaded_rx.close();
+                        return Err::<(), anyhow::Error>(e);
+                    }
+                    Err(e) => {
+                        // tokio JoinError — typically a panic in render_one.
+                        // Promote the panic message via anyhow so the chain
+                        // logs cleanly.
+                        let e = anyhow::anyhow!("render join failure: {e}");
+                        log::error!("render worker join failed:\n{e:?}");
+                        loaded_rx.close();
+                        return Err(e);
+                    }
                 };
                 rendered_count.fetch_add(1, Ordering::Relaxed);
                 if encoded_tx.send(encoded).await.is_err() {
@@ -599,8 +627,18 @@ where
     drop(loaded_rx);
 
     // Stage 4: writer (in this task). Drain the encoded channel.
+    let mut writer_err: Option<anyhow::Error> = None;
     while let Ok(tile) = encoded_rx.recv().await {
-        on_tile(tile)?;
+        if let Err(e) = on_tile(tile) {
+            // Log the writer error in the rich form, then cascade shutdown
+            // by closing upstream channels so the other stages stop fast
+            // instead of producing tens of thousands more encoded tiles.
+            log::error!("tile writer failed:\n{e:?}");
+            encoded_rx.close();
+            coord_rx_for_writer.close();
+            writer_err = Some(e);
+            break;
+        }
         progress.written.inc(1);
     }
 
@@ -609,18 +647,27 @@ where
     shutdown.store(true, Ordering::Relaxed);
     let _ = monitor_handle.await;
 
-    // Surface the first error from any stage.
+    // Surface the first error from any stage. Writer error wins (it triggers
+    // the cascade); otherwise pick the first worker error.
     let _ = coord_task.await;
+    let mut first_err: Option<anyhow::Error> = writer_err;
     for h in load_handles {
-        if let Ok(Err(e)) = h.await { return Err(e); }
+        if let Ok(Err(e)) = h.await {
+            first_err.get_or_insert(e);
+        }
     }
     for h in process_handles {
-        if let Ok(Err(e)) = h.await { return Err(e); }
+        if let Ok(Err(e)) = h.await {
+            first_err.get_or_insert(e);
+        }
     }
 
     progress.finish_all();
 
-    Ok(())
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 fn render_one(

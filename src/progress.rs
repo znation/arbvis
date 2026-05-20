@@ -9,8 +9,17 @@
 //!   Used for the AIMD throttle indicator.
 
 use std::sync::OnceLock;
+use std::time::Duration;
 
-use indicatif::{MultiProgress, ProgressDrawTarget, ProgressStyle};
+use indicatif::{HumanDuration, MultiProgress, ProgressDrawTarget, ProgressStyle};
+
+/// Threshold above which the rate-based ETA is suppressed.
+///
+/// Early in a run (or after a stall) the smoothed rate can be near zero, which
+/// makes `indicatif`'s ETA blow up to weeks or months even for jobs that
+/// finish in minutes. We replace those implausible estimates with `--` until
+/// enough samples accumulate for the rate to stabilize.
+const ETA_DISPLAY_CAP: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Process-wide `MultiProgress` that owns every progress bar across the run.
 ///
@@ -37,10 +46,18 @@ pub fn multi() -> &'static MultiProgress {
 
 pub fn counter_style() -> ProgressStyle {
     ProgressStyle::with_template(
-        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg} ({per_sec}, ETA {eta})",
+        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg} ({per_sec}, ETA {smart_eta})",
     )
     .expect("counter_style template parse")
     .progress_chars("=>-")
+    .with_key("smart_eta", |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+        let eta = state.eta();
+        if eta > ETA_DISPLAY_CAP {
+            let _ = w.write_str("--");
+        } else {
+            let _ = write!(w, "{:#}", HumanDuration(eta));
+        }
+    })
 }
 
 pub fn queue_style() -> ProgressStyle {

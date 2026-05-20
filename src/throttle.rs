@@ -72,6 +72,23 @@ pub struct Throttle {
     /// Notified when a permit is released or when `active_limit` rises. Parked
     /// acquirers re-check `in_flight < active_limit` after a wake.
     scale_up_notify: Notify,
+    // Cumulative perf counters surfaced via `stats()` for the perf monitor.
+    total_rate_limits: AtomicU64,
+    total_timeouts: AtomicU64,
+    /// Tasks currently sleeping in a `with_throttle` backoff between retries.
+    /// A stall during which `in_flight == 0` but `in_backoff > 0` is an AIMD
+    /// backoff stall, not idle.
+    in_backoff: AtomicUsize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ThrottleStats {
+    pub in_flight: usize,
+    pub active_limit: usize,
+    pub max_workers: usize,
+    pub in_backoff: usize,
+    pub total_rate_limits: u64,
+    pub total_timeouts: u64,
 }
 
 impl Throttle {
@@ -87,6 +104,21 @@ impl Throttle {
             successes_since_scale_up: AtomicUsize::new(0),
             jitter_nonce: AtomicU64::new(0),
             scale_up_notify: Notify::new(),
+            total_rate_limits: AtomicU64::new(0),
+            total_timeouts: AtomicU64::new(0),
+            in_backoff: AtomicUsize::new(0),
+        }
+    }
+
+    /// Snapshot of perf counters. Lock-free; safe to call at any time.
+    pub fn stats(&self) -> ThrottleStats {
+        ThrottleStats {
+            in_flight: self.in_flight.load(Ordering::Relaxed),
+            active_limit: self.active_limit.load(Ordering::Relaxed),
+            max_workers: self.max_workers,
+            in_backoff: self.in_backoff.load(Ordering::Relaxed),
+            total_rate_limits: self.total_rate_limits.load(Ordering::Relaxed),
+            total_timeouts: self.total_timeouts.load(Ordering::Relaxed),
         }
     }
 
@@ -213,6 +245,7 @@ impl Throttle {
 
     /// Record a rate-limit (429). Halve the active limit with a tight floor.
     pub fn record_rate_limit(&self) {
+        self.total_rate_limits.fetch_add(1, Ordering::Relaxed);
         let now = unix_now();
         self.last_rate_limit.store(now, Ordering::SeqCst);
         let floor = (self.max_workers / 64).max(4).min(self.max_workers);
@@ -234,6 +267,7 @@ impl Throttle {
 
     /// Record a transient/timeout failure. Reduce by 10% with a gentler floor.
     pub fn record_timeout(&self) {
+        self.total_timeouts.fetch_add(1, Ordering::Relaxed);
         let floor = (self.max_workers / 16).max(4).min(self.max_workers);
         let reduced = self
             .active_limit
@@ -396,7 +430,9 @@ where
                         rate_limit_retries,
                         MAX_RATE_LIMIT_RETRIES,
                     );
+                    throttle.in_backoff.fetch_add(1, Ordering::Relaxed);
                     tokio::time::sleep(delay).await;
+                    throttle.in_backoff.fetch_sub(1, Ordering::Relaxed);
                 }
                 Outcome::Timeout => {
                     timeout_retries += 1;
@@ -414,7 +450,9 @@ where
                         timeout_retries,
                         MAX_TIMEOUT_RETRIES,
                     );
+                    throttle.in_backoff.fetch_add(1, Ordering::Relaxed);
                     tokio::time::sleep(delay).await;
+                    throttle.in_backoff.fetch_sub(1, Ordering::Relaxed);
                 }
                 Outcome::Permanent => return Err(e),
             },

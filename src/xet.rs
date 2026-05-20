@@ -17,7 +17,9 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use lru::LruCache;
@@ -25,6 +27,72 @@ use serde::Deserialize;
 
 use crate::hf_url::{self, RemoteFileSpec};
 use crate::throttle::with_throttle;
+
+/// Shared HTTP client used by every xet endpoint (token, reconstruction,
+/// direct-CAS range fetches).
+///
+/// Two reasons to share one client instead of `reqwest::Client::new()` per call
+/// site:
+///
+/// 1. **Connection pool reuse.** Each `Client` has its own pool. A diff across
+///    `n` files spawns `n` `XetReader`s; one client per reader meant `n`
+///    separate pools and no HTTP/2 multiplexing across readers. With one
+///    shared client all xorb fetches against the same CAS host share live
+///    connections.
+/// 2. **Stuck-stream detection without penalising slow downloads.** A
+///    fresh-`Client::new()` has no timeouts, so a hung HTTP/2 stream can hold
+///    an AIMD throttle permit indefinitely. But a *total* request timeout
+///    (`timeout(_)`) would kill a legitimately slow 60 MB descriptor download
+///    just because the link is saturated by sibling fetches. `read_timeout`
+///    is the right primitive: it fires only when no bytes have been received
+///    for the configured window, so an actively-progressing download is
+///    never cut off, while a connection that's silently stalled is killed
+///    and the throttle retries.
+pub fn http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            // Per-read timeout: only fires when the server stops sending bytes
+            // for this long. A slow-but-progressing multi-MB descriptor
+            // download is unaffected; a wedged HTTP/2 stream is killed in
+            // well under the "minute-long stall" we used to see.
+            .read_timeout(Duration::from_secs(30))
+            // Tighter budget for opening the TCP+TLS connection. A failed
+            // handshake should fail fast so the retry loop can pick a new
+            // upstream / decorrelated-jitter window.
+            .connect_timeout(Duration::from_secs(10))
+            // Use rustls (default features) and let reqwest negotiate HTTP/2.
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .expect("reqwest client build")
+    })
+}
+
+/// In-flight direct-CAS HTTP requests across all `XetReader`s.
+///
+/// These bypass the AIMD throttle (xet.rs `load_descriptor`), so the AIMD
+/// counters miss them. The perf monitor reads this directly to see whether a
+/// stall is really a stall or just CAS requests still in flight.
+static CAS_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// Cumulative completed CAS HTTP requests (success or error).
+static CAS_COMPLETED: AtomicU64 = AtomicU64::new(0);
+/// Cumulative bytes received from CAS HTTP responses.
+static CAS_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug)]
+pub struct CasStats {
+    pub in_flight: usize,
+    pub completed: u64,
+    pub bytes: u64,
+}
+
+pub fn cas_stats() -> CasStats {
+    CasStats {
+        in_flight: CAS_INFLIGHT.load(Ordering::Relaxed),
+        completed: CAS_COMPLETED.load(Ordering::Relaxed),
+        bytes: CAS_BYTES.load(Ordering::Relaxed),
+    }
+}
 
 /// A flat byte-range view of one reconstruction term.
 ///
@@ -129,7 +197,7 @@ async fn fetch_cas_token(
         revision,
     );
     log::info!("Requesting xet CAS token for {repo_id}@{revision}");
-    let client = reqwest::Client::new();
+    let client = http_client();
     // `error_for_status()` converts non-2xx into a reqwest::Error carrying the
     // status code so the throttle's classifier can detect 429/5xx and retry.
     // Response body detail is lost on error, but the URL and status code are
@@ -168,7 +236,7 @@ async fn fetch_reconstruction_response(
 ) -> anyhow::Result<ReconstructionResponse> {
     let url = format!("{}/v2/reconstructions/{}", cas.cas_url, xet_hash_hex);
     log::info!("Fetching reconstruction terms: {url}");
-    let client = reqwest::Client::new();
+    let client = http_client();
     let resp = with_throttle(&format!("reconstruction {xet_hash_hex}"), || async {
         client
             .get(&url)
@@ -358,6 +426,7 @@ struct XorbInfo {
 /// Decoded descriptor payload kept in the LRU. `chunk_byte_indices[i]` is the
 /// start of chunk `chunk_start + i` within `data`, with a trailing entry equal
 /// to `data.len()` — semantics of `xet_core_structures::xorb_object::deserialize_chunks`.
+#[derive(Clone)]
 struct DecodedDescriptor {
     data: Arc<Vec<u8>>,
     chunk_byte_indices: Arc<Vec<u32>>,
@@ -411,15 +480,20 @@ impl DescriptorCache {
 
 /// Direct-CAS byte fetcher for one xet-backed remote file.
 ///
-/// Holds the V2 reconstruction (terms + signed-URL fetch info) and a
-/// shared-by-clone HTTP client. `fetch_range` is the only public surface.
+/// Holds the V2 reconstruction (terms + signed-URL fetch info). The HTTP
+/// client is process-shared via [`http_client`] so all readers reuse one
+/// connection pool. `inflight` deduplicates concurrent fetches of the same
+/// descriptor — RMS sampling and tile rendering both kick off many parallel
+/// `fetch_range` calls whose ranges land in the same 50-65 MB descriptor, so
+/// without dedup the same descriptor gets downloaded N times in parallel and
+/// N-1 copies are discarded.
 pub struct XetReader {
     terms: Vec<ReaderTerm>,          // sorted by file_offset
     xorbs: HashMap<String, XorbInfo>,
     file_size: u64,
     filename: Arc<String>,
-    http: reqwest::Client,
     cache: Mutex<DescriptorCache>,
+    inflight: Mutex<HashMap<CacheKey, Arc<tokio::sync::OnceCell<DecodedDescriptor>>>>,
 }
 
 /// Default per-reader cache budget — generous enough to keep hot regions of
@@ -495,8 +569,8 @@ impl XetReader {
             xorbs,
             file_size: spec.size,
             filename: Arc::clone(&spec.filename),
-            http: reqwest::Client::new(),
             cache: Mutex::new(DescriptorCache::new(DEFAULT_CACHE_BUDGET_BYTES)),
+            inflight: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -619,6 +693,13 @@ impl XetReader {
     }
 
     /// Fetch (or cache-hit) a descriptor's decoded chunk segment.
+    ///
+    /// Concurrent calls for the same `(xorb_hash, descriptor.byte_start)` key
+    /// share a single HTTP+decode pass via [`tokio::sync::OnceCell`]. Without
+    /// this, 16-way `buffer_unordered` callers whose ranges all land in the
+    /// same 50-65 MB descriptor would issue 16 parallel downloads and discard
+    /// 15 of them — visible in the perf monitor as `cas in_flight=16` sitting
+    /// at `0.0 req/s` for tens of seconds.
     async fn load_descriptor(
         &self,
         xorb_hash: &str,
@@ -629,6 +710,53 @@ impl XetReader {
             return Ok(hit);
         }
 
+        // Get-or-insert the in-flight cell. The first caller will run the
+        // fetch closure; concurrent callers wait on the same OnceCell and
+        // receive the result by clone.
+        let cell = {
+            let mut inflight = self.inflight.lock().unwrap();
+            Arc::clone(
+                inflight
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+            )
+        };
+
+        // anyhow::Error isn't Clone, so OnceCell can't store a Result directly
+        // — every awaiting caller would need the same error. Convert failures
+        // to a String once and let each caller wrap it in an Err with the same
+        // text. The first caller does the fetch; on success the value is also
+        // installed in the LRU below.
+        let decoded = cell
+            .get_or_try_init(|| async {
+                let res = self.fetch_and_decode_descriptor(xorb_hash, desc).await;
+                match res {
+                    Ok(d) => {
+                        self.cache.lock().unwrap().put(key.clone(), d.clone());
+                        Ok(d)
+                    }
+                    Err(e) => Err(format!("{e:#}")),
+                }
+            })
+            .await
+            .map_err(|e| anyhow!("{e}"))?
+            .clone();
+
+        // Drop the inflight entry now that the value is in the LRU. Future
+        // callers will see the LRU hit. If a caller raced in between, they
+        // will already have observed the OnceCell value via `get_or_try_init`,
+        // so removal is safe.
+        self.inflight.lock().unwrap().remove(&key);
+        Ok(decoded)
+    }
+
+    /// Do the actual HTTP fetch + decode. Wrapped by `load_descriptor` which
+    /// adds the cache + in-flight-dedup layers.
+    async fn fetch_and_decode_descriptor(
+        &self,
+        xorb_hash: &str,
+        desc: &ReaderDescriptor,
+    ) -> anyhow::Result<DecodedDescriptor> {
         // HTTP Range header is INCLUSIVE on both ends (RFC 7233 §2.1) — match
         // `HttpRange` semantics from xet-client's wire format.
         //
@@ -640,33 +768,33 @@ impl XetReader {
         // concurrency control). Network errors propagate; the load worker
         // surfaces them and aborts the pipeline.
         let range_header = format!("bytes={}-{}", desc.byte_start, desc.byte_end);
-        let bytes = self
-            .http
-            .get(desc.url.as_str())
-            .header(reqwest::header::RANGE, &range_header)
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-            .with_context(|| format!("HTTP error fetching xorb range {} for {}", desc.byte_start, xorb_hash))?
-            .bytes()
-            .await
-            .with_context(|| format!("body read fetching xorb range {} for {}", desc.byte_start, xorb_hash))?;
+        CAS_INFLIGHT.fetch_add(1, Ordering::Relaxed);
+        let bytes_res = async {
+            let resp = http_client()
+                .get(desc.url.as_str())
+                .header(reqwest::header::RANGE, &range_header)
+                .send()
+                .await
+                .and_then(|r| r.error_for_status())
+                .with_context(|| format!("HTTP error fetching xorb range {} for {}", desc.byte_start, xorb_hash))?;
+            resp.bytes()
+                .await
+                .with_context(|| format!("body read fetching xorb range {} for {}", desc.byte_start, xorb_hash))
+        }.await;
+        CAS_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+        CAS_COMPLETED.fetch_add(1, Ordering::Relaxed);
+        let bytes = bytes_res?;
+        CAS_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
 
         // Decode packed chunks → uncompressed bytes + per-chunk start offsets.
         let mut cursor = std::io::Cursor::new(bytes.as_ref());
         let (data, chunk_byte_indices) = xet_core_structures::xorb_object::deserialize_chunks(&mut cursor)
             .map_err(|e| anyhow!("decoding xorb {} bytes [{},{}]: {}", xorb_hash, desc.byte_start, desc.byte_end, e))?;
 
-        let decoded = DecodedDescriptor {
+        Ok(DecodedDescriptor {
             data: Arc::new(data),
             chunk_byte_indices: Arc::new(chunk_byte_indices),
-        };
-        let copy = DecodedDescriptor {
-            data: Arc::clone(&decoded.data),
-            chunk_byte_indices: Arc::clone(&decoded.chunk_byte_indices),
-        };
-        self.cache.lock().unwrap().put(key, copy);
-        Ok(decoded)
+        })
     }
 }
 

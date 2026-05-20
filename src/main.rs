@@ -5,6 +5,7 @@ mod geometry;
 mod hf_upload;
 mod hf_url;
 mod label;
+mod perf_monitor;
 mod progress;
 mod safetensors;
 mod single;
@@ -451,6 +452,10 @@ async fn main() -> anyhow::Result<()> {
         .try_init()
         .expect("global logger already set");
     log::set_max_level(max_level);
+
+    // Optional perf monitor (set ARBVIS_PERF_LOG=1) — emits one line/s with
+    // throttle + CAS HTTP counters. Used to localise pipeline stalls.
+    let _perf_monitor_stop = perf_monitor::spawn_if_enabled();
 
     let args = Args::parse();
     run(args).await

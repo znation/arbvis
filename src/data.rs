@@ -22,6 +22,16 @@ use crate::xet::{self, XetReader, XetTerm};
 /// runtime have enough simultaneous awaiting tasks to keep the throttle full.
 const SETUP_FETCH_CONCURRENCY: usize = 16;
 
+/// Per-tensor RMS sampling reads each sample as a 64 KB suffix of a
+/// `Data::Xet::fetch_range` call, which decompresses the underlying *xorb
+/// descriptor* — typically 50-65 MB before deduplication. Running 16 of those
+/// in parallel saturates the link with simultaneous descriptor downloads;
+/// none complete inside the progress bar's polling window, so the bar appears
+/// stalled for tens of seconds at a time. After the in-flight descriptor
+/// dedup added in [`xet::XetReader::load_descriptor`], we lower this to 4 so
+/// each descriptor batch completes quickly and bar ticks land smoothly.
+const RMS_SAMPLE_FETCH_CONCURRENCY: usize = 4;
+
 /// Build a one-shot progress bar attached to the global `MultiProgress` so
 /// it interleaves cleanly with log output. Always returns `Some(...)`; the
 /// non-TTY case is handled by the hidden draw target on the global multi.
@@ -1290,7 +1300,7 @@ async fn fetch_rms_estimates(
                 (idx, scale)
             }
         })
-        .buffer_unordered(SETUP_FETCH_CONCURRENCY)
+        .buffer_unordered(RMS_SAMPLE_FETCH_CONCURRENCY)
         .collect()
         .await;
     if let Some(pb) = pb.as_ref() { pb.finish_and_clear(); }

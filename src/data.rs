@@ -696,10 +696,6 @@ pub async fn prepare_diff_sources(
                     sources.extend(tensor_sources);
                     total += bytes;
                 }
-                // Surface --finetune contract violations to the user; everything
-                // else degrades gracefully so the non-safetensors diff below
-                // can still produce useful output.
-                Err(e) if is_finetune => return Err(e),
                 Err(e) => log::warn!("safetensors diff failed: {e} — skipping"),
             }
         }
@@ -735,8 +731,9 @@ pub async fn prepare_diff_sources(
             let names: Vec<String> = mod_only_keys.iter()
                 .map(|rel| modified.join(rel).display().to_string())
                 .collect();
-            anyhow::bail!(
-                "--diff --finetune: modified side has {} file(s) with no counterpart on the original/base side: {}",
+            log::warn!(
+                "--diff --finetune: modified side has {} file(s) with no counterpart on the \
+                 original/base side — rendering as green crosshatch: {}",
                 names.len(),
                 names.join(", ")
             );
@@ -776,21 +773,25 @@ pub async fn prepare_diff_sources(
                         }
                     };
                     if size_o != size_m {
-                        // Treat as if both sides are unmatched so neither is
-                        // hidden. In finetune mode this is also a contract
-                        // violation (the finetune side carries something the
-                        // base doesn't), so bail.
+                        // Size mismatch: render each side independently as
+                        // unmatched so neither is hidden. In finetune mode
+                        // this is technically a contract violation (the
+                        // finetune carries bytes the base doesn't), but we
+                        // warn rather than bail and still render — the
+                        // green crosshatch makes the divergence visually
+                        // obvious.
                         if is_finetune {
-                            anyhow::bail!(
-                                "--diff --finetune: size mismatch ({} vs {} bytes) for {} — finetune \
-                                 cannot diverge structurally from base",
+                            log::warn!(
+                                "--diff --finetune: size mismatch ({} vs {} bytes) for {} — \
+                                 rendering modified side as green crosshatch",
+                                size_o, size_m, rel.display()
+                            );
+                        } else {
+                            log::warn!(
+                                "size mismatch ({} vs {} bytes) for {} — rendering each side as unmatched",
                                 size_o, size_m, rel.display()
                             );
                         }
-                        log::warn!(
-                            "size mismatch ({} vs {} bytes) for {} — rendering each side as unmatched",
-                            size_o, size_m, rel.display()
-                        );
                         if size_o > 0 {
                             sources.push(Source {
                                 file_idx: sources.len(),
@@ -894,7 +895,6 @@ pub async fn prepare_diff_sources_from_http(
                 sources.extend(tensor_sources);
                 total += bytes;
             }
-            Err(e) if is_finetune => return Err(e),
             Err(e) => log::warn!("safetensors diff failed: {e} — skipping"),
         }
     }
@@ -916,8 +916,9 @@ pub async fn prepare_diff_sources_from_http(
         .collect();
     mod_only_files.sort();
     if is_finetune && !mod_only_files.is_empty() {
-        anyhow::bail!(
-            "--diff --finetune: modified side has {} file(s) with no counterpart on the original/base side: {}",
+        log::warn!(
+            "--diff --finetune: modified side has {} file(s) with no counterpart on the \
+             original/base side — rendering as green crosshatch: {}",
             mod_only_files.len(),
             mod_only_files.join(", ")
         );
@@ -944,16 +945,17 @@ pub async fn prepare_diff_sources_from_http(
         };
         if orig_spec.size != mod_spec.size {
             if is_finetune {
-                anyhow::bail!(
-                    "--diff --finetune: size mismatch for {fname} ({} vs {} bytes) — finetune \
-                     cannot diverge structurally from base",
+                log::warn!(
+                    "--diff --finetune: size mismatch for {fname} ({} vs {} bytes) — \
+                     rendering modified side as green crosshatch",
+                    orig_spec.size, mod_spec.size
+                );
+            } else {
+                log::warn!(
+                    "size mismatch for {fname} ({} vs {} bytes) — rendering each side as unmatched",
                     orig_spec.size, mod_spec.size
                 );
             }
-            log::warn!(
-                "size mismatch for {fname} ({} vs {} bytes) — rendering each side as unmatched",
-                orig_spec.size, mod_spec.size
-            );
             if orig_spec.size > 0 {
                 unmatched_orig.push((fname.to_string(), orig_spec.size, orig_fill_kind));
             }
@@ -1124,29 +1126,16 @@ pub struct TensorMatch {
     pub mod_only: Vec<String>,
 }
 
-/// Find matched + unmatched tensor name groupings between two name sets.
-///
-/// Applies the prefix-strip heuristic when no exact name overlap exists so
-/// e.g. wrapper-induced prefix nesting (`model.lm.lm.lm.X` vs `model.lm.X`)
-/// still pairs up. Unmatched tensors are returned so callers can surface them
-/// (now: render as crosshatch fill) rather than silently dropping them.
-fn find_matched_tensor_pairs(orig_names: &[String], mod_names: &[String]) -> TensorMatch {
-    let mod_set: std::collections::HashSet<&str> = mod_names.iter().map(|s| s.as_str()).collect();
-    let exact_overlap = orig_names.iter().any(|n| mod_set.contains(n.as_str()));
-    let (strip_o, strip_m) = if exact_overlap {
-        (0, 0)
-    } else {
-        let depths = find_strip_depths(orig_names, mod_names);
-        if depths != (0, 0) {
-            log::info!(
-                "safetensors diff: no exact tensor name overlap; \
-                 stripping {} prefix component(s) from original and {} from modified",
-                depths.0, depths.1
-            );
-        }
-        depths
-    };
-
+/// Match tensors under a fixed `(strip_o, strip_m)` strip pair: build the
+/// stripped-suffix maps (with collisions blanked), then pair up unique 1-to-1
+/// matches. Returns the matched `(orig_full, mod_full)` pairs only — caller
+/// drives iteration and tracks the unmatched residual.
+fn match_under_strip_depths(
+    orig_names: &[String],
+    mod_names: &[String],
+    strip_o: usize,
+    strip_m: usize,
+) -> Vec<(String, String)> {
     let orig_by_stripped: HashMap<String, &str> = orig_names.iter()
         .filter_map(|n| {
             strip_prefix_components(n, strip_o)
@@ -1169,34 +1158,94 @@ fn find_matched_tensor_pairs(orig_names: &[String], mod_names: &[String]) -> Ten
             acc
         });
 
-    let mut only_in_mod: Vec<String> = mod_by_stripped.iter()
-        .filter(|(stripped, &full)| !full.is_empty() && !orig_by_stripped.contains_key(stripped.as_str()))
-        .map(|(_, &full)| full.to_owned())
-        .collect();
-    only_in_mod.sort();
-
     let mut sorted_orig: Vec<&str> = orig_by_stripped.values().copied().filter(|s| !s.is_empty()).collect();
     sorted_orig.sort();
 
     let mut pairs = Vec::new();
-    let mut only_in_orig: Vec<String> = Vec::new();
     for orig_full in sorted_orig {
         let stripped = match strip_prefix_components(orig_full, strip_o) {
             Some(s) if !s.is_empty() => s,
-            _ => {
-                only_in_orig.push(orig_full.to_owned());
-                continue;
-            }
+            _ => continue,
         };
-        match mod_by_stripped.get(stripped) {
-            Some(s) if !s.is_empty() => {
-                pairs.push((orig_full.to_owned(), (*s).to_owned()));
+        if let Some(&mod_full) = mod_by_stripped.get(stripped) {
+            if !mod_full.is_empty() {
+                pairs.push((orig_full.to_owned(), mod_full.to_owned()));
             }
-            _ => only_in_orig.push(orig_full.to_owned()),
         }
     }
+    pairs
+}
 
-    TensorMatch { pairs, orig_only: only_in_orig, mod_only: only_in_mod }
+/// Find matched + unmatched tensor name groupings between two name sets.
+///
+/// **Multi-pass strip heuristic.** Real-world model files frequently mix
+/// multiple wrapper-induced prefix nestings — e.g. GRaPE-2-Nano's language
+/// tensors live under `model.language_model.language_model.language_model.*`
+/// (matching the base's `model.language_model.*` at strip depths `(1, 3)`)
+/// while its vision tensors live under `model.language_model.visual.*`
+/// (matching the base's `model.visual.*` at strip depths `(2, 3)`). A single
+/// `(strip_o, strip_m)` pair can't capture both — so we iterate:
+///
+/// 1. Pull out all exact-name matches first.
+/// 2. Greedily pick the best `(strip_o, strip_m)` over the remaining
+///    unmatched tensors, apply those matches, repeat.
+/// 3. Stop when no further pair yields any matches.
+///
+/// Unmatched tensors are returned so callers can surface them (e.g. as
+/// crosshatch fill) rather than silently dropping them.
+fn find_matched_tensor_pairs(orig_names: &[String], mod_names: &[String]) -> TensorMatch {
+    use std::collections::HashSet;
+    let mut remaining_orig: HashSet<String> = orig_names.iter().cloned().collect();
+    let mut remaining_mod:  HashSet<String> = mod_names.iter().cloned().collect();
+
+    let mut pairs: Vec<(String, String)> = Vec::new();
+
+    // Pass 0: exact-name overlap. Iterate the input order so the resulting
+    // log line is deterministic on repeat runs.
+    for name in orig_names {
+        if remaining_orig.contains(name) && remaining_mod.contains(name) {
+            remaining_orig.remove(name);
+            remaining_mod.remove(name);
+            pairs.push((name.clone(), name.clone()));
+        }
+    }
+    if !pairs.is_empty() {
+        log::debug!("safetensors diff: pass 0 exact match — {} pairs", pairs.len());
+    }
+
+    // Subsequent passes: greedy multi-pass strip search. Each pass picks the
+    // (strip_o, strip_m) that yields the most matches over the *remaining*
+    // unmatched tensors, applies those matches, and continues. Bounded by
+    // the strip search range (find_strip_depths) and by termination once no
+    // pair yields any matches.
+    let mut pass = 0usize;
+    loop {
+        if remaining_orig.is_empty() || remaining_mod.is_empty() { break; }
+        let orig_vec: Vec<String> = remaining_orig.iter().cloned().collect();
+        let mod_vec:  Vec<String> = remaining_mod.iter().cloned().collect();
+        let (strip_o, strip_m) = find_strip_depths(&orig_vec, &mod_vec);
+        if strip_o == 0 && strip_m == 0 { break; }
+        let new_pairs = match_under_strip_depths(&orig_vec, &mod_vec, strip_o, strip_m);
+        if new_pairs.is_empty() { break; }
+        pass += 1;
+        log::info!(
+            "safetensors diff: strip-match pass {}: stripping {} component(s) from original and {} from modified — {} new pair(s)",
+            pass, strip_o, strip_m, new_pairs.len()
+        );
+        for (o, m) in &new_pairs {
+            remaining_orig.remove(o);
+            remaining_mod.remove(m);
+        }
+        pairs.extend(new_pairs);
+    }
+
+    let mut orig_only: Vec<String> = remaining_orig.into_iter().collect();
+    let mut mod_only:  Vec<String> = remaining_mod.into_iter().collect();
+    orig_only.sort();
+    mod_only.sort();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    TensorMatch { pairs, orig_only, mod_only }
 }
 
 /// Sample each matched orig tensor's bytes and compute its RMS, used as the
@@ -1333,9 +1382,12 @@ async fn build_multi_safetensors_diff_sources_inner(
         }
     }
 
-    // Finetune contract: every tensor the finetune ships must exist (with the
-    // same shape) on the base side. Anything else is structural divergence
-    // and the user explicitly asked for a hard error so they notice.
+    // Finetune contract: every tensor the finetune ships should exist (with
+    // the same shape) on the base side. Real-world models sometimes break
+    // this — e.g. wrapper-saved finetunes that nest a vision tower under a
+    // language_model prefix the base doesn't share — so we warn rather than
+    // bail, and surface the offending tensors as green crosshatch via the
+    // normal only-in-modified rendering below.
     if is_finetune {
         let mut mod_extras: Vec<String> = mod_only.clone();
         for (_, mod_full) in &shape_mismatch {
@@ -1343,9 +1395,10 @@ async fn build_multi_safetensors_diff_sources_inner(
         }
         if !mod_extras.is_empty() {
             mod_extras.sort();
-            anyhow::bail!(
+            log::warn!(
                 "safetensors diff --finetune: modified side has {} tensor(s) not present \
-                 (or with mismatched shape) on the original/base side: {}",
+                 (or with mismatched shape) on the original/base side — rendering as green \
+                 crosshatch: {}",
                 mod_extras.len(),
                 mod_extras.join(", ")
             );
@@ -1416,24 +1469,22 @@ async fn build_multi_safetensors_diff_sources_inner(
         total += nelem;
     }
 
-    // mod-only tensors only render in non-finetune mode (finetune mode bailed
-    // earlier). They use modified-side metadata so the label and footprint
-    // reflect what the finetune actually ships.
-    if !is_finetune {
-        for name in &mod_only {
-            let t = &mod_map[name].1;
-            let nelem: u64 = t.shape.iter().product();
-            if nelem == 0 { continue; }
-            sources.push(Source {
-                file_idx: sources.len(),
-                kind: SourceKind::UnmatchedRegion { fill: DiffFill::Green },
-                byte_size: nelem,
-                safetensors: None,
-                name_override: Some(format!("[only in modified] {}", t.label())),
-                xet_terms: None,
-            });
-            total += nelem;
-        }
+    // mod-only tensors render as green crosshatch in both modes. In finetune
+    // mode the warning above already flagged the contract violation; the
+    // green crosshatch surfaces it visually too.
+    for name in &mod_only {
+        let t = &mod_map[name].1;
+        let nelem: u64 = t.shape.iter().product();
+        if nelem == 0 { continue; }
+        sources.push(Source {
+            file_idx: sources.len(),
+            kind: SourceKind::UnmatchedRegion { fill: DiffFill::Green },
+            byte_size: nelem,
+            safetensors: None,
+            name_override: Some(format!("[only in modified] {}", t.label())),
+            xet_terms: None,
+        });
+        total += nelem;
     }
 
     if !orig_only.is_empty() || !mod_only.is_empty() || !shape_mismatch.is_empty() {

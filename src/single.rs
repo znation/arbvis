@@ -329,17 +329,39 @@ fn render_chunks(
     pb_shared: &Option<Arc<ProgressBar>>,
 ) -> anyhow::Result<Vec<(usize, Option<(u32, u32, u32, u32)>)>> {
     let xet_mode = !xorb_map.is_empty();
-    let xet_color = |byte: u8, abs_byte: u64| -> Rgb<u8> {
-        if let Some(idx) = xorb_map.color_idx_at(abs_byte) {
-            let t = tableau[idx as usize];
-            let scale = byte as u16;
-            Rgb([
-                ((t[0] as u16 * scale + 127) / 255) as u8,
-                ((t[1] as u16 * scale + 127) / 255) as u8,
-                ((t[2] as u16 * scale + 127) / 255) as u8,
-            ])
-        } else {
-            pixel_lut[byte as usize]
+    // Per-pixel color combining (optional) xorb hue, (optional) dtype hue, and
+    // byte intensity. When both xorb and dtype are present, the two hues are
+    // averaged then modulated by the byte value; either alone falls back to
+    // pure xet or pure dtype-byte; with neither, the plain byte LUT.
+    let pixel_color = |byte: u8, abs_byte: u64, dtype: Option<Rgb<u8>>| -> Rgb<u8> {
+        match (xorb_map.color_idx_at(abs_byte), dtype) {
+            (Some(idx), Some(d)) => {
+                let t = tableau[idx as usize];
+                let s = byte as u32;
+                Rgb([
+                    (((d[0] as u32 + t[0] as u32) * s + 255) / 510) as u8,
+                    (((d[1] as u32 + t[1] as u32) * s + 255) / 510) as u8,
+                    (((d[2] as u32 + t[2] as u32) * s + 255) / 510) as u8,
+                ])
+            }
+            (Some(idx), None) => {
+                let t = tableau[idx as usize];
+                let s = byte as u16;
+                Rgb([
+                    ((t[0] as u16 * s + 127) / 255) as u8,
+                    ((t[1] as u16 * s + 127) / 255) as u8,
+                    ((t[2] as u16 * s + 127) / 255) as u8,
+                ])
+            }
+            (None, Some(d)) => {
+                let s = byte as u16;
+                Rgb([
+                    ((d[0] as u16 * s + 127) / 255) as u8,
+                    ((d[1] as u16 * s + 127) / 255) as u8,
+                    ((d[2] as u16 * s + 127) / 255) as u8,
+                ])
+            }
+            (None, None) => pixel_lut[byte as usize],
         }
     };
     let chunk_results: Vec<(usize, Option<(u32, u32, u32, u32)>)> = chunks_by_source
@@ -358,7 +380,12 @@ fn render_chunks(
                     SourceKind::UnmatchedRegion { fill } => Some(*fill),
                     _ => None,
                 };
-                let data = if dtype_ranges.is_none() && unmatched_fill.is_none() {
+                // Bytes are only needed for xet (entropy modulation) and for
+                // plain mode (byte LUT). Dtype and unmatched-region paths are
+                // position-only.
+                let needs_bytes = unmatched_fill.is_none()
+                    && (xet_mode || dtype_ranges.is_none());
+                let data = if needs_bytes {
                     Some(load_source_data(&sources[src_idx])?)
                 } else {
                     None
@@ -407,7 +434,8 @@ fn render_chunks(
                                 });
                                 cur_pixel += 1;
                             }
-                        } else if let Some(ranges) = dtype_ranges {
+                        } else if !needs_bytes {
+                            let ranges = dtype_ranges.unwrap();
                             let first = chunk_b_start
                                 + (stride - chunk_b_start % stride) % stride;
                             for strided_b in (first..chunk_b_end).step_by(stride as usize) {
@@ -444,11 +472,9 @@ fn render_chunks(
                             for &b in bytes {
                                 if cur_byte % stride == 0 {
                                     let (x, y) = hilbert_to_xy_u64(cur_pixel as u64, k as u8);
-                                    let color = if xet_mode {
-                                        xet_color(b, cur_byte)
-                                    } else {
-                                        pixel_lut[b as usize]
-                                    };
+                                    let dtype = dtype_ranges
+                                        .map(|r| color_for_pos(cur_byte - src_global_start, r));
+                                    let color = pixel_color(b, cur_byte, dtype);
                                     let pixel_idx = y as usize * side as usize + x as usize;
                                     unsafe {
                                         let p = (img_base as *mut u8).add(pixel_idx * 3);

@@ -23,7 +23,8 @@ use crate::throttle::{Throttle, MAX_FETCH_WORKERS};
 use crate::tiled::html::{FileEntity, generate_leaflet_content};
 use crate::tiled::leaf::{
     load_tile_bytes, render_leaf_tile_diff, render_leaf_tile_dtype, render_leaf_tile_from_buf,
-    render_leaf_tile_xet_from_buf, TileFormat, TILE, TILE_LOG2, TILE_PIXELS,
+    render_leaf_tile_xet_dtype_from_buf, render_leaf_tile_xet_from_buf, TileFormat, TILE,
+    TILE_LOG2, TILE_PIXELS,
 };
 use crate::tiled::pyramid_accum::{LocalFileSink, PyramidAccumulator, TileSink};
 use crate::xet::{TABLEAU_20, XorbMap};
@@ -167,12 +168,26 @@ enum LeafMode {
         pixel_lut: Arc<[image::Rgb<u8>; 256]>,
         fills: Arc<Vec<(u64, u64, DiffFill)>>,
     },
+    /// Combined xet + safetensors: blend dtype hue with xorb tableau hue,
+    /// modulated by byte intensity. Produces a single image where both tensor
+    /// boundaries and xorb boundaries are visible.
+    XetDtype {
+        xorb_ranges: Arc<Vec<(u64, u64, u8)>>,
+        tableau: Arc<[image::Rgb<u8>; 20]>,
+        dtype_ranges: Arc<Vec<(u64, u64, image::Rgb<u8>)>>,
+    },
 }
 
 impl LeafMode {
     /// Whether the fetch stage needs to read bytes for this mode.
     fn needs_bytes(&self) -> bool {
-        matches!(self, LeafMode::Plain { .. } | LeafMode::Xet { .. } | LeafMode::Diff { .. })
+        matches!(
+            self,
+            LeafMode::Plain { .. }
+                | LeafMode::Xet { .. }
+                | LeafMode::Diff { .. }
+                | LeafMode::XetDtype { .. }
+        )
     }
 
     /// Whether this mode produces leaves with ≤256 distinct colors, making
@@ -185,7 +200,8 @@ impl LeafMode {
     /// Diff mode adds at most 6 crosshatch colors (3 fills × 2 shades) on top
     /// of the 256-entry diff LUT — usually still ≤256 distinct colors per
     /// tile in practice, and the encoder falls back to truecolor when it
-    /// isn't.
+    /// isn't. XetDtype crosses dtype hues with tableau hues per xorb, so it's
+    /// high-color.
     fn is_palette_safe(&self) -> bool {
         matches!(
             self,
@@ -387,8 +403,9 @@ async fn build_tile_plan(
         arr
     };
 
-    let dtype_mode = !diff_mode && !xet_mode && sources.iter().any(|s| s.safetensors.is_some());
-    let combined_dtype_ranges: Vec<(u64, u64, image::Rgb<u8>)> = if dtype_mode {
+    let has_safetensors = !diff_mode && sources.iter().any(|s| s.safetensors.is_some());
+    let dtype_mode = has_safetensors && !xet_mode;
+    let combined_dtype_ranges: Vec<(u64, u64, image::Rgb<u8>)> = if has_safetensors {
         let mut ranges = Vec::new();
         let mut cumulative: u64 = 0;
         for source in &sources {
@@ -475,7 +492,13 @@ async fn build_tile_plan(
         Vec::new()
     };
 
-    let mode = if xet_mode {
+    let mode = if xet_mode && has_safetensors {
+        LeafMode::XetDtype {
+            xorb_ranges: Arc::new(xorb_map.global_ranges),
+            tableau: Arc::new(tableau),
+            dtype_ranges: Arc::new(combined_dtype_ranges),
+        }
+    } else if xet_mode {
         LeafMode::Xet {
             pixel_lut: pixel_lut.clone(),
             xorb_ranges: Arc::new(xorb_map.global_ranges),
@@ -782,6 +805,13 @@ fn render_one(
             render_leaf_tile_diff(
                 tx, ty, kh, height_tiles, square_pixels, total,
                 buf, pixel_lut, fills, fmt,
+            )?
+        }
+        LeafMode::XetDtype { xorb_ranges, tableau, dtype_ranges } => {
+            let buf = tile_buf.as_deref().expect("xet+dtype mode needs tile_buf");
+            render_leaf_tile_xet_dtype_from_buf(
+                tx, ty, kh, height_tiles, square_pixels, total,
+                buf, xorb_ranges, tableau, dtype_ranges, fmt,
             )?
         }
     };

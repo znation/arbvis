@@ -20,7 +20,31 @@ use anyhow::Context;
 use clap::{Parser, ValueEnum};
 
 use crate::data::InputSpec;
+use crate::safetensors::DiffMetric;
 use crate::tiled::leaf::TileFormat;
+
+/// CLI mirror of [`safetensors::DiffMetric`]. Kept separate so the clap
+/// derive doesn't pollute the core type.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DiffMetricArg {
+    /// Per-tensor RMS-normalized signed delta. Stable across tensors of
+    /// different scale; default.
+    Rms,
+    /// Absolute delta on a log brightness scale. Honest about raw magnitudes.
+    AbsLog,
+    /// Ternary: identical bytes → black; any change → full saturation.
+    Exact,
+}
+
+impl DiffMetricArg {
+    fn to_metric(self) -> DiffMetric {
+        match self {
+            DiffMetricArg::Rms => DiffMetric::Rms,
+            DiffMetricArg::AbsLog => DiffMetric::AbsLog,
+            DiffMetricArg::Exact => DiffMetric::Exact,
+        }
+    }
+}
 
 /// CLI tile-format choice. Maps to a `(leaf, pyramid)` pair of [`TileFormat`]s.
 ///
@@ -78,6 +102,27 @@ struct Args {
     /// Visualize abs(modified - original) byte differences; ORIGINAL and MODIFIED are files or directories
     #[arg(long, num_args = 2, value_names = ["ORIGINAL", "MODIFIED"])]
     diff: Option<Vec<PathBuf>>,
+
+    /// Force-treat the second --diff argument as a finetune of the first.
+    /// In finetune mode, tensors present only on the base side are rendered
+    /// as crosshatched grey (informational); anything present only on the
+    /// finetune side (or with a mismatched shape) is treated as a contract
+    /// violation and aborts the run. Without --finetune / --no-finetune the
+    /// relation is auto-detected from the HF model card (`base_model` +
+    /// `base_model_relation`) when both args are `hf://` model URLs, and
+    /// defaults to non-finetune otherwise.
+    #[arg(long, requires = "diff", conflicts_with = "no_finetune")]
+    finetune: bool,
+
+    /// Force-treat the diff as NOT a finetune (overrides auto-detection).
+    /// In this mode, tensors/files present only on one side render as red
+    /// (original-only) or green (modified-only) crosshatch.
+    #[arg(long = "no-finetune", requires = "diff", conflicts_with = "finetune")]
+    no_finetune: bool,
+
+    /// How per-element tensor deltas are encoded for visualization.
+    #[arg(long, value_enum, default_value_t = DiffMetricArg::Rms, requires = "diff")]
+    diff_metric: DiffMetricArg,
 
     /// Render tiles and deploy to this HF Space (e.g. username/my-vis);
     /// bucket is auto-named as <namespace>/<repo>_bucket
@@ -151,6 +196,37 @@ async fn run(args: Args) -> anyhow::Result<()> {
         let diff_title = args.title.as_deref().unwrap_or("arbvis diff");
         let orig_str = &diff_input_strs[0];
         let mod_str  = &diff_input_strs[1];
+        let is_finetune = if args.finetune {
+            log::info!("--diff finetune mode: forced on by --finetune");
+            true
+        } else if args.no_finetune {
+            log::info!("--diff finetune mode: forced off by --no-finetune");
+            false
+        } else {
+            match hf_url::detect_finetune_relation(orig_str, mod_str).await {
+                Some(true) => {
+                    log::info!(
+                        "--diff finetune mode: auto-detected ON ({} declares {} as its base in its HF model card)",
+                        mod_str, orig_str
+                    );
+                    true
+                }
+                Some(false) => {
+                    log::info!(
+                        "--diff finetune mode: auto-detected OFF ({} does not declare {} as a finetune base)",
+                        mod_str, orig_str
+                    );
+                    false
+                }
+                None => {
+                    log::info!(
+                        "--diff finetune mode: auto-detect skipped (not both hf:// model URLs or API lookup failed); defaulting to OFF — pass --finetune to override"
+                    );
+                    false
+                }
+            }
+        };
+        let metric = args.diff_metric.to_metric();
 
         let (sources, total) = if hf_url::is_repo_level(orig_str)? && hf_url::is_repo_level(mod_str)? {
             // Both are repo-level hf:// URLs: list files over API, diff lazily over HTTP.
@@ -159,14 +235,14 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 .with_context(|| format!("listing files in {orig_str}"))?;
             let mod_specs = hf_url::list_repo_as_http_specs(mod_str).await
                 .with_context(|| format!("listing files in {mod_str}"))?;
-            data::prepare_diff_sources_from_http(&orig_specs, &mod_specs).await?
+            data::prepare_diff_sources_from_http(&orig_specs, &mod_specs, is_finetune, metric).await?
         } else {
             // At least one side is a local path or single-file hf:// URL.
             let mut diff_args: Vec<PathBuf> = Vec::with_capacity(raw_diff_args.len());
             for p in raw_diff_args {
                 diff_args.push(resolve_input(p).await?);
             }
-            data::prepare_diff_sources(&diff_args[0], &diff_args[1]).await?
+            data::prepare_diff_sources(&diff_args[0], &diff_args[1], is_finetune, metric).await?
         };
         let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
         // Stream directly to HF — no tiles written to local disk.

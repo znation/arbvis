@@ -10,11 +10,23 @@ use minifb::{Window, WindowOptions};
 use rayon::prelude::*;
 
 use crate::color::{build_diff_signed_lut, build_pixel_lut};
-use crate::data::{load_source_data, Source};
+use crate::data::{load_source_data, Source, SourceKind};
 use crate::geometry::{sampled_in_range, hilbert_to_xy_u64};
 use crate::label::draw_file_label;
-use crate::safetensors::color_for_pos;
+use crate::safetensors::{color_for_pos, DiffFill};
 use crate::xet::{TABLEAU_20, XorbMap};
+
+/// Two-pixel-wide diagonal crosshatch on (x, y) for unmatched-region sources.
+/// Kept identical in spirit to the tile renderer's pattern so the single-image
+/// output is visually consistent with the tiled viewer.
+#[inline]
+fn is_crosshatch_stripe_single(x: u32, y: u32) -> bool {
+    const PERIOD: u32 = 8;
+    const STRIPE: u32 = 2;
+    let a = (x + y) % PERIOD;
+    let b = (x + (PERIOD - y % PERIOD)) % PERIOD;
+    a < STRIPE || b < STRIPE
+}
 
 /// Render a single Hilbert-curve image (non-tiled mode).
 pub fn run_single(
@@ -342,7 +354,11 @@ fn render_chunks(
                     .safetensors
                     .as_ref()
                     .map(|st| st.color_ranges.as_slice());
-                let data = if dtype_ranges.is_none() {
+                let unmatched_fill: Option<DiffFill> = match &sources[src_idx].kind {
+                    SourceKind::UnmatchedRegion { fill } => Some(*fill),
+                    _ => None,
+                };
+                let data = if dtype_ranges.is_none() && unmatched_fill.is_none() {
                     Some(load_source_data(&sources[src_idx])?)
                 } else {
                     None
@@ -357,7 +373,41 @@ fn render_chunks(
                         let mut cur_pixel = chunk_pixel_start as usize;
                         let mut bbox: Option<(u32, u32, u32, u32)> = None;
 
-                        if let Some(ranges) = dtype_ranges {
+                        if let Some(fill) = unmatched_fill {
+                            // No bytes to read — paint the crosshatch pattern
+                            // for every strided pixel in this chunk.
+                            let (stripe_c, base_c) = fill.colors();
+                            let first = chunk_b_start
+                                + (stride - chunk_b_start % stride) % stride;
+                            for _strided_b in (first..chunk_b_end).step_by(stride as usize) {
+                                if cur_pixel >= canvas_size {
+                                    break;
+                                }
+                                let (x, y) = hilbert_to_xy_u64(cur_pixel as u64, k as u8);
+                                let color = if is_crosshatch_stripe_single(x, y) {
+                                    stripe_c
+                                } else {
+                                    base_c
+                                };
+                                let pixel_idx = y as usize * side as usize + x as usize;
+                                unsafe {
+                                    let p = (img_base as *mut u8).add(pixel_idx * 3);
+                                    p.write(color[0]);
+                                    p.add(1).write(color[1]);
+                                    p.add(2).write(color[2]);
+                                    (pf_base as *mut Option<usize>)
+                                        .add(pixel_idx)
+                                        .write(Some(fi));
+                                }
+                                bbox = Some(match bbox {
+                                    None => (x, y, x, y),
+                                    Some((x0, y0, x1, y1)) => {
+                                        (x0.min(x), y0.min(y), x1.max(x), y1.max(y))
+                                    }
+                                });
+                                cur_pixel += 1;
+                            }
+                        } else if let Some(ranges) = dtype_ranges {
                             let first = chunk_b_start
                                 + (stride - chunk_b_start % stride) % stride;
                             for strided_b in (first..chunk_b_end).step_by(stride as usize) {

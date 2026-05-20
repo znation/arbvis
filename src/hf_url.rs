@@ -252,6 +252,85 @@ pub fn require_token() -> anyhow::Result<()> {
     )
 }
 
+/// Auto-detect whether `mod_url` is a HuggingFace-declared finetune of
+/// `orig_url`, by reading the modified-side model card metadata via the HF
+/// Hub API.
+///
+/// Returns:
+/// - `Some(true)` when both args are model URLs **and** the modified side's
+///   `cardData.base_model` (string or list) includes the original side's
+///   repo id **and** `cardData.base_model_relation` is `finetune` (or
+///   unspecified — HF's convention is that relation defaults to finetune
+///   when omitted but a base is declared).
+/// - `Some(false)` when both args are HF model URLs but the metadata
+///   doesn't establish a finetune relation in the orig→mod direction.
+/// - `None` when detection isn't applicable: either side isn't an `hf://`
+///   model URL, or the API call failed (network error, private repo
+///   without token, 404, etc.). Caller falls back to its own default.
+pub async fn detect_finetune_relation(orig_url: &str, mod_url: &str) -> Option<bool> {
+    let orig_hf = parse(orig_url).ok()?;
+    let mod_hf = parse(mod_url).ok()?;
+    // The finetune relation is only meaningful between two model repos.
+    if !matches!(orig_hf.kind, RepoKind::Model) || !matches!(mod_hf.kind, RepoKind::Model) {
+        return None;
+    }
+
+    let info = match fetch_model_info(&mod_hf.repo_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            log::debug!(
+                "finetune auto-detect: HF API lookup for {} failed: {e:#}",
+                mod_hf.repo_id
+            );
+            return None;
+        }
+    };
+
+    let cd = info.get("cardData")?;
+    let base_match = match cd.get("base_model") {
+        Some(serde_json::Value::String(s)) => repo_ids_equal(s, &orig_hf.repo_id),
+        Some(serde_json::Value::Array(a)) => a.iter().any(|v| {
+            v.as_str().map(|s| repo_ids_equal(s, &orig_hf.repo_id)).unwrap_or(false)
+        }),
+        _ => return Some(false),
+    };
+    if !base_match {
+        return Some(false);
+    }
+    // Per the HF model-card spec the relation defaults to "finetune" when a
+    // base is declared but no explicit relation is given. Anything else
+    // ("quantized", "merge", "adapter", "other", ...) does *not* satisfy the
+    // finetune contract.
+    let relation = cd
+        .get("base_model_relation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("finetune");
+    Some(relation.eq_ignore_ascii_case("finetune"))
+}
+
+/// `owner/name` comparison that tolerates case differences in the owner /
+/// name segments (HF treats these as case-insensitive).
+fn repo_ids_equal(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+/// Fetch `/api/models/{repo_id}` JSON. Used for finetune auto-detection.
+async fn fetch_model_info(repo_id: &str) -> anyhow::Result<serde_json::Value> {
+    let url = format!("{}/api/models/{repo_id}", endpoint());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("building reqwest client")?;
+    let mut req = client.get(&url);
+    if let Some(tok) = read_token() {
+        req = req.bearer_auth(tok);
+    }
+    let resp = req.send().await.context("HF model_info request failed")?;
+    let resp = resp.error_for_status().context("HF model_info non-2xx status")?;
+    let json: serde_json::Value = resp.json().await.context("HF model_info JSON decode failed")?;
+    Ok(json)
+}
+
 pub fn split_owner_name(repo_id: &str) -> anyhow::Result<(&str, &str)> {
     let slash = repo_id
         .find('/')
@@ -426,8 +505,18 @@ pub async fn resolve_to_http(path: &Path) -> anyhow::Result<RemoteFileSpec> {
     })
 }
 
-/// Returns true if the hf:// URL refers to an entire repo (no file path component).
+/// Returns true if `url_str` is a repo-level `hf://` URL (no file path
+/// component).
+///
+/// A non-`hf://` input (e.g. a local path) returns `Ok(false)` — it isn't an
+/// HF URL at all, so by definition it isn't repo-level. Only an actually
+/// malformed `hf://` input is an error. This lets call sites use a single
+/// `?` to route between the HTTP and local code paths without needing to
+/// pre-gate on the prefix.
 pub fn is_repo_level(url_str: &str) -> anyhow::Result<bool> {
+    if !url_str.starts_with("hf://") {
+        return Ok(false);
+    }
     Ok(parse(url_str)?.path_in_repo.is_empty())
 }
 
@@ -598,8 +687,15 @@ mod tests {
     }
 
     #[test]
-    fn is_repo_level_returns_error_on_bad_url() {
-        assert!(is_repo_level("not-an-hf-url").is_err());
+    fn is_repo_level_treats_non_hf_as_not_a_repo() {
+        // A local path or other non-hf:// string is "not a repo URL" rather
+        // than an error — the diff dispatcher in main.rs relies on this to
+        // route local paths through the local code path.
+        assert!(!is_repo_level("not-an-hf-url").unwrap());
+        assert!(!is_repo_level("/tmp/foo.safetensors").unwrap());
+        // Malformed hf:// inputs still error.
+        assert!(is_repo_level("hf://").is_err());
+        // Valid repo-level / file-level URLs return the expected bool.
         assert!(is_repo_level("hf://a/b").unwrap());
         assert!(!is_repo_level("hf://a/b/file").unwrap());
     }

@@ -5,6 +5,7 @@ use image::codecs::avif::AvifEncoder;
 use image::{ImageEncoder, ImageFormat, Rgb};
 
 use crate::data::Data;
+use crate::safetensors::DiffFill;
 
 pub const TILE: u32 = 512;
 pub const TILE_LOG2: u8 = TILE.trailing_zeros() as u8;
@@ -215,6 +216,83 @@ pub fn render_leaf_tile_from_buf(
                 pixel_lut[tile_buf[(local_idx - base) as usize] as usize]
             } else {
                 Rgb([0u8, 0, 0])
+            };
+            img.put_pixel(px, py, color);
+        }
+    }
+    encode_tile(img, fmt)
+}
+
+/// Whether a tile's pixel-screen position falls on a crosshatch stripe.
+///
+/// The pattern is two diagonals (`/` and `\`) of period `CROSSHATCH_PERIOD`,
+/// each `CROSSHATCH_STRIPE_WIDTH` pixels wide. Their intersection produces the
+/// visual "##" crosshatch. Tied to absolute (px, py) so the pattern doesn't
+/// shift between tiles.
+const CROSSHATCH_PERIOD: u32 = 8;
+const CROSSHATCH_STRIPE_WIDTH: u32 = 2;
+#[inline]
+fn is_crosshatch_stripe(px: u32, py: u32) -> bool {
+    let a = (px + py) % CROSSHATCH_PERIOD;
+    let b = (px + (CROSSHATCH_PERIOD - py % CROSSHATCH_PERIOD)) % CROSSHATCH_PERIOD;
+    a < CROSSHATCH_STRIPE_WIDTH || b < CROSSHATCH_STRIPE_WIDTH
+}
+
+/// Render a diff-mode leaf tile. Same as `render_leaf_tile_from_buf` but with
+/// an overlay: byte positions inside any `fills` range are painted with a
+/// crosshatch pattern instead of going through the byte LUT. Used for tensors
+/// / files that exist on only one side of the diff (and so have no per-byte
+/// signal to encode).
+pub fn render_leaf_tile_diff(
+    tx: u32,
+    ty: u32,
+    kh: u8,
+    height_tiles: u32,
+    square_pixels: u64,
+    total: u64,
+    tile_buf: &[u8; TILE_PIXELS],
+    pixel_lut: &[Rgb<u8>; 256],
+    fills: &[(u64, u64, DiffFill)],
+    fmt: TileFormat,
+) -> TileResult {
+    let sq = (tx / height_tiles) as u64;
+    let sq_off = sq * square_pixels;
+    let local_tx = tx % height_tiles;
+    let tile_order = kh - TILE_LOG2;
+    let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
+    let tile_pixel_start = sq_off + base;
+    let tile_pixel_end = (tile_pixel_start + TILE_AREA).min(total);
+
+    // Local view of the fills overlapping this tile. Avoids scanning the full
+    // (potentially thousands of) fills list per pixel.
+    let first_range = fills.partition_point(|r| r.1 <= tile_pixel_start);
+    let local_fills: Vec<(u64, u64, DiffFill)> = fills[first_range..]
+        .iter()
+        .take_while(|r| r.0 < tile_pixel_end)
+        .copied()
+        .collect();
+
+    let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
+    for py in 0..TILE {
+        let ly = ty * TILE + py;
+        for px in 0..TILE {
+            let lx = local_tx * TILE + px;
+            let local_idx = xy2h_u64(lx as u64, ly as u64, kh);
+            let pixel_idx = sq_off + local_idx;
+            let color = if pixel_idx >= total {
+                Rgb([0u8, 0, 0])
+            } else {
+                let mut fill: Option<DiffFill> = None;
+                for &(start, end, f) in &local_fills {
+                    if pixel_idx >= start && pixel_idx < end { fill = Some(f); break; }
+                }
+                match fill {
+                    Some(f) => {
+                        let (stripe, base_c) = f.colors();
+                        if is_crosshatch_stripe(px, py) { stripe } else { base_c }
+                    }
+                    None => pixel_lut[tile_buf[(local_idx - base) as usize] as usize],
+                }
             };
             img.put_pixel(px, py, color);
         }

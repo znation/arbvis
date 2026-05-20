@@ -12,7 +12,7 @@ use indicatif::ProgressBar;
 use memmap2::Mmap;
 
 use crate::progress::{counter_style, multi};
-use crate::safetensors::{self, TensorMeta};
+use crate::safetensors::{self, DiffFill, TensorMeta};
 use crate::hf_url::{RemoteFileSpec, RemoteRepo};
 use crate::xet::{self, XetReader, XetTerm};
 
@@ -66,6 +66,11 @@ pub enum Data {
     /// Async-only: the inner closure returns a future so it can issue HTTP
     /// range requests (and await them) without blocking the runtime.
     LazyDiff(LazyFetcher),
+    /// Synthetic zero-filled backing for `SourceKind::UnmatchedRegion`. The
+    /// renderer overrides bytes in these regions with a crosshatch pattern
+    /// anyway, so the underlying bytes are irrelevant — but `fetch_range`
+    /// must still return a buffer of the requested length.
+    ZeroFill,
 }
 
 impl std::ops::Deref for Data {
@@ -77,6 +82,7 @@ impl std::ops::Deref for Data {
             Data::Http { .. } => panic!("bug: use fetch_range() for remote HTTP Data, not Deref"),
             Data::Xet(_) => panic!("bug: use fetch_range() for Xet Data, not Deref"),
             Data::LazyDiff(_) => panic!("bug: use fetch_range() for LazyDiff Data, not Deref"),
+            Data::ZeroFill => panic!("bug: use fetch_range() for ZeroFill Data, not Deref"),
         }
     }
 }
@@ -98,6 +104,7 @@ impl Data {
             }
             Data::Xet(reader) => reader.fetch_range(start, len).await,
             Data::LazyDiff(f) => f(start, len).await,
+            Data::ZeroFill => Ok(vec![0u8; len]),
         }
     }
 
@@ -108,7 +115,7 @@ impl Data {
     /// could hit the Hub — otherwise mmap reads would be artificially capped
     /// at the throttle's initial 4-way concurrency.
     pub fn is_local(&self) -> bool {
-        matches!(self, Data::Mapped(_) | Data::Owned(_))
+        matches!(self, Data::Mapped(_) | Data::Owned(_) | Data::ZeroFill)
     }
 }
 
@@ -120,7 +127,10 @@ pub enum SourceKind {
     /// Remote HF file, accessed via hf-hub range requests per tile.
     Http(RemoteFileSpec),
     /// Per-tensor diff computed lazily from two whole-file Data sources.
-    /// `byte_size` output bytes are produced on demand.
+    /// `byte_size` output bytes are produced on demand. `metric` selects how
+    /// per-element deltas are encoded; `scale_orig` carries any per-tensor
+    /// statistic the metric needs (RMS of `orig` for `DiffMetric::Rms`),
+    /// pre-computed at setup so the per-tile path stays pure-streaming.
     TensorDiff {
         orig: Arc<Data>,
         mod_: Arc<Data>,
@@ -128,7 +138,14 @@ pub enum SourceKind {
         mod_start: u64,
         orig_dtype: safetensors::Dtype,
         mod_dtype: safetensors::Dtype,
+        metric: safetensors::DiffMetric,
+        scale_orig: f32,
     },
+    /// A canvas region for a tensor / file that exists on only one side of a
+    /// diff. The byte_size on the parent `Source` controls how much canvas
+    /// space it takes; the underlying bytes are zero (the renderer paints a
+    /// crosshatch pattern based on `fill` instead of using the byte LUT).
+    UnmatchedRegion { fill: DiffFill },
 }
 
 /// Input specification: local file path or resolved remote HF file.
@@ -172,6 +189,9 @@ impl Source {
             SourceKind::Http(spec) => spec.filename.as_str().to_string(),
             SourceKind::TensorDiff { .. } => {
                 unreachable!("TensorDiff sources always have name_override set")
+            }
+            SourceKind::UnmatchedRegion { .. } => {
+                unreachable!("UnmatchedRegion sources always have name_override set")
             }
         }
     }
@@ -283,14 +303,16 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
             filename: Arc::clone(&spec.filename),
             revision: Arc::clone(&spec.revision),
         }),
-        SourceKind::TensorDiff { orig, mod_, orig_start, mod_start, orig_dtype, mod_dtype } => {
+        SourceKind::UnmatchedRegion { .. } => Ok(Data::ZeroFill),
+        SourceKind::TensorDiff { orig, mod_, orig_start, mod_start, orig_dtype, mod_dtype, metric, scale_orig } => {
             let orig = Arc::clone(orig);
             let mod_ = Arc::clone(mod_);
             let orig_start = *orig_start;
             let mod_start = *mod_start;
             let orig_dtype = *orig_dtype;
             let mod_dtype = *mod_dtype;
-            const EPSILON: f32 = 1e-6;
+            let metric = *metric;
+            let scale_orig = *scale_orig;
             Ok(Data::LazyDiff(Arc::new(move |start: u64, len: usize| {
                 let orig = Arc::clone(&orig);
                 let mod_ = Arc::clone(&mod_);
@@ -299,7 +321,7 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
                     let mod_elem = mod_dtype.element_size() as u64;
                     let ob = orig.fetch_range(orig_start + start * orig_elem, (len as u64 * orig_elem) as usize).await?;
                     let mb = mod_.fetch_range(mod_start + start * mod_elem, (len as u64 * mod_elem) as usize).await?;
-                    Ok(orig_dtype.diff_to_u8(&ob, mod_dtype, &mb, EPSILON))
+                    Ok(orig_dtype.diff_to_u8(&ob, mod_dtype, &mb, metric, scale_orig))
                 })
             })))
         }
@@ -609,6 +631,8 @@ fn collect_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
 pub async fn prepare_diff_sources(
     original: &Path,
     modified: &Path,
+    is_finetune: bool,
+    metric: safetensors::DiffMetric,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     let orig_is_file = original.is_file();
     let mod_is_file = modified.is_file();
@@ -622,7 +646,7 @@ pub async fn prepare_diff_sources(
     if orig_is_file && mod_is_file {
         // Safetensors diff: expand into per-tensor diff Sources (one per matched pair).
         if is_st(original) && is_st(modified) {
-            return build_safetensors_diff_sources(original, modified).await;
+            return build_safetensors_diff_sources(original, modified, is_finetune, metric).await;
         }
 
         let size_o = std::fs::metadata(original)?.len();
@@ -663,26 +687,27 @@ pub async fn prepare_diff_sources(
         let orig_st: Vec<PathBuf> = orig_files.iter().filter(|p| is_st(p)).cloned().collect();
         let mod_st: Vec<PathBuf> = mod_files.iter().filter(|p| is_st(p)).cloned().collect();
         if !orig_st.is_empty() || !mod_st.is_empty() {
-            if orig_st.is_empty() {
-                log::warn!("original has no .safetensors files — skipping model weight diff");
-            } else if mod_st.is_empty() {
-                log::warn!("modified has no .safetensors files — skipping model weight diff");
-            } else {
-                match build_multi_safetensors_diff_sources(&orig_st, &mod_st).await {
-                    Ok((mut tensor_sources, bytes)) => {
-                        let base_idx = sources.len();
-                        for s in &mut tensor_sources {
-                            s.file_idx += base_idx;
-                        }
-                        sources.extend(tensor_sources);
-                        total += bytes;
+            match build_multi_safetensors_diff_sources(&orig_st, &mod_st, is_finetune, metric).await {
+                Ok((mut tensor_sources, bytes)) => {
+                    let base_idx = sources.len();
+                    for s in &mut tensor_sources {
+                        s.file_idx += base_idx;
                     }
-                    Err(e) => log::warn!("safetensors diff failed: {e} — skipping"),
+                    sources.extend(tensor_sources);
+                    total += bytes;
                 }
+                // Surface --finetune contract violations to the user; everything
+                // else degrades gracefully so the non-safetensors diff below
+                // can still produce useful output.
+                Err(e) if is_finetune => return Err(e),
+                Err(e) => log::warn!("safetensors diff failed: {e} — skipping"),
             }
         }
 
-        // Non-safetensors: match by relative path, require equal sizes.
+        // Non-safetensors: match by relative path. Same-size pairs become a
+        // byte diff; different-size or single-side files become crosshatched
+        // unmatched regions so they remain visible.
+        let orig_fill_kind = if is_finetune { DiffFill::Grey } else { DiffFill::Red };
         let orig_map: HashMap<PathBuf, PathBuf> = orig_files
             .iter()
             .filter(|p| !is_st(p))
@@ -702,13 +727,19 @@ pub async fn prepare_diff_sources(
             })
             .collect();
 
-        for rel in mod_map.keys() {
-            if !orig_map.contains_key(rel) {
-                log::warn!(
-                    "{} has no counterpart in original — skipping",
-                    modified.join(rel).display()
-                );
-            }
+        let mut mod_only_keys: Vec<&PathBuf> = mod_map.keys()
+            .filter(|k| !orig_map.contains_key(*k))
+            .collect();
+        mod_only_keys.sort();
+        if is_finetune && !mod_only_keys.is_empty() {
+            let names: Vec<String> = mod_only_keys.iter()
+                .map(|rel| modified.join(rel).display().to_string())
+                .collect();
+            anyhow::bail!(
+                "--diff --finetune: modified side has {} file(s) with no counterpart on the original/base side: {}",
+                names.len(),
+                names.join(", ")
+            );
         }
 
         let mut sorted_keys: Vec<&PathBuf> = orig_map.keys().collect();
@@ -716,21 +747,27 @@ pub async fn prepare_diff_sources(
 
         for rel in sorted_keys {
             let orig_abs = &orig_map[rel];
+            let size_o = match std::fs::metadata(orig_abs) {
+                Ok(m) => m.len(),
+                Err(e) => {
+                    log::warn!("{}: {} — skipping", orig_abs.display(), e);
+                    continue;
+                }
+            };
             match mod_map.get(rel) {
                 None => {
-                    log::warn!(
-                        "{} has no counterpart in modified — skipping",
-                        orig_abs.display()
-                    );
+                    if size_o == 0 { continue; }
+                    sources.push(Source {
+                        file_idx: sources.len(),
+                        kind: SourceKind::UnmatchedRegion { fill: orig_fill_kind },
+                        byte_size: size_o,
+                        safetensors: None,
+                        name_override: Some(format!("[only in original] {}", rel.display())),
+                        xet_terms: None,
+                    });
+                    total += size_o;
                 }
                 Some(mod_abs) => {
-                    let size_o = match std::fs::metadata(orig_abs) {
-                        Ok(m) => m.len(),
-                        Err(e) => {
-                            log::warn!("{}: {} — skipping", orig_abs.display(), e);
-                            continue;
-                        }
-                    };
                     let size_m = match std::fs::metadata(mod_abs) {
                         Ok(m) => m.len(),
                         Err(e) => {
@@ -739,12 +776,43 @@ pub async fn prepare_diff_sources(
                         }
                     };
                     if size_o != size_m {
+                        // Treat as if both sides are unmatched so neither is
+                        // hidden. In finetune mode this is also a contract
+                        // violation (the finetune side carries something the
+                        // base doesn't), so bail.
+                        if is_finetune {
+                            anyhow::bail!(
+                                "--diff --finetune: size mismatch ({} vs {} bytes) for {} — finetune \
+                                 cannot diverge structurally from base",
+                                size_o, size_m, rel.display()
+                            );
+                        }
                         log::warn!(
-                            "size mismatch ({} vs {} bytes) for {} — skipping",
-                            size_o,
-                            size_m,
-                            rel.display()
+                            "size mismatch ({} vs {} bytes) for {} — rendering each side as unmatched",
+                            size_o, size_m, rel.display()
                         );
+                        if size_o > 0 {
+                            sources.push(Source {
+                                file_idx: sources.len(),
+                                kind: SourceKind::UnmatchedRegion { fill: orig_fill_kind },
+                                byte_size: size_o,
+                                safetensors: None,
+                                name_override: Some(format!("[only in original] {}", rel.display())),
+                                xet_terms: None,
+                            });
+                            total += size_o;
+                        }
+                        if size_m > 0 {
+                            sources.push(Source {
+                                file_idx: sources.len(),
+                                kind: SourceKind::UnmatchedRegion { fill: DiffFill::Green },
+                                byte_size: size_m,
+                                safetensors: None,
+                                name_override: Some(format!("[only in modified] {}", rel.display())),
+                                xet_terms: None,
+                            });
+                            total += size_m;
+                        }
                         continue;
                     }
                     sources.push(Source {
@@ -761,6 +829,28 @@ pub async fn prepare_diff_sources(
                     total += size_o;
                 }
             }
+        }
+
+        // mod-only files (non-finetune case — finetune bailed earlier).
+        for rel in &mod_only_keys {
+            let mod_abs = &mod_map[*rel];
+            let size_m = match std::fs::metadata(mod_abs) {
+                Ok(m) => m.len(),
+                Err(e) => {
+                    log::warn!("{}: {} — skipping", mod_abs.display(), e);
+                    continue;
+                }
+            };
+            if size_m == 0 { continue; }
+            sources.push(Source {
+                file_idx: sources.len(),
+                kind: SourceKind::UnmatchedRegion { fill: DiffFill::Green },
+                byte_size: size_m,
+                safetensors: None,
+                name_override: Some(format!("[only in modified] {}", rel.display())),
+                xet_terms: None,
+            });
+            total += size_m;
         }
 
         if sources.is_empty() {
@@ -784,6 +874,8 @@ pub async fn prepare_diff_sources(
 pub async fn prepare_diff_sources_from_http(
     orig_specs: &[(String, RemoteFileSpec)],
     mod_specs: &[(String, RemoteFileSpec)],
+    is_finetune: bool,
+    metric: safetensors::DiffMetric,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     let is_st = |name: &str| name.ends_with(".safetensors");
 
@@ -795,60 +887,100 @@ pub async fn prepare_diff_sources_from_http(
 
     // Safetensors diff — fully lazy, no download.
     if !orig_st.is_empty() || !mod_st.is_empty() {
-        if orig_st.is_empty() {
-            log::warn!("original has no .safetensors files — skipping model weight diff");
-        } else if mod_st.is_empty() {
-            log::warn!("modified has no .safetensors files — skipping model weight diff");
-        } else {
-            match build_multi_safetensors_diff_sources_from_http(&orig_st, &mod_st).await {
-                Ok((mut tensor_sources, bytes)) => {
-                    let base_idx = sources.len();
-                    for s in &mut tensor_sources { s.file_idx += base_idx; }
-                    sources.extend(tensor_sources);
-                    total += bytes;
-                }
-                Err(e) => log::warn!("safetensors diff failed: {e} — skipping"),
+        match build_multi_safetensors_diff_sources_from_http(&orig_st, &mod_st, is_finetune, metric).await {
+            Ok((mut tensor_sources, bytes)) => {
+                let base_idx = sources.len();
+                for s in &mut tensor_sources { s.file_idx += base_idx; }
+                sources.extend(tensor_sources);
+                total += bytes;
             }
+            Err(e) if is_finetune => return Err(e),
+            Err(e) => log::warn!("safetensors diff failed: {e} — skipping"),
         }
     }
 
-    // Non-safetensors files: match by filename, download if small.
+    // Non-safetensors files: match by filename. Same-size pairs become a byte
+    // diff (downloaded if small); different-size or single-side files become
+    // crosshatched unmatched regions so they remain visible. Large files are
+    // sized but rendered as the orig-fill kind (we can't byte-diff something
+    // we won't download).
     const MAX_EAGER_SIZE: u64 = 16 * 1024 * 1024;
+    let orig_fill_kind = if is_finetune { DiffFill::Grey } else { DiffFill::Red };
     let orig_non: HashMap<&str, &RemoteFileSpec> =
         orig_specs.iter().filter(|(n, _)| !is_st(n)).map(|(n, s)| (n.as_str(), s)).collect();
     let mod_non: HashMap<&str, &RemoteFileSpec> =
         mod_specs.iter().filter(|(n, _)| !is_st(n)).map(|(n, s)| (n.as_str(), s)).collect();
 
-    for (fname, _) in &mod_non {
-        if !orig_non.contains_key(fname) {
-            log::warn!("{fname} only in modified — skipping");
-        }
+    let mut mod_only_files: Vec<&str> = mod_non.keys().copied()
+        .filter(|k| !orig_non.contains_key(k))
+        .collect();
+    mod_only_files.sort();
+    if is_finetune && !mod_only_files.is_empty() {
+        anyhow::bail!(
+            "--diff --finetune: modified side has {} file(s) with no counterpart on the original/base side: {}",
+            mod_only_files.len(),
+            mod_only_files.join(", ")
+        );
     }
 
     let mut sorted: Vec<&str> = orig_non.keys().copied().collect();
     sorted.sort();
 
-    // Build the (orig_spec, mod_spec, fname) jobs we'll actually download. The
-    // filter step is sync so it's cheap to do up-front; the download step is
-    // then parallelized via buffer_unordered.
+    // First pass (sync): partition into byte-diff jobs vs unmatched-region
+    // sources. Diff jobs are downloaded in parallel afterwards.
     let mut diff_jobs: Vec<(String, RemoteFileSpec, RemoteFileSpec)> = Vec::new();
+    let mut unmatched_orig: Vec<(String, u64, DiffFill)> = Vec::new();
+    let mut unmatched_mod: Vec<(String, u64, DiffFill)> = Vec::new();
     for fname in sorted {
         let orig_spec = &orig_non[fname];
         let mod_spec = match mod_non.get(fname) {
             Some(s) => s,
-            None => { log::warn!("{fname} only in original — skipping"); continue; }
+            None => {
+                if orig_spec.size > 0 {
+                    unmatched_orig.push((fname.to_string(), orig_spec.size, orig_fill_kind));
+                }
+                continue;
+            }
         };
         if orig_spec.size != mod_spec.size {
-            log::warn!("size mismatch for {fname} ({} vs {} bytes) — skipping",
-                orig_spec.size, mod_spec.size);
+            if is_finetune {
+                anyhow::bail!(
+                    "--diff --finetune: size mismatch for {fname} ({} vs {} bytes) — finetune \
+                     cannot diverge structurally from base",
+                    orig_spec.size, mod_spec.size
+                );
+            }
+            log::warn!(
+                "size mismatch for {fname} ({} vs {} bytes) — rendering each side as unmatched",
+                orig_spec.size, mod_spec.size
+            );
+            if orig_spec.size > 0 {
+                unmatched_orig.push((fname.to_string(), orig_spec.size, orig_fill_kind));
+            }
+            if mod_spec.size > 0 {
+                unmatched_mod.push((fname.to_string(), mod_spec.size, DiffFill::Green));
+            }
             continue;
         }
         if orig_spec.size > MAX_EAGER_SIZE {
-            log::warn!("{fname} exceeds {} MB — skipping non-safetensors large file",
-                MAX_EAGER_SIZE / 1024 / 1024);
+            // Too large to byte-diff lazily; show the orig footprint as an
+            // unmatched-region marker so the canvas still reflects the file's
+            // existence. (Could be promoted to a tile-streamed lazy diff
+            // later, but for now we just preserve visibility.)
+            log::warn!(
+                "{fname} exceeds {} MB — rendering as crosshatched region instead of byte diff",
+                MAX_EAGER_SIZE / 1024 / 1024
+            );
+            unmatched_orig.push((fname.to_string(), orig_spec.size, orig_fill_kind));
             continue;
         }
         diff_jobs.push((fname.to_string(), (*orig_spec).clone(), (*mod_spec).clone()));
+    }
+    for fname in &mod_only_files {
+        let spec = &mod_non[fname];
+        if spec.size > 0 {
+            unmatched_mod.push((fname.to_string(), spec.size, DiffFill::Green));
+        }
     }
 
     let pb = setup_progress("file pairs (non-safetensors diff downloads)", diff_jobs.len() as u64);
@@ -897,6 +1029,34 @@ pub async fn prepare_diff_sources_from_http(
             byte_size: size,
             safetensors: None,
             name_override: Some(fname),
+            xet_terms: None,
+        });
+        total += size;
+    }
+
+    // Unmatched / oversize / size-mismatch files surface as crosshatched
+    // regions so the user sees they exist even though no byte diff was
+    // computed.
+    unmatched_orig.sort();
+    for (fname, size, fill) in unmatched_orig {
+        sources.push(Source {
+            file_idx: sources.len(),
+            kind: SourceKind::UnmatchedRegion { fill },
+            byte_size: size,
+            safetensors: None,
+            name_override: Some(format!("[only in original] {fname}")),
+            xet_terms: None,
+        });
+        total += size;
+    }
+    unmatched_mod.sort();
+    for (fname, size, fill) in unmatched_mod {
+        sources.push(Source {
+            file_idx: sources.len(),
+            kind: SourceKind::UnmatchedRegion { fill },
+            byte_size: size,
+            safetensors: None,
+            name_override: Some(format!("[only in modified] {fname}")),
             xet_terms: None,
         });
         total += size;
@@ -954,11 +1114,23 @@ fn find_strip_depths(
     (best.0, best.1)
 }
 
-/// Find 1-to-1 matched tensor name pairs between two name sets.
-/// Applies the prefix-strip heuristic when no exact name overlap exists.
-/// Emits warnings for unmatched tensors when strip depths are both zero.
-/// Returns (orig_full_name, mod_full_name) pairs sorted by orig name.
-fn find_matched_tensor_pairs(orig_names: &[String], mod_names: &[String]) -> Vec<(String, String)> {
+/// Result of tensor-name matching across the two sides of a diff.
+pub struct TensorMatch {
+    /// 1-to-1 matched pairs `(orig_full, mod_full)`, sorted by `orig_full`.
+    pub pairs: Vec<(String, String)>,
+    /// Tensor full names present only on the original side, sorted.
+    pub orig_only: Vec<String>,
+    /// Tensor full names present only on the modified side, sorted.
+    pub mod_only: Vec<String>,
+}
+
+/// Find matched + unmatched tensor name groupings between two name sets.
+///
+/// Applies the prefix-strip heuristic when no exact name overlap exists so
+/// e.g. wrapper-induced prefix nesting (`model.lm.lm.lm.X` vs `model.lm.X`)
+/// still pairs up. Unmatched tensors are returned so callers can surface them
+/// (now: render as crosshatch fill) rather than silently dropping them.
+fn find_matched_tensor_pairs(orig_names: &[String], mod_names: &[String]) -> TensorMatch {
     let mod_set: std::collections::HashSet<&str> = mod_names.iter().map(|s| s.as_str()).collect();
     let exact_overlap = orig_names.iter().any(|n| mod_set.contains(n.as_str()));
     let (strip_o, strip_m) = if exact_overlap {
@@ -997,35 +1169,84 @@ fn find_matched_tensor_pairs(orig_names: &[String], mod_names: &[String]) -> Vec
             acc
         });
 
-    if strip_o == 0 && strip_m == 0 {
-        for (stripped, &full) in &mod_by_stripped {
-            if !orig_by_stripped.contains_key(stripped) && !full.is_empty() {
-                log::warn!("safetensors diff: tensor '{full}' only in modified — skipping");
-            }
-        }
-    }
+    let mut only_in_mod: Vec<String> = mod_by_stripped.iter()
+        .filter(|(stripped, &full)| !full.is_empty() && !orig_by_stripped.contains_key(stripped.as_str()))
+        .map(|(_, &full)| full.to_owned())
+        .collect();
+    only_in_mod.sort();
 
     let mut sorted_orig: Vec<&str> = orig_by_stripped.values().copied().filter(|s| !s.is_empty()).collect();
     sorted_orig.sort();
 
     let mut pairs = Vec::new();
+    let mut only_in_orig: Vec<String> = Vec::new();
     for orig_full in sorted_orig {
         let stripped = match strip_prefix_components(orig_full, strip_o) {
             Some(s) if !s.is_empty() => s,
-            _ => continue,
+            _ => {
+                only_in_orig.push(orig_full.to_owned());
+                continue;
+            }
         };
         match mod_by_stripped.get(stripped) {
             Some(s) if !s.is_empty() => {
                 pairs.push((orig_full.to_owned(), (*s).to_owned()));
             }
-            _ => {
-                if strip_o == 0 && strip_m == 0 {
-                    log::warn!("safetensors diff: tensor '{orig_full}' only in original — skipping");
-                }
-            }
+            _ => only_in_orig.push(orig_full.to_owned()),
         }
     }
-    pairs
+
+    TensorMatch { pairs, orig_only: only_in_orig, mod_only: only_in_mod }
+}
+
+/// Sample each matched orig tensor's bytes and compute its RMS, used as the
+/// per-tensor scale for `DiffMetric::Rms`. A 64 KB contiguous prefix is more
+/// than enough for a stable estimate; for HTTP/Xet sources this is one extra
+/// range fetch per matched tensor at setup, parallelised over the throttle.
+async fn fetch_rms_estimates(
+    paired_ok: &[(String, String)],
+    orig_map: &HashMap<String, (usize, safetensors::TensorMeta)>,
+    orig_data: &[Arc<Data>],
+) -> anyhow::Result<Vec<f32>> {
+    const SCALE_SAMPLE_BYTES: u64 = 64 * 1024;
+    let pb = setup_progress("orig tensor RMS samples", paired_ok.len() as u64);
+    let inputs: Vec<(usize, usize, u64, u64, safetensors::Dtype)> = paired_ok.iter()
+        .enumerate()
+        .map(|(idx, (orig_full, _))| {
+            let (oi, orig_t) = &orig_map[orig_full];
+            let elem = orig_t.dtype.element_size() as u64;
+            let tensor_bytes = orig_t.file_end.saturating_sub(orig_t.file_start);
+            let want = SCALE_SAMPLE_BYTES.min(tensor_bytes);
+            // Align sample length down to a whole element so rms_from_buf
+            // only sees complete values.
+            let len = if elem > 0 { (want / elem) * elem } else { 0 };
+            (idx, *oi, orig_t.file_start, len, orig_t.dtype)
+        })
+        .collect();
+    let mut out: Vec<(usize, f32)> = stream::iter(inputs)
+        .map(|(idx, oi, start, len, dtype)| {
+            let d = Arc::clone(&orig_data[oi]);
+            let pb = pb.clone();
+            async move {
+                let scale = if len == 0 { 0.0 } else {
+                    match d.fetch_range(start, len as usize).await {
+                        Ok(bytes) => safetensors::rms_from_buf(dtype, &bytes),
+                        Err(e) => {
+                            log::warn!("safetensors diff: orig RMS sample failed ({e}); using 0.0");
+                            0.0
+                        }
+                    }
+                };
+                if let Some(pb) = pb.as_ref() { pb.inc(1); }
+                (idx, scale)
+            }
+        })
+        .buffer_unordered(SETUP_FETCH_CONCURRENCY)
+        .collect()
+        .await;
+    if let Some(pb) = pb.as_ref() { pb.finish_and_clear(); }
+    out.sort_by_key(|(i, _)| *i);
+    Ok(out.into_iter().map(|(_, s)| s).collect())
 }
 
 /// Core tensor diff builder: given two parallel lists of whole-file Data sources,
@@ -1033,6 +1254,8 @@ fn find_matched_tensor_pairs(orig_names: &[String], mod_names: &[String]) -> Vec
 async fn build_multi_safetensors_diff_sources_inner(
     orig_data: &[Arc<Data>],
     mod_data:  &[Arc<Data>],
+    is_finetune: bool,
+    metric: safetensors::DiffMetric,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     // Two HTTP range requests per file (8-byte preamble + variable header).
     // For sharded models this is dozens of files per side; serializing them
@@ -1091,22 +1314,60 @@ async fn build_multi_safetensors_diff_sources_inner(
 
     let orig_names: Vec<String> = orig_map.keys().cloned().collect();
     let mod_names:  Vec<String> = mod_map.keys().cloned().collect();
-    let pairs = find_matched_tensor_pairs(&orig_names, &mod_names);
+    let TensorMatch { pairs, orig_only, mod_only } =
+        find_matched_tensor_pairs(&orig_names, &mod_names);
+
+    // Tensors present in both, but with incompatible shapes, can't be diffed
+    // element-wise. Treat each side independently: in non-finetune mode both
+    // sides surface as unmatched (red on orig, green on mod). In finetune
+    // mode the modified side is an error (see below), so we fail fast.
+    let mut shape_mismatch: Vec<(String, String)> = Vec::new();
+    let mut paired_ok: Vec<(String, String)> = Vec::with_capacity(pairs.len());
+    for (orig_full, mod_full) in pairs {
+        let orig_t = &orig_map[&orig_full].1;
+        let mod_t = &mod_map[&mod_full].1;
+        if orig_t.shape != mod_t.shape {
+            shape_mismatch.push((orig_full, mod_full));
+        } else {
+            paired_ok.push((orig_full, mod_full));
+        }
+    }
+
+    // Finetune contract: every tensor the finetune ships must exist (with the
+    // same shape) on the base side. Anything else is structural divergence
+    // and the user explicitly asked for a hard error so they notice.
+    if is_finetune {
+        let mut mod_extras: Vec<String> = mod_only.clone();
+        for (_, mod_full) in &shape_mismatch {
+            mod_extras.push(mod_full.clone());
+        }
+        if !mod_extras.is_empty() {
+            mod_extras.sort();
+            anyhow::bail!(
+                "safetensors diff --finetune: modified side has {} tensor(s) not present \
+                 (or with mismatched shape) on the original/base side: {}",
+                mod_extras.len(),
+                mod_extras.join(", ")
+            );
+        }
+    }
+
+    // For DiffMetric::Rms we need a per-tensor scale (RMS of orig). Sample
+    // up to RMS_SAMPLE_ELEMS elements per tensor via a single range fetch;
+    // for HTTP sources this is one extra request per tensor at setup time,
+    // for local mmap it's free. AbsLog and Exact don't need a scale.
+    let scales: Vec<f32> = if matches!(metric, safetensors::DiffMetric::Rms) {
+        fetch_rms_estimates(&paired_ok, &orig_map, orig_data).await?
+    } else {
+        vec![0.0; paired_ok.len()]
+    };
 
     let mut sources: Vec<Source> = Vec::new();
     let mut total = 0u64;
 
-    for (orig_full, mod_full) in pairs {
-        let (oi, orig_t) = &orig_map[&orig_full];
-        let (mi, mod_t)  = &mod_map[&mod_full];
-
-        if orig_t.shape != mod_t.shape {
-            log::warn!(
-                "safetensors diff: tensor '{}' shape mismatch {:?} vs {:?} — skipping",
-                orig_full, orig_t.shape, mod_t.shape
-            );
-            continue;
-        }
+    for ((orig_full, mod_full), scale_orig) in paired_ok.iter().zip(scales.iter()) {
+        let (oi, orig_t) = &orig_map[orig_full];
+        let (mi, mod_t)  = &mod_map[mod_full];
 
         let nelem: u64 = orig_t.shape.iter().product();
         sources.push(Source {
@@ -1118,6 +1379,8 @@ async fn build_multi_safetensors_diff_sources_inner(
                 mod_start:  mod_t.file_start,
                 orig_dtype: orig_t.dtype,
                 mod_dtype:  mod_t.dtype,
+                metric,
+                scale_orig: *scale_orig,
             },
             byte_size: nelem,
             safetensors: None,
@@ -1127,6 +1390,62 @@ async fn build_multi_safetensors_diff_sources_inner(
         total += nelem;
     }
 
+    // Unmatched / shape-mismatched tensors become crosshatched canvas regions.
+    // In finetune mode only orig-only entries can survive (mod-side errors
+    // were already raised above), and they render as informational grey.
+    let orig_fill = if is_finetune { DiffFill::Grey } else { DiffFill::Red };
+
+    let mut orig_unmatched: Vec<&safetensors::TensorMeta> = Vec::new();
+    for name in &orig_only {
+        orig_unmatched.push(&orig_map[name].1);
+    }
+    for (orig_full, _) in &shape_mismatch {
+        orig_unmatched.push(&orig_map[orig_full].1);
+    }
+    for t in orig_unmatched {
+        let nelem: u64 = t.shape.iter().product();
+        if nelem == 0 { continue; }
+        sources.push(Source {
+            file_idx: sources.len(),
+            kind: SourceKind::UnmatchedRegion { fill: orig_fill },
+            byte_size: nelem,
+            safetensors: None,
+            name_override: Some(format!("[only in original] {}", t.label())),
+            xet_terms: None,
+        });
+        total += nelem;
+    }
+
+    // mod-only tensors only render in non-finetune mode (finetune mode bailed
+    // earlier). They use modified-side metadata so the label and footprint
+    // reflect what the finetune actually ships.
+    if !is_finetune {
+        for name in &mod_only {
+            let t = &mod_map[name].1;
+            let nelem: u64 = t.shape.iter().product();
+            if nelem == 0 { continue; }
+            sources.push(Source {
+                file_idx: sources.len(),
+                kind: SourceKind::UnmatchedRegion { fill: DiffFill::Green },
+                byte_size: nelem,
+                safetensors: None,
+                name_override: Some(format!("[only in modified] {}", t.label())),
+                xet_terms: None,
+            });
+            total += nelem;
+        }
+    }
+
+    if !orig_only.is_empty() || !mod_only.is_empty() || !shape_mismatch.is_empty() {
+        log::info!(
+            "safetensors diff: {} matched, {} only in original, {} only in modified, {} shape-mismatch",
+            sources.iter().filter(|s| matches!(s.kind, SourceKind::TensorDiff { .. })).count(),
+            orig_only.len(),
+            mod_only.len(),
+            shape_mismatch.len()
+        );
+    }
+
     Ok((sources, total))
 }
 
@@ -1134,6 +1453,8 @@ async fn build_multi_safetensors_diff_sources_inner(
 async fn build_multi_safetensors_diff_sources(
     orig_files: &[PathBuf],
     mod_files: &[PathBuf],
+    is_finetune: bool,
+    metric: safetensors::DiffMetric,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     let open_arcs = |files: &[PathBuf]| -> anyhow::Result<Vec<Arc<Data>>> {
         files.iter().map(|p| {
@@ -1143,7 +1464,7 @@ async fn build_multi_safetensors_diff_sources(
     };
     let orig_data = open_arcs(orig_files)?;
     let mod_data  = open_arcs(mod_files)?;
-    build_multi_safetensors_diff_sources_inner(&orig_data, &mod_data).await
+    build_multi_safetensors_diff_sources_inner(&orig_data, &mod_data, is_finetune, metric).await
 }
 
 /// Build per-tensor diff Sources from multiple remote .safetensors files on each side.
@@ -1155,6 +1476,8 @@ async fn build_multi_safetensors_diff_sources(
 async fn build_multi_safetensors_diff_sources_from_http(
     orig_specs: &[&(String, RemoteFileSpec)],
     mod_specs:  &[&(String, RemoteFileSpec)],
+    is_finetune: bool,
+    metric: safetensors::DiffMetric,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     async fn make_arcs(specs: Vec<RemoteFileSpec>) -> anyhow::Result<Vec<Arc<Data>>> {
         let total = specs.len() as u64;
@@ -1203,16 +1526,20 @@ async fn build_multi_safetensors_diff_sources_from_http(
     }
     let orig_data = make_arcs(orig_specs.iter().map(|(_, s)| s.clone()).collect()).await?;
     let mod_data  = make_arcs(mod_specs.iter().map(|(_, s)| s.clone()).collect()).await?;
-    build_multi_safetensors_diff_sources_inner(&orig_data, &mod_data).await
+    build_multi_safetensors_diff_sources_inner(&orig_data, &mod_data, is_finetune, metric).await
 }
 
 /// Build per-tensor diff Sources from two single .safetensors files.
 async fn build_safetensors_diff_sources(
     original: &Path,
     modified: &Path,
+    is_finetune: bool,
+    metric: safetensors::DiffMetric,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     build_multi_safetensors_diff_sources(
         &[original.to_path_buf()],
         &[modified.to_path_buf()],
+        is_finetune,
+        metric,
     ).await
 }

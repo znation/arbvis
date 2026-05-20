@@ -13,7 +13,8 @@ use async_channel::{bounded, Receiver, Sender};
 use indicatif::ProgressBar;
 
 use crate::color::{build_diff_signed_lut, build_pixel_lut};
-use crate::data::{load_source_data, Data, Source};
+use crate::data::{load_source_data, Data, Source, SourceKind};
+use crate::safetensors::DiffFill;
 use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, rects_centroid};
 use crate::hf_upload::HfTileSink;
 use crate::hf_url::HfOutputSpec;
@@ -21,7 +22,7 @@ use crate::progress::{counter_style, multi, queue_style, status_style};
 use crate::throttle::{Throttle, MAX_FETCH_WORKERS};
 use crate::tiled::html::{FileEntity, generate_leaflet_content};
 use crate::tiled::leaf::{
-    load_tile_bytes, render_leaf_tile_dtype, render_leaf_tile_from_buf,
+    load_tile_bytes, render_leaf_tile_diff, render_leaf_tile_dtype, render_leaf_tile_from_buf,
     render_leaf_tile_xet_from_buf, TileFormat, TILE, TILE_LOG2, TILE_PIXELS,
 };
 use crate::tiled::pyramid_accum::{LocalFileSink, PyramidAccumulator, TileSink};
@@ -158,12 +159,20 @@ enum LeafMode {
     Dtype {
         ranges: Arc<Vec<(u64, u64, image::Rgb<u8>)>>,
     },
+    /// Diff mode: byte → color via the signed-diff LUT, *plus* a crosshatch
+    /// overlay for byte ranges that map to `UnmatchedRegion` sources (tensors
+    /// or files that exist on only one side). `fills` is sorted by start
+    /// offset, non-overlapping.
+    Diff {
+        pixel_lut: Arc<[image::Rgb<u8>; 256]>,
+        fills: Arc<Vec<(u64, u64, DiffFill)>>,
+    },
 }
 
 impl LeafMode {
     /// Whether the fetch stage needs to read bytes for this mode.
     fn needs_bytes(&self) -> bool {
-        matches!(self, LeafMode::Plain { .. } | LeafMode::Xet { .. })
+        matches!(self, LeafMode::Plain { .. } | LeafMode::Xet { .. } | LeafMode::Diff { .. })
     }
 
     /// Whether this mode produces leaves with ≤256 distinct colors, making
@@ -173,8 +182,15 @@ impl LeafMode {
     /// can exceed 256 distinct colors in a single tile — indexed-PNG would
     /// fall back to truecolor in that case, so we route Xet through AVIF
     /// instead where the encoder can win on the high-color content.
+    /// Diff mode adds at most 6 crosshatch colors (3 fills × 2 shades) on top
+    /// of the 256-entry diff LUT — usually still ≤256 distinct colors per
+    /// tile in practice, and the encoder falls back to truecolor when it
+    /// isn't.
     fn is_palette_safe(&self) -> bool {
-        matches!(self, LeafMode::Plain { .. } | LeafMode::Dtype { .. })
+        matches!(
+            self,
+            LeafMode::Plain { .. } | LeafMode::Dtype { .. } | LeafMode::Diff { .. }
+        )
     }
 }
 
@@ -438,6 +454,27 @@ async fn build_tile_plan(
         }
     }
 
+    // For diff mode: collect crosshatch fills from any UnmatchedRegion
+    // sources. Their byte_size already accounts for their canvas footprint;
+    // we just translate each source's cumulative offset + size into a fill
+    // range. Sources are listed in canvas order, so the resulting list is
+    // already sorted by start.
+    let diff_fills: Vec<(u64, u64, DiffFill)> = if diff_mode {
+        let mut fills = Vec::new();
+        let mut cumulative = 0u64;
+        for source in &sources {
+            if let SourceKind::UnmatchedRegion { fill } = &source.kind {
+                if source.byte_size > 0 {
+                    fills.push((cumulative, cumulative + source.byte_size, *fill));
+                }
+            }
+            cumulative += source.byte_size;
+        }
+        fills
+    } else {
+        Vec::new()
+    };
+
     let mode = if xet_mode {
         LeafMode::Xet {
             pixel_lut: pixel_lut.clone(),
@@ -446,6 +483,11 @@ async fn build_tile_plan(
         }
     } else if dtype_mode {
         LeafMode::Dtype { ranges: Arc::new(combined_dtype_ranges) }
+    } else if diff_mode {
+        LeafMode::Diff {
+            pixel_lut: pixel_lut.clone(),
+            fills: Arc::new(diff_fills),
+        }
     } else {
         LeafMode::Plain { pixel_lut: pixel_lut.clone() }
     };
@@ -734,6 +776,13 @@ fn render_one(
         }
         LeafMode::Dtype { ranges } => {
             render_leaf_tile_dtype(tx, ty, kh, height_tiles, square_pixels, total, ranges, fmt)?
+        }
+        LeafMode::Diff { pixel_lut, fills } => {
+            let buf = tile_buf.as_deref().expect("diff mode needs tile_buf");
+            render_leaf_tile_diff(
+                tx, ty, kh, height_tiles, square_pixels, total,
+                buf, pixel_lut, fills, fmt,
+            )?
         }
     };
     Ok(EncodedTile { tx, ty, image, bytes })

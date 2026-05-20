@@ -28,11 +28,20 @@ def labels():
     return Response(content=data, media_type="application/json")
 
 
-@app.get("/tiles/{z}/{x}/{y_png}")
-def tile(z: int, x: int, y_png: str):
-    path = f"hf://buckets/{BUCKET_ID}/tiles/{z}/{x}/{y_png}"
+_TILE_MEDIA_TYPES = {
+    "avif": "image/avif",
+    "png": "image/png",
+    "webp": "image/webp",
+}
+
+
+@app.get("/tiles/{z}/{x}/{y_ext}")
+def tile(z: int, x: int, y_ext: str):
+    path = f"hf://buckets/{BUCKET_ID}/tiles/{z}/{x}/{y_ext}"
     try:
         data = fs().read_bytes(path)
     except (FileNotFoundError, EntryNotFoundError):
         return Response(status_code=404)
-    return Response(content=data, media_type="image/png")
+    ext = y_ext.rsplit(".", 1)[-1].lower() if "." in y_ext else ""
+    media_type = _TILE_MEDIA_TYPES.get(ext, "application/octet-stream")
+    return Response(content=data, media_type=media_type)

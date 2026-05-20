@@ -10,6 +10,11 @@ clap = { version = "4", features = ["derive"] }
 fast_hilbert = "2.0"
 image = "0.25"
 imageproc = "0.25"
+# Used directly for indexed-color PNG output of Plain/Dtype leaf tiles, which
+# the `image` crate's PNG encoder doesn't support (it only emits truecolor).
+# Indexed PNG cuts leaf tile size 2-4× vs truecolor PNG for the ≤256-color
+# palette content arbvis produces.
+png = "0.18"
 indicatif = "0.17"
 # Routes log::* output through indicatif's MultiProgress so log lines and
 # progress bars never overwrite each other.

@@ -1,6 +1,5 @@
 pub mod html;
 pub mod leaf;
-pub mod pyramid;
 pub mod pyramid_accum;
 
 use std::path::PathBuf;
@@ -23,10 +22,9 @@ use crate::throttle::{Throttle, MAX_FETCH_WORKERS};
 use crate::tiled::html::{FileEntity, generate_leaflet_content};
 use crate::tiled::leaf::{
     load_tile_bytes, render_leaf_tile_dtype, render_leaf_tile_from_buf,
-    render_leaf_tile_xet_from_buf, TILE, TILE_LOG2, TILE_PIXELS,
+    render_leaf_tile_xet_from_buf, TileFormat, TILE, TILE_LOG2, TILE_PIXELS,
 };
-use crate::tiled::pyramid::build_pyramid;
-use crate::tiled::pyramid_accum::{PyramidAccumulator, TileSink};
+use crate::tiled::pyramid_accum::{LocalFileSink, PyramidAccumulator, TileSink};
 use crate::xet::{TABLEAU_20, XorbMap};
 
 /// Channel capacity for the fetch→process queue, per CPU core. Keeps memory
@@ -143,7 +141,7 @@ struct EncodedTile {
     tx: u32,
     ty: u32,
     image: image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
-    png_bytes: Vec<u8>,
+    bytes: Vec<u8>,
 }
 
 /// Which leaf render to run.
@@ -167,6 +165,40 @@ impl LeafMode {
     fn needs_bytes(&self) -> bool {
         matches!(self, LeafMode::Plain { .. } | LeafMode::Xet { .. })
     }
+
+    /// Whether this mode produces leaves with ≤256 distinct colors, making
+    /// indexed-PNG the smallest lossless option. Plain mode draws from a
+    /// fixed 256-entry LUT; Dtype mode uses a short list of dtype colors.
+    /// Xet mode multiplies the byte LUT by 20 Tableau colors per xorb, which
+    /// can exceed 256 distinct colors in a single tile — indexed-PNG would
+    /// fall back to truecolor in that case, so we route Xet through AVIF
+    /// instead where the encoder can win on the high-color content.
+    fn is_palette_safe(&self) -> bool {
+        matches!(self, LeafMode::Plain { .. } | LeafMode::Dtype { .. })
+    }
+}
+
+/// Return the extension of the first regular file found in `dir`.
+fn sniff_ext_in(dir: &std::path::Path) -> Option<String> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .find_map(|e| {
+            e.path()
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        })
+}
+
+/// Return the extension of any tile under `tiles/{zoom}/<x>/<y>.<ext>`.
+fn sniff_ext_for_zoom(tiles_dir: &std::path::Path, zoom: u32) -> Option<String> {
+    let zoom_dir = tiles_dir.join(format!("{zoom}"));
+    let x_dir = std::fs::read_dir(&zoom_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().is_dir())?;
+    sniff_ext_in(&x_dir.path())
 }
 
 /// Regenerate `index.html` for an existing tiles directory without re-rendering tiles.
@@ -185,12 +217,20 @@ pub fn regen_html(tile_dir: &PathBuf) -> anyhow::Result<()> {
         .with_context(|| format!("cannot read {}", zoom_dir.display()))?
         .filter(|e| e.as_ref().map(|e| e.path().is_dir()).unwrap_or(false))
         .count() as u32;
-    let height_tiles = {
-        let first_x = std::fs::read_dir(&zoom_dir)?
-            .filter_map(|e| e.ok())
-            .find(|e| e.path().is_dir())
-            .ok_or_else(|| anyhow::anyhow!("no x-dirs found at zoom {max_zoom}"))?;
-        std::fs::read_dir(first_x.path())?.count() as u32
+    let first_x = std::fs::read_dir(&zoom_dir)?
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().is_dir())
+        .ok_or_else(|| anyhow::anyhow!("no x-dirs found at zoom {max_zoom}"))?;
+    let first_x_path = first_x.path();
+    let height_tiles = std::fs::read_dir(&first_x_path)?.count() as u32;
+    // Sniff the tile extensions from existing files. Leaf zoom (max_zoom) and
+    // the pyramid levels can use different formats — e.g. indexed-PNG leaves
+    // with lossy-AVIF pyramid — so we sniff each one independently.
+    let leaf_ext = sniff_ext_in(&first_x_path).unwrap_or_else(|| "png".to_string());
+    let pyramid_ext = if max_zoom > 0 {
+        sniff_ext_for_zoom(&tiles_dir, max_zoom - 1).unwrap_or_else(|| leaf_ext.clone())
+    } else {
+        leaf_ext.clone()
     };
     let height = height_tiles * TILE;
     let world_w = (width_tiles / height_tiles.max(1)) * TILE;
@@ -240,7 +280,7 @@ pub fn regen_html(tile_dir: &PathBuf) -> anyhow::Result<()> {
         })
         .collect();
 
-    html::write_leaflet_html(tile_dir, world_w, max_zoom, height, TILE, &entities, "arbvis", &[])?;
+    html::write_leaflet_html(tile_dir, world_w, max_zoom, height, TILE, &entities, "arbvis", &[], &leaf_ext, &pyramid_ext)?;
     log::info!(
         "Regenerated index.html in {} (zoom 0–{max_zoom}, {width_tiles}×{height_tiles} tiles, height={height})",
         tile_dir.display()
@@ -434,7 +474,7 @@ async fn build_tile_plan(
 /// The caller's `on_tile` closure is invoked sequentially (the pipeline keeps
 /// a single write task draining the encoded-tile channel) so it can mutate
 /// shared state freely.
-async fn drive_pipeline<W>(plan: &TilePlan, mut on_tile: W) -> anyhow::Result<()>
+async fn drive_pipeline<W>(plan: &TilePlan, leaf_format: TileFormat, mut on_tile: W) -> anyhow::Result<()>
 where
     W: FnMut(EncodedTile) -> anyhow::Result<()> + Send,
 {
@@ -592,7 +632,7 @@ where
             while let Ok(tile) = loaded_rx.recv().await {
                 let mode = mode.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    render_one(tile, &mode, kh, height_tiles, square_pixels, total)
+                    render_one(tile, &mode, kh, height_tiles, square_pixels, total, leaf_format)
                 })
                 .await;
                 let encoded = match result {
@@ -677,28 +717,51 @@ fn render_one(
     height_tiles: u32,
     square_pixels: u64,
     total: u64,
+    fmt: TileFormat,
 ) -> Result<EncodedTile, String> {
     let LoadedTile { tx, ty, tile_buf } = tile;
-    let (image, png_bytes) = match mode {
+    let (image, bytes) = match mode {
         LeafMode::Plain { pixel_lut } => {
             let buf = tile_buf.as_deref().expect("plain mode needs tile_buf");
-            render_leaf_tile_from_buf(tx, ty, kh, height_tiles, square_pixels, total, buf, pixel_lut)?
+            render_leaf_tile_from_buf(tx, ty, kh, height_tiles, square_pixels, total, buf, pixel_lut, fmt)?
         }
         LeafMode::Xet { pixel_lut, xorb_ranges, tableau } => {
             let buf = tile_buf.as_deref().expect("xet mode needs tile_buf");
             render_leaf_tile_xet_from_buf(
                 tx, ty, kh, height_tiles, square_pixels, total,
-                buf, pixel_lut, xorb_ranges, tableau,
+                buf, pixel_lut, xorb_ranges, tableau, fmt,
             )?
         }
         LeafMode::Dtype { ranges } => {
-            render_leaf_tile_dtype(tx, ty, kh, height_tiles, square_pixels, total, ranges)?
+            render_leaf_tile_dtype(tx, ty, kh, height_tiles, square_pixels, total, ranges, fmt)?
         }
     };
-    Ok(EncodedTile { tx, ty, image, png_bytes })
+    Ok(EncodedTile { tx, ty, image, bytes })
+}
+
+/// Pick the actual leaf tile format given the user's request and the render
+/// mode. When the user asked for AVIF and the mode produces ≤256 distinct
+/// colors per tile (Plain / Dtype), indexed-PNG beats lossless AVIF
+/// substantially (AV1 isn't tuned for palette content). Xet-mode tiles can
+/// exceed 256 colors so they stay on AVIF; truecolor PNG passes through
+/// unchanged.
+fn derive_leaf_format(user_choice: TileFormat, mode: &LeafMode) -> TileFormat {
+    match (user_choice, mode.is_palette_safe()) {
+        (TileFormat::Avif { .. }, true) => TileFormat::IndexedPng,
+        (fmt, _) => fmt,
+    }
 }
 
 /// Run the tiled/pyramidal output pipeline to a local directory.
+///
+/// `leaf_format` controls how each leaf tile is encoded; the actual format
+/// may be upgraded to `IndexedPng` when the render mode produces ≤256-color
+/// tiles (see [`derive_leaf_format`]). `pyramid_format` controls the
+/// downsampled levels (default AVIF q≈85, since averaged pixels already
+/// smudge the palette). The pyramid is built in memory by the streaming
+/// accumulator as leaves complete, so we never re-decode tiles back from
+/// disk — which is also why this code path doesn't need a decoder for AVIF
+/// tiles.
 pub async fn run_tiles(
     sources: Vec<Source>,
     total: u64,
@@ -707,44 +770,57 @@ pub async fn run_tiles(
     title: &str,
     inputs: &[String],
     show_xet_xorbs: bool,
+    leaf_format: TileFormat,
+    pyramid_format: TileFormat,
 ) -> anyhow::Result<()> {
     let plan = build_tile_plan(sources, total, diff_mode, show_xet_xorbs).await?;
 
+    let leaf_format = derive_leaf_format(leaf_format, &plan.mode);
     let max_zoom = plan.max_zoom;
-    let tile_size = TILE;
-    let width_tiles = plan.width_tiles;
-    let height_tiles = plan.height_tiles;
     let world_w = plan.world_w;
     let height = plan.height;
     let total_tiles = plan.total_tiles;
+    let leaf_ext = leaf_format.extension();
+    let pyramid_ext = pyramid_format.extension();
 
     std::fs::create_dir_all(tile_dir.join(format!("tiles/{max_zoom}")))?;
 
-    log::info!("Rendering {} leaf tiles...", total_tiles);
+    log::info!("Rendering {} leaf tiles ({} leaf / {} pyramid)...", total_tiles, leaf_ext, pyramid_ext);
+
+    let sink = Arc::new(LocalFileSink { root: tile_dir.clone() });
+    let pyramid_path_fn: Arc<dyn Fn(u32, u32, u32) -> String + Send + Sync> = {
+        let ext = pyramid_ext.to_string();
+        Arc::new(move |z, x, y| format!("tiles/{z}/{x}/{y}.{ext}"))
+    };
+    let pyramid = Arc::new(PyramidAccumulator::new(
+        TILE,
+        max_zoom,
+        sink.clone(),
+        pyramid_path_fn,
+        pyramid_format,
+    ));
 
     let tile_dir_for_write = tile_dir.clone();
-    drive_pipeline(&plan, move |t: EncodedTile| {
-        let path = tile_dir_for_write.join(format!("tiles/{max_zoom}/{}/{}.png", t.tx, t.ty));
+    let pyramid_for_write = pyramid.clone();
+    drive_pipeline(&plan, leaf_format, move |t: EncodedTile| {
+        let path = tile_dir_for_write.join(format!("tiles/{max_zoom}/{}/{}.{leaf_ext}", t.tx, t.ty));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating tile dir {}", parent.display()))?;
         }
-        std::fs::write(&path, &t.png_bytes)
+        std::fs::write(&path, &t.bytes)
             .with_context(|| format!("writing tile {}", path.display()))?;
+        pyramid_for_write.contribute(max_zoom, t.tx, t.ty, &t.image);
         Ok(())
     })
     .await?;
 
-    log::info!("Building tile pyramid ({} zoom levels)...", max_zoom);
-    let tiles_path = tile_dir.join("tiles");
-    tokio::task::spawn_blocking(move || {
-        build_pyramid(&tiles_path, tile_size, max_zoom, width_tiles, height_tiles)
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("pyramid join failure: {e}"))??;
+    log::info!("Draining pyramid encode tasks...");
+    pyramid.drain().await;
+    drop(pyramid);
 
     log::info!("Writing HTML viewer...");
-    html::write_leaflet_html(&tile_dir, world_w, max_zoom, height, TILE, &plan.entities, title, inputs)?;
+    html::write_leaflet_html(&tile_dir, world_w, max_zoom, height, TILE, &plan.entities, title, inputs, leaf_ext, pyramid_ext)?;
 
     log::info!("Tiled output written to {}", tile_dir.display());
     Ok(())
@@ -759,28 +835,44 @@ pub async fn run_tiles_hf_streaming(
     title: &str,
     inputs: &[String],
     show_xet_xorbs: bool,
+    leaf_format: TileFormat,
+    pyramid_format: TileFormat,
 ) -> anyhow::Result<Vec<u8>> {
     crate::hf_url::require_token()?;
     let client = crate::hf_url::client()?;
 
     let plan = build_tile_plan(sources, total, diff_mode, show_xet_xorbs).await?;
+    let leaf_format = derive_leaf_format(leaf_format, &plan.mode);
     let tile_size = TILE;
     let max_zoom = plan.max_zoom;
     let world_w = plan.world_w;
     let height = plan.height;
     let total_tiles = plan.total_tiles;
+    let leaf_ext = leaf_format.extension();
+    let pyramid_ext = pyramid_format.extension();
 
     let sink = Arc::new(HfTileSink::new(client, hf_out.clone())?);
-    let pyramid = Arc::new(PyramidAccumulator::new(tile_size, max_zoom, sink.clone(), Arc::new(hf_out.clone())));
+    let pyramid_path_fn: Arc<dyn Fn(u32, u32, u32) -> String + Send + Sync> = {
+        let hf_out = hf_out.clone();
+        let ext = pyramid_ext.to_string();
+        Arc::new(move |z, x, y| hf_out.tile_repo_path(z, x, y, &ext))
+    };
+    let pyramid = Arc::new(PyramidAccumulator::new(
+        tile_size,
+        max_zoom,
+        sink.clone(),
+        pyramid_path_fn,
+        pyramid_format,
+    ));
 
-    log::info!("Rendering and uploading {} leaf tiles...", total_tiles);
+    log::info!("Rendering and uploading {} leaf tiles ({} leaf / {} pyramid)...", total_tiles, leaf_ext, pyramid_ext);
 
     let sink_for_write = sink.clone();
     let pyramid_for_write = pyramid.clone();
     let hf_out_for_write = hf_out.clone();
-    drive_pipeline(&plan, move |t: EncodedTile| {
-        let repo_path = hf_out_for_write.tile_repo_path(max_zoom, t.tx, t.ty);
-        sink_for_write.upload_tile(repo_path, t.png_bytes)?;
+    drive_pipeline(&plan, leaf_format, move |t: EncodedTile| {
+        let repo_path = hf_out_for_write.tile_repo_path(max_zoom, t.tx, t.ty, leaf_ext);
+        sink_for_write.upload_tile(repo_path, t.bytes)?;
         pyramid_for_write.contribute(max_zoom, t.tx, t.ty, &t.image);
         Ok(())
     })
@@ -791,7 +883,7 @@ pub async fn run_tiles_hf_streaming(
     pyramid.drain().await;
 
     log::info!("Uploading index.html and labels.json...");
-    let (html_bytes, labels_bytes) = generate_leaflet_content(world_w, max_zoom, height, TILE, &plan.entities, title, inputs);
+    let (html_bytes, labels_bytes) = generate_leaflet_content(world_w, max_zoom, height, TILE, &plan.entities, title, inputs, leaf_ext, pyramid_ext);
     sink.upload_tile(hf_out.index_html_path(), html_bytes.clone())?;
     sink.upload_tile(hf_out.labels_json_path(), labels_bytes)?;
 

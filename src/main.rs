@@ -17,9 +17,37 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::path::PathBuf;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use crate::data::InputSpec;
+use crate::tiled::leaf::TileFormat;
+
+/// CLI tile-format choice. Maps to a `(leaf, pyramid)` pair of [`TileFormat`]s.
+///
+/// AVIF is the default: ~30-50% smaller than PNG and supported in every
+/// modern browser. Pick `png` only for byte-for-byte regression checks or
+/// for the rare audience without AVIF support.
+#[derive(Clone, Copy, Debug, ValueEnum, Default)]
+enum TileFormatArg {
+    #[default]
+    Avif,
+    Png,
+}
+
+impl TileFormatArg {
+    /// Returns `(leaf_format, pyramid_format)`. Leaf tiles are encoded
+    /// near-lossless (each pixel is one source byte; users may inspect),
+    /// pyramid tiles are lossy (averaged content tolerates a few QP steps).
+    fn split(self) -> (TileFormat, TileFormat) {
+        match self {
+            TileFormatArg::Avif => (
+                TileFormat::Avif { quality: 100, speed: 6 },
+                TileFormat::Avif { quality: 85, speed: 8 },
+            ),
+            TileFormatArg::Png => (TileFormat::Png, TileFormat::Png),
+        }
+    }
+}
 
 /// Visualize binary files as Hilbert curve plots.
 ///
@@ -67,6 +95,11 @@ struct Args {
     /// Color regions by xorb ID for xet-backed files; hue = xorb, intensity = byte.
     #[arg(long)]
     show_xet_xorbs: bool,
+
+    /// Tile output format. AVIF (default) is ~30-50% smaller than PNG over
+    /// the wire; PNG is the universal fallback.
+    #[arg(long, value_enum, default_value_t = TileFormatArg::Avif)]
+    tile_format: TileFormatArg,
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
@@ -76,6 +109,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
 
     let xet_vis = args.show_xet_xorbs;
     let show_xet_xorbs = args.show_xet_xorbs;
+    let (leaf_format, pyramid_format) = args.tile_format.split();
 
     if xet_vis && args.diff.is_some() {
         anyhow::bail!("--show-xet-xorbs is incompatible with --diff");
@@ -138,17 +172,17 @@ async fn run(args: Args) -> anyhow::Result<()> {
         // Stream directly to HF — no tiles written to local disk.
         if let Some(ref hf_out_url) = tiles_hf_out {
             let hf_out = hf_url::parse_hf_output(hf_out_url)?;
-            let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, true, diff_title, &diff_input_strs, false).await?;
+            let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, true, diff_title, &diff_input_strs, false, leaf_format, pyramid_format).await?;
             return Ok(());
         }
         if let Some(ref space_id) = args.space {
             let bucket_spec = deploy::create_space_bucket(space_id).await?;
-            let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, true, diff_title, &diff_input_strs, false).await?;
+            let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, true, diff_title, &diff_input_strs, false, leaf_format, pyramid_format).await?;
             deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html).await?;
             return Ok(());
         }
         if let Some(ref tile_dir) = tiles_arg {
-            tiled::run_tiles(sources, total, tile_dir.clone(), true, diff_title, &diff_input_strs, false).await?;
+            tiled::run_tiles(sources, total, tile_dir.clone(), true, diff_title, &diff_input_strs, false, leaf_format, pyramid_format).await?;
             if let Some(ref url) = tiles_upload {
                 deploy::upload_dir_to(url, tile_dir).await?;
             }
@@ -226,7 +260,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         data::materialize_http_sources(&mut sources).await?;
         let hf_out = hf_url::parse_hf_output(hf_out_url)?;
         let stream_title = args.title.as_deref().unwrap_or("arbvis");
-        let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, false, stream_title, &input_strs, show_xet_xorbs).await?;
+        let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, false, stream_title, &input_strs, show_xet_xorbs, leaf_format, pyramid_format).await?;
         return Ok(());
     }
 
@@ -276,7 +310,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let display_files: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
 
     if let Some(ref tile_dir) = tiles_arg {
-        tiled::run_tiles(sources, total, tile_dir.clone(), false, tile_title, &original_inputs, show_xet_xorbs).await?;
+        tiled::run_tiles(sources, total, tile_dir.clone(), false, tile_title, &original_inputs, show_xet_xorbs, leaf_format, pyramid_format).await?;
         if let Some(ref space_id) = args.space {
             deploy::run_deploy(tile_dir, space_id).await?;
         }
@@ -288,7 +322,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
 
     if let Some(ref space_id) = args.space {
         let bucket_spec = deploy::create_space_bucket(space_id).await?;
-        let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, false, tile_title, &original_inputs, show_xet_xorbs).await?;
+        let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, false, tile_title, &original_inputs, show_xet_xorbs, leaf_format, pyramid_format).await?;
         deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html).await?;
         return Ok(());
     }

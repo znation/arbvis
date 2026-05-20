@@ -160,6 +160,7 @@ dependencies = [
  "lru",
  "memmap2",
  "minifb",
+ "png",
  "rayon",
  "reqwest",
  "serde",

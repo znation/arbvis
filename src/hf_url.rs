@@ -91,10 +91,10 @@ pub struct HfOutputSpec {
 }
 
 impl HfOutputSpec {
-    pub fn tile_repo_path(&self, z: u32, x: u32, y: u32) -> String {
+    pub fn tile_repo_path(&self, z: u32, x: u32, y: u32, ext: &str) -> String {
         let p = &self.path_prefix;
-        if p.is_empty() { format!("tiles/{z}/{x}/{y}.png") }
-        else { format!("{p}/tiles/{z}/{x}/{y}.png") }
+        if p.is_empty() { format!("tiles/{z}/{x}/{y}.{ext}") }
+        else { format!("{p}/tiles/{z}/{x}/{y}.{ext}") }
     }
     pub fn index_html_path(&self) -> String {
         let p = &self.path_prefix;

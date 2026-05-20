@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::io::Cursor;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use image::{ImageFormat, Rgb};
+use image::Rgb;
 use tokio::task::JoinHandle;
 
-use crate::hf_url::HfOutputSpec;
+use crate::tiled::leaf::{encode_tile, TileFormat};
 
 /// Per-tile accumulator: running RGB sums (4 × u32 per pixel, averaged at encode time)
 /// and a count of how many of the 4 child tiles have contributed.
@@ -15,8 +15,10 @@ struct TileAcc {
 }
 
 /// Streaming pyramid accumulator that builds parent/ancestor tiles in memory as
-/// leaf tiles complete, uploading each parent to the provided sink immediately
-/// without storing anything locally.
+/// leaf tiles complete, encoding + dispatching each parent to the provided
+/// sink immediately. Used by both the local-disk and HF-streaming output
+/// paths; the latter avoids decoding tiles back from disk during pyramid
+/// build, which matters for AVIF (no pure-Rust AVIF decoder in our dep set).
 ///
 /// Thread-safe and async-aware: when a parent's 4 children have all
 /// contributed, the encode+upload work is offloaded to
@@ -30,23 +32,52 @@ pub struct PyramidAccumulator<S: TileSink> {
     #[allow(dead_code)]
     max_zoom: u32,
     sink: Arc<S>,
-    spec: Arc<HfOutputSpec>,
+    /// Maps `(zoom, x, y)` → destination path string. The sink interprets it
+    /// (HF repo path, local filesystem path, …).
+    path_fn: Arc<dyn Fn(u32, u32, u32) -> String + Send + Sync>,
+    /// Format used for pyramid (non-leaf) tiles. Leaf tiles are encoded in
+    /// the leaf render stage and don't pass through this encoder.
+    pyramid_format: TileFormat,
 }
 
-/// Accepts encoded tile bytes and uploads them.
+/// Accepts encoded tile bytes and persists them.
 pub trait TileSink: Send + Sync + 'static {
-    fn upload_tile(&self, repo_path: String, png_bytes: Vec<u8>) -> anyhow::Result<()>;
+    fn upload_tile(&self, path: String, bytes: Vec<u8>) -> anyhow::Result<()>;
+}
+
+/// Writes encoded tile bytes to a local filesystem path, creating parent
+/// directories as needed. Used by the local `run_tiles` output path.
+pub struct LocalFileSink {
+    pub root: PathBuf,
+}
+
+impl TileSink for LocalFileSink {
+    fn upload_tile(&self, path: String, bytes: Vec<u8>) -> anyhow::Result<()> {
+        let full = self.root.join(path);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&full, &bytes)?;
+        Ok(())
+    }
 }
 
 impl<S: TileSink> PyramidAccumulator<S> {
-    pub fn new(tile_size: u32, max_zoom: u32, sink: Arc<S>, spec: Arc<HfOutputSpec>) -> Self {
+    pub fn new(
+        tile_size: u32,
+        max_zoom: u32,
+        sink: Arc<S>,
+        path_fn: Arc<dyn Fn(u32, u32, u32) -> String + Send + Sync>,
+        pyramid_format: TileFormat,
+    ) -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
             outstanding: Mutex::new(Vec::new()),
             tile_size,
             max_zoom,
             sink,
-            spec,
+            path_fn,
+            pyramid_format,
         }
     }
 
@@ -54,7 +85,7 @@ impl<S: TileSink> PyramidAccumulator<S> {
     /// accumulated into the parent tile. When all 4 children of a parent
     /// arrive, the encode + upload (and the recursive contribute upward) is
     /// dispatched to `spawn_blocking` so the writer task is never blocked on
-    /// PNG encoding or disk I/O.
+    /// encoding or disk I/O.
     pub fn contribute(
         self: &Arc<Self>,
         zoom: u32,
@@ -114,6 +145,7 @@ impl<S: TileSink> PyramidAccumulator<S> {
 
         let me = Arc::clone(self);
         let ts32 = self.tile_size;
+        let fmt = self.pyramid_format;
         let handle = tokio::task::spawn_blocking(move || {
             let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(ts32, ts32);
             for (i, pixel) in img.pixels_mut().enumerate() {
@@ -124,15 +156,16 @@ impl<S: TileSink> PyramidAccumulator<S> {
                 ]);
             }
 
-            let mut cursor = Cursor::new(Vec::new());
-            if let Err(e) = img.write_to(&mut cursor, ImageFormat::Png) {
-                log::error!("pyramid: PNG encode error at zoom {parent_z} ({parent_x},{parent_y}): {e}");
-                return;
-            }
-            let png_bytes = cursor.into_inner();
-            let repo_path = me.spec.tile_repo_path(parent_z, parent_x, parent_y);
-            if let Err(e) = me.sink.upload_tile(repo_path, png_bytes) {
-                log::error!("pyramid: upload error at zoom {parent_z} ({parent_x},{parent_y}): {e}");
+            let (img, bytes) = match encode_tile(img, fmt) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("pyramid: encode error at zoom {parent_z} ({parent_x},{parent_y}): {e}");
+                    return;
+                }
+            };
+            let path = (me.path_fn)(parent_z, parent_x, parent_y);
+            if let Err(e) = me.sink.upload_tile(path, bytes) {
+                log::error!("pyramid: write error at zoom {parent_z} ({parent_x},{parent_y}): {e}");
                 return;
             }
 

@@ -12,6 +12,12 @@ pub struct FileEntity {
 }
 
 /// Generate HTML viewer and labels JSON as byte vectors without writing to disk.
+///
+/// `leaf_ext` and `pyramid_ext` are the file extensions for the tile format
+/// emitted at the deepest zoom vs. the downsampled levels. They may differ:
+/// e.g. leaves can be lossless AVIF while pyramid levels are lossy AVIF, or
+/// leaves indexed-palette PNG while pyramid is AVIF — Leaflet's tileLayer URL
+/// template uses a custom `getTileUrl` to switch on `z`.
 pub fn generate_leaflet_content(
     world_w: u32,
     max_zoom: u32,
@@ -20,9 +26,11 @@ pub fn generate_leaflet_content(
     entities: &[FileEntity],
     title: &str,
     inputs: &[String],
+    leaf_ext: &str,
+    pyramid_ext: &str,
 ) -> (Vec<u8>, Vec<u8>) {
     let entities_json = build_labels_json(entities);
-    let html = build_html(world_w, max_zoom, height, tile_size, title, inputs);
+    let html = build_html(world_w, max_zoom, height, tile_size, title, inputs, leaf_ext, pyramid_ext);
     (html.into_bytes(), entities_json.into_bytes())
 }
 
@@ -36,11 +44,13 @@ pub fn write_leaflet_html(
     entities: &[FileEntity],
     title: &str,
     inputs: &[String],
+    leaf_ext: &str,
+    pyramid_ext: &str,
 ) -> anyhow::Result<()> {
     let entities_json = build_labels_json(entities);
     std::fs::write(dir.join("labels.json"), &entities_json)?;
 
-    let html = build_html(world_w, max_zoom, height, tile_size, title, inputs);
+    let html = build_html(world_w, max_zoom, height, tile_size, title, inputs, leaf_ext, pyramid_ext);
     std::fs::write(dir.join("index.html"), html)?;
     Ok(())
 }
@@ -198,7 +208,7 @@ fn build_info_html(title: &str, inputs: &[String]) -> String {
     )
 }
 
-fn build_html(world_w: u32, max_zoom: u32, height: u32, tile_size: u32, title: &str, inputs: &[String]) -> String {
+fn build_html(world_w: u32, max_zoom: u32, height: u32, tile_size: u32, title: &str, inputs: &[String], leaf_ext: &str, pyramid_ext: &str) -> String {
     let info_html = build_info_html(title, inputs);
     let viewer_max_zoom = max_zoom + 3;
     format!(
@@ -257,7 +267,13 @@ fn build_html(world_w: u32, max_zoom: u32, height: u32, tile_size: u32, title: &
       maxZoom: {viewer_max_zoom},
       preferCanvas: true,
     }});
-    L.tileLayer('tiles/{{z}}/{{x}}/{{y}}.png', {{
+    var ArbvisTileLayer = L.TileLayer.extend({{
+      getTileUrl: function(coords) {{
+        var ext = coords.z >= {max_zoom} ? '{leaf_ext}' : '{pyramid_ext}';
+        return 'tiles/' + coords.z + '/' + coords.x + '/' + coords.y + '.' + ext;
+      }}
+    }});
+    new ArbvisTileLayer('', {{
       tileSize: {tile_size},
       maxNativeZoom: {max_zoom},
       bounds: [[-{tile_size}, 0], [0, {world_w}]],
@@ -385,5 +401,7 @@ fn build_html(world_w: u32, max_zoom: u32, height: u32, tile_size: u32, title: &
         viewer_max_zoom = viewer_max_zoom,
         world_w = world_w,
         height = height,
+        leaf_ext = leaf_ext,
+        pyramid_ext = pyramid_ext,
     )
 }

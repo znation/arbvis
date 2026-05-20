@@ -298,8 +298,21 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
                 let m_o = Arc::clone(&m_o);
                 let m_m = Arc::clone(&m_m);
                 Box::pin(async move {
-                    let a = &m_o[start as usize..start as usize + len];
-                    let b = &m_m[start as usize..start as usize + len];
+                    // Zero-pad reads beyond either side's length so that
+                    // same-name files with different sizes can share one diff
+                    // source. The longer side's tail diffs against zero.
+                    let read_padded = |m: &Mmap| -> Vec<u8> {
+                        let s = start as usize;
+                        let mlen = m.len();
+                        let mut buf = vec![0u8; len];
+                        if s < mlen {
+                            let take = (mlen - s).min(len);
+                            buf[..take].copy_from_slice(&m[s..s + take]);
+                        }
+                        buf
+                    };
+                    let a = read_padded(&m_o);
+                    let b = read_padded(&m_m);
                     Ok(a.iter().zip(b.iter()).map(|(&a, &b)| {
                         let delta = b as i16 - a as i16;
                         let brightness = (delta.unsigned_abs() as f32 / 255.0 * 127.0).round() as u8;
@@ -783,61 +796,33 @@ pub async fn prepare_diff_sources(
                         }
                     };
                     if size_o != size_m {
-                        // Size mismatch: render each side independently as
-                        // unmatched so neither is hidden. In finetune mode
-                        // this is technically a contract violation (the
-                        // finetune carries bytes the base doesn't), but we
-                        // warn rather than bail and still render — the
-                        // green crosshatch makes the divergence visually
-                        // obvious.
                         if is_finetune {
                             log::warn!(
                                 "--diff --finetune: size mismatch ({} vs {} bytes) for {} — \
-                                 rendering modified side as green crosshatch",
+                                 byte-diffing with zero-padding on the shorter side",
                                 size_o, size_m, rel.display()
                             );
                         } else {
                             log::warn!(
-                                "size mismatch ({} vs {} bytes) for {} — rendering each side as unmatched",
+                                "size mismatch ({} vs {} bytes) for {} — byte-diffing with zero-padding",
                                 size_o, size_m, rel.display()
                             );
                         }
-                        if size_o > 0 {
-                            sources.push(Source {
-                                file_idx: sources.len(),
-                                kind: SourceKind::UnmatchedRegion { fill: orig_fill_kind },
-                                byte_size: size_o,
-                                safetensors: None,
-                                name_override: Some(format!("[only in original] {}", rel.display())),
-                                xet_terms: None,
-                            });
-                            total += size_o;
-                        }
-                        if size_m > 0 {
-                            sources.push(Source {
-                                file_idx: sources.len(),
-                                kind: SourceKind::UnmatchedRegion { fill: DiffFill::Green },
-                                byte_size: size_m,
-                                safetensors: None,
-                                name_override: Some(format!("[only in modified] {}", rel.display())),
-                                xet_terms: None,
-                            });
-                            total += size_m;
-                        }
-                        continue;
                     }
+                    let max_size = size_o.max(size_m);
+                    if max_size == 0 { continue; }
                     sources.push(Source {
                         file_idx: sources.len(),
                         kind: SourceKind::Diff {
                             original: orig_abs.clone(),
                             modified: mod_abs.clone(),
                         },
-                        byte_size: size_o,
+                        byte_size: max_size,
                         safetensors: None,
                         name_override: None,
                         xet_terms: None,
                     });
-                    total += size_o;
+                    total += max_size;
                 }
             }
         }
@@ -942,6 +927,9 @@ pub async fn prepare_diff_sources_from_http(
     let mut diff_jobs: Vec<(String, RemoteFileSpec, RemoteFileSpec)> = Vec::new();
     let mut unmatched_orig: Vec<(String, u64, DiffFill)> = Vec::new();
     let mut unmatched_mod: Vec<(String, u64, DiffFill)> = Vec::new();
+    // Files present in both repos but too large to eagerly byte-diff. Rendered
+    // as a single crosshatch source per file (not split across both sides).
+    let mut unmatched_modified: Vec<(String, u64, DiffFill)> = Vec::new();
     for fname in sorted {
         let orig_spec = &orig_non[fname];
         let mod_spec = match mod_non.get(fname) {
@@ -957,33 +945,27 @@ pub async fn prepare_diff_sources_from_http(
             if is_finetune {
                 log::warn!(
                     "--diff --finetune: size mismatch for {fname} ({} vs {} bytes) — \
-                     rendering modified side as green crosshatch",
+                     byte-diffing with zero-padding on the shorter side",
                     orig_spec.size, mod_spec.size
                 );
             } else {
                 log::warn!(
-                    "size mismatch for {fname} ({} vs {} bytes) — rendering each side as unmatched",
+                    "size mismatch for {fname} ({} vs {} bytes) — byte-diffing with zero-padding",
                     orig_spec.size, mod_spec.size
                 );
             }
-            if orig_spec.size > 0 {
-                unmatched_orig.push((fname.to_string(), orig_spec.size, orig_fill_kind));
-            }
-            if mod_spec.size > 0 {
-                unmatched_mod.push((fname.to_string(), mod_spec.size, DiffFill::Green));
-            }
-            continue;
         }
-        if orig_spec.size > MAX_EAGER_SIZE {
-            // Too large to byte-diff lazily; show the orig footprint as an
-            // unmatched-region marker so the canvas still reflects the file's
-            // existence. (Could be promoted to a tile-streamed lazy diff
-            // later, but for now we just preserve visibility.)
+        let max_size = orig_spec.size.max(mod_spec.size);
+        if max_size == 0 { continue; }
+        if max_size > MAX_EAGER_SIZE {
+            // Too large to byte-diff eagerly; surface as a single crosshatched
+            // region sized to max(orig, mod) so the file appears once in the
+            // canvas, regardless of whether sizes match.
             log::warn!(
                 "{fname} exceeds {} MB — rendering as crosshatched region instead of byte diff",
                 MAX_EAGER_SIZE / 1024 / 1024
             );
-            unmatched_orig.push((fname.to_string(), orig_spec.size, orig_fill_kind));
+            unmatched_modified.push((fname.to_string(), max_size, orig_fill_kind));
             continue;
         }
         diff_jobs.push((fname.to_string(), (*orig_spec).clone(), (*mod_spec).clone()));
@@ -1013,7 +995,14 @@ pub async fn prepare_diff_sources_from_http(
                 };
                 let ob = orig_data.fetch_range(0, orig_spec.size as usize).await?;
                 let mb = mod_data.fetch_range(0, mod_spec.size as usize).await?;
-                let diff: Vec<u8> = ob.iter().zip(mb.iter()).map(|(&a, &b)| {
+                // Pad the shorter side with zeros so size-mismatched but
+                // same-named files share one diff source. The longer side's
+                // tail diffs against zero, which renders as deltas indicating
+                // bytes that exist on only one side.
+                let len = ob.len().max(mb.len());
+                let diff: Vec<u8> = (0..len).map(|i| {
+                    let a = ob.get(i).copied().unwrap_or(0);
+                    let b = mb.get(i).copied().unwrap_or(0);
                     let delta = b as i16 - a as i16;
                     let brightness = (delta.unsigned_abs() as f32 / 255.0 * 127.0).round() as u8;
                     if delta >= 0 { 127u8 + brightness } else { 127u8 - brightness }
@@ -1069,6 +1058,18 @@ pub async fn prepare_diff_sources_from_http(
             byte_size: size,
             safetensors: None,
             name_override: Some(format!("[only in modified] {fname}")),
+            xet_terms: None,
+        });
+        total += size;
+    }
+    unmatched_modified.sort();
+    for (fname, size, fill) in unmatched_modified {
+        sources.push(Source {
+            file_idx: sources.len(),
+            kind: SourceKind::UnmatchedRegion { fill },
+            byte_size: size,
+            safetensors: None,
+            name_override: Some(fname),
             xet_terms: None,
         });
         total += size;

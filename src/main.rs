@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 mod color;
 mod data;
 mod deploy;
@@ -94,8 +96,14 @@ impl TileFormatArg {
     fn split(self) -> (TileFormat, TileFormat) {
         match self {
             TileFormatArg::Avif => (
-                TileFormat::Avif { quality: 100, speed: 6 },
-                TileFormat::Avif { quality: 85, speed: 8 },
+                TileFormat::Avif {
+                    quality: 100,
+                    speed: 6,
+                },
+                TileFormat::Avif {
+                    quality: 85,
+                    speed: 8,
+                },
             ),
             TileFormatArg::Png => (TileFormat::Png, TileFormat::Png),
         }
@@ -221,7 +229,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
         Some(ref p) if p.to_string_lossy().starts_with("hf://") => {
             let td = tempfile::tempdir()?;
             let local = td.path().to_path_buf();
-            (Some(td), Some(local), Some(p.to_string_lossy().into_owned()))
+            (
+                Some(td),
+                Some(local),
+                Some(p.to_string_lossy().into_owned()),
+            )
         }
         Some(p) => (None, Some(p), None),
     };
@@ -230,7 +242,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
         Some(ref p) if p.to_string_lossy().starts_with("hf://") => {
             let td = tempfile::tempdir()?;
             let local = td.path().join("output.png");
-            (Some(td), Some(local), Some(p.to_string_lossy().into_owned()))
+            (
+                Some(td),
+                Some(local),
+                Some(p.to_string_lossy().into_owned()),
+            )
         }
         Some(p) => (None, Some(p), None),
     };
@@ -242,7 +258,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             .collect();
         let diff_title = args.title.as_deref().unwrap_or("arbvis diff");
         let orig_str = &diff_input_strs[0];
-        let mod_str  = &diff_input_strs[1];
+        let mod_str = &diff_input_strs[1];
         let is_finetune = if args.finetune {
             log::info!("--diff finetune mode: forced on by --finetune");
             true
@@ -275,14 +291,19 @@ async fn run(args: Args) -> anyhow::Result<()> {
         };
         let metric = args.diff_metric.to_metric();
 
-        let (sources, total) = if hf_url::is_repo_level(orig_str)? && hf_url::is_repo_level(mod_str)? {
+        let (sources, total) = if hf_url::is_repo_level(orig_str)?
+            && hf_url::is_repo_level(mod_str)?
+        {
             // Both are repo-level hf:// URLs: list files over API, diff lazily over HTTP.
             // No model weights are downloaded to disk or held in RAM.
-            let orig_specs = hf_url::list_repo_as_http_specs(orig_str).await
+            let orig_specs = hf_url::list_repo_as_http_specs(orig_str)
+                .await
                 .with_context(|| format!("listing files in {orig_str}"))?;
-            let mod_specs = hf_url::list_repo_as_http_specs(mod_str).await
+            let mod_specs = hf_url::list_repo_as_http_specs(mod_str)
+                .await
                 .with_context(|| format!("listing files in {mod_str}"))?;
-            data::prepare_diff_sources_from_http(&orig_specs, &mod_specs, is_finetune, metric).await?
+            data::prepare_diff_sources_from_http(&orig_specs, &mod_specs, is_finetune, metric)
+                .await?
         } else {
             // At least one side is a local path or single-file hf:// URL.
             let mut diff_args: Vec<PathBuf> = Vec::with_capacity(raw_diff_args.len());
@@ -295,17 +316,53 @@ async fn run(args: Args) -> anyhow::Result<()> {
         // Stream directly to HF — no tiles written to local disk.
         if let Some(ref hf_out_url) = tiles_hf_out {
             let hf_out = hf_url::parse_hf_output(hf_out_url)?;
-            let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, true, diff_title, &diff_input_strs, false, leaf_format, pyramid_format, layout_mode).await?;
+            let _ = tiled::run_tiles_hf_streaming(
+                sources,
+                total,
+                &hf_out,
+                true,
+                diff_title,
+                &diff_input_strs,
+                false,
+                leaf_format,
+                pyramid_format,
+                layout_mode,
+            )
+            .await?;
             return Ok(());
         }
         if let Some(ref space_id) = args.space {
             let bucket_spec = deploy::create_space_bucket(space_id).await?;
-            let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, true, diff_title, &diff_input_strs, false, leaf_format, pyramid_format, layout_mode).await?;
+            let html = tiled::run_tiles_hf_streaming(
+                sources,
+                total,
+                &bucket_spec,
+                true,
+                diff_title,
+                &diff_input_strs,
+                false,
+                leaf_format,
+                pyramid_format,
+                layout_mode,
+            )
+            .await?;
             deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html).await?;
             return Ok(());
         }
         if let Some(ref tile_dir) = tiles_arg {
-            tiled::run_tiles(sources, total, tile_dir.clone(), true, diff_title, &diff_input_strs, false, leaf_format, pyramid_format, layout_mode).await?;
+            tiled::run_tiles(
+                sources,
+                total,
+                tile_dir.clone(),
+                true,
+                diff_title,
+                &diff_input_strs,
+                false,
+                leaf_format,
+                pyramid_format,
+                layout_mode,
+            )
+            .await?;
             if let Some(ref url) = tiles_upload {
                 deploy::upload_dir_to(url, tile_dir).await?;
             }
@@ -318,7 +375,15 @@ async fn run(args: Args) -> anyhow::Result<()> {
         let output_arg_owned = output_arg.clone();
         let diff_mode = true;
         tokio::task::spawn_blocking(move || {
-            single::run_single(&labels, output_arg_owned, sources_owned, total, diff_mode, false, layout_mode)
+            single::run_single(
+                &labels,
+                output_arg_owned,
+                sources_owned,
+                total,
+                diff_mode,
+                false,
+                layout_mode,
+            )
         })
         .await
         .map_err(|e| anyhow::anyhow!("run_single join failure: {e}"))??;
@@ -342,7 +407,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
 
     let mut files = args.files;
     if let Some(list_path) = args.file_list {
-        let reader: Box<dyn Read> = if list_path == PathBuf::from("-") {
+        let reader: Box<dyn Read> = if list_path.as_os_str() == "-" {
             Box::new(io::stdin())
         } else {
             Box::new(
@@ -383,7 +448,19 @@ async fn run(args: Args) -> anyhow::Result<()> {
         data::materialize_http_sources(&mut sources).await?;
         let hf_out = hf_url::parse_hf_output(hf_out_url)?;
         let stream_title = args.title.as_deref().unwrap_or("arbvis");
-        let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, false, stream_title, &input_strs, show_xet_xorbs, leaf_format, pyramid_format, layout_mode).await?;
+        let _ = tiled::run_tiles_hf_streaming(
+            sources,
+            total,
+            &hf_out,
+            false,
+            stream_title,
+            &input_strs,
+            show_xet_xorbs,
+            leaf_format,
+            pyramid_format,
+            layout_mode,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -402,7 +479,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
             let s = p.to_string_lossy();
             if s.starts_with("hf://") {
                 if hf_url::is_repo_level(&s)? {
-                    let listed = hf_url::list_repo_as_http_specs(&s).await
+                    let listed = hf_url::list_repo_as_http_specs(&s)
+                        .await
                         .with_context(|| format!("listing files in {s}"))?;
                     for (_, spec) in listed {
                         specs.push(InputSpec::Remote(spec));
@@ -433,7 +511,19 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let display_files: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
 
     if let Some(ref tile_dir) = tiles_arg {
-        tiled::run_tiles(sources, total, tile_dir.clone(), false, tile_title, &original_inputs, show_xet_xorbs, leaf_format, pyramid_format, layout_mode).await?;
+        tiled::run_tiles(
+            sources,
+            total,
+            tile_dir.clone(),
+            false,
+            tile_title,
+            &original_inputs,
+            show_xet_xorbs,
+            leaf_format,
+            pyramid_format,
+            layout_mode,
+        )
+        .await?;
         if let Some(ref space_id) = args.space {
             deploy::run_deploy(tile_dir, space_id).await?;
         }
@@ -445,7 +535,19 @@ async fn run(args: Args) -> anyhow::Result<()> {
 
     if let Some(ref space_id) = args.space {
         let bucket_spec = deploy::create_space_bucket(space_id).await?;
-        let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, false, tile_title, &original_inputs, show_xet_xorbs, leaf_format, pyramid_format, layout_mode).await?;
+        let html = tiled::run_tiles_hf_streaming(
+            sources,
+            total,
+            &bucket_spec,
+            false,
+            tile_title,
+            &original_inputs,
+            show_xet_xorbs,
+            leaf_format,
+            pyramid_format,
+            layout_mode,
+        )
+        .await?;
         deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html).await?;
         return Ok(());
     }
@@ -456,7 +558,15 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let sources_owned = sources;
     let output_arg_owned = output_arg.clone();
     tokio::task::spawn_blocking(move || {
-        single::run_single(&display_files_owned, output_arg_owned, sources_owned, total, false, show_xet_xorbs, layout_mode)
+        single::run_single(
+            &display_files_owned,
+            output_arg_owned,
+            sources_owned,
+            total,
+            false,
+            show_xet_xorbs,
+            layout_mode,
+        )
     })
     .await
     .map_err(|e| anyhow::anyhow!("run_single join failure: {e}"))??;
@@ -469,9 +579,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
 /// Resolve an input path: download from HF if it starts with `hf://`.
 async fn resolve_input(path: PathBuf) -> anyhow::Result<PathBuf> {
     let display = path.display().to_string();
-    hf_url::resolve(&path).await.with_context(|| format!("resolving {display}"))
+    hf_url::resolve(&path)
+        .await
+        .with_context(|| format!("resolving {display}"))
 }
-
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -483,7 +594,9 @@ async fn main() -> anyhow::Result<()> {
     // Rust toolchains.
     if std::env::var_os("RUST_BACKTRACE").is_none() {
         // SAFETY: see comment above.
-        unsafe { std::env::set_var("RUST_BACKTRACE", "1"); }
+        unsafe {
+            std::env::set_var("RUST_BACKTRACE", "1");
+        }
     }
 
     // Build env_logger but DON'T install it directly; wrap it in `LogWrapper`

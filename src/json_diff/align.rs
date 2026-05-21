@@ -13,8 +13,8 @@
 //! - A single O(n) coalesce pass merges adjacent same-kind spans whose byte
 //!   ranges are contiguous on both sides.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
@@ -43,9 +43,21 @@ pub fn align_documents(
     mod_base: u64,
 ) -> Vec<AlignmentSpan> {
     let mut out = Vec::new();
-    align_ws(orig_doc.leading_ws.clone(), mod_doc.leading_ws.clone(), orig_base, mod_base, &mut out);
+    align_ws(
+        orig_doc.leading_ws.clone(),
+        mod_doc.leading_ws.clone(),
+        orig_base,
+        mod_base,
+        &mut out,
+    );
     align_node(&orig_doc.root, &mod_doc.root, orig_base, mod_base, &mut out);
-    align_ws(orig_doc.trailing_ws.clone(), mod_doc.trailing_ws.clone(), orig_base, mod_base, &mut out);
+    align_ws(
+        orig_doc.trailing_ws.clone(),
+        mod_doc.trailing_ws.clone(),
+        orig_base,
+        mod_base,
+        &mut out,
+    );
     coalesce(out)
 }
 
@@ -104,13 +116,17 @@ fn align_bytes(
 
 fn push_orig_only(r: Range<u64>, base: u64, out: &mut Vec<AlignmentSpan>) {
     if r.start != r.end {
-        out.push(AlignmentSpan::OrigOnly { orig: base + r.start..base + r.end });
+        out.push(AlignmentSpan::OrigOnly {
+            orig: base + r.start..base + r.end,
+        });
     }
 }
 
 fn push_mod_only(r: Range<u64>, base: u64, out: &mut Vec<AlignmentSpan>) {
     if r.start != r.end {
-        out.push(AlignmentSpan::ModOnly { mod_: base + r.start..base + r.end });
+        out.push(AlignmentSpan::ModOnly {
+            mod_: base + r.start..base + r.end,
+        });
     }
 }
 
@@ -122,13 +138,7 @@ fn push_node_mod_only(n: &Node, base: u64, out: &mut Vec<AlignmentSpan>) {
     push_mod_only(n.range(), base, out);
 }
 
-fn align_node(
-    o: &Node,
-    m: &Node,
-    orig_base: u64,
-    mod_base: u64,
-    out: &mut Vec<AlignmentSpan>,
-) {
+fn align_node(o: &Node, m: &Node, orig_base: u64, mod_base: u64, out: &mut Vec<AlignmentSpan>) {
     if o.kind != m.kind {
         push_node_orig_only(o, orig_base, out);
         push_node_mod_only(m, mod_base, out);
@@ -151,13 +161,7 @@ fn align_primitive(
     align_bytes(o.range(), m.range(), orig_base, mod_base, out);
 }
 
-fn align_object(
-    o: &Node,
-    m: &Node,
-    orig_base: u64,
-    mod_base: u64,
-    out: &mut Vec<AlignmentSpan>,
-) {
+fn align_object(o: &Node, m: &Node, orig_base: u64, mod_base: u64, out: &mut Vec<AlignmentSpan>) {
     // Opening brace.
     out.push(AlignmentSpan::Aligned {
         orig: orig_base + o.byte_start..orig_base + o.byte_start + 1,
@@ -176,7 +180,13 @@ fn align_object(
     // Walk orig in source order.
     for oc in &o.children {
         match oc {
-            Child::Member { key_decoded, key_range, between_key_value, value, trailing } => {
+            Child::Member {
+                key_decoded,
+                key_range,
+                between_key_value,
+                value,
+                trailing,
+            } => {
                 if key_decoded.is_empty() && key_range.start == key_range.end {
                     // Synthetic ws-only sentinel (from empty object with interior ws).
                     // Emit its trailing as orig-only — there is no peer on the mod side
@@ -187,9 +197,28 @@ fn align_object(
                 if let Some(&mi) = mod_by_key.get(key_decoded.as_str()) {
                     mod_used[mi] = true;
                     let mc = &m.children[mi];
-                    if let Child::Member { key_range: mk_range, between_key_value: mb, value: mv, trailing: mt, .. } = mc {
-                        align_bytes(key_range.clone(), mk_range.clone(), orig_base, mod_base, out);
-                        align_bytes(between_key_value.clone(), mb.clone(), orig_base, mod_base, out);
+                    if let Child::Member {
+                        key_range: mk_range,
+                        between_key_value: mb,
+                        value: mv,
+                        trailing: mt,
+                        ..
+                    } = mc
+                    {
+                        align_bytes(
+                            key_range.clone(),
+                            mk_range.clone(),
+                            orig_base,
+                            mod_base,
+                            out,
+                        );
+                        align_bytes(
+                            between_key_value.clone(),
+                            mb.clone(),
+                            orig_base,
+                            mod_base,
+                            out,
+                        );
                         align_node(value, mv, orig_base, mod_base, out);
                         align_bytes(trailing.clone(), mt.clone(), orig_base, mod_base, out);
                     }
@@ -207,9 +236,17 @@ fn align_object(
 
     // Mod-only members (visited in mod source order to keep their bytes contiguous).
     for (i, mc) in m.children.iter().enumerate() {
-        if mod_used[i] { continue; }
+        if mod_used[i] {
+            continue;
+        }
         match mc {
-            Child::Member { key_decoded, key_range, between_key_value, value, trailing } => {
+            Child::Member {
+                key_decoded,
+                key_range,
+                between_key_value,
+                value,
+                trailing,
+            } => {
                 if key_decoded.is_empty() && key_range.start == key_range.end {
                     push_mod_only(trailing.clone(), mod_base, out);
                     continue;
@@ -230,13 +267,7 @@ fn align_object(
     });
 }
 
-fn align_array(
-    o: &Node,
-    m: &Node,
-    orig_base: u64,
-    mod_base: u64,
-    out: &mut Vec<AlignmentSpan>,
-) {
+fn align_array(o: &Node, m: &Node, orig_base: u64, mod_base: u64, out: &mut Vec<AlignmentSpan>) {
     // Opening bracket.
     out.push(AlignmentSpan::Aligned {
         orig: orig_base + o.byte_start..orig_base + o.byte_start + 1,
@@ -249,8 +280,8 @@ fn align_array(
     let use_lcs = o_elems.len() <= MAX_LCS_ELEMENTS && m_elems.len() <= MAX_LCS_ELEMENTS;
 
     if use_lcs {
-        let o_hashes: Vec<u64> = o_elems.iter().map(|c| shape_hash_of(*c)).collect();
-        let m_hashes: Vec<u64> = m_elems.iter().map(|c| shape_hash_of(*c)).collect();
+        let o_hashes: Vec<u64> = o_elems.iter().map(|c| shape_hash_of(c)).collect();
+        let m_hashes: Vec<u64> = m_elems.iter().map(|c| shape_hash_of(c)).collect();
         let pairs = lcs_pairs(&o_hashes, &m_hashes);
         emit_array_pairs(&o_elems, &m_elems, &pairs, orig_base, mod_base, out);
     } else {
@@ -258,7 +289,9 @@ fn align_array(
         // logging context here — caller checks size and logs).
         let len = o_elems.len().min(m_elems.len());
         let mut pairs = Vec::with_capacity(len);
-        for i in 0..len { pairs.push((i, i)); }
+        for i in 0..len {
+            pairs.push((i, i));
+        }
         emit_array_pairs(&o_elems, &m_elems, &pairs, orig_base, mod_base, out);
     }
 
@@ -313,7 +346,16 @@ fn emit_child_paired(
     out: &mut Vec<AlignmentSpan>,
 ) {
     match (oc, mc) {
-        (Child::Element { value: ov, trailing: ot }, Child::Element { value: mv, trailing: mt }) => {
+        (
+            Child::Element {
+                value: ov,
+                trailing: ot,
+            },
+            Child::Element {
+                value: mv,
+                trailing: mt,
+            },
+        ) => {
             align_node(ov, mv, orig_base, mod_base, out);
             align_bytes(ot.clone(), mt.clone(), orig_base, mod_base, out);
         }
@@ -340,7 +382,9 @@ fn emit_child_mod_only(c: &Child, mod_base: u64, out: &mut Vec<AlignmentSpan>) {
 pub fn shape_hash_of(c: &Child) -> u64 {
     match c {
         Child::Element { value, .. } => shape_hash_node(value),
-        Child::Member { key_decoded, value, .. } => {
+        Child::Member {
+            key_decoded, value, ..
+        } => {
             let mut h = DefaultHasher::new();
             "member".hash(&mut h);
             key_decoded.hash(&mut h);
@@ -356,20 +400,38 @@ fn shape_hash_node(n: &Node) -> u64 {
         NodeKind::Object => {
             "object".hash(&mut h);
             // Sorted decoded keys.
-            let mut keys: Vec<&str> = n.children.iter().filter_map(|c| match c {
-                Child::Member { key_decoded, key_range, .. } if !(key_decoded.is_empty() && key_range.start == key_range.end) => Some(key_decoded.as_str()),
-                _ => None,
-            }).collect();
+            let mut keys: Vec<&str> = n
+                .children
+                .iter()
+                .filter_map(|c| match c {
+                    Child::Member {
+                        key_decoded,
+                        key_range,
+                        ..
+                    } if !(key_decoded.is_empty() && key_range.start == key_range.end) => {
+                        Some(key_decoded.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
             keys.sort_unstable();
-            for k in keys { k.hash(&mut h); }
+            for k in keys {
+                k.hash(&mut h);
+            }
         }
         NodeKind::Array => {
             "array".hash(&mut h);
             // Length + element-kind histogram.
-            let real_children: Vec<&Child> = n.children.iter().filter(|c| match c {
-                Child::Element { value, .. } => !(value.kind == NodeKind::Null && value.byte_start == value.byte_end),
-                _ => true,
-            }).collect();
+            let real_children: Vec<&Child> = n
+                .children
+                .iter()
+                .filter(|c| match c {
+                    Child::Element { value, .. } => {
+                        !(value.kind == NodeKind::Null && value.byte_start == value.byte_end)
+                    }
+                    _ => true,
+                })
+                .collect();
             real_children.len().hash(&mut h);
             for c in real_children {
                 if let Child::Element { value, .. } = c {
@@ -411,7 +473,9 @@ fn discriminant(k: NodeKind) -> u8 {
 pub fn lcs_pairs(a: &[u64], b: &[u64]) -> Vec<(usize, usize)> {
     let n = a.len();
     let m = b.len();
-    if n == 0 || m == 0 { return Vec::new(); }
+    if n == 0 || m == 0 {
+        return Vec::new();
+    }
     // dp[i][j] = LCS length of a[..i], b[..j].
     let mut dp = vec![vec![0u32; m + 1]; n + 1];
     for i in 0..n {
@@ -429,7 +493,8 @@ pub fn lcs_pairs(a: &[u64], b: &[u64]) -> Vec<(usize, usize)> {
     while i > 0 && j > 0 {
         if a[i - 1] == b[j - 1] {
             pairs.push((i - 1, j - 1));
-            i -= 1; j -= 1;
+            i -= 1;
+            j -= 1;
         } else if dp[i - 1][j] >= dp[i][j - 1] {
             i -= 1;
         } else {
@@ -467,29 +532,25 @@ pub fn coalesce(spans: Vec<AlignmentSpan>) -> Vec<AlignmentSpan> {
                         continue;
                     }
                 }
-                (
-                    AlignmentSpan::OrigOnly { orig: lo },
-                    AlignmentSpan::OrigOnly { orig: ro },
-                ) => {
-                    if lo.end == ro.start {
-                        lo.end = ro.end;
-                        continue;
-                    }
+                (AlignmentSpan::OrigOnly { orig: lo }, AlignmentSpan::OrigOnly { orig: ro })
+                    if lo.end == ro.start =>
+                {
+                    lo.end = ro.end;
+                    continue;
                 }
-                (
-                    AlignmentSpan::ModOnly { mod_: lm },
-                    AlignmentSpan::ModOnly { mod_: rm },
-                ) => {
-                    if lm.end == rm.start {
-                        lm.end = rm.end;
-                        continue;
-                    }
+                (AlignmentSpan::ModOnly { mod_: lm }, AlignmentSpan::ModOnly { mod_: rm })
+                    if lm.end == rm.start =>
+                {
+                    lm.end = rm.end;
+                    continue;
                 }
                 _ => {}
             }
         }
         // Drop empty spans before pushing.
-        if span_is_empty(&s) { continue; }
+        if span_is_empty(&s) {
+            continue;
+        }
         out.push(s);
     }
     out
@@ -505,8 +566,8 @@ fn span_is_empty(s: &AlignmentSpan) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::parse::parse;
+    use super::*;
 
     fn align(o: &str, m: &str) -> Vec<AlignmentSpan> {
         let od = parse(o.as_bytes()).unwrap();
@@ -559,7 +620,9 @@ mod tests {
     #[test]
     fn key_removed() {
         let r = align(r#"{"a":1,"b":2}"#, r#"{"a":1}"#);
-        let has_orig_only = r.iter().any(|s| matches!(s, AlignmentSpan::OrigOnly { .. }));
+        let has_orig_only = r
+            .iter()
+            .any(|s| matches!(s, AlignmentSpan::OrigOnly { .. }));
         assert!(has_orig_only, "spans: {r:?}");
     }
 
@@ -568,18 +631,35 @@ mod tests {
         let r = align(r#"{"a":1,"b":2}"#, r#"{"b":2,"a":1}"#);
         // Both keys exist on both sides; the only structural mismatch is the
         // trailing-comma asymmetry (last member has no trailing comma).
-        let total_one_sided = r.iter().filter(|s| matches!(s, AlignmentSpan::OrigOnly { .. } | AlignmentSpan::ModOnly { .. })).count();
+        let total_one_sided = r
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s,
+                    AlignmentSpan::OrigOnly { .. } | AlignmentSpan::ModOnly { .. }
+                )
+            })
+            .count();
         assert!(total_one_sided <= 2, "spans: {r:?}");
         // The "a":1 substring should align even though it's at different positions.
         let has_cross_position_aligned = r.iter().any(|s| matches!(s, AlignmentSpan::Aligned { orig, mod_ } if orig != mod_ && orig.end - orig.start == 5));
-        assert!(has_cross_position_aligned, "expected key-value aligned at differing positions: {r:?}");
+        assert!(
+            has_cross_position_aligned,
+            "expected key-value aligned at differing positions: {r:?}"
+        );
     }
 
     #[test]
     fn type_change_emits_both_sides() {
         let r = align(r#"{"x":"foo"}"#, r#"{"x":42}"#);
-        let orig_only = r.iter().filter(|s| matches!(s, AlignmentSpan::OrigOnly { .. })).count();
-        let mod_only = r.iter().filter(|s| matches!(s, AlignmentSpan::ModOnly { .. })).count();
+        let orig_only = r
+            .iter()
+            .filter(|s| matches!(s, AlignmentSpan::OrigOnly { .. }))
+            .count();
+        let mod_only = r
+            .iter()
+            .filter(|s| matches!(s, AlignmentSpan::ModOnly { .. }))
+            .count();
         assert!(orig_only >= 1 && mod_only >= 1, "spans: {r:?}");
     }
 
@@ -588,8 +668,14 @@ mod tests {
         // Insert "99" between 1 and 2 in modified.
         let r = align("[1,2,3]", "[1,99,2,3]");
         // We expect at least one Aligned span and at least one ModOnly span.
-        let aligned = r.iter().filter(|s| matches!(s, AlignmentSpan::Aligned { .. })).count();
-        let mod_only = r.iter().filter(|s| matches!(s, AlignmentSpan::ModOnly { .. })).count();
+        let aligned = r
+            .iter()
+            .filter(|s| matches!(s, AlignmentSpan::Aligned { .. }))
+            .count();
+        let mod_only = r
+            .iter()
+            .filter(|s| matches!(s, AlignmentSpan::ModOnly { .. }))
+            .count();
         assert!(aligned >= 1 && mod_only >= 1, "spans: {r:?}");
     }
 
@@ -605,7 +691,10 @@ mod tests {
         // Same logical content, different whitespace.
         let r = align(r#"{"a":1}"#, r#"{ "a" : 1 }"#);
         // Mod side has extra spaces; expect Aligned spans plus ModOnly for the spaces.
-        let mod_only = r.iter().filter(|s| matches!(s, AlignmentSpan::ModOnly { .. })).count();
+        let mod_only = r
+            .iter()
+            .filter(|s| matches!(s, AlignmentSpan::ModOnly { .. }))
+            .count();
         assert!(mod_only >= 1, "spans: {r:?}");
     }
 }

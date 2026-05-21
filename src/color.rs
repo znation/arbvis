@@ -47,17 +47,16 @@ pub fn build_diff_signed_lut() -> [Rgb<u8>; 256] {
             255 => Rgb([255, 255, 255]),
             128..=254 => {
                 let b = ((i - 127) as f32 / 127.0 * 255.0).round() as u8;
-                Rgb([0, b, 0])   // green: value increased
+                Rgb([0, b, 0]) // green: value increased
             }
             _ => {
                 let b = ((127 - i) as f32 / 127.0 * 255.0).round() as u8;
-                Rgb([b, 0, 0])   // red: value decreased
+                Rgb([b, 0, 0]) // red: value decreased
             }
         };
     }
     lut
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -104,5 +103,4 @@ mod tests {
         assert_eq!(lut[0], Rgb([0, 0, 0]));
         assert_eq!(lut[255], Rgb([255, 255, 255]));
     }
-
 }

@@ -5,6 +5,7 @@
 
 use crate::tiled::leaf::{TILE, TILE_LOG2};
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct HilbertLayout {
     pub kh: u8,
@@ -29,7 +30,7 @@ impl HilbertLayout {
             s += 1;
         }
         let kh = (s / 2) as u8;
-        let kw = ((s + 1) / 2) as u8;
+        let kw = s.div_ceil(2) as u8;
         let height = 1u32 << kh;
         let width = 1u32 << kw;
         let tile_size = TILE;
@@ -49,9 +50,5 @@ impl HilbertLayout {
             square_pixels,
             total,
         }
-    }
-
-    pub fn canvas_size(&self) -> (u32, u32) {
-        (self.world_w, self.height)
     }
 }

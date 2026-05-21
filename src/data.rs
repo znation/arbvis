@@ -11,10 +11,10 @@ use image::Rgb;
 use indicatif::ProgressBar;
 use memmap2::Mmap;
 
+use crate::hf_url::{self, RemoteFileSpec, RemoteRepo};
 use crate::layout::model_config::{ModelConfig, SafetensorsIndex};
 use crate::progress::{counter_style, multi};
 use crate::safetensors::{self, DiffFill, TensorMeta};
-use crate::hf_url::{self, RemoteFileSpec, RemoteRepo};
 use crate::xet::{self, XetReader, XetTerm};
 
 /// Bounded concurrency for setup-time HTTP loops (xet reconstruction,
@@ -39,7 +39,8 @@ const RMS_SAMPLE_FETCH_CONCURRENCY: usize = 4;
 /// `Option<ProgressBar>` is kept in the signature so existing call sites that
 /// pattern-match it continue to compile.
 fn setup_progress(label: &str, total: u64) -> Option<ProgressBar> {
-    let pb = multi().add(ProgressBar::new(total))
+    let pb = multi()
+        .add(ProgressBar::new(total))
         .with_style(counter_style())
         .with_message(label.to_string());
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
@@ -86,7 +87,10 @@ pub enum Data {
     /// `inner.fetch_range(base + s, n)`. Used by JSON / JSONL structure-aware
     /// diff so each one-sided structural span can expose its underlying bytes
     /// without re-mmapping the file.
-    OffsetSlice { inner: Arc<Data>, base: u64 },
+    OffsetSlice {
+        inner: Arc<Data>,
+        base: u64,
+    },
 }
 
 impl std::ops::Deref for Data {
@@ -116,8 +120,13 @@ impl Data {
         match self {
             Data::Mapped(m) => Ok(m[start as usize..start as usize + len].to_vec()),
             Data::Owned(v) => Ok(v[start as usize..start as usize + len].to_vec()),
-            Data::Http { repo, filename, revision } => {
-                repo.fetch_range(filename, revision, start..start + len as u64).await
+            Data::Http {
+                repo,
+                filename,
+                revision,
+            } => {
+                repo.fetch_range(filename, revision, start..start + len as u64)
+                    .await
             }
             Data::Xet(reader) => reader.fetch_range(start, len).await,
             Data::LazyDiff(f) => f(start, len).await,
@@ -149,7 +158,10 @@ impl Data {
 pub enum SourceKind {
     Buffered(Vec<u8>),
     File(PathBuf),
-    Diff { original: PathBuf, modified: PathBuf },
+    Diff {
+        original: PathBuf,
+        modified: PathBuf,
+    },
     /// Remote HF file, accessed via hf-hub range requests per tile.
     Http(RemoteFileSpec),
     /// Per-tensor diff computed lazily from two whole-file Data sources.
@@ -171,7 +183,9 @@ pub enum SourceKind {
     /// diff. The byte_size on the parent `Source` controls how much canvas
     /// space it takes; the underlying bytes are zero (the renderer paints a
     /// crosshatch pattern based on `fill` instead of using the byte LUT).
-    UnmatchedRegion { fill: DiffFill },
+    UnmatchedRegion {
+        fill: DiffFill,
+    },
     /// Byte-for-byte signed diff over a sub-range of two whole-file Data
     /// sources. Identical rendering semantics to `SourceKind::Diff` (signed
     /// byte delta) but parameterised over (Arc<Data>, start_offset) so each
@@ -279,9 +293,16 @@ pub fn prepare_sources(files: &[PathBuf]) -> anyhow::Result<(Vec<Source>, u64)> 
 
     // Expand any directory paths (e.g. from a repo-level hf:// download) into
     // their constituent files so they can be treated as individual sources.
-    let expanded: Vec<PathBuf> = files.iter().flat_map(|p| {
-        if p.is_dir() { collect_files_recursive(p) } else { vec![p.clone()] }
-    }).collect();
+    let expanded: Vec<PathBuf> = files
+        .iter()
+        .flat_map(|p| {
+            if p.is_dir() {
+                collect_files_recursive(p)
+            } else {
+                vec![p.clone()]
+            }
+        })
+        .collect();
 
     let mut sources = Vec::new();
     let mut total = 0u64;
@@ -300,7 +321,11 @@ pub fn prepare_sources(files: &[PathBuf]) -> anyhow::Result<(Vec<Source>, u64)> 
             match load_safetensors_info(path, size) {
                 Ok(info) => Some(info),
                 Err(e) => {
-                    log::warn!("{}: failed to parse safetensors header: {} — treating as plain binary", path.display(), e);
+                    log::warn!(
+                        "{}: failed to parse safetensors header: {} — treating as plain binary",
+                        path.display(),
+                        e
+                    );
                     None
                 }
             }
@@ -355,11 +380,19 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
                     };
                     let a = read_padded(&m_o);
                     let b = read_padded(&m_m);
-                    Ok(a.iter().zip(b.iter()).map(|(&a, &b)| {
-                        let delta = b as i16 - a as i16;
-                        let brightness = (delta.unsigned_abs() as f32 / 255.0 * 127.0).round() as u8;
-                        if delta >= 0 { 127u8 + brightness } else { 127u8 - brightness }
-                    }).collect())
+                    Ok(a.iter()
+                        .zip(b.iter())
+                        .map(|(&a, &b)| {
+                            let delta = b as i16 - a as i16;
+                            let brightness =
+                                (delta.unsigned_abs() as f32 / 255.0 * 127.0).round() as u8;
+                            if delta >= 0 {
+                                127u8 + brightness
+                            } else {
+                                127u8 - brightness
+                            }
+                        })
+                        .collect())
                 })
             })))
         }
@@ -369,7 +402,12 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
             revision: Arc::clone(&spec.revision),
         }),
         SourceKind::UnmatchedRegion { .. } => Ok(Data::ZeroFill),
-        SourceKind::RangeDiff { orig, mod_, orig_start, mod_start } => {
+        SourceKind::RangeDiff {
+            orig,
+            mod_,
+            orig_start,
+            mod_start,
+        } => {
             let orig = Arc::clone(orig);
             let mod_ = Arc::clone(mod_);
             let orig_start = *orig_start;
@@ -380,18 +418,36 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
                 Box::pin(async move {
                     let a = orig.fetch_range(orig_start + start, len).await?;
                     let b = mod_.fetch_range(mod_start + start, len).await?;
-                    Ok(a.iter().zip(b.iter()).map(|(&a, &b)| {
-                        let delta = b as i16 - a as i16;
-                        let brightness = (delta.unsigned_abs() as f32 / 255.0 * 127.0).round() as u8;
-                        if delta >= 0 { 127u8 + brightness } else { 127u8 - brightness }
-                    }).collect())
+                    Ok(a.iter()
+                        .zip(b.iter())
+                        .map(|(&a, &b)| {
+                            let delta = b as i16 - a as i16;
+                            let brightness =
+                                (delta.unsigned_abs() as f32 / 255.0 * 127.0).round() as u8;
+                            if delta >= 0 {
+                                127u8 + brightness
+                            } else {
+                                127u8 - brightness
+                            }
+                        })
+                        .collect())
                 })
             })))
         }
-        SourceKind::OneSidedRange { data, start, .. } => {
-            Ok(Data::OffsetSlice { inner: Arc::clone(data), base: *start })
-        }
-        SourceKind::TensorDiff { orig, mod_, orig_start, mod_start, orig_dtype, mod_dtype, metric, scale_orig } => {
+        SourceKind::OneSidedRange { data, start, .. } => Ok(Data::OffsetSlice {
+            inner: Arc::clone(data),
+            base: *start,
+        }),
+        SourceKind::TensorDiff {
+            orig,
+            mod_,
+            orig_start,
+            mod_start,
+            orig_dtype,
+            mod_dtype,
+            metric,
+            scale_orig,
+        } => {
             let orig = Arc::clone(orig);
             let mod_ = Arc::clone(mod_);
             let orig_start = *orig_start;
@@ -406,8 +462,18 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
                 Box::pin(async move {
                     let orig_elem = orig_dtype.element_size() as u64;
                     let mod_elem = mod_dtype.element_size() as u64;
-                    let ob = orig.fetch_range(orig_start + start * orig_elem, (len as u64 * orig_elem) as usize).await?;
-                    let mb = mod_.fetch_range(mod_start + start * mod_elem, (len as u64 * mod_elem) as usize).await?;
+                    let ob = orig
+                        .fetch_range(
+                            orig_start + start * orig_elem,
+                            (len as u64 * orig_elem) as usize,
+                        )
+                        .await?;
+                    let mb = mod_
+                        .fetch_range(
+                            mod_start + start * mod_elem,
+                            (len as u64 * mod_elem) as usize,
+                        )
+                        .await?;
                     Ok(orig_dtype.diff_to_u8(&ob, mod_dtype, &mb, metric, scale_orig))
                 })
             })))
@@ -417,9 +483,7 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
 
 /// Build sources from a mixed list of local paths and remote HF file specs.
 /// Remote specs are turned into `SourceKind::Http` entries (no download).
-pub fn prepare_sources_from_specs(
-    specs: &[InputSpec],
-) -> anyhow::Result<(Vec<Source>, u64)> {
+pub fn prepare_sources_from_specs(specs: &[InputSpec]) -> anyhow::Result<(Vec<Source>, u64)> {
     if specs.is_empty() {
         log::info!("Reading stdin...");
         let mut buf = Vec::new();
@@ -666,17 +730,25 @@ fn load_safetensors_info(path: &Path, file_size: u64) -> anyhow::Result<Safetens
 
     let (tensors, header_end) = safetensors::parse_header(&header_buf)?;
     let color_ranges = safetensors::build_color_ranges(&tensors, header_end, file_size);
-    Ok(SafetensorsInfo { tensors, color_ranges })
+    Ok(SafetensorsInfo {
+        tensors,
+        color_ranges,
+    })
 }
 
 /// Fetch and parse the safetensors header from any Data source.
 /// For local sources (Mapped/Owned): zero-copy slice access.
 /// For remote sources (Http): two range requests (8 bytes, then full header).
-async fn fetch_safetensors_header(data: &Data) -> anyhow::Result<(Vec<safetensors::TensorMeta>, u64)> {
+async fn fetch_safetensors_header(
+    data: &Data,
+) -> anyhow::Result<(Vec<safetensors::TensorMeta>, u64)> {
     let size_bytes = data.fetch_range(0, 8).await?;
     let header_size = u64::from_le_bytes(size_bytes[..8].try_into().unwrap());
     if header_size > 100 * 1024 * 1024 {
-        anyhow::bail!("safetensors header_size={} exceeds 100 MB safety limit", header_size);
+        anyhow::bail!(
+            "safetensors header_size={} exceeds 100 MB safety limit",
+            header_size
+        );
     }
     let total_header = 8 + header_size as usize;
     let header_bytes = data.fetch_range(0, total_header).await?;
@@ -726,9 +798,8 @@ pub async fn prepare_diff_sources(
     let orig_is_dir = original.is_dir();
     let mod_is_dir = modified.is_dir();
 
-    let is_st = |p: &Path| -> bool {
-        p.extension().and_then(|e| e.to_str()) == Some("safetensors")
-    };
+    let is_st =
+        |p: &Path| -> bool { p.extension().and_then(|e| e.to_str()) == Some("safetensors") };
 
     let is_json = |p: &Path| -> bool {
         matches!(
@@ -741,7 +812,8 @@ pub async fn prepare_diff_sources(
         // JSON / JSONL: structure-aware diff so unchanged bytes line up on the
         // canvas even when an edit shifts subsequent positions.
         if is_json(original) && is_json(modified) {
-            return crate::json_diff::build_json_diff_sources(original, modified, is_finetune).await;
+            return crate::json_diff::build_json_diff_sources(original, modified, is_finetune)
+                .await;
         }
         // Safetensors diff: expand into per-tensor diff Sources (one per matched pair).
         if is_st(original) && is_st(modified) {
@@ -786,7 +858,8 @@ pub async fn prepare_diff_sources(
         let orig_st: Vec<PathBuf> = orig_files.iter().filter(|p| is_st(p)).cloned().collect();
         let mod_st: Vec<PathBuf> = mod_files.iter().filter(|p| is_st(p)).cloned().collect();
         if !orig_st.is_empty() || !mod_st.is_empty() {
-            match build_multi_safetensors_diff_sources(&orig_st, &mod_st, is_finetune, metric).await {
+            match build_multi_safetensors_diff_sources(&orig_st, &mod_st, is_finetune, metric).await
+            {
                 Ok((mut tensor_sources, bytes)) => {
                     let base_idx = sources.len();
                     for s in &mut tensor_sources {
@@ -802,7 +875,11 @@ pub async fn prepare_diff_sources(
         // Non-safetensors: match by relative path. Same-size pairs become a
         // byte diff; different-size or single-side files become crosshatched
         // unmatched regions so they remain visible.
-        let orig_fill_kind = if is_finetune { DiffFill::Grey } else { DiffFill::Red };
+        let orig_fill_kind = if is_finetune {
+            DiffFill::Grey
+        } else {
+            DiffFill::Red
+        };
         let orig_map: HashMap<PathBuf, PathBuf> = orig_files
             .iter()
             .filter(|p| !is_st(p))
@@ -822,12 +899,14 @@ pub async fn prepare_diff_sources(
             })
             .collect();
 
-        let mut mod_only_keys: Vec<&PathBuf> = mod_map.keys()
+        let mut mod_only_keys: Vec<&PathBuf> = mod_map
+            .keys()
             .filter(|k| !orig_map.contains_key(*k))
             .collect();
         mod_only_keys.sort();
         if is_finetune && !mod_only_keys.is_empty() {
-            let names: Vec<String> = mod_only_keys.iter()
+            let names: Vec<String> = mod_only_keys
+                .iter()
                 .map(|rel| modified.join(rel).display().to_string())
                 .collect();
             log::warn!(
@@ -852,10 +931,14 @@ pub async fn prepare_diff_sources(
             };
             match mod_map.get(rel) {
                 None => {
-                    if size_o == 0 { continue; }
+                    if size_o == 0 {
+                        continue;
+                    }
                     sources.push(Source {
                         file_idx: sources.len(),
-                        kind: SourceKind::UnmatchedRegion { fill: orig_fill_kind },
+                        kind: SourceKind::UnmatchedRegion {
+                            fill: orig_fill_kind,
+                        },
                         byte_size: size_o,
                         safetensors: None,
                         name_override: Some(format!("[only in original] {}", rel.display())),
@@ -876,7 +959,9 @@ pub async fn prepare_diff_sources(
                             log::warn!(
                                 "--diff --finetune: size mismatch ({} vs {} bytes) for {} — \
                                  byte-diffing with zero-padding on the shorter side",
-                                size_o, size_m, rel.display()
+                                size_o,
+                                size_m,
+                                rel.display()
                             );
                         } else {
                             log::warn!(
@@ -886,7 +971,9 @@ pub async fn prepare_diff_sources(
                         }
                     }
                     let max_size = size_o.max(size_m);
-                    if max_size == 0 { continue; }
+                    if max_size == 0 {
+                        continue;
+                    }
                     sources.push(Source {
                         file_idx: sources.len(),
                         kind: SourceKind::Diff {
@@ -913,10 +1000,14 @@ pub async fn prepare_diff_sources(
                     continue;
                 }
             };
-            if size_m == 0 { continue; }
+            if size_m == 0 {
+                continue;
+            }
             sources.push(Source {
                 file_idx: sources.len(),
-                kind: SourceKind::UnmatchedRegion { fill: DiffFill::Green },
+                kind: SourceKind::UnmatchedRegion {
+                    fill: DiffFill::Green,
+                },
                 byte_size: size_m,
                 safetensors: None,
                 name_override: Some(format!("[only in modified] {}", rel.display())),
@@ -933,8 +1024,20 @@ pub async fn prepare_diff_sources(
 
     anyhow::bail!(
         "--diff: both arguments must be files or both must be directories (got {} and {})",
-        if orig_is_file { "file" } else if orig_is_dir { "directory" } else { "missing path" },
-        if mod_is_file { "file" } else if mod_is_dir { "directory" } else { "missing path" }
+        if orig_is_file {
+            "file"
+        } else if orig_is_dir {
+            "directory"
+        } else {
+            "missing path"
+        },
+        if mod_is_file {
+            "file"
+        } else if mod_is_dir {
+            "directory"
+        } else {
+            "missing path"
+        }
     );
 }
 
@@ -951,18 +1054,24 @@ pub async fn prepare_diff_sources_from_http(
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     let is_st = |name: &str| name.ends_with(".safetensors");
 
-    let orig_st: Vec<&(String, RemoteFileSpec)> = orig_specs.iter().filter(|(n, _)| is_st(n)).collect();
-    let mod_st: Vec<&(String, RemoteFileSpec)>  = mod_specs.iter().filter(|(n, _)| is_st(n)).collect();
+    let orig_st: Vec<&(String, RemoteFileSpec)> =
+        orig_specs.iter().filter(|(n, _)| is_st(n)).collect();
+    let mod_st: Vec<&(String, RemoteFileSpec)> =
+        mod_specs.iter().filter(|(n, _)| is_st(n)).collect();
 
     let mut sources: Vec<Source> = Vec::new();
     let mut total = 0u64;
 
     // Safetensors diff — fully lazy, no download.
     if !orig_st.is_empty() || !mod_st.is_empty() {
-        match build_multi_safetensors_diff_sources_from_http(&orig_st, &mod_st, is_finetune, metric).await {
+        match build_multi_safetensors_diff_sources_from_http(&orig_st, &mod_st, is_finetune, metric)
+            .await
+        {
             Ok((mut tensor_sources, bytes)) => {
                 let base_idx = sources.len();
-                for s in &mut tensor_sources { s.file_idx += base_idx; }
+                for s in &mut tensor_sources {
+                    s.file_idx += base_idx;
+                }
                 sources.extend(tensor_sources);
                 total += bytes;
             }
@@ -976,13 +1085,25 @@ pub async fn prepare_diff_sources_from_http(
     // sized but rendered as the orig-fill kind (we can't byte-diff something
     // we won't download).
     const MAX_EAGER_SIZE: u64 = 16 * 1024 * 1024;
-    let orig_fill_kind = if is_finetune { DiffFill::Grey } else { DiffFill::Red };
-    let orig_non: HashMap<&str, &RemoteFileSpec> =
-        orig_specs.iter().filter(|(n, _)| !is_st(n)).map(|(n, s)| (n.as_str(), s)).collect();
-    let mod_non: HashMap<&str, &RemoteFileSpec> =
-        mod_specs.iter().filter(|(n, _)| !is_st(n)).map(|(n, s)| (n.as_str(), s)).collect();
+    let orig_fill_kind = if is_finetune {
+        DiffFill::Grey
+    } else {
+        DiffFill::Red
+    };
+    let orig_non: HashMap<&str, &RemoteFileSpec> = orig_specs
+        .iter()
+        .filter(|(n, _)| !is_st(n))
+        .map(|(n, s)| (n.as_str(), s))
+        .collect();
+    let mod_non: HashMap<&str, &RemoteFileSpec> = mod_specs
+        .iter()
+        .filter(|(n, _)| !is_st(n))
+        .map(|(n, s)| (n.as_str(), s))
+        .collect();
 
-    let mut mod_only_files: Vec<&str> = mod_non.keys().copied()
+    let mut mod_only_files: Vec<&str> = mod_non
+        .keys()
+        .copied()
         .filter(|k| !orig_non.contains_key(k))
         .collect();
     mod_only_files.sort();
@@ -1022,17 +1143,21 @@ pub async fn prepare_diff_sources_from_http(
                 log::warn!(
                     "--diff --finetune: size mismatch for {fname} ({} vs {} bytes) — \
                      byte-diffing with zero-padding on the shorter side",
-                    orig_spec.size, mod_spec.size
+                    orig_spec.size,
+                    mod_spec.size
                 );
             } else {
                 log::warn!(
                     "size mismatch for {fname} ({} vs {} bytes) — byte-diffing with zero-padding",
-                    orig_spec.size, mod_spec.size
+                    orig_spec.size,
+                    mod_spec.size
                 );
             }
         }
         let max_size = orig_spec.size.max(mod_spec.size);
-        if max_size == 0 { continue; }
+        if max_size == 0 {
+            continue;
+        }
         if max_size > MAX_EAGER_SIZE {
             // Too large to byte-diff eagerly; surface as a single crosshatched
             // region sized to max(orig, mod) so the file appears once in the
@@ -1053,7 +1178,10 @@ pub async fn prepare_diff_sources_from_http(
         }
     }
 
-    let pb = setup_progress("file pairs (non-safetensors diff downloads)", diff_jobs.len() as u64);
+    let pb = setup_progress(
+        "file pairs (non-safetensors diff downloads)",
+        diff_jobs.len() as u64,
+    );
     let pb_for_workers = pb.clone();
     let diffs: Vec<anyhow::Result<(String, Vec<u8>)>> = stream::iter(diff_jobs)
         .map(|(fname, orig_spec, mod_spec)| {
@@ -1076,13 +1204,20 @@ pub async fn prepare_diff_sources_from_http(
                 // tail diffs against zero, which renders as deltas indicating
                 // bytes that exist on only one side.
                 let len = ob.len().max(mb.len());
-                let diff: Vec<u8> = (0..len).map(|i| {
-                    let a = ob.get(i).copied().unwrap_or(0);
-                    let b = mb.get(i).copied().unwrap_or(0);
-                    let delta = b as i16 - a as i16;
-                    let brightness = (delta.unsigned_abs() as f32 / 255.0 * 127.0).round() as u8;
-                    if delta >= 0 { 127u8 + brightness } else { 127u8 - brightness }
-                }).collect();
+                let diff: Vec<u8> = (0..len)
+                    .map(|i| {
+                        let a = ob.get(i).copied().unwrap_or(0);
+                        let b = mb.get(i).copied().unwrap_or(0);
+                        let delta = b as i16 - a as i16;
+                        let brightness =
+                            (delta.unsigned_abs() as f32 / 255.0 * 127.0).round() as u8;
+                        if delta >= 0 {
+                            127u8 + brightness
+                        } else {
+                            127u8 - brightness
+                        }
+                    })
+                    .collect();
                 if let Some(pb) = pb.as_ref() {
                     pb.inc(1);
                 }
@@ -1096,7 +1231,8 @@ pub async fn prepare_diff_sources_from_http(
         pb.finish_and_clear();
     }
     // Re-sort by filename so the Source order is deterministic.
-    let mut diffs: Vec<(String, Vec<u8>)> = diffs.into_iter().collect::<anyhow::Result<Vec<_>>>()?;
+    let mut diffs: Vec<(String, Vec<u8>)> =
+        diffs.into_iter().collect::<anyhow::Result<Vec<_>>>()?;
     diffs.sort_by(|a, b| a.0.cmp(&b.0));
     for (fname, diff) in diffs {
         let size = diff.len() as u64;
@@ -1169,10 +1305,7 @@ fn strip_prefix_components(name: &str, n: usize) -> Option<&str> {
 
 /// Find (strip_orig, strip_mod) prefix depths that maximise unique 1-to-1 tensor name matches.
 /// Returns (0, 0) if exact matching already produces matches.
-fn find_strip_depths(
-    orig_names: &[String],
-    mod_names: &[String],
-) -> (usize, usize) {
+fn find_strip_depths(orig_names: &[String], mod_names: &[String]) -> (usize, usize) {
     // Count unique-suffix occurrences for a set of names stripped by `n` components.
     let unique_suffixes = |names: &[String], n: usize| -> HashMap<String, usize> {
         let mut counts: HashMap<String, usize> = HashMap::new();
@@ -1190,9 +1323,12 @@ fn find_strip_depths(
     for so in 0usize..=5 {
         let orig_counts = unique_suffixes(orig_names, so);
         for sm in 0usize..=5 {
-            if so == 0 && sm == 0 { continue; }
+            if so == 0 && sm == 0 {
+                continue;
+            }
             let mod_counts = unique_suffixes(mod_names, sm);
-            let matches = orig_counts.iter()
+            let matches = orig_counts
+                .iter()
                 .filter(|(s, &oc)| oc == 1 && mod_counts.get(s.as_str()) == Some(&1))
                 .count();
             if matches > best.2 {
@@ -1223,7 +1359,8 @@ fn match_under_strip_depths(
     strip_o: usize,
     strip_m: usize,
 ) -> Vec<(String, String)> {
-    let orig_by_stripped: HashMap<String, &str> = orig_names.iter()
+    let orig_by_stripped: HashMap<String, &str> = orig_names
+        .iter()
         .filter_map(|n| {
             strip_prefix_components(n, strip_o)
                 .filter(|s| !s.is_empty())
@@ -1234,7 +1371,8 @@ fn match_under_strip_depths(
             acc
         });
 
-    let mod_by_stripped: HashMap<String, &str> = mod_names.iter()
+    let mod_by_stripped: HashMap<String, &str> = mod_names
+        .iter()
         .filter_map(|n| {
             strip_prefix_components(n, strip_m)
                 .filter(|s| !s.is_empty())
@@ -1245,7 +1383,11 @@ fn match_under_strip_depths(
             acc
         });
 
-    let mut sorted_orig: Vec<&str> = orig_by_stripped.values().copied().filter(|s| !s.is_empty()).collect();
+    let mut sorted_orig: Vec<&str> = orig_by_stripped
+        .values()
+        .copied()
+        .filter(|s| !s.is_empty())
+        .collect();
     sorted_orig.sort();
 
     let mut pairs = Vec::new();
@@ -1283,7 +1425,7 @@ fn match_under_strip_depths(
 fn find_matched_tensor_pairs(orig_names: &[String], mod_names: &[String]) -> TensorMatch {
     use std::collections::HashSet;
     let mut remaining_orig: HashSet<String> = orig_names.iter().cloned().collect();
-    let mut remaining_mod:  HashSet<String> = mod_names.iter().cloned().collect();
+    let mut remaining_mod: HashSet<String> = mod_names.iter().cloned().collect();
 
     let mut pairs: Vec<(String, String)> = Vec::new();
 
@@ -1297,7 +1439,10 @@ fn find_matched_tensor_pairs(orig_names: &[String], mod_names: &[String]) -> Ten
         }
     }
     if !pairs.is_empty() {
-        log::debug!("safetensors diff: pass 0 exact match — {} pairs", pairs.len());
+        log::debug!(
+            "safetensors diff: pass 0 exact match — {} pairs",
+            pairs.len()
+        );
     }
 
     // Subsequent passes: greedy multi-pass strip search. Each pass picks the
@@ -1307,13 +1452,19 @@ fn find_matched_tensor_pairs(orig_names: &[String], mod_names: &[String]) -> Ten
     // pair yields any matches.
     let mut pass = 0usize;
     loop {
-        if remaining_orig.is_empty() || remaining_mod.is_empty() { break; }
+        if remaining_orig.is_empty() || remaining_mod.is_empty() {
+            break;
+        }
         let orig_vec: Vec<String> = remaining_orig.iter().cloned().collect();
-        let mod_vec:  Vec<String> = remaining_mod.iter().cloned().collect();
+        let mod_vec: Vec<String> = remaining_mod.iter().cloned().collect();
         let (strip_o, strip_m) = find_strip_depths(&orig_vec, &mod_vec);
-        if strip_o == 0 && strip_m == 0 { break; }
+        if strip_o == 0 && strip_m == 0 {
+            break;
+        }
         let new_pairs = match_under_strip_depths(&orig_vec, &mod_vec, strip_o, strip_m);
-        if new_pairs.is_empty() { break; }
+        if new_pairs.is_empty() {
+            break;
+        }
         pass += 1;
         log::info!(
             "safetensors diff: strip-match pass {}: stripping {} component(s) from original and {} from modified — {} new pair(s)",
@@ -1327,12 +1478,16 @@ fn find_matched_tensor_pairs(orig_names: &[String], mod_names: &[String]) -> Ten
     }
 
     let mut orig_only: Vec<String> = remaining_orig.into_iter().collect();
-    let mut mod_only:  Vec<String> = remaining_mod.into_iter().collect();
+    let mut mod_only: Vec<String> = remaining_mod.into_iter().collect();
     orig_only.sort();
     mod_only.sort();
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
-    TensorMatch { pairs, orig_only, mod_only }
+    TensorMatch {
+        pairs,
+        orig_only,
+        mod_only,
+    }
 }
 
 /// Sample each matched orig tensor's bytes and compute its RMS, used as the
@@ -1346,7 +1501,8 @@ async fn fetch_rms_estimates(
 ) -> anyhow::Result<Vec<f32>> {
     const SCALE_SAMPLE_BYTES: u64 = 64 * 1024;
     let pb = setup_progress("orig tensor RMS samples", paired_ok.len() as u64);
-    let inputs: Vec<(usize, usize, u64, u64, safetensors::Dtype)> = paired_ok.iter()
+    let inputs: Vec<(usize, usize, u64, u64, safetensors::Dtype)> = paired_ok
+        .iter()
         .enumerate()
         .map(|(idx, (orig_full, _))| {
             let (oi, orig_t) = &orig_map[orig_full];
@@ -1355,7 +1511,7 @@ async fn fetch_rms_estimates(
             let want = SCALE_SAMPLE_BYTES.min(tensor_bytes);
             // Align sample length down to a whole element so rms_from_buf
             // only sees complete values.
-            let len = if elem > 0 { (want / elem) * elem } else { 0 };
+            let len = want.checked_div(elem).map(|q| q * elem).unwrap_or(0);
             (idx, *oi, orig_t.file_start, len, orig_t.dtype)
         })
         .collect();
@@ -1364,7 +1520,9 @@ async fn fetch_rms_estimates(
             let d = Arc::clone(&orig_data[oi]);
             let pb = pb.clone();
             async move {
-                let scale = if len == 0 { 0.0 } else {
+                let scale = if len == 0 {
+                    0.0
+                } else {
                     match d.fetch_range(start, len as usize).await {
                         Ok(bytes) => safetensors::rms_from_buf(dtype, &bytes),
                         Err(e) => {
@@ -1373,14 +1531,18 @@ async fn fetch_rms_estimates(
                         }
                     }
                 };
-                if let Some(pb) = pb.as_ref() { pb.inc(1); }
+                if let Some(pb) = pb.as_ref() {
+                    pb.inc(1);
+                }
                 (idx, scale)
             }
         })
         .buffer_unordered(RMS_SAMPLE_FETCH_CONCURRENCY)
         .collect()
         .await;
-    if let Some(pb) = pb.as_ref() { pb.finish_and_clear(); }
+    if let Some(pb) = pb.as_ref() {
+        pb.finish_and_clear();
+    }
     out.sort_by_key(|(i, _)| *i);
     Ok(out.into_iter().map(|(_, s)| s).collect())
 }
@@ -1389,7 +1551,7 @@ async fn fetch_rms_estimates(
 /// build per-tensor TensorDiff Source entries without reading any tensor bytes.
 async fn build_multi_safetensors_diff_sources_inner(
     orig_data: &[Arc<Data>],
-    mod_data:  &[Arc<Data>],
+    mod_data: &[Arc<Data>],
     is_finetune: bool,
     metric: safetensors::DiffMetric,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
@@ -1415,7 +1577,9 @@ async fn build_multi_safetensors_diff_sources_inner(
                         let r = fetch_safetensors_header(&d)
                             .await
                             .map(|(t, _)| t)
-                            .with_context(|| format!("reading safetensors header for {side} file {i}"));
+                            .with_context(|| {
+                                format!("reading safetensors header for {side} file {i}")
+                            });
                         if let Some(pb) = pb.as_ref() {
                             pb.inc(1);
                         }
@@ -1449,9 +1613,12 @@ async fn build_multi_safetensors_diff_sources_inner(
     }
 
     let orig_names: Vec<String> = orig_map.keys().cloned().collect();
-    let mod_names:  Vec<String> = mod_map.keys().cloned().collect();
-    let TensorMatch { pairs, orig_only, mod_only } =
-        find_matched_tensor_pairs(&orig_names, &mod_names);
+    let mod_names: Vec<String> = mod_map.keys().cloned().collect();
+    let TensorMatch {
+        pairs,
+        orig_only,
+        mod_only,
+    } = find_matched_tensor_pairs(&orig_names, &mod_names);
 
     // Tensors present in both, but with incompatible shapes, can't be diffed
     // element-wise. Treat each side independently: in non-finetune mode both
@@ -1507,7 +1674,7 @@ async fn build_multi_safetensors_diff_sources_inner(
 
     for ((orig_full, mod_full), scale_orig) in paired_ok.iter().zip(scales.iter()) {
         let (oi, orig_t) = &orig_map[orig_full];
-        let (mi, mod_t)  = &mod_map[mod_full];
+        let (mi, mod_t) = &mod_map[mod_full];
 
         let nelem: u64 = orig_t.shape.iter().product();
         sources.push(Source {
@@ -1516,9 +1683,9 @@ async fn build_multi_safetensors_diff_sources_inner(
                 orig: Arc::clone(&orig_data[*oi]),
                 mod_: Arc::clone(&mod_data[*mi]),
                 orig_start: orig_t.file_start,
-                mod_start:  mod_t.file_start,
+                mod_start: mod_t.file_start,
                 orig_dtype: orig_t.dtype,
-                mod_dtype:  mod_t.dtype,
+                mod_dtype: mod_t.dtype,
                 metric,
                 scale_orig: *scale_orig,
             },
@@ -1533,7 +1700,11 @@ async fn build_multi_safetensors_diff_sources_inner(
     // Unmatched / shape-mismatched tensors become crosshatched canvas regions.
     // In finetune mode only orig-only entries can survive (mod-side errors
     // were already raised above), and they render as informational grey.
-    let orig_fill = if is_finetune { DiffFill::Grey } else { DiffFill::Red };
+    let orig_fill = if is_finetune {
+        DiffFill::Grey
+    } else {
+        DiffFill::Red
+    };
 
     let mut orig_unmatched: Vec<&safetensors::TensorMeta> = Vec::new();
     for name in &orig_only {
@@ -1544,7 +1715,9 @@ async fn build_multi_safetensors_diff_sources_inner(
     }
     for t in orig_unmatched {
         let nelem: u64 = t.shape.iter().product();
-        if nelem == 0 { continue; }
+        if nelem == 0 {
+            continue;
+        }
         sources.push(Source {
             file_idx: sources.len(),
             kind: SourceKind::UnmatchedRegion { fill: orig_fill },
@@ -1562,10 +1735,14 @@ async fn build_multi_safetensors_diff_sources_inner(
     for name in &mod_only {
         let t = &mod_map[name].1;
         let nelem: u64 = t.shape.iter().product();
-        if nelem == 0 { continue; }
+        if nelem == 0 {
+            continue;
+        }
         sources.push(Source {
             file_idx: sources.len(),
-            kind: SourceKind::UnmatchedRegion { fill: DiffFill::Green },
+            kind: SourceKind::UnmatchedRegion {
+                fill: DiffFill::Green,
+            },
             byte_size: nelem,
             safetensors: None,
             name_override: Some(format!("[only in modified] {}", t.label())),
@@ -1595,13 +1772,16 @@ async fn build_multi_safetensors_diff_sources(
     metric: safetensors::DiffMetric,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     let open_arcs = |files: &[PathBuf]| -> anyhow::Result<Vec<Arc<Data>>> {
-        files.iter().map(|p| {
-            let f = File::open(p).with_context(|| format!("opening {}", p.display()))?;
-            Ok(Arc::new(Data::Mapped(unsafe { Mmap::map(&f) }?)))
-        }).collect()
+        files
+            .iter()
+            .map(|p| {
+                let f = File::open(p).with_context(|| format!("opening {}", p.display()))?;
+                Ok(Arc::new(Data::Mapped(unsafe { Mmap::map(&f) }?)))
+            })
+            .collect()
     };
     let orig_data = open_arcs(orig_files)?;
-    let mod_data  = open_arcs(mod_files)?;
+    let mod_data = open_arcs(mod_files)?;
     build_multi_safetensors_diff_sources_inner(&orig_data, &mod_data, is_finetune, metric).await
 }
 
@@ -1613,7 +1793,7 @@ async fn build_multi_safetensors_diff_sources(
 /// Non-xet remote files fall back to `Data::Http` which routes through hf-hub.
 async fn build_multi_safetensors_diff_sources_from_http(
     orig_specs: &[&(String, RemoteFileSpec)],
-    mod_specs:  &[&(String, RemoteFileSpec)],
+    mod_specs: &[&(String, RemoteFileSpec)],
     is_finetune: bool,
     metric: safetensors::DiffMetric,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
@@ -1660,10 +1840,12 @@ async fn build_multi_safetensors_diff_sources_from_http(
             pb.finish_and_clear();
         }
         out.sort_by_key(|(i, _)| *i);
-        out.into_iter().map(|(_, r)| r).collect::<anyhow::Result<Vec<_>>>()
+        out.into_iter()
+            .map(|(_, r)| r)
+            .collect::<anyhow::Result<Vec<_>>>()
     }
     let orig_data = make_arcs(orig_specs.iter().map(|(_, s)| s.clone()).collect()).await?;
-    let mod_data  = make_arcs(mod_specs.iter().map(|(_, s)| s.clone()).collect()).await?;
+    let mod_data = make_arcs(mod_specs.iter().map(|(_, s)| s.clone()).collect()).await?;
     build_multi_safetensors_diff_sources_inner(&orig_data, &mod_data, is_finetune, metric).await
 }
 
@@ -1679,7 +1861,8 @@ async fn build_safetensors_diff_sources(
         &[modified.to_path_buf()],
         is_finetune,
         metric,
-    ).await
+    )
+    .await
 }
 
 /// Sidecar metadata fetched alongside a safetensors source. Both fields are
@@ -1691,12 +1874,6 @@ async fn build_safetensors_diff_sources(
 pub struct SourceMeta {
     pub config: Option<ModelConfig>,
     pub index: Option<SafetensorsIndex>,
-}
-
-impl SourceMeta {
-    pub fn is_empty(&self) -> bool {
-        self.config.is_none() && self.index.is_none()
-    }
 }
 
 /// Best-effort opportunistic load of `config.json` and
@@ -1726,10 +1903,11 @@ pub async fn try_load_source_meta(source: &Source) -> SourceMeta {
                 .await
                 .ok()
                 .and_then(|b| ModelConfig::from_bytes(&b));
-            let index = fetch_hf_sidecar(&spec.repo, &spec.revision, "model.safetensors.index.json")
-                .await
-                .ok()
-                .and_then(|b| SafetensorsIndex::from_bytes(&b));
+            let index =
+                fetch_hf_sidecar(&spec.repo, &spec.revision, "model.safetensors.index.json")
+                    .await
+                    .ok()
+                    .and_then(|b| SafetensorsIndex::from_bytes(&b));
             SourceMeta { config, index }
         }
         _ => SourceMeta::default(),
@@ -1773,7 +1951,11 @@ pub async fn load_meta_for_sources(sources: &[Source]) -> Vec<SourceMeta> {
 /// Fetch a small sidecar file (e.g. `config.json`) from an HF Hub repo via
 /// a raw GET to `{endpoint}/{repo_id}/resolve/{revision}/{filename}`.
 /// Returns the raw bytes on success.
-async fn fetch_hf_sidecar(repo: &RemoteRepo, revision: &str, filename: &str) -> anyhow::Result<Vec<u8>> {
+async fn fetch_hf_sidecar(
+    repo: &RemoteRepo,
+    revision: &str,
+    filename: &str,
+) -> anyhow::Result<Vec<u8>> {
     let url = format!(
         "{}/{}/resolve/{}/{}",
         hf_url::endpoint(),
@@ -1789,8 +1971,16 @@ async fn fetch_hf_sidecar(repo: &RemoteRepo, revision: &str, filename: &str) -> 
     if let Some(tok) = hf_url::read_token() {
         req = req.bearer_auth(tok);
     }
-    let resp = req.send().await.with_context(|| format!("fetching {url}"))?;
-    let resp = resp.error_for_status().with_context(|| format!("non-2xx for {filename}"))?;
-    let bytes = resp.bytes().await.with_context(|| format!("reading body of {filename}"))?;
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("fetching {url}"))?;
+    let resp = resp
+        .error_for_status()
+        .with_context(|| format!("non-2xx for {filename}"))?;
+    let bytes = resp
+        .bytes()
+        .await
+        .with_context(|| format!("reading body of {filename}"))?;
     Ok(bytes.to_vec())
 }

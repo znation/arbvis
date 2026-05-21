@@ -11,13 +11,13 @@ use rayon::prelude::*;
 
 use crate::color::{build_diff_signed_lut, build_pixel_lut};
 use crate::data::{load_source_data, Data, Source, SourceKind};
-use crate::geometry::{sampled_in_range, hilbert_to_xy_u64};
+use crate::geometry::{hilbert_to_xy_u64, sampled_in_range};
 use crate::label::draw_file_label;
 use crate::layout::arch::ArchLayout;
 use crate::layout::render::{plain_element_color, PADDING_RGB};
 use crate::layout::{select_layout, Layout, LayoutMode};
 use crate::safetensors::{color_for_pos, DiffFill};
-use crate::xet::{TABLEAU_20, XorbMap};
+use crate::xet::{XorbMap, TABLEAU_20};
 
 /// Two-pixel-wide diagonal crosshatch on (x, y) for unmatched-region sources.
 /// Kept identical in spirit to the tile renderer's pattern so the single-image
@@ -50,7 +50,10 @@ pub fn run_single(
     let cumulative_offsets: Vec<u64> = {
         let mut v = Vec::with_capacity(sources.len());
         let mut o = 0u64;
-        for s in &sources { v.push(o); o += s.byte_size; }
+        for s in &sources {
+            v.push(o);
+            o += s.byte_size;
+        }
         v
     };
     // Opportunistic sidecar (config.json / index.json) load. Runs inside
@@ -60,10 +63,12 @@ pub fn run_single(
     let metas = if matches!(layout_mode, LayoutMode::Hilbert) {
         Vec::new()
     } else {
-        tokio::runtime::Handle::current()
-            .block_on(crate::data::load_meta_for_sources(&sources))
+        tokio::runtime::Handle::current().block_on(crate::data::load_meta_for_sources(&sources))
     };
-    if let Some(arch_summary) = metas.iter().find_map(|m| m.config.as_ref().map(|c| c.summary())) {
+    if let Some(arch_summary) = metas
+        .iter()
+        .find_map(|m| m.config.as_ref().map(|c| c.summary()))
+    {
         log::info!("model config: {arch_summary}");
     }
     let layout = select_layout(&sources, &cumulative_offsets, total, layout_mode, &metas);
@@ -74,7 +79,10 @@ pub fn run_single(
         // renderer is synchronous and we don't want to block a tokio worker
         // inside spawn_blocking on per-pixel HTTP calls.
         let all_local = sources.iter().all(|s| {
-            matches!(s.kind, SourceKind::File(_) | SourceKind::Buffered(_) | SourceKind::Diff { .. })
+            matches!(
+                s.kind,
+                SourceKind::File(_) | SourceKind::Buffered(_) | SourceKind::Diff { .. }
+            )
         });
         if all_local && !diff_mode && !show_xet_xorbs {
             return run_single_arch(files, output, &sources, arch);
@@ -94,7 +102,16 @@ pub fn run_single(
         .map(load_source_data)
         .collect::<anyhow::Result<_>>()?;
     let rt = tokio::runtime::Handle::current();
-    run_single_hilbert(files, output, sources, source_data, total, diff_mode, show_xet_xorbs, rt)
+    run_single_hilbert(
+        files,
+        output,
+        sources,
+        source_data,
+        total,
+        diff_mode,
+        show_xet_xorbs,
+        rt,
+    )
 }
 
 /// Synchronous architectural-mode single-image render. Renders every tensor
@@ -109,12 +126,14 @@ fn run_single_arch(
     let (canvas_w, canvas_h) = (layout.width, layout.height);
     // Global integer downscale so the largest dimension fits in SINGLE_MAX_DIM.
     let max_dim = canvas_w.max(canvas_h).max(1);
-    let scale: u32 = ((max_dim + SINGLE_MAX_DIM - 1) / SINGLE_MAX_DIM).max(1);
+    let scale: u32 = max_dim.div_ceil(SINGLE_MAX_DIM).max(1);
     let out_w = (canvas_w / scale).max(1);
     let out_h = (canvas_h / scale).max(1);
 
     let mut img: image::ImageBuffer<Rgb<u8>, Vec<u8>> = image::ImageBuffer::new(out_w, out_h);
-    for p in img.pixels_mut() { *p = PADDING_RGB; }
+    for p in img.pixels_mut() {
+        *p = PADDING_RGB;
+    }
 
     // Open each source as `Data` so we can borrow its bytes synchronously
     // via `Deref` (panics for HTTP/Xet/LazyDiff — but `run_single`'s
@@ -143,29 +162,40 @@ fn run_single_arch(
             _ => continue,
         };
         // Tensor byte start, local to its source.
-        let local_off = t.tensor_byte_start.saturating_sub(
-            sources[..src_idx].iter().map(|s| s.byte_size).sum::<u64>(),
-        );
+        let local_off = t
+            .tensor_byte_start
+            .saturating_sub(sources[..src_idx].iter().map(|s| s.byte_size).sum::<u64>());
 
         // Output rect after scaling.
         let out_x0 = t.canvas_x / scale;
         let out_y0 = t.canvas_y / scale;
         let out_x1 = ((t.canvas_x + cols.min(u32::MAX as u64) as u32) / scale).min(out_w);
         let out_y1 = ((t.canvas_y + rows.min(u32::MAX as u64) as u32) / scale).min(out_h);
-        if out_x1 <= out_x0 || out_y1 <= out_y0 { continue; }
+        if out_x1 <= out_x0 || out_y1 <= out_y0 {
+            continue;
+        }
 
         for oy in out_y0..out_y1 {
             // Map output y back to a representative tensor row.
             let dy = (oy - out_y0) as u64 * scale as u64;
-            if dy >= rows { break; }
+            if dy >= rows {
+                break;
+            }
             let row_off = local_off + dy * stride;
             for ox in out_x0..out_x1 {
                 let dx = (ox - out_x0) as u64 * scale as u64;
-                if dx >= cols { break; }
+                if dx >= cols {
+                    break;
+                }
                 let elem_off = (row_off + dx * elem) as usize;
-                if elem_off + elem as usize > src_bytes.len() { continue; }
+                if elem_off + elem as usize > src_bytes.len() {
+                    continue;
+                }
                 let color = plain_element_color(
-                    t.dtype, &src_bytes[elem_off..elem_off + elem as usize], 0, &pixel_lut,
+                    t.dtype,
+                    &src_bytes[elem_off..elem_off + elem as usize],
+                    0,
+                    &pixel_lut,
                 );
                 img.put_pixel(ox, oy, color);
             }
@@ -178,18 +208,21 @@ fn run_single_arch(
     }
 
     // Interactive window: just show the final image and wait for close.
-    let pixels: Vec<u32> = img.pixels()
+    let pixels: Vec<u32> = img
+        .pixels()
         .map(|p| ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32))
         .collect();
     let mut window = Window::new(
         "arbvis (arch layout) — press Esc or close to quit",
-        out_w as usize, out_h as usize,
+        out_w as usize,
+        out_h as usize,
         WindowOptions::default(),
     )
     .map_err(|e| anyhow::anyhow!("failed to open preview window: {e}"))?;
     window.set_target_fps(10);
     while window.is_open() && !window.is_key_down(minifb::Key::Escape) {
-        window.update_with_buffer(&pixels, out_w as usize, out_h as usize)
+        window
+            .update_with_buffer(&pixels, out_w as usize, out_h as usize)
             .map_err(|e| anyhow::anyhow!("window update error: {e}"))?;
     }
     Ok(())
@@ -226,24 +259,28 @@ fn run_single_hilbert(
 
     // Subsample if there are more bytes than canvas pixels.
     let stride = if total_usize > canvas_size {
-        (total_usize + canvas_size - 1) / canvas_size
+        total_usize.div_ceil(canvas_size)
     } else {
         1
     } as u64;
 
-    let pixel_lut = if diff_mode { build_diff_signed_lut() } else { build_pixel_lut() };
+    let pixel_lut = if diff_mode {
+        build_diff_signed_lut()
+    } else {
+        build_pixel_lut()
+    };
 
     // Build xorb map only when xorb coloring was explicitly requested.
     let xorb_map = if show_xet_xorbs {
-        XorbMap::build(
-            sources.iter().scan(0u64, |off, s| {
-                let cur = *off;
-                *off += s.byte_size;
-                Some((s.xet_terms.as_deref(), cur))
-            }),
-        )
+        XorbMap::build(sources.iter().scan(0u64, |off, s| {
+            let cur = *off;
+            *off += s.byte_size;
+            Some((s.xet_terms.as_deref(), cur))
+        }))
     } else {
-        XorbMap { global_ranges: Vec::new() }
+        XorbMap {
+            global_ranges: Vec::new(),
+        }
     };
     let tableau: [Rgb<u8>; 20] = {
         let mut arr = [Rgb([0u8, 0, 0]); 20];
@@ -317,9 +354,22 @@ fn run_single_hilbert(
         let canvas_u = canvas_size as u64;
 
         let chunk_results = render_chunks(
-            &sources, &source_data, &chunks_by_source,
-            &cancelled, img_base, pf_base, canvas_u, canvas_size, side, k, stride,
-            &pixel_lut, &xorb_map, &tableau, &pb_shared, &rt,
+            &sources,
+            &source_data,
+            &chunks_by_source,
+            &cancelled,
+            img_base,
+            pf_base,
+            canvas_u,
+            canvas_size,
+            side,
+            k,
+            stride,
+            &pixel_lut,
+            &xorb_map,
+            &tableau,
+            &pb_shared,
+            &rt,
         )?;
 
         for (fi, bbox) in chunk_results {
@@ -345,7 +395,6 @@ fn run_single_hilbert(
             }
             DynamicImage::ImageRgb8(img).save(&path)?;
         }
-
     } else {
         // ─── Interactive path: rendering in background, minifb on main thread ─
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -373,9 +422,22 @@ fn run_single_hilbert(
 
         let bg_thread = std::thread::spawn(move || {
             let result = render_chunks(
-                &sources, &source_data, &chunks_by_source,
-                &cancelled_bg, img_ptr, pf_ptr, canvas_u, canvas_size, side, k, stride,
-                &pixel_lut, &xorb_map, &tableau, &pb_shared, &rt,
+                &sources,
+                &source_data,
+                &chunks_by_source,
+                &cancelled_bg,
+                img_ptr,
+                pf_ptr,
+                canvas_u,
+                canvas_size,
+                side,
+                k,
+                stride,
+                &pixel_lut,
+                &xorb_map,
+                &tableau,
+                &pb_shared,
+                &rt,
             );
 
             let chunk_results = match result {
@@ -392,7 +454,9 @@ fn run_single_hilbert(
                 if let Some(b) = bbox {
                     bboxes[fi] = Some(match bboxes[fi] {
                         None => b,
-                        Some((x0, y0, x1, y1)) => (x0.min(b.0), y0.min(b.1), x1.max(b.2), y1.max(b.3)),
+                        Some((x0, y0, x1, y1)) => {
+                            (x0.min(b.0), y0.min(b.1), x1.max(b.2), y1.max(b.3))
+                        }
                     });
                 }
             }
@@ -414,8 +478,7 @@ fn run_single_hilbert(
         window.set_target_fps(10);
 
         loop {
-            let is_open = window.is_open()
-                && !window.is_key_down(minifb::Key::Escape);
+            let is_open = window.is_open() && !window.is_key_down(minifb::Key::Escape);
 
             if !is_open {
                 cancelled.store(true, Ordering::Release);
@@ -436,7 +499,8 @@ fn run_single_hilbert(
                     })
                     .collect()
             };
-            window.update_with_buffer(&pixels, side as usize, side as usize)
+            window
+                .update_with_buffer(&pixels, side as usize, side as usize)
                 .map_err(|e| anyhow::anyhow!("window update error: {e}"))?;
 
             if render_done.load(Ordering::Acquire) {
@@ -467,10 +531,12 @@ fn run_single_hilbert(
                 }
             }
         }
-        let final_pixels: Vec<u32> = img.pixels().map(|p| {
-            ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32)
-        }).collect();
-        window.update_with_buffer(&final_pixels, side as usize, side as usize)
+        let final_pixels: Vec<u32> = img
+            .pixels()
+            .map(|p| ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32))
+            .collect();
+        window
+            .update_with_buffer(&final_pixels, side as usize, side as usize)
             .map_err(|e| anyhow::anyhow!("window update error: {e}"))?;
 
         // Keep window open until user closes it.
@@ -655,10 +721,9 @@ fn render_chunks(
                                 Some(v) => v,
                                 None => &data[local_start..local_end],
                             };
-                            let mut cur_byte = chunk_b_start;
-
-                            for &b in bytes {
-                                if cur_byte % stride == 0 {
+                            for (i, &b) in bytes.iter().enumerate() {
+                                let cur_byte = chunk_b_start + i as u64;
+                                if cur_byte.is_multiple_of(stride) {
                                     let (x, y) = hilbert_to_xy_u64(cur_pixel as u64, k as u8);
                                     let dtype = dtype_ranges
                                         .map(|r| color_for_pos(cur_byte - src_global_start, r));
@@ -684,7 +749,6 @@ fn render_chunks(
                                         break;
                                     }
                                 }
-                                cur_byte += 1;
                             }
                         }
                         if let Some(ref pb) = pb_shared {
@@ -702,28 +766,34 @@ fn render_chunks(
         .collect();
 
     // When multiple files are given, mark border pixels black.
-    if sources.iter().map(|s| s.file_idx).collect::<std::collections::HashSet<_>>().len() > 1 {
+    if sources
+        .iter()
+        .map(|s| s.file_idx)
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        > 1
+    {
         let side_u = side as usize;
         // Reconstruct pixel_file reference from raw pointer for border pass
-        let pf_slice: &[Option<usize>] = unsafe {
-            std::slice::from_raw_parts(pf_base as *const Option<usize>, canvas_size)
-        };
+        let pf_slice: &[Option<usize>] =
+            unsafe { std::slice::from_raw_parts(pf_base as *const Option<usize>, canvas_size) };
         (0..side_u).into_par_iter().for_each(|y| {
             for x in 0..side_u {
                 let idx = y * side_u + x;
                 if let Some(file_idx) = pf_slice[idx] {
-                    let is_border = [(0i32, 1i32), (0, -1), (1, 0), (-1, 0)]
-                        .iter()
-                        .any(|(dx, dy)| {
-                            let nx = x as i32 + *dx;
-                            let ny = y as i32 + *dy;
-                            if nx >= 0 && nx < side_u as i32 && ny >= 0 && ny < side_u as i32 {
-                                let nidx = ny as usize * side_u + nx as usize;
-                                pf_slice[nidx].map_or(false, |nf| nf != file_idx)
-                            } else {
-                                false
-                            }
-                        });
+                    let is_border =
+                        [(0i32, 1i32), (0, -1), (1, 0), (-1, 0)]
+                            .iter()
+                            .any(|(dx, dy)| {
+                                let nx = x as i32 + *dx;
+                                let ny = y as i32 + *dy;
+                                if nx >= 0 && nx < side_u as i32 && ny >= 0 && ny < side_u as i32 {
+                                    let nidx = ny as usize * side_u + nx as usize;
+                                    pf_slice[nidx].is_some_and(|nf| nf != file_idx)
+                                } else {
+                                    false
+                                }
+                            });
                     if is_border {
                         unsafe {
                             let p = (img_base as *mut u8).add(idx * 3);

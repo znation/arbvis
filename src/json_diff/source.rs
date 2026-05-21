@@ -23,7 +23,11 @@ pub fn spans_to_sources(
     orig_label: &str,
     mod_label: &str,
 ) -> (Vec<Source>, u64) {
-    let orig_fill = if is_finetune { DiffFill::Grey } else { DiffFill::Red };
+    let orig_fill = if is_finetune {
+        DiffFill::Grey
+    } else {
+        DiffFill::Red
+    };
 
     let mut sources: Vec<Source> = Vec::with_capacity(spans.len() * 2);
     let mut total: u64 = 0;
@@ -33,7 +37,9 @@ pub fn spans_to_sources(
             AlignmentSpan::Aligned { orig, mod_ } => {
                 let o_len = orig.end.saturating_sub(orig.start);
                 let m_len = mod_.end.saturating_sub(mod_.start);
-                if o_len == 0 && m_len == 0 { continue; }
+                if o_len == 0 && m_len == 0 {
+                    continue;
+                }
                 let common = o_len.min(m_len);
                 if common > 0 {
                     let idx = sources.len();
@@ -49,7 +55,10 @@ pub fn spans_to_sources(
                         safetensors: None,
                         name_override: Some(format!(
                             "diff @ orig:[{}, {}) vs mod:[{}, {})",
-                            orig.start, orig.start + common, mod_.start, mod_.start + common
+                            orig.start,
+                            orig.start + common,
+                            mod_.start,
+                            mod_.start + common
                         )),
                         xet_terms: None,
                     });
@@ -72,7 +81,9 @@ pub fn spans_to_sources(
                         safetensors: None,
                         name_override: Some(format!(
                             "[only in original] {} @ [{}, {})",
-                            orig_label, orig.start + common, orig.end
+                            orig_label,
+                            orig.start + common,
+                            orig.end
                         )),
                         xet_terms: None,
                     });
@@ -92,7 +103,9 @@ pub fn spans_to_sources(
                         safetensors: None,
                         name_override: Some(format!(
                             "[only in modified] {} @ [{}, {})",
-                            mod_label, mod_.start + common, mod_.end
+                            mod_label,
+                            mod_.start + common,
+                            mod_.end
                         )),
                         xet_terms: None,
                     });
@@ -101,7 +114,9 @@ pub fn spans_to_sources(
             }
             AlignmentSpan::OrigOnly { orig } => {
                 let len = orig.end.saturating_sub(orig.start);
-                if len == 0 { continue; }
+                if len == 0 {
+                    continue;
+                }
                 let idx = sources.len();
                 sources.push(Source {
                     file_idx: idx,
@@ -122,7 +137,9 @@ pub fn spans_to_sources(
             }
             AlignmentSpan::ModOnly { mod_ } => {
                 let len = mod_.end.saturating_sub(mod_.start);
-                if len == 0 { continue; }
+                if len == 0 {
+                    continue;
+                }
                 let idx = sources.len();
                 sources.push(Source {
                     file_idx: idx,

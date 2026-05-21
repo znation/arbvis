@@ -21,7 +21,7 @@ use crate::layout::render::{
     PADDING_RGB,
 };
 use crate::layout::TileRegion;
-use crate::safetensors::{DiffMetric, Dtype};
+use crate::safetensors::DiffMetric;
 use crate::tiled::leaf::{encode_tile, TileFormat, TILE};
 
 type TileResult = Result<(image::ImageBuffer<Rgb<u8>, Vec<u8>>, Vec<u8>), String>;
@@ -39,9 +39,8 @@ fn region_byte_span(r: &TileRegion) -> (u64, usize) {
     let stride = r.tensor_cols * elem;
     let first = r.tensor_byte_start + r.row_first * stride + r.col_first * elem;
     // Last byte: end of element at (row_last-1, col_last-1).
-    let last = r.tensor_byte_start
-        + (r.row_last_exclusive - 1) * stride
-        + r.col_last_exclusive * elem;
+    let last =
+        r.tensor_byte_start + (r.row_last_exclusive - 1) * stride + r.col_last_exclusive * elem;
     debug_assert!(last >= first);
     (first, (last - first) as usize)
 }
@@ -80,10 +79,7 @@ pub async fn load_arch_tile_regions(
 /// `paint(rel_x, rel_y, elem_idx)` once per pixel. `elem_idx` is the offset
 /// (in *elements*, not bytes) into `bytes` where this pixel's element starts.
 #[inline]
-fn iter_region_pixels(
-    region: &TileRegion,
-    mut paint: impl FnMut(u32, u32, usize),
-) {
+fn iter_region_pixels(region: &TileRegion, mut paint: impl FnMut(u32, u32, usize)) {
     let cols = region.tensor_cols;
     for py in region.tile_y0..region.tile_y1 {
         let dy = (py - region.tile_y0) as u64;
@@ -133,10 +129,7 @@ pub fn render_arch_tile_plain(
 ///
 /// For architectural mode this is just "paint each region with its dtype
 /// color flat" — there are no inter-tensor bytes, the gaps are padding.
-pub fn render_arch_tile_dtype(
-    tile: &LoadedArchTile,
-    fmt: TileFormat,
-) -> TileResult {
+pub fn render_arch_tile_dtype(tile: &LoadedArchTile, fmt: TileFormat) -> TileResult {
     let mut img = blank_tile();
     for (region, _bytes) in &tile.regions {
         let color = region.dtype.to_color();
@@ -204,7 +197,8 @@ pub fn render_arch_tile_xet(
             + region.row_first * region.tensor_cols * dtype.element_size() as u64
             + region.col_first * dtype.element_size() as u64;
         iter_region_pixels(region, |px, py, elem_off| {
-            let color = xet_element_color(dtype, bytes, elem_off, tbs, xorb_ranges, tableau, pixel_lut);
+            let color =
+                xet_element_color(dtype, bytes, elem_off, tbs, xorb_ranges, tableau, pixel_lut);
             img.put_pixel(px, py, color);
         });
     }
@@ -250,10 +244,14 @@ pub fn render_arch_tile_diff_paired(
     // tensor placement). Mismatches fall back to padding.
     let mut by_id_b: std::collections::HashMap<usize, &(TileRegion, Vec<u8>)> =
         std::collections::HashMap::new();
-    for r in &tile_b.regions { by_id_b.insert(r.0.tensor_id, r); }
+    for r in &tile_b.regions {
+        by_id_b.insert(r.0.tensor_id, r);
+    }
 
     for (region_a, bytes_a) in &tile_a.regions {
-        let Some((region_b, bytes_b)) = by_id_b.get(&region_a.tensor_id) else { continue; };
+        let Some((region_b, bytes_b)) = by_id_b.get(&region_a.tensor_id) else {
+            continue;
+        };
         let dtype = region_a.dtype;
         let dtype_b = region_b.dtype;
         // Per-tensor scale is unknown at this layer in v1; pass 0 → RMS path
@@ -261,9 +259,7 @@ pub fn render_arch_tile_diff_paired(
         let scale_orig = 0.0f32;
         iter_region_pixels(region_a, |px, py, elem_off| {
             let color = diff_element_color(
-                dtype, bytes_a, elem_off,
-                dtype_b, bytes_b, elem_off,
-                metric, scale_orig, pixel_lut,
+                dtype, bytes_a, elem_off, dtype_b, bytes_b, elem_off, metric, scale_orig, pixel_lut,
             );
             img.put_pixel(px, py, color);
         });

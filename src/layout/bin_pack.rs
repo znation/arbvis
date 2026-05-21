@@ -11,6 +11,7 @@ pub struct Slot {
     pub height: u32,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct Placement {
     pub x: u32,
@@ -43,8 +44,12 @@ pub fn pack(slots: &[Slot], max_width: u32, padding: u32) -> (Vec<Placement>, u3
             height: s.height,
         });
         x_cursor += s.width + padding;
-        if s.height > shelf_height { shelf_height = s.height; }
-        if x_cursor > max_x_seen { max_x_seen = x_cursor; }
+        if s.height > shelf_height {
+            shelf_height = s.height;
+        }
+        if x_cursor > max_x_seen {
+            max_x_seen = x_cursor;
+        }
     }
 
     let total_height = y_cursor + shelf_height;
@@ -76,7 +81,10 @@ mod tests {
 
     #[test]
     fn pack_single_slot_no_padding() {
-        let slots = vec![Slot { width: 100, height: 50 }];
+        let slots = vec![Slot {
+            width: 100,
+            height: 50,
+        }];
         let (placements, w, h) = pack(&slots, 1000, 0);
         assert_eq!(placements.len(), 1);
         assert_eq!((placements[0].x, placements[0].y), (0, 0));
@@ -86,22 +94,37 @@ mod tests {
     #[test]
     fn pack_two_slots_fit_one_shelf() {
         let slots = vec![
-            Slot { width: 100, height: 50 },
-            Slot { width: 100, height: 60 },
+            Slot {
+                width: 100,
+                height: 50,
+            },
+            Slot {
+                width: 100,
+                height: 60,
+            },
         ];
         let (placements, w, h) = pack(&slots, 500, 4);
         assert_eq!(placements[0].x, 0);
         assert_eq!(placements[1].x, 104);
         assert_eq!(h, 60);
-        assert!(w >= 204 && w <= 208);
+        assert!((204..=208).contains(&w));
     }
 
     #[test]
     fn pack_wraps_when_overflow() {
         let slots = vec![
-            Slot { width: 100, height: 50 },
-            Slot { width: 100, height: 60 },
-            Slot { width: 100, height: 40 },
+            Slot {
+                width: 100,
+                height: 50,
+            },
+            Slot {
+                width: 100,
+                height: 60,
+            },
+            Slot {
+                width: 100,
+                height: 40,
+            },
         ];
         let (placements, _, h) = pack(&slots, 250, 4);
         // First two fit on shelf 0; third wraps to shelf 1 because 100+4+100+4+100 > 250.
@@ -114,10 +137,22 @@ mod tests {
     #[test]
     fn pack_preserves_input_order() {
         let slots = vec![
-            Slot { width: 10, height: 10 },
-            Slot { width: 20, height: 10 },
-            Slot { width: 30, height: 10 },
-            Slot { width: 40, height: 10 },
+            Slot {
+                width: 10,
+                height: 10,
+            },
+            Slot {
+                width: 20,
+                height: 10,
+            },
+            Slot {
+                width: 30,
+                height: 10,
+            },
+            Slot {
+                width: 40,
+                height: 10,
+            },
         ];
         let (placements, _, _) = pack(&slots, 1000, 0);
         // x positions are monotonically increasing for a single-shelf pack.

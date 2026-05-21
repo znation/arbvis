@@ -16,7 +16,12 @@ pub async fn upload_file(
     kind: RepoKind,
     path_in_repo: &str,
 ) -> anyhow::Result<()> {
-    log::info!("Uploading {} → hf://{}/{} ...", local.display(), repo_id, path_in_repo);
+    log::info!(
+        "Uploading {} → hf://{}/{} ...",
+        local.display(),
+        repo_id,
+        path_in_repo
+    );
     let client = hf_url::client()?;
     let (owner, name) = hf_url::split_owner_name(repo_id)?;
     let source = AddSource::file(PathBuf::from(local));
@@ -57,7 +62,8 @@ pub async fn upload_file(
                 .await
                 .map(|_| ()),
         }
-    }).await?;
+    })
+    .await?;
     Ok(())
 }
 
@@ -68,11 +74,20 @@ pub async fn upload_dir(
     kind: RepoKind,
     path_prefix: &str,
 ) -> anyhow::Result<()> {
-    log::info!("Uploading {}/ → hf://{}/{} ...", local_dir.display(), repo_id, path_prefix);
+    log::info!(
+        "Uploading {}/ → hf://{}/{} ...",
+        local_dir.display(),
+        repo_id,
+        path_prefix
+    );
     let client = hf_url::client()?;
     let (owner, name) = hf_url::split_owner_name(repo_id)?;
     let folder = PathBuf::from(local_dir);
-    let prefix = if path_prefix.is_empty() { None } else { Some(path_prefix.to_string()) };
+    let prefix = if path_prefix.is_empty() {
+        None
+    } else {
+        Some(path_prefix.to_string())
+    };
 
     let label = format!("upload_dir {repo_id}/{path_prefix}");
     with_throttle(&label, || async {
@@ -111,7 +126,8 @@ pub async fn upload_dir(
                 .await
                 .map(|_| ()),
         }
-    }).await?;
+    })
+    .await?;
     Ok(())
 }
 
@@ -157,7 +173,11 @@ pub async fn create_space_bucket(space_id: &str) -> anyhow::Result<HfOutputSpec>
 /// Deploy (or redeploy) the Space app files — app.py, README, Dockerfile,
 /// requirements.txt, and index.html. Assumes tiles and labels.json are already
 /// in the bucket (either synced from local disk or streamed directly).
-pub async fn deploy_space_app(space_id: &str, bucket_id: &str, index_html: Vec<u8>) -> anyhow::Result<()> {
+pub async fn deploy_space_app(
+    space_id: &str,
+    bucket_id: &str,
+    index_html: Vec<u8>,
+) -> anyhow::Result<()> {
     log::info!("Ensuring Space {} exists...", space_id);
     let client = hf_url::client()?;
     with_throttle(&format!("create_repository {space_id}"), || async {
@@ -227,7 +247,10 @@ pub async fn run_deploy(tiles_dir: &Path, space_id: &str) -> anyhow::Result<()> 
     with_throttle(&format!("bucket upload labels {bucket_id}"), || async {
         bucket
             .upload_files()
-            .files(vec![BucketUpload::new(labels_path.clone(), "labels.json".to_string())])
+            .files(vec![BucketUpload::new(
+                labels_path.clone(),
+                "labels.json".to_string(),
+            )])
             .send()
             .await
             .map(|_| ())
@@ -270,8 +293,7 @@ fn derive_bucket_id(space_id: &str) -> anyhow::Result<String> {
 fn write_space_files(dir: &Path, bucket_id: &str, space_id: &str) -> anyhow::Result<()> {
     let repo_name = space_id.split('/').nth(1).unwrap_or(space_id);
 
-    let readme = include_str!("space_template/README.md.tmpl")
-        .replace("__REPO_NAME__", repo_name);
+    let readme = include_str!("space_template/README.md.tmpl").replace("__REPO_NAME__", repo_name);
     std::fs::write(dir.join("README.md"), readme)?;
 
     std::fs::write(
@@ -284,8 +306,7 @@ fn write_space_files(dir: &Path, bucket_id: &str, space_id: &str) -> anyhow::Res
         include_str!("space_template/requirements.txt"),
     )?;
 
-    let app_py = include_str!("space_template/app.py.tmpl")
-        .replace("__BUCKET_ID__", bucket_id);
+    let app_py = include_str!("space_template/app.py.tmpl").replace("__BUCKET_ID__", bucket_id);
     std::fs::write(dir.join("app.py"), app_py)?;
 
     Ok(())

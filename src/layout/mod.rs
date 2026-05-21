@@ -26,6 +26,7 @@ use crate::safetensors::Dtype;
 /// One contiguous (row-major) element range of one tensor that overlaps a
 /// tile. The tile renderer fetches `byte_start..byte_end` from the source
 /// and decodes elements at the natural dtype stride.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TileRegion {
     /// Index into the source list this region's bytes come from.
@@ -53,10 +54,11 @@ pub struct TileRegion {
 }
 
 /// User-facing layout selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutMode {
     /// Auto-select: architectural if every source is safetensors AND
     /// transformer-style names are detected; otherwise hilbert.
+    #[default]
     Auto,
     /// Force architectural (structure-aware) layout. Falls back to hilbert if
     /// no source is safetensors.
@@ -65,35 +67,14 @@ pub enum LayoutMode {
     Hilbert,
 }
 
-impl Default for LayoutMode {
-    fn default() -> Self { LayoutMode::Auto }
-}
-
 /// The chosen layout for the current run.
+#[allow(dead_code)]
 pub enum Layout {
     HilbertGlobal(hilbert::HilbertLayout),
     Architectural(arch::ArchLayout),
 }
 
 impl Layout {
-    /// Total canvas dimensions, in pixels.
-    pub fn canvas_size(&self) -> (u32, u32) {
-        match self {
-            Layout::HilbertGlobal(h) => h.canvas_size(),
-            Layout::Architectural(a) => a.canvas_size(),
-        }
-    }
-
-    /// Total pixel count (= width * height).
-    pub fn total_pixels(&self) -> u64 {
-        let (w, h) = self.canvas_size();
-        w as u64 * h as u64
-    }
-
-    /// Whether this layout's per-pixel rendering needs source byte access
-    /// (Plain / Diff / Xet) or can be drawn from layout metadata alone (Dtype).
-    pub fn needs_bytes_for_plain(&self) -> bool { true }
-
     /// Whether this is the architectural variant (drives a few mode branches
     /// downstream — e.g. element-per-pixel decoding vs byte-per-pixel LUT).
     pub fn is_architectural(&self) -> bool {
@@ -126,18 +107,21 @@ pub fn select_layout(
     // structure. If forced (`Arch`) but the data doesn't support it, we still
     // fall back to hilbert with a log line — accidentally rendering nothing is
     // a worse outcome than ignoring the forced flag.
-    let all_safetensors = !sources.is_empty()
-        && sources.iter().all(|s| s.safetensors.is_some());
+    let all_safetensors = !sources.is_empty() && sources.iter().all(|s| s.safetensors.is_some());
 
     if all_safetensors {
         if let Some(arch) = arch::ArchLayout::try_build(sources, cumulative_offsets, metas) {
             return Layout::Architectural(arch);
         }
         if matches!(mode, LayoutMode::Arch) {
-            log::warn!("--layout arch requested but no recognisable structure; falling back to hilbert");
+            log::warn!(
+                "--layout arch requested but no recognisable structure; falling back to hilbert"
+            );
         }
     } else if matches!(mode, LayoutMode::Arch) {
-        log::warn!("--layout arch requested but not every input is safetensors; falling back to hilbert");
+        log::warn!(
+            "--layout arch requested but not every input is safetensors; falling back to hilbert"
+        );
     }
 
     Layout::HilbertGlobal(hilbert::HilbertLayout::from_total(total_bytes))

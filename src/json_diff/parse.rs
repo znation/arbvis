@@ -86,7 +86,10 @@ impl<'a> Parser<'a> {
     }
 
     fn err(&self, msg: impl Into<String>) -> ParseError {
-        ParseError { byte_offset: self.pos as u64, msg: msg.into() }
+        ParseError {
+            byte_offset: self.pos as u64,
+            msg: msg.into(),
+        }
     }
 
     fn peek(&self) -> Option<u8> {
@@ -105,7 +108,9 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 Ok(())
             }
-            Some(other) => Err(self.err(format!("expected {what} (0x{b:02x}), found 0x{other:02x}"))),
+            Some(other) => {
+                Err(self.err(format!("expected {what} (0x{b:02x}), found 0x{other:02x}")))
+            }
             None => Err(self.err(format!("expected {what} (0x{b:02x}), found EOF"))),
         }
     }
@@ -131,7 +136,12 @@ impl<'a> Parser<'a> {
             Some(b'[') => self.parse_array(),
             Some(b'"') => {
                 let (_decoded, end) = self.parse_string_at(start)?;
-                Ok(Node { kind: NodeKind::String, byte_start: start as u64, byte_end: end as u64, children: vec![] })
+                Ok(Node {
+                    kind: NodeKind::String,
+                    byte_start: start as u64,
+                    byte_end: end as u64,
+                    children: vec![],
+                })
             }
             Some(b't') | Some(b'f') => self.parse_bool(),
             Some(b'n') => self.parse_null(),
@@ -315,7 +325,10 @@ impl<'a> Parser<'a> {
                 false
             };
             let trailing = trailing_start as u64..self.pos as u64;
-            children.push(Child::Element { value: Box::new(value), trailing });
+            children.push(Child::Element {
+                value: Box::new(value),
+                trailing,
+            });
 
             if saw_comma {
                 continue;
@@ -339,11 +352,21 @@ impl<'a> Parser<'a> {
         let mut out = String::new();
         loop {
             match self.advance() {
-                None => return Err(ParseError { byte_offset: self.pos as u64, msg: "unterminated string".into() }),
+                None => {
+                    return Err(ParseError {
+                        byte_offset: self.pos as u64,
+                        msg: "unterminated string".into(),
+                    })
+                }
                 Some(b'"') => return Ok((out, self.pos)),
                 Some(b'\\') => {
                     match self.advance() {
-                        None => return Err(ParseError { byte_offset: self.pos as u64, msg: "EOF in escape".into() }),
+                        None => {
+                            return Err(ParseError {
+                                byte_offset: self.pos as u64,
+                                msg: "EOF in escape".into(),
+                            })
+                        }
                         Some(b'"') => out.push('"'),
                         Some(b'\\') => out.push('\\'),
                         Some(b'/') => out.push('/'),
@@ -357,13 +380,17 @@ impl<'a> Parser<'a> {
                             // Surrogate pair handling: if cp is a high surrogate, expect \uXXXX low surrogate.
                             if (0xD800..=0xDBFF).contains(&cp) {
                                 if self.advance() != Some(b'\\') || self.advance() != Some(b'u') {
-                                    return Err(self.err("expected low surrogate after high surrogate"));
+                                    return Err(
+                                        self.err("expected low surrogate after high surrogate")
+                                    );
                                 }
                                 let lo = self.parse_hex4()?;
                                 if !(0xDC00..=0xDFFF).contains(&lo) {
                                     return Err(self.err("invalid low surrogate"));
                                 }
-                                let codepoint = 0x10000 + (((cp - 0xD800) as u32) << 10) + ((lo - 0xDC00) as u32);
+                                let codepoint = 0x10000
+                                    + (((cp - 0xD800) as u32) << 10)
+                                    + ((lo - 0xDC00) as u32);
                                 if let Some(c) = char::from_u32(codepoint) {
                                     out.push(c);
                                 } else {
@@ -400,10 +427,15 @@ impl<'a> Parser<'a> {
                         // Multi-byte start: figure out length, copy raw bytes,
                         // and try to interpret. If decoding fails, we substitute
                         // the replacement char so matching still works.
-                        let extra = if b & 0xE0 == 0xC0 { 1 }
-                            else if b & 0xF0 == 0xE0 { 2 }
-                            else if b & 0xF8 == 0xF0 { 3 }
-                            else { return Err(self.err("invalid UTF-8 lead byte in string")); };
+                        let extra = if b & 0xE0 == 0xC0 {
+                            1
+                        } else if b & 0xF0 == 0xE0 {
+                            2
+                        } else if b & 0xF8 == 0xF0 {
+                            3
+                        } else {
+                            return Err(self.err("invalid UTF-8 lead byte in string"));
+                        };
                         let mut buf = vec![b];
                         for _ in 0..extra {
                             match self.advance() {
@@ -424,7 +456,10 @@ impl<'a> Parser<'a> {
     fn parse_hex4(&mut self) -> Result<u16, ParseError> {
         let mut acc: u16 = 0;
         for _ in 0..4 {
-            let b = self.advance().ok_or_else(|| ParseError { byte_offset: self.pos as u64, msg: "EOF in \\uXXXX".into() })?;
+            let b = self.advance().ok_or_else(|| ParseError {
+                byte_offset: self.pos as u64,
+                msg: "EOF in \\uXXXX".into(),
+            })?;
             let d: u16 = match b {
                 b'0'..=b'9' => (b - b'0') as u16,
                 b'a'..=b'f' => (b - b'a' + 10) as u16,
@@ -438,14 +473,22 @@ impl<'a> Parser<'a> {
 
     fn parse_number(&mut self) -> Result<Node, ParseError> {
         let start = self.pos;
-        if self.peek() == Some(b'-') { self.pos += 1; }
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
         // Integer part: 0 | [1-9][0-9]*
         match self.peek() {
-            Some(b'0') => { self.pos += 1; }
+            Some(b'0') => {
+                self.pos += 1;
+            }
             Some(b) if (b'1'..=b'9').contains(&b) => {
                 self.pos += 1;
                 while let Some(c) = self.peek() {
-                    if c.is_ascii_digit() { self.pos += 1; } else { break; }
+                    if c.is_ascii_digit() {
+                        self.pos += 1;
+                    } else {
+                        break;
+                    }
                 }
             }
             _ => return Err(self.err("invalid number: missing integer part")),
@@ -455,7 +498,11 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             let frac_start = self.pos;
             while let Some(c) = self.peek() {
-                if c.is_ascii_digit() { self.pos += 1; } else { break; }
+                if c.is_ascii_digit() {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
             }
             if self.pos == frac_start {
                 return Err(self.err("invalid number: empty fraction"));
@@ -464,16 +511,27 @@ impl<'a> Parser<'a> {
         // Exponent part.
         if matches!(self.peek(), Some(b'e') | Some(b'E')) {
             self.pos += 1;
-            if matches!(self.peek(), Some(b'+') | Some(b'-')) { self.pos += 1; }
+            if matches!(self.peek(), Some(b'+') | Some(b'-')) {
+                self.pos += 1;
+            }
             let exp_start = self.pos;
             while let Some(c) = self.peek() {
-                if c.is_ascii_digit() { self.pos += 1; } else { break; }
+                if c.is_ascii_digit() {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
             }
             if self.pos == exp_start {
                 return Err(self.err("invalid number: empty exponent"));
             }
         }
-        Ok(Node { kind: NodeKind::Number, byte_start: start as u64, byte_end: self.pos as u64, children: vec![] })
+        Ok(Node {
+            kind: NodeKind::Number,
+            byte_start: start as u64,
+            byte_end: self.pos as u64,
+            children: vec![],
+        })
     }
 
     fn parse_bool(&mut self) -> Result<Node, ParseError> {
@@ -481,10 +539,20 @@ impl<'a> Parser<'a> {
         let rem = &self.src[self.pos..];
         if rem.starts_with(b"true") {
             self.pos += 4;
-            Ok(Node { kind: NodeKind::Bool, byte_start: start as u64, byte_end: self.pos as u64, children: vec![] })
+            Ok(Node {
+                kind: NodeKind::Bool,
+                byte_start: start as u64,
+                byte_end: self.pos as u64,
+                children: vec![],
+            })
         } else if rem.starts_with(b"false") {
             self.pos += 5;
-            Ok(Node { kind: NodeKind::Bool, byte_start: start as u64, byte_end: self.pos as u64, children: vec![] })
+            Ok(Node {
+                kind: NodeKind::Bool,
+                byte_start: start as u64,
+                byte_end: self.pos as u64,
+                children: vec![],
+            })
         } else {
             Err(self.err("invalid bool literal"))
         }
@@ -494,7 +562,12 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         if self.src[self.pos..].starts_with(b"null") {
             self.pos += 4;
-            Ok(Node { kind: NodeKind::Null, byte_start: start as u64, byte_end: self.pos as u64, children: vec![] })
+            Ok(Node {
+                kind: NodeKind::Null,
+                byte_start: start as u64,
+                byte_end: self.pos as u64,
+                children: vec![],
+            })
         } else {
             Err(self.err("invalid null literal"))
         }
@@ -509,9 +582,16 @@ pub fn parse(src: &[u8]) -> Result<Document, ParseError> {
     let root = p.parse_value()?;
     let trailing = p.skip_ws();
     if p.pos != src.len() {
-        return Err(ParseError { byte_offset: p.pos as u64, msg: "trailing data after root value".into() });
+        return Err(ParseError {
+            byte_offset: p.pos as u64,
+            msg: "trailing data after root value".into(),
+        });
     }
-    Ok(Document { leading_ws: leading, root, trailing_ws: trailing })
+    Ok(Document {
+        leading_ws: leading,
+        root,
+        trailing_ws: trailing,
+    })
 }
 
 /// Walk a Document's tree and emit every leaf byte range in document order.
@@ -519,9 +599,13 @@ pub fn parse(src: &[u8]) -> Result<Document, ParseError> {
 #[cfg(test)]
 pub fn collect_ranges(doc: &Document) -> Vec<Range<u64>> {
     let mut out = Vec::new();
-    if !doc.leading_ws.is_empty() { out.push(doc.leading_ws.clone()); }
+    if !doc.leading_ws.is_empty() {
+        out.push(doc.leading_ws.clone());
+    }
     walk_node(&doc.root, &mut out);
-    if !doc.trailing_ws.is_empty() { out.push(doc.trailing_ws.clone()); }
+    if !doc.trailing_ws.is_empty() {
+        out.push(doc.trailing_ws.clone());
+    }
     out
 }
 
@@ -540,15 +624,29 @@ fn walk_node(n: &Node, out: &mut Vec<Range<u64>>) {
     }
     for c in &n.children {
         match c {
-            Child::Member { key_range, between_key_value, value, trailing, .. } => {
-                if !key_range.is_empty() { out.push(key_range.clone()); }
-                if !between_key_value.is_empty() { out.push(between_key_value.clone()); }
+            Child::Member {
+                key_range,
+                between_key_value,
+                value,
+                trailing,
+                ..
+            } => {
+                if !key_range.is_empty() {
+                    out.push(key_range.clone());
+                }
+                if !between_key_value.is_empty() {
+                    out.push(between_key_value.clone());
+                }
                 walk_node(value, out);
-                if !trailing.is_empty() { out.push(trailing.clone()); }
+                if !trailing.is_empty() {
+                    out.push(trailing.clone());
+                }
             }
             Child::Element { value, trailing } => {
                 walk_node(value, out);
-                if !trailing.is_empty() { out.push(trailing.clone()); }
+                if !trailing.is_empty() {
+                    out.push(trailing.clone());
+                }
             }
         }
     }
@@ -577,17 +675,31 @@ mod tests {
     }
 
     #[test]
-    fn empty_object() { rt("{}"); }
+    fn empty_object() {
+        rt("{}");
+    }
     #[test]
-    fn empty_array() { rt("[]"); }
+    fn empty_array() {
+        rt("[]");
+    }
     #[test]
-    fn primitive_number() { rt("42"); rt("-1.5e10"); }
+    fn primitive_number() {
+        rt("42");
+        rt("-1.5e10");
+    }
     #[test]
-    fn primitive_bool() { rt("true"); rt("false"); }
+    fn primitive_bool() {
+        rt("true");
+        rt("false");
+    }
     #[test]
-    fn primitive_null() { rt("null"); }
+    fn primitive_null() {
+        rt("null");
+    }
     #[test]
-    fn primitive_string() { rt("\"hello\""); }
+    fn primitive_string() {
+        rt("\"hello\"");
+    }
     #[test]
     fn string_escapes() {
         rt(r#""a\"b""#);
@@ -614,7 +726,11 @@ mod tests {
     fn error_position() {
         let e = parse(b"{\"a\":}").unwrap_err();
         // Error should be at the '}' position (byte 5).
-        assert!(e.byte_offset >= 4 && e.byte_offset <= 6, "got offset {}", e.byte_offset);
+        assert!(
+            e.byte_offset >= 4 && e.byte_offset <= 6,
+            "got offset {}",
+            e.byte_offset
+        );
     }
     #[test]
     fn error_trailing_data() {
@@ -635,7 +751,11 @@ mod tests {
     #[test]
     fn round_trip_many() {
         let inputs = [
-            "{}", "[]", "[1]", "[1,2]", "{\"a\":[1,{\"b\":null}]}",
+            "{}",
+            "[]",
+            "[1]",
+            "[1,2]",
+            "{\"a\":[1,{\"b\":null}]}",
             "[ 1 , 2 , 3 ]",
             "{ }",
             "[ ]",
@@ -645,6 +765,8 @@ mod tests {
             "1e10",
             "-0.5e-3",
         ];
-        for s in inputs { rt(s); }
+        for s in inputs {
+            rt(s);
+        }
     }
 }

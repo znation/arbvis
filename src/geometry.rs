@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use fast_hilbert::h2xy;
+use std::collections::HashMap;
 
 // Hilbert sub-quadrant state table.
 // CHILD_TABLE[state][i] = (dx, dy, child_state) where (dx,dy) ∈ {0,1}²

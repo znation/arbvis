@@ -23,6 +23,7 @@ pub enum LayerSlot {
 }
 
 /// Result of classifying every tensor in a checkpoint.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ArchProfile {
     /// `Some(re)` when the checkpoint was identified as transformer-style.
@@ -92,7 +93,9 @@ pub fn classify(names: &[&str]) -> ArchProfile {
             let idx: u32 = caps.get(1).unwrap().as_str().parse().unwrap_or(0);
             let sub = caps.get(2).unwrap().as_str().to_string();
             block_matches += 1;
-            if idx > max_idx { max_idx = idx; }
+            if idx > max_idx {
+                max_idx = idx;
+            }
             slots.push(LayerSlot::Block { idx, sub_path: sub });
         } else {
             let stripped = if !prefix.is_empty() && n.starts_with(&prefix) {
@@ -100,7 +103,9 @@ pub fn classify(names: &[&str]) -> ArchProfile {
             } else {
                 n
             };
-            slots.push(LayerSlot::TopLevel { name: stripped.to_string() });
+            slots.push(LayerSlot::TopLevel {
+                name: stripped.to_string(),
+            });
         }
     }
 
@@ -120,7 +125,8 @@ pub fn classify(names: &[&str]) -> ArchProfile {
         // Generic name-tree grouping: split each name into (group, leaf) where
         // group is everything up to the last dot. Singleton groups (one tensor)
         // become TopLevel; multi-tensor groups become Generic.
-        let mut group_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut group_counts: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
         let split: Vec<(String, String)> = names
             .iter()
             .map(|n| {
@@ -189,12 +195,23 @@ mod tests {
             "lm_head.weight",
         ];
         let p = classify(&names);
-        assert!(p.block_regex.is_some(), "expected transformer classification");
+        assert!(
+            p.block_regex.is_some(),
+            "expected transformer classification"
+        );
         assert_eq!(p.num_layers, 2);
         assert_eq!(p.prefix, "model.");
 
-        let block_count = p.slots.iter().filter(|s| matches!(s, LayerSlot::Block { .. })).count();
-        let top_count = p.slots.iter().filter(|s| matches!(s, LayerSlot::TopLevel { .. })).count();
+        let block_count = p
+            .slots
+            .iter()
+            .filter(|s| matches!(s, LayerSlot::Block { .. }))
+            .count();
+        let top_count = p
+            .slots
+            .iter()
+            .filter(|s| matches!(s, LayerSlot::TopLevel { .. }))
+            .count();
         assert_eq!(block_count, 18);
         // embed_tokens, norm, lm_head — lm_head has no `model.` prefix so prefix-stripping is a no-op for it.
         assert_eq!(top_count, 3);
@@ -228,7 +245,10 @@ mod tests {
             "first_stage_model.decoder.conv_out.bias",
         ];
         let p = classify(&names);
-        assert!(p.block_regex.is_none(), "should not classify as transformer");
+        assert!(
+            p.block_regex.is_none(),
+            "should not classify as transformer"
+        );
     }
 
     #[test]
@@ -236,7 +256,9 @@ mod tests {
         // Mixed prefixes; "model." wins because it's the supermajority.
         let mut names: Vec<&'static str> = Vec::new();
         for i in 0..20 {
-            names.push(Box::leak(format!("model.layers.{i}.weight").into_boxed_str()));
+            names.push(Box::leak(
+                format!("model.layers.{i}.weight").into_boxed_str(),
+            ));
         }
         names.push("lm_head.weight");
         names.push("model.norm.weight");
@@ -261,7 +283,9 @@ mod tests {
     #[test]
     fn block_regex_matches_bert_encoder_layer() {
         let re = block_regex();
-        let caps = re.captures("encoder.layer.5.attention.self.query.weight").unwrap();
+        let caps = re
+            .captures("encoder.layer.5.attention.self.query.weight")
+            .unwrap();
         assert_eq!(caps.get(1).unwrap().as_str(), "5");
         assert_eq!(caps.get(2).unwrap().as_str(), "attention.self.query.weight");
     }

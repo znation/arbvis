@@ -22,6 +22,7 @@ use serde::Deserialize;
 /// Fields we care about from a HuggingFace `config.json`. Everything is
 /// optional because configs vary across architectures — `vocab_size` and
 /// `intermediate_size` aren't present on every model card.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ModelConfig {
     /// `["LlamaForCausalLM", …]` etc. Used for display only.
@@ -58,7 +59,11 @@ impl ModelConfig {
 
     /// Short display string: first architecture name + key dims.
     pub fn summary(&self) -> String {
-        let arch = self.architectures.first().map(String::as_str).unwrap_or("?");
+        let arch = self
+            .architectures
+            .first()
+            .map(String::as_str)
+            .unwrap_or("?");
         let n = self.num_hidden_layers.unwrap_or(0);
         let h = self.hidden_size.unwrap_or(0);
         format!("{arch} ({n} layers, hidden={h})")
@@ -92,13 +97,6 @@ impl SafetensorsIndex {
         let bytes = std::fs::read(&path).ok()?;
         log::debug!("loaded safetensors index from {}", path.display());
         Self::from_bytes(&bytes)
-    }
-
-    /// All tensor names referenced by the index, sorted.
-    pub fn tensor_names(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.weight_map.keys().cloned().collect();
-        v.sort();
-        v
     }
 }
 
@@ -144,9 +142,10 @@ mod tests {
         }"#;
         let i = SafetensorsIndex::from_bytes(json).expect("parses");
         assert_eq!(i.weight_map.len(), 3);
-        let names = i.tensor_names();
-        assert!(names.contains(&"model.embed_tokens.weight".to_string()));
-        assert!(names.contains(&"model.layers.31.mlp.down_proj.weight".to_string()));
+        assert!(i.weight_map.contains_key("model.embed_tokens.weight"));
+        assert!(i
+            .weight_map
+            .contains_key("model.layers.31.mlp.down_proj.weight"));
     }
 
     #[test]

@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 
 use crate::data::{Source, SourceKind, SourceMeta};
-use crate::layout::bin_pack::{align_up, pack, Placement, Slot};
+use crate::layout::bin_pack::{align_up, pack, Slot};
 use crate::layout::name_tree::{self, LayerSlot};
 use crate::layout::TileRegion;
 use crate::safetensors::{Dtype, TensorMeta};
@@ -28,6 +28,7 @@ const PAD: u32 = 8;
 const MAX_LAYER_WIDTH: u32 = 65_536;
 
 /// One placed tensor in the architectural canvas.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PlacedTensor {
     pub source_idx: usize,
@@ -50,6 +51,7 @@ pub struct PlacedTensor {
 
 /// One transformer block's bounding rectangle on the canvas. Drawn as a
 /// single layer-granularity overlay polygon.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct LayerBounds {
     pub layer_idx: u32,
@@ -59,6 +61,7 @@ pub struct LayerBounds {
     pub height: u32,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct ArchLayout {
     pub width: u32,
@@ -79,8 +82,6 @@ pub struct ArchLayout {
 }
 
 impl ArchLayout {
-    pub fn canvas_size(&self) -> (u32, u32) { (self.width, self.height) }
-
     /// Build an architectural layout. Returns `None` if the inputs can't be
     /// shape-mapped (e.g. zero tensors after merging sources).
     ///
@@ -101,23 +102,27 @@ impl ArchLayout {
         // those into padding instead.
         let mut all: Vec<(usize, &TensorMeta, u64)> = Vec::new();
         for (sidx, s) in sources.iter().enumerate() {
-            if matches!(s.kind, SourceKind::UnmatchedRegion { .. }) { continue; }
-            let Some(st) = s.safetensors.as_ref() else { continue; };
+            if matches!(s.kind, SourceKind::UnmatchedRegion { .. }) {
+                continue;
+            }
+            let Some(st) = s.safetensors.as_ref() else {
+                continue;
+            };
             let off = cumulative_offsets.get(sidx).copied().unwrap_or(0);
             for t in &st.tensors {
                 all.push((sidx, t, off));
             }
         }
-        if all.is_empty() { return None; }
+        if all.is_empty() {
+            return None;
+        }
 
         // Pick the first non-empty config across sources. Most multi-shard
         // checkpoints have one shared config.json next to all shards, so
         // we take any one — a discrepancy across them would surface as
         // mismatched tensor counts anyway.
         let pinned_config = metas.iter().find_map(|m| m.config.as_ref());
-        let architecture = pinned_config
-            .map(|c| c.summary())
-            .unwrap_or_default();
+        let architecture = pinned_config.map(|c| c.summary()).unwrap_or_default();
 
         // Classify every tensor by name.
         let names: Vec<&str> = all.iter().map(|(_, t, _)| t.name.as_str()).collect();
@@ -125,7 +130,8 @@ impl ArchLayout {
 
         // Group: each `layer_idx` -> { sub_path -> (source_idx, tensor, abs_byte_start) }.
         // Top-level singletons collect into `top_level`.
-        let mut blocks: BTreeMap<u32, BTreeMap<String, (usize, &TensorMeta, u64)>> = BTreeMap::new();
+        let mut blocks: BTreeMap<u32, BTreeMap<String, (usize, &TensorMeta, u64)>> =
+            BTreeMap::new();
         let mut top_level: Vec<(usize, &TensorMeta, u64)> = Vec::new();
 
         for ((sidx, t, base_off), slot) in all.iter().zip(profile.slots.iter()) {
@@ -177,8 +183,10 @@ impl ArchLayout {
         let mut canonical_subpaths: Vec<String> = {
             use std::collections::BTreeSet;
             let mut set: BTreeSet<String> = BTreeSet::new();
-            for (_, sub) in &blocks {
-                for k in sub.keys() { set.insert(k.clone()); }
+            for sub in blocks.values() {
+                for k in sub.keys() {
+                    set.insert(k.clone());
+                }
             }
             // Also seed from any safetensors.index.json: tensor names listed
             // there but not loaded (different shard) become canonical slots
@@ -211,8 +219,12 @@ impl ArchLayout {
                 for sub in blocks.values() {
                     if let Some((_, t, _)) = sub.get(sp) {
                         let (r, c) = t.element_shape();
-                        if r > max_h { max_h = r; }
-                        if c > max_w { max_w = c; }
+                        if r > max_h {
+                            max_h = r;
+                        }
+                        if c > max_w {
+                            max_w = c;
+                        }
                     }
                 }
                 let slot = Slot {
@@ -342,7 +354,9 @@ impl ArchLayout {
         }
 
         // Assign tensor_ids in canvas order.
-        for (i, t) in tensors.iter_mut().enumerate() { t.tensor_id = i; }
+        for (i, t) in tensors.iter_mut().enumerate() {
+            t.tensor_id = i;
+        }
 
         // Round canvas dimensions UP to tile-size multiples so the tile grid
         // covers everything.
@@ -400,9 +414,15 @@ impl ArchLayout {
 
             // Early skip — once a tensor's top edge is past the tile bottom,
             // every subsequent tensor in sorted order is too (we sorted by y).
-            if ty0 >= tile_y1 { break; }
-            if tx1 <= tile_x0 || tx0 >= tile_x1 { continue; }
-            if ty1 <= tile_y0 { continue; }
+            if ty0 >= tile_y1 {
+                break;
+            }
+            if tx1 <= tile_x0 || tx0 >= tile_x1 {
+                continue;
+            }
+            if ty1 <= tile_y0 {
+                continue;
+            }
 
             let ix0 = tx0.max(tile_x0);
             let iy0 = ty0.max(tile_y0);
@@ -620,11 +640,16 @@ mod tests {
             off2 += bytes;
         }
         let source2 = synthetic_source(tensors2);
-        let mut config = crate::layout::model_config::ModelConfig::default();
-        config.architectures = vec!["LlamaForCausalLM".to_string()];
-        config.num_hidden_layers = Some(8);
-        config.hidden_size = Some(8);
-        let meta = SourceMeta { config: Some(config), index: None };
+        let config = crate::layout::model_config::ModelConfig {
+            architectures: vec!["LlamaForCausalLM".to_string()],
+            num_hidden_layers: Some(8),
+            hidden_size: Some(8),
+            ..Default::default()
+        };
+        let meta = SourceMeta {
+            config: Some(config),
+            index: None,
+        };
         let with_config = ArchLayout::try_build(&[source2], &cumulative, &[meta]).unwrap();
         assert_eq!(with_config.layer_bounds.len(), 8);
         assert!(with_config.architecture.contains("LlamaForCausalLM"));

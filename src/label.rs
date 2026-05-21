@@ -8,7 +8,9 @@ use imageproc::rect::Rect;
 /// Deterministic per-cell jitter for label positions.
 /// Returns (jx, jy, neg_x, neg_y) where jx,jy ∈ 0..=100.
 pub fn jitter(i: u32, j: u32) -> (u32, u32, bool, bool) {
-    let h = i.wrapping_mul(2654435761).wrapping_add(j.wrapping_mul(2246822519));
+    let h = i
+        .wrapping_mul(2654435761)
+        .wrapping_add(j.wrapping_mul(2246822519));
     let jx = (h & 0xFF) % 101;
     let jy = ((h >> 8) & 0xFF) % 101;
     let neg_x = (h >> 16) & 1 == 1;
@@ -52,9 +54,8 @@ pub fn draw_file_label(
             return false;
         }
         let owned = (label_y..label_y + box_h).all(|py| {
-            (label_x..label_x + box_w).all(|px| {
-                pixel_file[py as usize * side as usize + px as usize] == Some(fi)
-            })
+            (label_x..label_x + box_w)
+                .all(|px| pixel_file[py as usize * side as usize + px as usize] == Some(fi))
         });
         if !owned {
             return false;

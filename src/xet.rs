@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use lru::LruCache;
 use serde::Deserialize;
 
@@ -176,7 +176,11 @@ async fn fetch_cas_token(
     repo_id: &str,
     revision: &str,
 ) -> anyhow::Result<CasToken> {
-    let key = (api_segment.to_string(), repo_id.to_string(), revision.to_string());
+    let key = (
+        api_segment.to_string(),
+        repo_id.to_string(),
+        revision.to_string(),
+    );
     {
         let mut guard = CAS_TOKEN_CACHE.lock().unwrap();
         let cache = guard.get_or_insert_with(HashMap::new);
@@ -287,7 +291,12 @@ pub async fn reconstruction_for(spec: &RemoteFileSpec) -> anyhow::Result<Vec<Xet
         );
         return Ok(Vec::new());
     };
-    let cas = fetch_cas_token(spec.repo.api_segment(), &spec.repo.repo_id(), &spec.revision).await?;
+    let cas = fetch_cas_token(
+        spec.repo.api_segment(),
+        &spec.repo.repo_id(),
+        &spec.revision,
+    )
+    .await?;
     fetch_reconstruction_terms(&cas, hash).await
 }
 
@@ -488,7 +497,7 @@ impl DescriptorCache {
 /// without dedup the same descriptor gets downloaded N times in parallel and
 /// N-1 copies are discarded.
 pub struct XetReader {
-    terms: Vec<ReaderTerm>,          // sorted by file_offset
+    terms: Vec<ReaderTerm>, // sorted by file_offset
     xorbs: HashMap<String, XorbInfo>,
     file_size: u64,
     filename: Arc<String>,
@@ -509,7 +518,12 @@ impl XetReader {
             .xet_hash
             .as_deref()
             .ok_or_else(|| anyhow!("{}: not xet-backed, cannot build XetReader", spec.filename))?;
-        let cas = fetch_cas_token(spec.repo.api_segment(), &spec.repo.repo_id(), &spec.revision).await?;
+        let cas = fetch_cas_token(
+            spec.repo.api_segment(),
+            &spec.repo.repo_id(),
+            &spec.revision,
+        )
+        .await?;
         let raw = fetch_reconstruction_response(&cas, hash).await?;
 
         // Build the per-xorb descriptor lookup (sorted by chunk_start).
@@ -560,7 +574,9 @@ impl XetReader {
         if offset != spec.size {
             log::warn!(
                 "{}: reconstruction unpacked_length total {} disagrees with file size {}",
-                spec.filename, offset, spec.size,
+                spec.filename,
+                offset,
+                spec.size,
             );
         }
 
@@ -583,7 +599,10 @@ impl XetReader {
         if end > self.file_size {
             anyhow::bail!(
                 "{}: range [{},{}) past file size {}",
-                self.filename, start, end, self.file_size,
+                self.filename,
+                start,
+                end,
+                self.file_size,
             );
         }
         let mut out = Vec::with_capacity(len);
@@ -605,7 +624,11 @@ impl XetReader {
         if out.len() != len {
             anyhow::bail!(
                 "{}: fetch_range[{},{}) produced {} bytes (expected {})",
-                self.filename, start, end, out.len(), len,
+                self.filename,
+                start,
+                end,
+                out.len(),
+                len,
             );
         }
         Ok(out)
@@ -663,7 +686,10 @@ impl XetReader {
             if hi_idx >= indices.len() {
                 anyhow::bail!(
                     "descriptor {}@{}: chunk index {} out of bounds (have {})",
-                    term.xorb_hash, desc.byte_start, hi_idx, indices.len(),
+                    term.xorb_hash,
+                    desc.byte_start,
+                    hi_idx,
+                    indices.len(),
                 );
             }
             let desc_byte_lo = indices[lo_idx] as usize;
@@ -776,11 +802,20 @@ impl XetReader {
                 .send()
                 .await
                 .and_then(|r| r.error_for_status())
-                .with_context(|| format!("HTTP error fetching xorb range {} for {}", desc.byte_start, xorb_hash))?;
-            resp.bytes()
-                .await
-                .with_context(|| format!("body read fetching xorb range {} for {}", desc.byte_start, xorb_hash))
-        }.await;
+                .with_context(|| {
+                    format!(
+                        "HTTP error fetching xorb range {} for {}",
+                        desc.byte_start, xorb_hash
+                    )
+                })?;
+            resp.bytes().await.with_context(|| {
+                format!(
+                    "body read fetching xorb range {} for {}",
+                    desc.byte_start, xorb_hash
+                )
+            })
+        }
+        .await;
         CAS_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
         CAS_COMPLETED.fetch_add(1, Ordering::Relaxed);
         let bytes = bytes_res?;
@@ -788,8 +823,16 @@ impl XetReader {
 
         // Decode packed chunks → uncompressed bytes + per-chunk start offsets.
         let mut cursor = std::io::Cursor::new(bytes.as_ref());
-        let (data, chunk_byte_indices) = xet_core_structures::xorb_object::deserialize_chunks(&mut cursor)
-            .map_err(|e| anyhow!("decoding xorb {} bytes [{},{}]: {}", xorb_hash, desc.byte_start, desc.byte_end, e))?;
+        let (data, chunk_byte_indices) =
+            xet_core_structures::xorb_object::deserialize_chunks(&mut cursor).map_err(|e| {
+                anyhow!(
+                    "decoding xorb {} bytes [{},{}]: {}",
+                    xorb_hash,
+                    desc.byte_start,
+                    desc.byte_end,
+                    e
+                )
+            })?;
 
         Ok(DecodedDescriptor {
             data: Arc::new(data),
@@ -803,16 +846,18 @@ mod tests {
     use super::*;
 
     fn t(offset: u64, len: u64, hash: &str) -> XetTerm {
-        XetTerm { file_offset: offset, byte_len: len, xorb_hash: hash.to_string() }
+        XetTerm {
+            file_offset: offset,
+            byte_len: len,
+            xorb_hash: hash.to_string(),
+        }
     }
 
     #[test]
     fn xorbmap_recycles_after_20_unique() {
         let mut terms = Vec::new();
-        let mut off = 0u64;
-        for i in 0..25 {
-            terms.push(t(off, 1, &format!("xorb-{i}")));
-            off += 1;
+        for i in 0..25u64 {
+            terms.push(t(i, 1, &format!("xorb-{i}")));
         }
         let m = XorbMap::build(std::iter::once((Some(&terms[..]), 0)));
         // 21st distinct xorb → wraps to color 0.
@@ -824,12 +869,9 @@ mod tests {
 
     #[test]
     fn xorbmap_shifts_by_source_offset() {
-        let a = vec![t(0, 10, "A")];
-        let b = vec![t(0, 5, "B")];
-        let m = XorbMap::build(vec![
-            (Some(&a[..]), 0),
-            (Some(&b[..]), 10),
-        ]);
+        let a = [t(0, 10, "A")];
+        let b = [t(0, 5, "B")];
+        let m = XorbMap::build(vec![(Some(&a[..]), 0), (Some(&b[..]), 10)]);
         assert_eq!(m.color_idx_at(0), Some(0));
         assert_eq!(m.color_idx_at(9), Some(0));
         assert_eq!(m.color_idx_at(10), Some(1));
@@ -839,12 +881,9 @@ mod tests {
 
     #[test]
     fn xorbmap_shared_xorb_across_sources_gets_same_color() {
-        let a = vec![t(0, 10, "shared")];
-        let b = vec![t(0, 5, "shared")];
-        let m = XorbMap::build(vec![
-            (Some(&a[..]), 0),
-            (Some(&b[..]), 10),
-        ]);
+        let a = [t(0, 10, "shared")];
+        let b = [t(0, 5, "shared")];
+        let m = XorbMap::build(vec![(Some(&a[..]), 0), (Some(&b[..]), 10)]);
         assert_eq!(m.color_idx_at(0), m.color_idx_at(10));
     }
 }

@@ -45,7 +45,11 @@ impl UploadProgressBars {
         for pb in [&status, &logical, &transfer] {
             pb.enable_steady_tick(Duration::from_millis(100));
         }
-        Self { status, logical, transfer }
+        Self {
+            status,
+            logical,
+            transfer,
+        }
     }
 
     fn finish(&self) {
@@ -68,13 +72,18 @@ struct UploadProgressLogger {
 
 impl UploadProgressLogger {
     fn new(bars: UploadProgressBars) -> Self {
-        Self { bars: Mutex::new(bars) }
+        Self {
+            bars: Mutex::new(bars),
+        }
     }
 
     /// Stop the spinners and release the terminal lines. Safe to call when no
     /// bars were created (non-TTY runs).
     fn finish_bars(&self) {
-        self.bars.lock().expect("upload progress mutex poisoned").finish();
+        self.bars
+            .lock()
+            .expect("upload progress mutex poisoned")
+            .finish();
     }
 }
 
@@ -83,7 +92,10 @@ impl ProgressHandler for UploadProgressLogger {
         let guard = self.bars.lock().expect("upload progress mutex poisoned");
         let bars = &*guard;
         match event {
-            ProgressEvent::Upload(UploadEvent::Start { total_files, total_bytes }) => {
+            ProgressEvent::Upload(UploadEvent::Start {
+                total_files,
+                total_bytes,
+            }) => {
                 bars.logical.set_length(*total_bytes);
                 bars.transfer.set_length(*total_bytes);
                 bars.status.set_message(format!(
@@ -103,7 +115,8 @@ impl ProgressHandler for UploadProgressLogger {
                 bars.transfer.set_position(*transfer_bytes_completed);
             }
             ProgressEvent::Upload(UploadEvent::Committing) => {
-                bars.status.set_message("hf upload: committing (server-side)");
+                bars.status
+                    .set_message("hf upload: committing (server-side)");
             }
             ProgressEvent::Upload(UploadEvent::Complete) => {
                 bars.status.set_message("hf upload: complete");
@@ -147,23 +160,32 @@ impl HfTileSink {
             .prefix("arbvis-tiles-")
             .tempdir()
             .context("creating tile staging tempdir")?;
-        Ok(Self { client, spec, tempdir, staged: Mutex::new(Vec::new()) })
+        Ok(Self {
+            client,
+            spec,
+            tempdir,
+            staged: Mutex::new(Vec::new()),
+        })
     }
 
     /// Finalize: push everything to the Hub in one commit (or bucket upload).
     pub async fn commit(self, summary: &str) -> anyhow::Result<()> {
-        let staged = self
-            .staged
-            .into_inner()
-            .expect("tile sink mutex poisoned");
+        let staged = self.staged.into_inner().expect("tile sink mutex poisoned");
 
         if staged.is_empty() {
-            log::info!("No tiles staged; skipping commit to hf://{}", self.spec.repo_id);
+            log::info!(
+                "No tiles staged; skipping commit to hf://{}",
+                self.spec.repo_id
+            );
             return Ok(());
         }
 
         let (owner, name) = hf_url::split_owner_name(&self.spec.repo_id)?;
-        log::info!("Committing {} files to hf://{}", staged.len(), self.spec.repo_id);
+        log::info!(
+            "Committing {} files to hf://{}",
+            staged.len(),
+            self.spec.repo_id
+        );
 
         let logger = std::sync::Arc::new(UploadProgressLogger::new(UploadProgressBars::new()));
 
@@ -174,13 +196,15 @@ impl HfTileSink {
                     .map(|t| BucketUpload::new(t.local_path, t.repo_path))
                     .collect();
                 with_throttle(&format!("bucket upload {}", self.spec.repo_id), || async {
-                    self.client.bucket(owner, name)
+                    self.client
+                        .bucket(owner, name)
                         .upload_files()
                         .files(uploads.clone())
                         .progress(logger.clone())
                         .send()
                         .await
-                }).await?;
+                })
+                .await?;
             }
             kind => {
                 let ops: Vec<CommitOperation> = staged
@@ -193,7 +217,8 @@ impl HfTileSink {
                 with_throttle(&label, || async {
                     match kind {
                         RepoKind::Model => self
-                            .client.model(owner, name)
+                            .client
+                            .model(owner, name)
                             .create_commit()
                             .operations(ops.clone())
                             .commit_message(message.clone())
@@ -203,7 +228,8 @@ impl HfTileSink {
                             .await
                             .map(|_| ()),
                         RepoKind::Dataset => self
-                            .client.dataset(owner, name)
+                            .client
+                            .dataset(owner, name)
                             .create_commit()
                             .operations(ops.clone())
                             .commit_message(message.clone())
@@ -213,7 +239,8 @@ impl HfTileSink {
                             .await
                             .map(|_| ()),
                         RepoKind::Space => self
-                            .client.space(owner, name)
+                            .client
+                            .space(owner, name)
                             .create_commit()
                             .operations(ops.clone())
                             .commit_message(message.clone())
@@ -224,7 +251,8 @@ impl HfTileSink {
                             .map(|_| ()),
                         RepoKind::Bucket => unreachable!(),
                     }
-                }).await?;
+                })
+                .await?;
             }
         }
 
@@ -247,7 +275,10 @@ impl TileSink for HfTileSink {
         self.staged
             .lock()
             .expect("tile sink mutex poisoned")
-            .push(StagedTile { repo_path, local_path });
+            .push(StagedTile {
+                repo_path,
+                local_path,
+            });
         Ok(())
     }
 }

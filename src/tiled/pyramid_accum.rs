@@ -159,7 +159,9 @@ impl<S: TileSink> PyramidAccumulator<S> {
             let (img, bytes) = match encode_tile(img, fmt) {
                 Ok(v) => v,
                 Err(e) => {
-                    log::error!("pyramid: encode error at zoom {parent_z} ({parent_x},{parent_y}): {e}");
+                    log::error!(
+                        "pyramid: encode error at zoom {parent_z} ({parent_x},{parent_y}): {e}"
+                    );
                     return;
                 }
             };

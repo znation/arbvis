@@ -3,9 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use futures::StreamExt;
-use hf_hub::{
-    HFBucket, HFClient, HFRepository, RepoTypeDataset, RepoTypeModel, RepoTypeSpace,
-};
+use hf_hub::{HFBucket, HFClient, HFRepository, RepoTypeDataset, RepoTypeModel, RepoTypeSpace};
 
 use crate::throttle::with_throttle;
 
@@ -38,15 +36,42 @@ pub enum RemoteRepo {
 }
 
 impl RemoteRepo {
-    pub async fn fetch_range(&self, filename: &str, revision: &str, range: std::ops::Range<u64>) -> anyhow::Result<Vec<u8>> {
+    pub async fn fetch_range(
+        &self,
+        filename: &str,
+        revision: &str,
+        range: std::ops::Range<u64>,
+    ) -> anyhow::Result<Vec<u8>> {
         let label = format!("fetch_range {filename}");
         let bytes = with_throttle(&label, || async {
             match self {
-                RemoteRepo::Model(r) => r.download_file_to_bytes().filename(filename).revision(revision).range(range.clone()).send().await,
-                RemoteRepo::Dataset(r) => r.download_file_to_bytes().filename(filename).revision(revision).range(range.clone()).send().await,
-                RemoteRepo::Space(r) => r.download_file_to_bytes().filename(filename).revision(revision).range(range.clone()).send().await,
+                RemoteRepo::Model(r) => {
+                    r.download_file_to_bytes()
+                        .filename(filename)
+                        .revision(revision)
+                        .range(range.clone())
+                        .send()
+                        .await
+                }
+                RemoteRepo::Dataset(r) => {
+                    r.download_file_to_bytes()
+                        .filename(filename)
+                        .revision(revision)
+                        .range(range.clone())
+                        .send()
+                        .await
+                }
+                RemoteRepo::Space(r) => {
+                    r.download_file_to_bytes()
+                        .filename(filename)
+                        .revision(revision)
+                        .range(range.clone())
+                        .send()
+                        .await
+                }
             }
-        }).await?;
+        })
+        .await?;
         Ok(bytes.to_vec())
     }
 
@@ -93,18 +118,27 @@ pub struct HfOutputSpec {
 impl HfOutputSpec {
     pub fn tile_repo_path(&self, z: u32, x: u32, y: u32, ext: &str) -> String {
         let p = &self.path_prefix;
-        if p.is_empty() { format!("tiles/{z}/{x}/{y}.{ext}") }
-        else { format!("{p}/tiles/{z}/{x}/{y}.{ext}") }
+        if p.is_empty() {
+            format!("tiles/{z}/{x}/{y}.{ext}")
+        } else {
+            format!("{p}/tiles/{z}/{x}/{y}.{ext}")
+        }
     }
     pub fn index_html_path(&self) -> String {
         let p = &self.path_prefix;
-        if p.is_empty() { "index.html".to_string() }
-        else { format!("{p}/index.html") }
+        if p.is_empty() {
+            "index.html".to_string()
+        } else {
+            format!("{p}/index.html")
+        }
     }
     pub fn labels_json_path(&self) -> String {
         let p = &self.path_prefix;
-        if p.is_empty() { "labels.json".to_string() }
-        else { format!("{p}/labels.json") }
+        if p.is_empty() {
+            "labels.json".to_string()
+        } else {
+            format!("{p}/labels.json")
+        }
     }
 }
 
@@ -173,9 +207,18 @@ pub(crate) fn parse(raw: &str) -> anyhow::Result<HfUrl> {
     }
 
     let repo_id = format!("{owner}/{repo_name}");
-    let path_in_repo = if segs.len() >= 3 { segs[2..].join("/") } else { String::new() };
+    let path_in_repo = if segs.len() >= 3 {
+        segs[2..].join("/")
+    } else {
+        String::new()
+    };
 
-    Ok(HfUrl { kind, repo_id, revision, path_in_repo })
+    Ok(HfUrl {
+        kind,
+        repo_id,
+        revision,
+        path_in_repo,
+    })
 }
 
 /// Shared `HFClient` reused across all HF operations.
@@ -247,9 +290,7 @@ pub fn require_token() -> anyhow::Result<()> {
     if read_token().is_some() {
         return Ok(());
     }
-    anyhow::bail!(
-        "HF token required for hf:// output; set HF_TOKEN or run `hf auth login`"
-    )
+    anyhow::bail!("HF token required for hf:// output; set HF_TOKEN or run `hf auth login`")
 }
 
 /// Auto-detect whether `mod_url` is a HuggingFace-declared finetune of
@@ -290,7 +331,9 @@ pub async fn detect_finetune_relation(orig_url: &str, mod_url: &str) -> Option<b
     let base_match = match cd.get("base_model") {
         Some(serde_json::Value::String(s)) => repo_ids_equal(s, &orig_hf.repo_id),
         Some(serde_json::Value::Array(a)) => a.iter().any(|v| {
-            v.as_str().map(|s| repo_ids_equal(s, &orig_hf.repo_id)).unwrap_or(false)
+            v.as_str()
+                .map(|s| repo_ids_equal(s, &orig_hf.repo_id))
+                .unwrap_or(false)
         }),
         _ => return Some(false),
     };
@@ -326,8 +369,13 @@ async fn fetch_model_info(repo_id: &str) -> anyhow::Result<serde_json::Value> {
         req = req.bearer_auth(tok);
     }
     let resp = req.send().await.context("HF model_info request failed")?;
-    let resp = resp.error_for_status().context("HF model_info non-2xx status")?;
-    let json: serde_json::Value = resp.json().await.context("HF model_info JSON decode failed")?;
+    let resp = resp
+        .error_for_status()
+        .context("HF model_info non-2xx status")?;
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .context("HF model_info JSON decode failed")?;
     Ok(json)
 }
 
@@ -383,9 +431,24 @@ pub async fn resolve(path: &Path) -> anyhow::Result<PathBuf> {
         log::info!("Resolving repo {} ...", hf.repo_id);
         let dir = with_throttle(&format!("snapshot_download {}", hf.repo_id), || async {
             match &repo {
-                RemoteRepo::Model(r) => r.snapshot_download().revision(hf.revision.clone()).send().await,
-                RemoteRepo::Dataset(r) => r.snapshot_download().revision(hf.revision.clone()).send().await,
-                RemoteRepo::Space(r) => r.snapshot_download().revision(hf.revision.clone()).send().await,
+                RemoteRepo::Model(r) => {
+                    r.snapshot_download()
+                        .revision(hf.revision.clone())
+                        .send()
+                        .await
+                }
+                RemoteRepo::Dataset(r) => {
+                    r.snapshot_download()
+                        .revision(hf.revision.clone())
+                        .send()
+                        .await
+                }
+                RemoteRepo::Space(r) => {
+                    r.snapshot_download()
+                        .revision(hf.revision.clone())
+                        .send()
+                        .await
+                }
             }
         })
         .await
@@ -397,9 +460,27 @@ pub async fn resolve(path: &Path) -> anyhow::Result<PathBuf> {
 
     let local = with_throttle(&format!("download_file {}", hf.path_in_repo), || async {
         match &repo {
-            RemoteRepo::Model(r) => r.download_file().filename(hf.path_in_repo.clone()).revision(hf.revision.clone()).send().await,
-            RemoteRepo::Dataset(r) => r.download_file().filename(hf.path_in_repo.clone()).revision(hf.revision.clone()).send().await,
-            RemoteRepo::Space(r) => r.download_file().filename(hf.path_in_repo.clone()).revision(hf.revision.clone()).send().await,
+            RemoteRepo::Model(r) => {
+                r.download_file()
+                    .filename(hf.path_in_repo.clone())
+                    .revision(hf.revision.clone())
+                    .send()
+                    .await
+            }
+            RemoteRepo::Dataset(r) => {
+                r.download_file()
+                    .filename(hf.path_in_repo.clone())
+                    .revision(hf.revision.clone())
+                    .send()
+                    .await
+            }
+            RemoteRepo::Space(r) => {
+                r.download_file()
+                    .filename(hf.path_in_repo.clone())
+                    .revision(hf.revision.clone())
+                    .send()
+                    .await
+            }
         }
     })
     .await
@@ -427,9 +508,8 @@ async fn resolve_bucket(cli: &HFClient, hf: &HfUrl) -> anyhow::Result<PathBuf> {
     if hf.path_in_repo.is_empty() {
         log::info!("Resolving bucket {} ...", hf.repo_id);
         // list_tree returns a Stream of entries — collect under a single throttle permit.
-        let entries: Vec<BucketTreeEntry> = with_throttle(
-            &format!("bucket list_tree {}", hf.repo_id),
-            || async {
+        let entries: Vec<BucketTreeEntry> =
+            with_throttle(&format!("bucket list_tree {}", hf.repo_id), || async {
                 let stream = bucket.list_tree().recursive(true).send()?;
                 futures::pin_mut!(stream);
                 let mut out = Vec::new();
@@ -437,10 +517,9 @@ async fn resolve_bucket(cli: &HFClient, hf: &HfUrl) -> anyhow::Result<PathBuf> {
                     out.push(e?);
                 }
                 Ok::<_, hf_hub::HFError>(out)
-            },
-        )
-        .await
-        .with_context(|| format!("listing bucket {}", hf.repo_id))?;
+            })
+            .await
+            .with_context(|| format!("listing bucket {}", hf.repo_id))?;
         let downloads: Vec<BucketDownload> = entries
             .into_iter()
             .filter_map(|e| match e {
@@ -455,22 +534,36 @@ async fn resolve_bucket(cli: &HFClient, hf: &HfUrl) -> anyhow::Result<PathBuf> {
             anyhow::bail!("bucket {} has no files", hf.repo_id);
         }
         with_throttle(&format!("bucket download_files {}", hf.repo_id), || async {
-            bucket.download_files().files(downloads.clone()).send().await
+            bucket
+                .download_files()
+                .files(downloads.clone())
+                .send()
+                .await
         })
         .await
         .with_context(|| format!("downloading bucket {}", hf.repo_id))?;
         return Ok(dest_root);
     }
 
-    log::info!("Fetching {} from bucket {} ...", hf.path_in_repo, hf.repo_id);
+    log::info!(
+        "Fetching {} from bucket {} ...",
+        hf.path_in_repo,
+        hf.repo_id
+    );
     let local = dest_root.join(&hf.path_in_repo);
-    with_throttle(&format!("bucket download_files {}", hf.path_in_repo), || async {
-        bucket
-            .download_files()
-            .files(vec![BucketDownload::new(hf.path_in_repo.clone(), local.clone())])
-            .send()
-            .await
-    })
+    with_throttle(
+        &format!("bucket download_files {}", hf.path_in_repo),
+        || async {
+            bucket
+                .download_files()
+                .files(vec![BucketDownload::new(
+                    hf.path_in_repo.clone(),
+                    local.clone(),
+                )])
+                .send()
+                .await
+        },
+    )
     .await
     .with_context(|| format!("fetching hf://buckets/{}/{}", hf.repo_id, hf.path_in_repo))?;
     log::info!("Cached at {}", local.display());
@@ -485,13 +578,34 @@ pub async fn resolve_to_http(path: &Path) -> anyhow::Result<RemoteFileSpec> {
     let hf = parse(&s).with_context(|| format!("invalid hf:// URL: {s:?}"))?;
     let cli = client()?;
     let repo = make_remote_repo(&cli, &hf)?;
-    let meta = with_throttle(&format!("get_file_metadata {}", hf.path_in_repo), || async {
-        match &repo {
-            RemoteRepo::Model(r) => r.get_file_metadata().filepath(hf.path_in_repo.clone()).revision(hf.revision.clone()).send().await,
-            RemoteRepo::Dataset(r) => r.get_file_metadata().filepath(hf.path_in_repo.clone()).revision(hf.revision.clone()).send().await,
-            RemoteRepo::Space(r) => r.get_file_metadata().filepath(hf.path_in_repo.clone()).revision(hf.revision.clone()).send().await,
-        }
-    })
+    let meta = with_throttle(
+        &format!("get_file_metadata {}", hf.path_in_repo),
+        || async {
+            match &repo {
+                RemoteRepo::Model(r) => {
+                    r.get_file_metadata()
+                        .filepath(hf.path_in_repo.clone())
+                        .revision(hf.revision.clone())
+                        .send()
+                        .await
+                }
+                RemoteRepo::Dataset(r) => {
+                    r.get_file_metadata()
+                        .filepath(hf.path_in_repo.clone())
+                        .revision(hf.revision.clone())
+                        .send()
+                        .await
+                }
+                RemoteRepo::Space(r) => {
+                    r.get_file_metadata()
+                        .filepath(hf.path_in_repo.clone())
+                        .revision(hf.revision.clone())
+                        .send()
+                        .await
+                }
+            }
+        },
+    )
     .await
     .with_context(|| format!("metadata for hf://{}/{}", hf.repo_id, hf.path_in_repo))?;
 
@@ -521,7 +635,9 @@ pub fn is_repo_level(url_str: &str) -> anyhow::Result<bool> {
 }
 
 /// List all files in a repo-level hf:// URL as `RemoteFileSpec`s without downloading.
-pub async fn list_repo_as_http_specs(url_str: &str) -> anyhow::Result<Vec<(String, RemoteFileSpec)>> {
+pub async fn list_repo_as_http_specs(
+    url_str: &str,
+) -> anyhow::Result<Vec<(String, RemoteFileSpec)>> {
     let hf = parse(url_str).with_context(|| format!("invalid hf:// URL: {url_str:?}"))?;
     let cli = client()?;
     let repo = make_remote_repo(&cli, &hf)?;
@@ -530,41 +646,66 @@ pub async fn list_repo_as_http_specs(url_str: &str) -> anyhow::Result<Vec<(Strin
     // Each variant has its own Stream type because the inferred impl Stream
     // depends on the typed RepoType, so the drain code is duplicated rather
     // than going through a generic closure.
-    let entries: Vec<hf_hub::repository::RepoTreeEntry> = with_throttle(
-        &format!("list_tree {}", hf.repo_id),
-        || async {
+    let entries: Vec<hf_hub::repository::RepoTreeEntry> =
+        with_throttle(&format!("list_tree {}", hf.repo_id), || async {
             match &repo {
                 RemoteRepo::Model(r) => {
-                    let stream = r.list_tree().revision(hf.revision.clone()).recursive(true).expand(true).send()?;
+                    let stream = r
+                        .list_tree()
+                        .revision(hf.revision.clone())
+                        .recursive(true)
+                        .expand(true)
+                        .send()?;
                     futures::pin_mut!(stream);
                     let mut out = Vec::new();
-                    while let Some(e) = stream.next().await { out.push(e?); }
+                    while let Some(e) = stream.next().await {
+                        out.push(e?);
+                    }
                     Ok::<_, hf_hub::HFError>(out)
                 }
                 RemoteRepo::Dataset(r) => {
-                    let stream = r.list_tree().revision(hf.revision.clone()).recursive(true).expand(true).send()?;
+                    let stream = r
+                        .list_tree()
+                        .revision(hf.revision.clone())
+                        .recursive(true)
+                        .expand(true)
+                        .send()?;
                     futures::pin_mut!(stream);
                     let mut out = Vec::new();
-                    while let Some(e) = stream.next().await { out.push(e?); }
+                    while let Some(e) = stream.next().await {
+                        out.push(e?);
+                    }
                     Ok::<_, hf_hub::HFError>(out)
                 }
                 RemoteRepo::Space(r) => {
-                    let stream = r.list_tree().revision(hf.revision.clone()).recursive(true).expand(true).send()?;
+                    let stream = r
+                        .list_tree()
+                        .revision(hf.revision.clone())
+                        .recursive(true)
+                        .expand(true)
+                        .send()?;
                     futures::pin_mut!(stream);
                     let mut out = Vec::new();
-                    while let Some(e) = stream.next().await { out.push(e?); }
+                    while let Some(e) = stream.next().await {
+                        out.push(e?);
+                    }
                     Ok::<_, hf_hub::HFError>(out)
                 }
             }
-        },
-    )
-    .await
-    .with_context(|| format!("listing files for {}", hf.repo_id))?;
+        })
+        .await
+        .with_context(|| format!("listing files for {}", hf.repo_id))?;
 
     let mut specs = Vec::new();
     let revision = Arc::new(hf.revision);
     for entry in entries {
-        if let hf_hub::repository::RepoTreeEntry::File { path, size, xet_hash, .. } = entry {
+        if let hf_hub::repository::RepoTreeEntry::File {
+            path,
+            size,
+            xet_hash,
+            ..
+        } = entry
+        {
             log::info!("  {} — {} bytes", path, size);
             specs.push((
                 path.clone(),
@@ -587,7 +728,8 @@ pub async fn list_repo_as_http_specs(url_str: &str) -> anyhow::Result<Vec<(Strin
 
 /// Parse an `hf://` output URL into an `HfOutputSpec`.
 pub fn parse_hf_output(hf_url_str: &str) -> anyhow::Result<HfOutputSpec> {
-    let hf = parse(hf_url_str).with_context(|| format!("invalid hf:// output URL: {hf_url_str:?}"))?;
+    let hf =
+        parse(hf_url_str).with_context(|| format!("invalid hf:// output URL: {hf_url_str:?}"))?;
     Ok(HfOutputSpec {
         repo_id: hf.repo_id,
         kind: hf.kind,

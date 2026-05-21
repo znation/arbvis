@@ -61,14 +61,11 @@ pub fn counter_style() -> ProgressStyle {
 }
 
 pub fn queue_style() -> ProgressStyle {
-    ProgressStyle::with_template(
-        "  └─ {msg}: {pos}/{len} [{bar:30.yellow/dim}]",
-    )
-    .expect("queue_style template parse")
-    .progress_chars("=>-")
+    ProgressStyle::with_template("  └─ {msg}: {pos}/{len} [{bar:30.yellow/dim}]")
+        .expect("queue_style template parse")
+        .progress_chars("=>-")
 }
 
 pub fn status_style() -> ProgressStyle {
-    ProgressStyle::with_template("{msg}  ({elapsed_precise})")
-        .expect("status_style template parse")
+    ProgressStyle::with_template("{msg}  ({elapsed_precise})").expect("status_style template parse")
 }

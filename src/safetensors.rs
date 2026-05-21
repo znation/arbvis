@@ -76,7 +76,12 @@ impl Dtype {
             Dtype::F64 | Dtype::I64 | Dtype::U64 => 8,
             Dtype::F32 | Dtype::I32 | Dtype::U32 => 4,
             Dtype::F16 | Dtype::BF16 | Dtype::I16 | Dtype::U16 => 2,
-            Dtype::F8E4M3 | Dtype::F8E5M2 | Dtype::I8 | Dtype::U8 | Dtype::Bool | Dtype::Unknown => 1,
+            Dtype::F8E4M3
+            | Dtype::F8E5M2
+            | Dtype::I8
+            | Dtype::U8
+            | Dtype::Bool
+            | Dtype::Unknown => 1,
         }
     }
 
@@ -118,7 +123,9 @@ impl Dtype {
             .map(|(oc, mc)| {
                 let o = decode_element(self, oc);
                 let m = decode_element(mod_dtype, mc);
-                if !o.is_finite() || !m.is_finite() { return 255u8; }
+                if !o.is_finite() || !m.is_finite() {
+                    return 255u8;
+                }
                 let delta = m - o;
                 let signed = match metric {
                     DiffMetric::Rms => (delta / rms_denom).clamp(-1.0, 1.0),
@@ -127,20 +134,31 @@ impl Dtype {
                         if abs_d <= ABS_LOG_MIN {
                             0.0
                         } else {
-                            let norm = ((abs_d.log10() - log_min) / (log_max - log_min))
-                                .clamp(0.0, 1.0);
-                            if delta >= 0.0 { norm } else { -norm }
+                            let norm =
+                                ((abs_d.log10() - log_min) / (log_max - log_min)).clamp(0.0, 1.0);
+                            if delta >= 0.0 {
+                                norm
+                            } else {
+                                -norm
+                            }
                         }
                     }
                     DiffMetric::Exact => {
-                        if delta == 0.0 { 0.0 }
-                        else if delta > 0.0 { 1.0 }
-                        else { -1.0 }
+                        if delta == 0.0 {
+                            0.0
+                        } else if delta > 0.0 {
+                            1.0
+                        } else {
+                            -1.0
+                        }
                     }
                 };
                 let brightness = (signed.abs() * 127.0).round() as u8;
-                if signed >= 0.0 { 127u8.saturating_add(brightness) }
-                else { 127u8.saturating_sub(brightness) }
+                if signed >= 0.0 {
+                    127u8.saturating_add(brightness)
+                } else {
+                    127u8.saturating_sub(brightness)
+                }
             })
             .collect()
     }
@@ -151,7 +169,7 @@ impl Dtype {
 /// All three preserve the sign convention (green = grew, red = shrank,
 /// black = no change, white = NaN/Inf in either side). They differ in how
 /// brightness is computed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum DiffMetric {
     /// Per-tensor RMS-normalized signed delta:
     ///   `signed = clamp(delta / (K_RMS_SAT * rms(orig)), -1, 1)`
@@ -160,6 +178,7 @@ pub enum DiffMetric {
     /// across tensors regardless of weight scale, and doesn't blow up on
     /// small base weights the way per-element `(m-o)/|o|` does. Requires a
     /// per-tensor scale (computed at setup via sampling). Default.
+    #[default]
     Rms,
     /// Absolute delta on a log brightness scale, no normalization:
     ///   `signed = sign(delta) * clamp((log10(|delta|) - log10(ABS_LOG_MIN))
@@ -173,10 +192,6 @@ pub enum DiffMetric {
     /// direction of the change. Best diagnostic for LoRA-merge patterns —
     /// every untouched element is pitch black, touched elements glow.
     Exact,
-}
-
-impl Default for DiffMetric {
-    fn default() -> Self { DiffMetric::Rms }
 }
 
 /// Saturation threshold for `DiffMetric::Rms`: an element whose delta equals
@@ -205,7 +220,9 @@ const ABS_LOG_MAX: f32 = 1e-1;
 /// elements give a stable estimate.
 pub fn rms_from_buf(dtype: Dtype, bytes: &[u8]) -> f32 {
     let elem = dtype.element_size();
-    if elem == 0 || bytes.is_empty() { return 0.0; }
+    if elem == 0 || bytes.is_empty() {
+        return 0.0;
+    }
     let mut sum_sq = 0.0f64;
     let mut count = 0u64;
     for chunk in bytes.chunks_exact(elem) {
@@ -215,7 +232,9 @@ pub fn rms_from_buf(dtype: Dtype, bytes: &[u8]) -> f32 {
             count += 1;
         }
     }
-    if count == 0 { return 0.0; }
+    if count == 0 {
+        return 0.0;
+    }
     (sum_sq / count as f64).sqrt() as f32
 }
 
@@ -253,12 +272,6 @@ impl TensorMeta {
                 (rows, cols)
             }
         }
-    }
-
-    /// Total element count = rows × cols of `element_shape`.
-    pub fn element_count(&self) -> u64 {
-        let (r, c) = self.element_shape();
-        r * c
     }
 
     pub fn label(&self) -> String {
@@ -321,7 +334,10 @@ pub fn parse_header(data: &[u8]) -> anyhow::Result<(Vec<TensorMeta>, u64)> {
         );
     }
     if header_size > 100 * 1024 * 1024 {
-        anyhow::bail!("safetensors: header_size={} exceeds 100 MB safety limit", header_size);
+        anyhow::bail!(
+            "safetensors: header_size={} exceeds 100 MB safety limit",
+            header_size
+        );
     }
 
     let json_bytes = &data[8..header_end as usize];
@@ -354,8 +370,9 @@ pub fn parse_header(data: &[u8]) -> anyhow::Result<(Vec<TensorMeta>, u64)> {
             .ok_or_else(|| anyhow::anyhow!("safetensors: tensor '{}' missing 'shape'", name))?
             .iter()
             .map(|d| {
-                d.as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("safetensors: tensor '{}' shape dim is not u64", name))
+                d.as_u64().ok_or_else(|| {
+                    anyhow::anyhow!("safetensors: tensor '{}' shape dim is not u64", name)
+                })
             })
             .collect::<anyhow::Result<_>>()?;
 
@@ -364,14 +381,17 @@ pub fn parse_header(data: &[u8]) -> anyhow::Result<(Vec<TensorMeta>, u64)> {
             .and_then(|v| v.as_array())
             .filter(|a| a.len() == 2)
             .ok_or_else(|| {
-                anyhow::anyhow!("safetensors: tensor '{}' missing valid 'data_offsets'", name)
+                anyhow::anyhow!(
+                    "safetensors: tensor '{}' missing valid 'data_offsets'",
+                    name
+                )
             })?;
-        let rel_start = offsets[0]
-            .as_u64()
-            .ok_or_else(|| anyhow::anyhow!("safetensors: tensor '{}' data_offsets[0] not u64", name))?;
-        let rel_end = offsets[1]
-            .as_u64()
-            .ok_or_else(|| anyhow::anyhow!("safetensors: tensor '{}' data_offsets[1] not u64", name))?;
+        let rel_start = offsets[0].as_u64().ok_or_else(|| {
+            anyhow::anyhow!("safetensors: tensor '{}' data_offsets[0] not u64", name)
+        })?;
+        let rel_end = offsets[1].as_u64().ok_or_else(|| {
+            anyhow::anyhow!("safetensors: tensor '{}' data_offsets[1] not u64", name)
+        })?;
 
         tensors.push(TensorMeta {
             name: name.clone(),
@@ -432,7 +452,6 @@ pub fn color_for_pos(pos: u64, ranges: &[(u64, u64, Rgb<u8>)]) -> Rgb<u8> {
         Rgb([0, 0, 0])
     }
 }
-
 
 #[cfg(test)]
 mod tests {

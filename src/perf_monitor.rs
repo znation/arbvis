@@ -35,7 +35,10 @@ pub fn spawn_if_enabled() -> Option<Arc<AtomicBool>> {
                 break;
             }
             let now = Instant::now();
-            let dt = now.saturating_duration_since(last_tick).as_secs_f64().max(0.001);
+            let dt = now
+                .saturating_duration_since(last_tick)
+                .as_secs_f64()
+                .max(0.001);
             last_tick = now;
 
             let ts = Throttle::global().stats();

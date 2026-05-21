@@ -66,8 +66,13 @@ pub fn encode_tile(
         TileFormat::Avif { quality, speed } => {
             let mut out: Vec<u8> = Vec::new();
             let enc = AvifEncoder::new_with_speed_quality(&mut out, speed, quality);
-            enc.write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::Rgb8)
-                .map_err(|e| e.to_string())?;
+            enc.write_image(
+                img.as_raw(),
+                img.width(),
+                img.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .map_err(|e| e.to_string())?;
             out
         }
         TileFormat::Png => encode_truecolor_png(&img)?,
@@ -77,7 +82,8 @@ pub fn encode_tile(
 
 fn encode_truecolor_png(img: &image::ImageBuffer<Rgb<u8>, Vec<u8>>) -> Result<Vec<u8>, String> {
     let mut cursor = Cursor::new(Vec::new());
-    img.write_to(&mut cursor, ImageFormat::Png).map_err(|e| e.to_string())?;
+    img.write_to(&mut cursor, ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
     Ok(cursor.into_inner())
 }
 
@@ -87,7 +93,9 @@ fn encode_truecolor_png(img: &image::ImageBuffer<Rgb<u8>, Vec<u8>>) -> Result<Ve
 /// Builds the palette on the fly from the pixels actually present — works for
 /// any RGB content without needing the source LUT. The forward pass is O(N)
 /// with a `HashMap<[u8;3], u8>` lookup per pixel.
-fn encode_indexed_png(img: &image::ImageBuffer<Rgb<u8>, Vec<u8>>) -> Result<Option<Vec<u8>>, String> {
+fn encode_indexed_png(
+    img: &image::ImageBuffer<Rgb<u8>, Vec<u8>>,
+) -> Result<Option<Vec<u8>>, String> {
     let pixel_count = (img.width() as usize) * (img.height() as usize);
     let mut palette: Vec<[u8; 3]> = Vec::with_capacity(64);
     let mut idx_of: HashMap<[u8; 3], u8> = HashMap::with_capacity(64);
@@ -127,7 +135,9 @@ fn encode_indexed_png(img: &image::ImageBuffer<Rgb<u8>, Vec<u8>>) -> Result<Opti
         // most of its compression off the predictable byte sequence rather
         // than the compression level knob.
         let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
-        writer.write_image_data(&indexed).map_err(|e| e.to_string())?;
+        writer
+            .write_image_data(&indexed)
+            .map_err(|e| e.to_string())?;
     }
     Ok(Some(out))
 }
@@ -302,15 +312,25 @@ pub fn render_leaf_tile_diff(
                 let byte = tile_buf[(local_idx - base) as usize];
                 let mut fill: Option<DiffFill> = None;
                 for &(start, end, f) in &local_fills {
-                    if pixel_idx >= start && pixel_idx < end { fill = Some(f); break; }
+                    if pixel_idx >= start && pixel_idx < end {
+                        fill = Some(f);
+                        break;
+                    }
                 }
                 if let Some(f) = fill {
                     let (stripe, base_c) = f.colors();
-                    if is_crosshatch_stripe(px, py) { stripe } else { base_c }
+                    if is_crosshatch_stripe(px, py) {
+                        stripe
+                    } else {
+                        base_c
+                    }
                 } else {
                     let mut tint: Option<DiffFill> = None;
                     for &(start, end, f) in &local_tints {
-                        if pixel_idx >= start && pixel_idx < end { tint = Some(f); break; }
+                        if pixel_idx >= start && pixel_idx < end {
+                            tint = Some(f);
+                            break;
+                        }
                     }
                     match tint {
                         Some(t) => blend_with_tint(plain_lut[byte as usize], t),

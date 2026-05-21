@@ -30,7 +30,16 @@ pub fn generate_leaflet_content(
     pyramid_ext: &str,
 ) -> (Vec<u8>, Vec<u8>) {
     let entities_json = build_labels_json(entities);
-    let html = build_html(world_w, max_zoom, height, tile_size, title, inputs, leaf_ext, pyramid_ext);
+    let html = build_html(
+        world_w,
+        max_zoom,
+        height,
+        tile_size,
+        title,
+        inputs,
+        leaf_ext,
+        pyramid_ext,
+    );
     (html.into_bytes(), entities_json.into_bytes())
 }
 
@@ -50,7 +59,16 @@ pub fn write_leaflet_html(
     let entities_json = build_labels_json(entities);
     std::fs::write(dir.join("labels.json"), &entities_json)?;
 
-    let html = build_html(world_w, max_zoom, height, tile_size, title, inputs, leaf_ext, pyramid_ext);
+    let html = build_html(
+        world_w,
+        max_zoom,
+        height,
+        tile_size,
+        title,
+        inputs,
+        leaf_ext,
+        pyramid_ext,
+    );
     std::fs::write(dir.join("index.html"), html)?;
     Ok(())
 }
@@ -132,52 +150,6 @@ fn hf_url_to_web(s: &str) -> Option<String> {
     Some(format!("{base}/{verb}/{rev}/{path}"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::hf_url_to_web;
-
-    #[test]
-    fn bare_model_repo() {
-        assert_eq!(
-            hf_url_to_web("hf://owner/repo"),
-            Some("https://huggingface.co/owner/repo".to_string())
-        );
-    }
-
-    #[test]
-    fn bare_dataset_repo() {
-        assert_eq!(
-            hf_url_to_web("hf://datasets/owner/repo"),
-            Some("https://huggingface.co/datasets/owner/repo".to_string())
-        );
-    }
-
-    #[test]
-    fn file_in_model_repo() {
-        assert_eq!(
-            hf_url_to_web("hf://owner/repo/model.safetensors"),
-            Some("https://huggingface.co/owner/repo/blob/main/model.safetensors".to_string())
-        );
-    }
-
-    #[test]
-    fn file_in_dataset_repo() {
-        assert_eq!(
-            hf_url_to_web("hf://datasets/owner/repo/data.safetensors"),
-            Some(
-                "https://huggingface.co/datasets/owner/repo/blob/main/data.safetensors"
-                    .to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn non_hf_url_returns_none() {
-        assert_eq!(hf_url_to_web("/local/path/file.safetensors"), None);
-        assert_eq!(hf_url_to_web("hf://owner"), None);
-    }
-}
-
 fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -208,7 +180,16 @@ fn build_info_html(title: &str, inputs: &[String]) -> String {
     )
 }
 
-fn build_html(world_w: u32, max_zoom: u32, height: u32, tile_size: u32, title: &str, inputs: &[String], leaf_ext: &str, pyramid_ext: &str) -> String {
+fn build_html(
+    world_w: u32,
+    max_zoom: u32,
+    height: u32,
+    tile_size: u32,
+    title: &str,
+    inputs: &[String],
+    leaf_ext: &str,
+    pyramid_ext: &str,
+) -> String {
     let info_html = build_info_html(title, inputs);
     let viewer_max_zoom = max_zoom + 3;
     format!(
@@ -404,4 +385,49 @@ fn build_html(world_w: u32, max_zoom: u32, height: u32, tile_size: u32, title: &
         leaf_ext = leaf_ext,
         pyramid_ext = pyramid_ext,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hf_url_to_web;
+
+    #[test]
+    fn bare_model_repo() {
+        assert_eq!(
+            hf_url_to_web("hf://owner/repo"),
+            Some("https://huggingface.co/owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn bare_dataset_repo() {
+        assert_eq!(
+            hf_url_to_web("hf://datasets/owner/repo"),
+            Some("https://huggingface.co/datasets/owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn file_in_model_repo() {
+        assert_eq!(
+            hf_url_to_web("hf://owner/repo/model.safetensors"),
+            Some("https://huggingface.co/owner/repo/blob/main/model.safetensors".to_string())
+        );
+    }
+
+    #[test]
+    fn file_in_dataset_repo() {
+        assert_eq!(
+            hf_url_to_web("hf://datasets/owner/repo/data.safetensors"),
+            Some(
+                "https://huggingface.co/datasets/owner/repo/blob/main/data.safetensors".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn non_hf_url_returns_none() {
+        assert_eq!(hf_url_to_web("/local/path/file.safetensors"), None);
+        assert_eq!(hf_url_to_web("hf://owner"), None);
+    }
 }

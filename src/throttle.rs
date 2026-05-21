@@ -192,10 +192,7 @@ impl Throttle {
 
         // CAS-on-counter: only the task that wins the `successes` → 0 swap
         // performs the scale-up.
-        let successes = self
-            .successes_since_scale_up
-            .fetch_add(1, Ordering::SeqCst)
-            + 1;
+        let successes = self.successes_since_scale_up.fetch_add(1, Ordering::SeqCst) + 1;
         if successes < SUCCESSES_TO_SCALE_UP {
             return;
         }
@@ -214,21 +211,19 @@ impl Throttle {
         // Without slow-start, getting from 4 → 128 workers would take ~124
         // ticks; with it, only ~5.
         let in_slow_start = last_rate_limit == 0 && last_timeout == 0;
-        let scaled = self.active_limit.fetch_update(
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-            |current| {
-                if current >= self.max_workers {
-                    return None;
-                }
-                let next = if in_slow_start {
-                    current.saturating_mul(2).min(self.max_workers)
-                } else {
-                    current + 1
-                };
-                Some(next)
-            },
-        );
+        let scaled =
+            self.active_limit
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    if current >= self.max_workers {
+                        return None;
+                    }
+                    let next = if in_slow_start {
+                        current.saturating_mul(2).min(self.max_workers)
+                    } else {
+                        current + 1
+                    };
+                    Some(next)
+                });
         if let Ok(prev) = scaled {
             let new_limit = self.active_limit.load(Ordering::SeqCst);
             self.last_scale_up.store(now, Ordering::SeqCst);
@@ -250,12 +245,16 @@ impl Throttle {
         self.last_rate_limit.store(now, Ordering::SeqCst);
         let floor = (self.max_workers / 64).max(4).min(self.max_workers);
         let prev = self.active_limit.load(Ordering::SeqCst);
-        let new_limit = self
-            .active_limit
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                let new = (current / 2).max(floor);
-                if new != current { Some(new) } else { None }
-            });
+        let new_limit =
+            self.active_limit
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    let new = (current / 2).max(floor);
+                    if new != current {
+                        Some(new)
+                    } else {
+                        None
+                    }
+                });
         self.successes_since_scale_up.store(0, Ordering::SeqCst);
         if new_limit.is_ok() {
             let now_limit = self.active_limit.load(Ordering::SeqCst);
@@ -269,12 +268,16 @@ impl Throttle {
     pub fn record_timeout(&self) {
         self.total_timeouts.fetch_add(1, Ordering::Relaxed);
         let floor = (self.max_workers / 16).max(4).min(self.max_workers);
-        let reduced = self
-            .active_limit
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                let new = ((current * 9) / 10).max(floor);
-                if new < current { Some(new) } else { None }
-            });
+        let reduced =
+            self.active_limit
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    let new = ((current * 9) / 10).max(floor);
+                    if new < current {
+                        Some(new)
+                    } else {
+                        None
+                    }
+                });
         if reduced.is_ok() {
             self.successes_since_scale_up.store(0, Ordering::SeqCst);
             self.last_timeout.store(unix_now(), Ordering::SeqCst);
@@ -438,9 +441,7 @@ where
                     timeout_retries += 1;
                     throttle.record_timeout();
                     if timeout_retries > MAX_TIMEOUT_RETRIES {
-                        log::warn!(
-                            "{label}: giving up after {timeout_retries} transient retries",
-                        );
+                        log::warn!("{label}: giving up after {timeout_retries} transient retries",);
                         return Err(e);
                     }
                     let delay = throttle.timeout_backoff(timeout_retries);
@@ -558,7 +559,11 @@ mod tests {
         for _ in 0..(SUCCESSES_TO_SCALE_UP - 1) {
             t.record_success();
         }
-        assert_eq!(t.active_limit(), 20, "should not scale before the next success burst");
+        assert_eq!(
+            t.active_limit(),
+            20,
+            "should not scale before the next success burst"
+        );
     }
 
     #[test]
@@ -568,7 +573,8 @@ mod tests {
         t.active_limit.store(10, Ordering::SeqCst);
         // Mark a timeout in the distant past so the cooldown gate is already passed
         // but slow-start is permanently exited.
-        t.last_timeout.store(unix_now() - TIMEOUT_COOLDOWN_SECS - 1, Ordering::SeqCst);
+        t.last_timeout
+            .store(unix_now() - TIMEOUT_COOLDOWN_SECS - 1, Ordering::SeqCst);
         for _ in 0..SUCCESSES_TO_SCALE_UP {
             t.record_success();
         }

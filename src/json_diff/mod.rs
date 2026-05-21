@@ -37,21 +37,16 @@ pub async fn build_json_diff_sources(
     modified: &Path,
     is_finetune: bool,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
-    let orig_bytes = std::fs::read(original)
-        .with_context(format!("reading {}", original.display()))?;
-    let mod_bytes = std::fs::read(modified)
-        .with_context(format!("reading {}", modified.display()))?;
+    let orig_bytes =
+        std::fs::read(original).with_context(format!("reading {}", original.display()))?;
+    let mod_bytes =
+        std::fs::read(modified).with_context(format!("reading {}", modified.display()))?;
 
     let orig_label = filename_label(original);
     let mod_label = filename_label(modified);
 
-    let is_jsonl = matches!(
-        original.extension().and_then(|e| e.to_str()),
-        Some("jsonl")
-    ) || matches!(
-        modified.extension().and_then(|e| e.to_str()),
-        Some("jsonl")
-    );
+    let is_jsonl = matches!(original.extension().and_then(|e| e.to_str()), Some("jsonl"))
+        || matches!(modified.extension().and_then(|e| e.to_str()), Some("jsonl"));
 
     // Mmap each file for the per-tile RangeDiff / OneSidedRange path. Even
     // though we already have the bytes in `orig_bytes`/`mod_bytes`, the
@@ -67,7 +62,15 @@ pub async fn build_json_diff_sources(
             (Ok(o), Ok(m)) => align_documents(&o, &m, 0, 0),
             (orig_r, mod_r) => {
                 log_parse_failures(original, &orig_r, modified, &mod_r);
-                return fallback_byte_diff(original, modified, &orig_bytes, &mod_bytes, is_finetune, orig_data, mod_data);
+                return fallback_byte_diff(
+                    original,
+                    modified,
+                    &orig_bytes,
+                    &mod_bytes,
+                    is_finetune,
+                    orig_data,
+                    mod_data,
+                );
             }
         }
     };
@@ -81,7 +84,15 @@ pub async fn build_json_diff_sources(
             modified.display(),
             MAX_SPANS
         );
-        return fallback_byte_diff(original, modified, &orig_bytes, &mod_bytes, is_finetune, orig_data, mod_data);
+        return fallback_byte_diff(
+            original,
+            modified,
+            &orig_bytes,
+            &mod_bytes,
+            is_finetune,
+            orig_data,
+            mod_data,
+        );
     }
 
     let (sources, total) = source::spans_to_sources(
@@ -117,14 +128,22 @@ fn align_jsonl(orig: &[u8], mod_: &[u8]) -> Vec<AlignmentSpan> {
     };
     let cap = align::MAX_LCS_ELEMENTS;
     let pairs = if orig_lines.len() <= cap && mod_lines.len() <= cap {
-        let o_hashes: Vec<u64> = orig_lines.iter().map(|r| hash(&orig[r.start as usize..r.end as usize])).collect();
-        let m_hashes: Vec<u64> = mod_lines.iter().map(|r| hash(&mod_[r.start as usize..r.end as usize])).collect();
+        let o_hashes: Vec<u64> = orig_lines
+            .iter()
+            .map(|r| hash(&orig[r.start as usize..r.end as usize]))
+            .collect();
+        let m_hashes: Vec<u64> = mod_lines
+            .iter()
+            .map(|r| hash(&mod_[r.start as usize..r.end as usize]))
+            .collect();
         align::lcs_pairs(&o_hashes, &m_hashes)
     } else {
         log::warn!(
             "json-diff: jsonl file has {} / {} lines — exceeding LCS cap ({}), \
              falling back to index-based line matching",
-            orig_lines.len(), mod_lines.len(), cap
+            orig_lines.len(),
+            mod_lines.len(),
+            cap
         );
         let len = orig_lines.len().min(mod_lines.len());
         (0..len).map(|i| (i, i)).collect()
@@ -135,11 +154,15 @@ fn align_jsonl(orig: &[u8], mod_: &[u8]) -> Vec<AlignmentSpan> {
     let mut mi = 0usize;
     for &(po, pm) in &pairs {
         while oi < po {
-            out.push(AlignmentSpan::OrigOnly { orig: orig_lines[oi].clone() });
+            out.push(AlignmentSpan::OrigOnly {
+                orig: orig_lines[oi].clone(),
+            });
             oi += 1;
         }
         while mi < pm {
-            out.push(AlignmentSpan::ModOnly { mod_: mod_lines[mi].clone() });
+            out.push(AlignmentSpan::ModOnly {
+                mod_: mod_lines[mi].clone(),
+            });
             mi += 1;
         }
         let or = orig_lines[oi].clone();
@@ -165,7 +188,8 @@ fn align_jsonl(orig: &[u8], mod_: &[u8]) -> Vec<AlignmentSpan> {
                         align::align_bytes_pub(
                             or.end - o_nl..or.end,
                             mr.end - m_nl..mr.end,
-                            0, 0,
+                            0,
+                            0,
                             &mut out,
                         );
                     }
@@ -180,11 +204,15 @@ fn align_jsonl(orig: &[u8], mod_: &[u8]) -> Vec<AlignmentSpan> {
         mi += 1;
     }
     while oi < orig_lines.len() {
-        out.push(AlignmentSpan::OrigOnly { orig: orig_lines[oi].clone() });
+        out.push(AlignmentSpan::OrigOnly {
+            orig: orig_lines[oi].clone(),
+        });
         oi += 1;
     }
     while mi < mod_lines.len() {
-        out.push(AlignmentSpan::ModOnly { mod_: mod_lines[mi].clone() });
+        out.push(AlignmentSpan::ModOnly {
+            mod_: mod_lines[mi].clone(),
+        });
         mi += 1;
     }
     coalesce(out)
@@ -220,8 +248,7 @@ fn strip_trailing_newline(s: &[u8]) -> (&[u8], u64) {
 }
 
 fn open_mmap_data(path: &Path) -> anyhow::Result<Arc<Data>> {
-    let f = std::fs::File::open(path)
-        .with_context(format!("opening {}", path.display()))?;
+    let f = std::fs::File::open(path).with_context(format!("opening {}", path.display()))?;
     let mmap = unsafe { Mmap::map(&f)? };
     Ok(Arc::new(Data::Mapped(mmap)))
 }
@@ -241,13 +268,15 @@ fn log_parse_failures(
     if let Err(e) = orig_r {
         log::warn!(
             "json-diff: failed to parse {} ({}) — falling back to byte diff",
-            orig_path.display(), e
+            orig_path.display(),
+            e
         );
     }
     if let Err(e) = mod_r {
         log::warn!(
             "json-diff: failed to parse {} ({}) — falling back to byte diff",
-            mod_path.display(), e
+            mod_path.display(),
+            e
         );
     }
 }
@@ -263,7 +292,11 @@ fn fallback_byte_diff(
     _orig_data: Arc<Data>,
     _mod_data: Arc<Data>,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
-    let orig_fill = if is_finetune { DiffFill::Grey } else { DiffFill::Red };
+    let orig_fill = if is_finetune {
+        DiffFill::Grey
+    } else {
+        DiffFill::Red
+    };
     if orig_bytes.len() == mod_bytes.len() {
         let size = orig_bytes.len() as u64;
         let source = Source {
@@ -297,7 +330,9 @@ fn fallback_byte_diff(
         let size = mod_bytes.len() as u64;
         sources.push(Source {
             file_idx: sources.len(),
-            kind: SourceKind::UnmatchedRegion { fill: DiffFill::Green },
+            kind: SourceKind::UnmatchedRegion {
+                fill: DiffFill::Green,
+            },
             byte_size: size,
             safetensors: None,
             name_override: Some(format!("[only in modified] {}", filename_label(mod_path))),

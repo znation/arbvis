@@ -6,7 +6,7 @@
 
 use image::Rgb;
 
-use crate::safetensors::{decode_element, Dtype, DiffMetric};
+use crate::safetensors::{decode_element, DiffMetric, Dtype};
 
 /// Neutral background colour for canvas pixels that fall outside every
 /// tensor's rectangle in [`crate::layout::arch::ArchLayout`]. Not pure black
@@ -49,7 +49,9 @@ pub fn plain_element_color(
 ) -> Rgb<u8> {
     let elem = dtype.element_size();
     let start = elem_idx * elem;
-    if start + elem > bytes.len() { return PADDING_RGB; }
+    if start + elem > bytes.len() {
+        return PADDING_RGB;
+    }
     let raw = &bytes[start..start + elem];
     pixel_lut[element_to_byte_proxy(dtype, raw) as usize]
 }
@@ -100,18 +102,29 @@ pub fn diff_element_color(
                 let log_min = ABS_LOG_MIN.log10();
                 let log_max = ABS_LOG_MAX.log10();
                 let norm = ((abs_d.log10() - log_min) / (log_max - log_min)).clamp(0.0, 1.0);
-                if delta >= 0.0 { norm } else { -norm }
+                if delta >= 0.0 {
+                    norm
+                } else {
+                    -norm
+                }
             }
         }
         DiffMetric::Exact => {
-            if delta == 0.0 { 0.0 }
-            else if delta > 0.0 { 1.0 }
-            else { -1.0 }
+            if delta == 0.0 {
+                0.0
+            } else if delta > 0.0 {
+                1.0
+            } else {
+                -1.0
+            }
         }
     };
     let brightness = (signed.abs() * 127.0).round() as u8;
-    let byte = if signed >= 0.0 { 127u8.saturating_add(brightness) }
-               else { 127u8.saturating_sub(brightness) };
+    let byte = if signed >= 0.0 {
+        127u8.saturating_add(brightness)
+    } else {
+        127u8.saturating_sub(brightness)
+    };
     pixel_lut[byte as usize]
 }
 
@@ -129,7 +142,9 @@ pub fn xet_dtype_element_color(
 ) -> Rgb<u8> {
     let elem = dtype.element_size();
     let start = elem_idx * elem;
-    if start + elem > bytes.len() { return PADDING_RGB; }
+    if start + elem > bytes.len() {
+        return PADDING_RGB;
+    }
     let raw = &bytes[start..start + elem];
     let byte = element_to_byte_proxy(dtype, raw);
     let d = dtype.to_color();
@@ -169,7 +184,9 @@ pub fn xet_element_color(
 ) -> Rgb<u8> {
     let elem = dtype.element_size();
     let start = elem_idx * elem;
-    if start + elem > bytes.len() { return PADDING_RGB; }
+    if start + elem > bytes.len() {
+        return PADDING_RGB;
+    }
     let raw = &bytes[start..start + elem];
     let byte = element_to_byte_proxy(dtype, raw);
     let abs_byte_pos = tensor_byte_start + start as u64;
@@ -190,7 +207,9 @@ pub fn xet_element_color(
 /// Binary-search a sorted-non-overlapping `(start, end, color_idx)` list for
 /// the entry that contains `pos`.
 fn xorb_color_idx(ranges: &[(u64, u64, u8)], pos: u64) -> Option<u8> {
-    if ranges.is_empty() { return None; }
+    if ranges.is_empty() {
+        return None;
+    }
     let mut lo = 0usize;
     let mut hi = ranges.len();
     while lo < hi {

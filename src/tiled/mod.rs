@@ -640,7 +640,14 @@ async fn build_tile_plan(
     // For Architectural we let the layout module rebuild the grid, then
     // override `width_tiles`, `height_tiles`, `max_zoom`, `total_tiles`,
     // and `world_w`/`height` with the layout-derived values.
-    let layout = select_layout(&sources, &cumulative_offsets, total, layout_mode, &metas);
+    let layout = select_layout(
+        &sources,
+        &cumulative_offsets,
+        total,
+        layout_mode,
+        &metas,
+        diff_mode,
+    );
 
     let (
         kh_out,

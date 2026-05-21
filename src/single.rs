@@ -71,7 +71,14 @@ pub fn run_single(
     {
         log::info!("model config: {arch_summary}");
     }
-    let layout = select_layout(&sources, &cumulative_offsets, total, layout_mode, &metas);
+    let layout = select_layout(
+        &sources,
+        &cumulative_offsets,
+        total,
+        layout_mode,
+        &metas,
+        diff_mode,
+    );
     if let Layout::Architectural(arch) = &layout {
         // Arch mode only handles local (mmap'd / owned) data for now. If any
         // source needs an HTTP/Xet/LazyDiff fetch we fall through to the

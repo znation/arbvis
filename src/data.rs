@@ -1677,6 +1677,18 @@ async fn build_multi_safetensors_diff_sources_inner(
         let (mi, mod_t) = &mod_map[mod_full];
 
         let nelem: u64 = orig_t.shape.iter().product();
+        // Describe the diff buffer as a synthetic 1-byte-per-element tensor so
+        // the architectural layout can place it at its natural 2D shape. The
+        // dtype is U8 (the output of `Dtype::diff_to_u8`); the *element shape*
+        // tracks the original tensor's so layer-N q_proj stacks pixel-aligned
+        // with layer-N+1 q_proj.
+        let diff_meta = safetensors::TensorMeta {
+            name: orig_t.name.clone(),
+            dtype: safetensors::Dtype::U8,
+            shape: orig_t.shape.clone(),
+            file_start: 0,
+            file_end: nelem,
+        };
         sources.push(Source {
             file_idx: sources.len(),
             kind: SourceKind::TensorDiff {
@@ -1690,7 +1702,10 @@ async fn build_multi_safetensors_diff_sources_inner(
                 scale_orig: *scale_orig,
             },
             byte_size: nelem,
-            safetensors: None,
+            safetensors: Some(SafetensorsInfo {
+                tensors: vec![diff_meta],
+                color_ranges: Vec::new(),
+            }),
             name_override: Some(orig_t.label()),
             xet_terms: None,
         });
@@ -1718,11 +1733,26 @@ async fn build_multi_safetensors_diff_sources_inner(
         if nelem == 0 {
             continue;
         }
+        // Carry the original shape so the gate in `select_layout` treats this
+        // as a safetensors-aware source. The arch layout currently *skips*
+        // UnmatchedRegion entries (they're drawn via the crosshatch overlay in
+        // the Hilbert path); attaching the synthetic meta keeps future arch
+        // crosshatch wiring straightforward.
+        let unmatched_meta = safetensors::TensorMeta {
+            name: t.name.clone(),
+            dtype: safetensors::Dtype::U8,
+            shape: t.shape.clone(),
+            file_start: 0,
+            file_end: nelem,
+        };
         sources.push(Source {
             file_idx: sources.len(),
             kind: SourceKind::UnmatchedRegion { fill: orig_fill },
             byte_size: nelem,
-            safetensors: None,
+            safetensors: Some(SafetensorsInfo {
+                tensors: vec![unmatched_meta],
+                color_ranges: Vec::new(),
+            }),
             name_override: Some(format!("[only in original] {}", t.label())),
             xet_terms: None,
         });
@@ -1738,13 +1768,23 @@ async fn build_multi_safetensors_diff_sources_inner(
         if nelem == 0 {
             continue;
         }
+        let unmatched_meta = safetensors::TensorMeta {
+            name: t.name.clone(),
+            dtype: safetensors::Dtype::U8,
+            shape: t.shape.clone(),
+            file_start: 0,
+            file_end: nelem,
+        };
         sources.push(Source {
             file_idx: sources.len(),
             kind: SourceKind::UnmatchedRegion {
                 fill: DiffFill::Green,
             },
             byte_size: nelem,
-            safetensors: None,
+            safetensors: Some(SafetensorsInfo {
+                tensors: vec![unmatched_meta],
+                color_ranges: Vec::new(),
+            }),
             name_override: Some(format!("[only in modified] {}", t.label())),
             xet_terms: None,
         });

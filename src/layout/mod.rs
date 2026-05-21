@@ -91,26 +91,49 @@ impl Layout {
 /// extend the canonical layer stack to `num_hidden_layers` when only a
 /// subset of shards was loaded; (2) extend the canonical sub-path set with
 /// tensor names listed in the index but not loaded. Pass `&[]` to opt out.
+///
+/// `diff_mode` relaxes the all-safetensors gate. In a diff run between two
+/// model repos, every per-tensor `TensorDiff` source carries synthetic
+/// safetensors info, but non-tensor file diffs (e.g. tokenizer.json) remain
+/// without it — under the strict all-safetensors gate they'd block arch
+/// selection and force the whole run back to Hilbert. In diff mode we accept
+/// arch as long as *some* source has safetensors; non-safetensors diff
+/// sources stay in the pipeline but aren't placed on the arch canvas.
 pub fn select_layout(
     sources: &[Source],
     cumulative_offsets: &[u64],
     total_bytes: u64,
     mode: LayoutMode,
     metas: &[SourceMeta],
+    diff_mode: bool,
 ) -> Layout {
     // Force-hilbert path: use legacy byte-Hilbert geometry as-is.
     if matches!(mode, LayoutMode::Hilbert) {
         return Layout::HilbertGlobal(hilbert::HilbertLayout::from_total(total_bytes));
     }
 
-    // Architectural requires every source to be safetensors AND a detectable
-    // structure. If forced (`Arch`) but the data doesn't support it, we still
-    // fall back to hilbert with a log line — accidentally rendering nothing is
-    // a worse outcome than ignoring the forced flag.
+    // Architectural requires safetensors data AND a detectable structure. In
+    // non-diff mode every source must be safetensors (otherwise the user has
+    // explicitly mixed in non-tensor inputs they'd expect to see). In diff
+    // mode it's enough that any source carries safetensors info: the typical
+    // case is a model-repo diff where the tensor sources are the point and
+    // tokenizer/config diffs are incidental.
     let all_safetensors = !sources.is_empty() && sources.iter().all(|s| s.safetensors.is_some());
+    let any_safetensors = sources.iter().any(|s| s.safetensors.is_some());
+    let arch_eligible = if diff_mode {
+        any_safetensors
+    } else {
+        all_safetensors
+    };
 
-    if all_safetensors {
+    if arch_eligible {
         if let Some(arch) = arch::ArchLayout::try_build(sources, cumulative_offsets, metas) {
+            if diff_mode && !all_safetensors {
+                let skipped = sources.iter().filter(|s| s.safetensors.is_none()).count();
+                log::info!(
+                    "arch layout: {skipped} non-safetensors diff source(s) will not appear on the arch canvas (file-level diffs are only rendered in --layout hilbert)"
+                );
+            }
             return Layout::Architectural(arch);
         }
         if matches!(mode, LayoutMode::Arch) {
@@ -120,7 +143,7 @@ pub fn select_layout(
         }
     } else if matches!(mode, LayoutMode::Arch) {
         log::warn!(
-            "--layout arch requested but not every input is safetensors; falling back to hilbert"
+            "--layout arch requested but no input carries safetensors data; falling back to hilbert"
         );
     }
 

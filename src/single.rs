@@ -10,9 +10,12 @@ use minifb::{Window, WindowOptions};
 use rayon::prelude::*;
 
 use crate::color::{build_diff_signed_lut, build_pixel_lut};
-use crate::data::{load_source_data, Source, SourceKind};
+use crate::data::{load_source_data, Data, Source, SourceKind};
 use crate::geometry::{sampled_in_range, hilbert_to_xy_u64};
 use crate::label::draw_file_label;
+use crate::layout::arch::ArchLayout;
+use crate::layout::render::{plain_element_color, PADDING_RGB};
+use crate::layout::{select_layout, Layout, LayoutMode};
 use crate::safetensors::{color_for_pos, DiffFill};
 use crate::xet::{TABLEAU_20, XorbMap};
 
@@ -28,8 +31,162 @@ fn is_crosshatch_stripe_single(x: u32, y: u32) -> bool {
     a < STRIPE || b < STRIPE
 }
 
-/// Render a single Hilbert-curve image (non-tiled mode).
+/// Maximum side length of the single-image output. Mirrors the GPU buffer
+/// size cap baked into the legacy Hilbert path (`(1 << 12)² × 3 ≈ 50 MB`).
+const SINGLE_MAX_DIM: u32 = 4096;
+
+/// Render a single image (non-tiled mode). Chooses between the legacy global-
+/// Hilbert layout and the architectural layout based on `layout_mode`.
 pub fn run_single(
+    files: &[PathBuf],
+    output: Option<PathBuf>,
+    sources: Vec<Source>,
+    total: u64,
+    diff_mode: bool,
+    show_xet_xorbs: bool,
+    layout_mode: LayoutMode,
+) -> anyhow::Result<()> {
+    // Compute cumulative source offsets for layout selection.
+    let cumulative_offsets: Vec<u64> = {
+        let mut v = Vec::with_capacity(sources.len());
+        let mut o = 0u64;
+        for s in &sources { v.push(o); o += s.byte_size; }
+        v
+    };
+    // Opportunistic sidecar (config.json / index.json) load. Runs inside
+    // the ambient tokio runtime via `block_on` because `run_single` is sync
+    // and is already inside `spawn_blocking`. For Hilbert mode we skip —
+    // the legacy path doesn't consume the metadata.
+    let metas = if matches!(layout_mode, LayoutMode::Hilbert) {
+        Vec::new()
+    } else {
+        tokio::runtime::Handle::current()
+            .block_on(crate::data::load_meta_for_sources(&sources))
+    };
+    if let Some(arch_summary) = metas.iter().find_map(|m| m.config.as_ref().map(|c| c.summary())) {
+        log::info!("model config: {arch_summary}");
+    }
+    let layout = select_layout(&sources, &cumulative_offsets, total, layout_mode, &metas);
+    if let Layout::Architectural(arch) = &layout {
+        // Arch mode only handles local (mmap'd / owned) data for now. If any
+        // source needs an HTTP/Xet/LazyDiff fetch we fall through to the
+        // Hilbert path with a warning, since the architectural single-image
+        // renderer is synchronous and we don't want to block a tokio worker
+        // inside spawn_blocking on per-pixel HTTP calls.
+        let all_local = sources.iter().all(|s| {
+            matches!(s.kind, SourceKind::File(_) | SourceKind::Buffered(_) | SourceKind::Diff { .. })
+        });
+        if all_local && !diff_mode && !show_xet_xorbs {
+            return run_single_arch(files, output, &sources, arch);
+        }
+        log::warn!(
+            "architectural single-image layout requires local non-diff non-xet inputs; falling back to hilbert"
+        );
+    }
+    run_single_hilbert(files, output, sources, total, diff_mode, show_xet_xorbs)
+}
+
+/// Synchronous architectural-mode single-image render. Renders every tensor
+/// into a downsampled overview that fits inside `SINGLE_MAX_DIM²`; preserves
+/// the per-tensor 2D aspect via independent integer downsampling.
+fn run_single_arch(
+    _files: &[PathBuf],
+    output: Option<PathBuf>,
+    sources: &[Source],
+    layout: &ArchLayout,
+) -> anyhow::Result<()> {
+    let (canvas_w, canvas_h) = (layout.width, layout.height);
+    // Global integer downscale so the largest dimension fits in SINGLE_MAX_DIM.
+    let max_dim = canvas_w.max(canvas_h).max(1);
+    let scale: u32 = ((max_dim + SINGLE_MAX_DIM - 1) / SINGLE_MAX_DIM).max(1);
+    let out_w = (canvas_w / scale).max(1);
+    let out_h = (canvas_h / scale).max(1);
+
+    let mut img: image::ImageBuffer<Rgb<u8>, Vec<u8>> = image::ImageBuffer::new(out_w, out_h);
+    for p in img.pixels_mut() { *p = PADDING_RGB; }
+
+    // Open each source as `Data` so we can borrow its bytes synchronously
+    // via `Deref` (panics for HTTP/Xet/LazyDiff — but `run_single`'s
+    // dispatcher already gated those out above).
+    let data: Vec<Data> = sources
+        .iter()
+        .map(load_source_data)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let pixel_lut = build_pixel_lut();
+
+    // Per tensor, sample every `scale`-th element in row-major order and
+    // paint it into the output image. The sampling is intentionally simple
+    // pixel-skip (not box-averaged) — for a 4096²-bound overview the loss
+    // of detail vs box-averaging is invisible at this scale and the loop is
+    // a memory-bound walk.
+    for t in &layout.tensors {
+        let cols = t.tensor_cols;
+        let rows = t.tensor_rows;
+        let elem = t.dtype.element_size() as u64;
+        let stride = cols * elem;
+        let src_idx = t.source_idx;
+        let src_bytes: &[u8] = match &data[src_idx] {
+            Data::Mapped(m) => m,
+            Data::Owned(v) => v,
+            _ => continue,
+        };
+        // Tensor byte start, local to its source.
+        let local_off = t.tensor_byte_start.saturating_sub(
+            sources[..src_idx].iter().map(|s| s.byte_size).sum::<u64>(),
+        );
+
+        // Output rect after scaling.
+        let out_x0 = t.canvas_x / scale;
+        let out_y0 = t.canvas_y / scale;
+        let out_x1 = ((t.canvas_x + cols.min(u32::MAX as u64) as u32) / scale).min(out_w);
+        let out_y1 = ((t.canvas_y + rows.min(u32::MAX as u64) as u32) / scale).min(out_h);
+        if out_x1 <= out_x0 || out_y1 <= out_y0 { continue; }
+
+        for oy in out_y0..out_y1 {
+            // Map output y back to a representative tensor row.
+            let dy = (oy - out_y0) as u64 * scale as u64;
+            if dy >= rows { break; }
+            let row_off = local_off + dy * stride;
+            for ox in out_x0..out_x1 {
+                let dx = (ox - out_x0) as u64 * scale as u64;
+                if dx >= cols { break; }
+                let elem_off = (row_off + dx * elem) as usize;
+                if elem_off + elem as usize > src_bytes.len() { continue; }
+                let color = plain_element_color(
+                    t.dtype, &src_bytes[elem_off..elem_off + elem as usize], 0, &pixel_lut,
+                );
+                img.put_pixel(ox, oy, color);
+            }
+        }
+    }
+
+    if let Some(path) = output {
+        image::DynamicImage::ImageRgb8(img).save(&path)?;
+        return Ok(());
+    }
+
+    // Interactive window: just show the final image and wait for close.
+    let pixels: Vec<u32> = img.pixels()
+        .map(|p| ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32))
+        .collect();
+    let mut window = Window::new(
+        "arbvis (arch layout) — press Esc or close to quit",
+        out_w as usize, out_h as usize,
+        WindowOptions::default(),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to open preview window: {e}"))?;
+    window.set_target_fps(10);
+    while window.is_open() && !window.is_key_down(minifb::Key::Escape) {
+        window.update_with_buffer(&pixels, out_w as usize, out_h as usize)
+            .map_err(|e| anyhow::anyhow!("window update error: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Legacy Hilbert-curve single-image renderer. Body unchanged from the
+/// pre-architectural code; only renamed.
+fn run_single_hilbert(
     files: &[PathBuf],
     output: Option<PathBuf>,
     sources: Vec<Source>,

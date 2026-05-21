@@ -6,6 +6,7 @@ mod hf_upload;
 mod hf_url;
 mod json_diff;
 mod label;
+mod layout;
 mod perf_monitor;
 mod progress;
 mod safetensors;
@@ -22,6 +23,7 @@ use anyhow::Context;
 use clap::{Parser, ValueEnum};
 
 use crate::data::InputSpec;
+use crate::layout::LayoutMode;
 use crate::safetensors::DiffMetric;
 use crate::tiled::leaf::TileFormat;
 
@@ -44,6 +46,31 @@ impl DiffMetricArg {
             DiffMetricArg::Rms => DiffMetric::Rms,
             DiffMetricArg::AbsLog => DiffMetric::AbsLog,
             DiffMetricArg::Exact => DiffMetric::Exact,
+        }
+    }
+}
+
+/// CLI choice for layout strategy. Mirrors `layout::LayoutMode`.
+#[derive(Clone, Copy, Debug, ValueEnum, Default)]
+enum LayoutArg {
+    /// Architectural layout if every input is safetensors with detectable
+    /// structure; otherwise byte-Hilbert. Default.
+    #[default]
+    Auto,
+    /// Force architectural (structure-aware) layout. Falls back to hilbert if
+    /// no input is safetensors.
+    Arch,
+    /// Force the legacy global-Hilbert layout (1 px = 1 byte). Useful for
+    /// non-safetensors inputs and regression-checking the old output.
+    Hilbert,
+}
+
+impl LayoutArg {
+    fn to_mode(self) -> LayoutMode {
+        match self {
+            LayoutArg::Auto => LayoutMode::Auto,
+            LayoutArg::Arch => LayoutMode::Arch,
+            LayoutArg::Hilbert => LayoutMode::Hilbert,
         }
     }
 }
@@ -147,6 +174,23 @@ struct Args {
     /// the wire; PNG is the universal fallback.
     #[arg(long, value_enum, default_value_t = TileFormatArg::Avif)]
     tile_format: TileFormatArg,
+
+    /// Layout strategy for arranging tensors on the canvas.
+    ///
+    /// `auto` (default): structure-aware layout when every input is
+    /// safetensors and tensor names look transformer-style; otherwise the
+    /// legacy global-Hilbert curve.
+    ///
+    /// `arch`: force structure-aware layout. Each tensor is rendered at its
+    /// natural 2D element shape (1 px = 1 element); transformer blocks stack
+    /// vertically with corresponding sub-tensors pixel-aligned across the
+    /// stack. Falls back to hilbert if no input is safetensors.
+    ///
+    /// `hilbert`: force the legacy layout. 1 px = 1 byte along a global
+    /// Hilbert curve over the concatenated source bytes. Reproduces the
+    /// pre-architectural output for regression checks.
+    #[arg(long, value_enum, default_value_t = LayoutArg::Auto)]
+    layout: LayoutArg,
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
@@ -157,6 +201,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let xet_vis = args.show_xet_xorbs;
     let show_xet_xorbs = args.show_xet_xorbs;
     let (leaf_format, pyramid_format) = args.tile_format.split();
+    let layout_mode = args.layout.to_mode();
 
     if xet_vis && args.diff.is_some() {
         anyhow::bail!("--show-xet-xorbs is incompatible with --diff");
@@ -250,17 +295,17 @@ async fn run(args: Args) -> anyhow::Result<()> {
         // Stream directly to HF — no tiles written to local disk.
         if let Some(ref hf_out_url) = tiles_hf_out {
             let hf_out = hf_url::parse_hf_output(hf_out_url)?;
-            let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, true, diff_title, &diff_input_strs, false, leaf_format, pyramid_format).await?;
+            let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, true, diff_title, &diff_input_strs, false, leaf_format, pyramid_format, layout_mode).await?;
             return Ok(());
         }
         if let Some(ref space_id) = args.space {
             let bucket_spec = deploy::create_space_bucket(space_id).await?;
-            let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, true, diff_title, &diff_input_strs, false, leaf_format, pyramid_format).await?;
+            let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, true, diff_title, &diff_input_strs, false, leaf_format, pyramid_format, layout_mode).await?;
             deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html).await?;
             return Ok(());
         }
         if let Some(ref tile_dir) = tiles_arg {
-            tiled::run_tiles(sources, total, tile_dir.clone(), true, diff_title, &diff_input_strs, false, leaf_format, pyramid_format).await?;
+            tiled::run_tiles(sources, total, tile_dir.clone(), true, diff_title, &diff_input_strs, false, leaf_format, pyramid_format, layout_mode).await?;
             if let Some(ref url) = tiles_upload {
                 deploy::upload_dir_to(url, tile_dir).await?;
             }
@@ -273,7 +318,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         let output_arg_owned = output_arg.clone();
         let diff_mode = true;
         tokio::task::spawn_blocking(move || {
-            single::run_single(&labels, output_arg_owned, sources_owned, total, diff_mode, false)
+            single::run_single(&labels, output_arg_owned, sources_owned, total, diff_mode, false, layout_mode)
         })
         .await
         .map_err(|e| anyhow::anyhow!("run_single join failure: {e}"))??;
@@ -338,7 +383,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         data::materialize_http_sources(&mut sources).await?;
         let hf_out = hf_url::parse_hf_output(hf_out_url)?;
         let stream_title = args.title.as_deref().unwrap_or("arbvis");
-        let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, false, stream_title, &input_strs, show_xet_xorbs, leaf_format, pyramid_format).await?;
+        let _ = tiled::run_tiles_hf_streaming(sources, total, &hf_out, false, stream_title, &input_strs, show_xet_xorbs, leaf_format, pyramid_format, layout_mode).await?;
         return Ok(());
     }
 
@@ -388,7 +433,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let display_files: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
 
     if let Some(ref tile_dir) = tiles_arg {
-        tiled::run_tiles(sources, total, tile_dir.clone(), false, tile_title, &original_inputs, show_xet_xorbs, leaf_format, pyramid_format).await?;
+        tiled::run_tiles(sources, total, tile_dir.clone(), false, tile_title, &original_inputs, show_xet_xorbs, leaf_format, pyramid_format, layout_mode).await?;
         if let Some(ref space_id) = args.space {
             deploy::run_deploy(tile_dir, space_id).await?;
         }
@@ -400,7 +445,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
 
     if let Some(ref space_id) = args.space {
         let bucket_spec = deploy::create_space_bucket(space_id).await?;
-        let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, false, tile_title, &original_inputs, show_xet_xorbs, leaf_format, pyramid_format).await?;
+        let html = tiled::run_tiles_hf_streaming(sources, total, &bucket_spec, false, tile_title, &original_inputs, show_xet_xorbs, leaf_format, pyramid_format, layout_mode).await?;
         deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html).await?;
         return Ok(());
     }
@@ -411,7 +456,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let sources_owned = sources;
     let output_arg_owned = output_arg.clone();
     tokio::task::spawn_blocking(move || {
-        single::run_single(&display_files_owned, output_arg_owned, sources_owned, total, false, show_xet_xorbs)
+        single::run_single(&display_files_owned, output_arg_owned, sources_owned, total, false, show_xet_xorbs, layout_mode)
     })
     .await
     .map_err(|e| anyhow::anyhow!("run_single join failure: {e}"))??;

@@ -1,5 +1,6 @@
 pub mod html;
 pub mod leaf;
+pub mod leaf_arch;
 pub mod pyramid_accum;
 
 use std::path::PathBuf;
@@ -14,6 +15,7 @@ use indicatif::ProgressBar;
 
 use crate::color::{build_diff_signed_lut, build_pixel_lut};
 use crate::data::{load_source_data, Data, Source, SourceKind};
+use crate::layout::{select_layout, Layout, LayoutMode};
 use crate::safetensors::DiffFill;
 use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, rects_centroid};
 use crate::hf_upload::HfTileSink;
@@ -25,6 +27,10 @@ use crate::tiled::leaf::{
     load_tile_bytes, render_leaf_tile_diff, render_leaf_tile_dtype, render_leaf_tile_from_buf,
     render_leaf_tile_xet_dtype_from_buf, render_leaf_tile_xet_from_buf, TileFormat, TILE,
     TILE_LOG2, TILE_PIXELS,
+};
+use crate::tiled::leaf_arch::{
+    load_arch_tile_regions, render_arch_tile_diff, render_arch_tile_dtype,
+    render_arch_tile_plain, render_arch_tile_xet, render_arch_tile_xet_dtype, LoadedArchTile,
 };
 use crate::tiled::pyramid_accum::{LocalFileSink, PyramidAccumulator, TileSink};
 use crate::xet::{TABLEAU_20, XorbMap};
@@ -134,9 +140,13 @@ impl PipelineProgress {
 struct LoadedTile {
     tx: u32,
     ty: u32,
-    /// `Some` when the mode needs raw byte data (plain or xet); `None` for
-    /// dtype mode which doesn't read bytes.
+    /// `Some` when the mode needs raw byte data AND the layout is the legacy
+    /// Hilbert curve (one fixed 256 KiB buffer per tile); `None` for dtype
+    /// mode or architectural mode (which uses `arch_tile` instead).
     tile_buf: Option<Box<[u8; TILE_PIXELS]>>,
+    /// `Some` when the layout is architectural; carries per-region byte
+    /// slices for the (typically O(tens)) tensors that intersect this tile.
+    arch_tile: Option<LoadedArchTile>,
 }
 
 struct EncodedTile {
@@ -341,6 +351,7 @@ struct TilePlan {
     source_data: Arc<Vec<Data>>,
     cumulative_offsets: Arc<Vec<u64>>,
     entities: Vec<FileEntity>,
+    layout: Arc<Layout>,
 }
 
 async fn build_tile_plan(
@@ -348,6 +359,7 @@ async fn build_tile_plan(
     total: u64,
     diff_mode: bool,
     show_xet_xorbs: bool,
+    layout_mode: LayoutMode,
 ) -> anyhow::Result<TilePlan> {
     let mut s = 2 * TILE_LOG2 as u32;
     while (1u64 << s) < total {
@@ -527,20 +539,120 @@ async fn build_tile_plan(
         LeafMode::Plain { pixel_lut: pixel_lut.clone() }
     };
 
-    Ok(TilePlan {
-        kh: kh as u8,
-        width_tiles,
-        height_tiles,
-        world_w,
-        height,
-        max_zoom,
-        total_tiles: width_tiles as u64 * height_tiles as u64,
-        square_pixels,
+    // Opportunistically fetch config.json / model.safetensors.index.json
+    // for each source. These are advisory — `select_layout` falls back to
+    // pure tensor-name inference when the sidecars are absent.
+    let metas = if matches!(layout_mode, LayoutMode::Hilbert) {
+        Vec::new()
+    } else {
+        crate::data::load_meta_for_sources(&sources).await
+    };
+    if let Some(arch_summary) = metas.iter().find_map(|m| m.config.as_ref().map(|c| c.summary())) {
+        log::info!("model config: {arch_summary}");
+    }
+
+    // Construct the layout. For Hilbert (the legacy path) we already have
+    // every field — we wrap them so downstream code can take `&Layout`.
+    // For Architectural we let the layout module rebuild the grid, then
+    // override `width_tiles`, `height_tiles`, `max_zoom`, `total_tiles`,
+    // and `world_w`/`height` with the layout-derived values.
+    let layout = select_layout(
+        &sources,
+        &cumulative_offsets,
         total,
+        layout_mode,
+        &metas,
+    );
+
+    let (
+        kh_out,
+        width_tiles_out,
+        height_tiles_out,
+        world_w_out,
+        height_out,
+        max_zoom_out,
+        total_tiles_out,
+        square_pixels_out,
+        total_out,
+        arch_entities,
+    ) = match &layout {
+        Layout::HilbertGlobal(_) => (
+            kh as u8,
+            width_tiles,
+            height_tiles,
+            world_w,
+            height,
+            max_zoom,
+            width_tiles as u64 * height_tiles as u64,
+            square_pixels,
+            total,
+            None,
+        ),
+        Layout::Architectural(a) => {
+            // Build per-tensor entities directly from the architectural layout.
+            // Skip Hilbert-decomposition: each entity is a single rect.
+            let mut ents: Vec<FileEntity> = Vec::with_capacity(a.tensors.len());
+            for t in &a.tensors {
+                let w = t.tensor_cols.min(u32::MAX as u64) as u32;
+                let h = t.tensor_rows.min(u32::MAX as u64) as u32;
+                let x0 = t.canvas_x;
+                let y0 = t.canvas_y;
+                let x1 = x0.saturating_add(w);
+                let y1 = y0.saturating_add(h);
+                let segments = vec![
+                    (x0, y0, x1, y0),
+                    (x1, y0, x1, y1),
+                    (x0, y1, x1, y1),
+                    (x0, y0, x0, y1),
+                ];
+                let cx = x0 + (x1 - x0) / 2;
+                let cy = y0 + (y1 - y0) / 2;
+                ents.push(FileEntity {
+                    name: t.name.clone(),
+                    pixel_x: cx,
+                    pixel_y: cy,
+                    hue: t.hue,
+                    byte_size: t.tensor_rows.saturating_mul(t.tensor_cols)
+                        .saturating_mul(t.dtype.element_size() as u64),
+                    bbox: (x0, y0, x1, y1),
+                    segments,
+                });
+            }
+            // For architectural the `kh`/`square_pixels`/`total` Hilbert
+            // fields are unused at render time; populate them with safe
+            // values that won't divide by zero if accidentally read.
+            (
+                /* kh */ 0u8,
+                a.width_tiles,
+                a.height_tiles,
+                a.width,
+                a.height,
+                a.max_zoom,
+                a.total_tiles,
+                /* square_pixels */ 1u64,
+                /* total */ a.width as u64 * a.height as u64,
+                Some(ents),
+            )
+        }
+    };
+
+    let entities = arch_entities.unwrap_or(entities);
+
+    Ok(TilePlan {
+        kh: kh_out,
+        width_tiles: width_tiles_out,
+        height_tiles: height_tiles_out,
+        world_w: world_w_out,
+        height: height_out,
+        max_zoom: max_zoom_out,
+        total_tiles: total_tiles_out,
+        square_pixels: square_pixels_out,
+        total: total_out,
         mode,
         source_data: Arc::new(source_data),
         cumulative_offsets: Arc::new(cumulative_offsets),
         entities,
+        layout: Arc::new(layout),
     })
 }
 
@@ -625,6 +737,7 @@ where
     // 4-way limit.
     let needs_bytes = plan.mode.needs_bytes();
     let any_remote_source = plan.source_data.iter().any(|d| !d.is_local());
+    let is_arch = plan.layout.is_architectural();
     let mut load_handles = Vec::new();
     for _ in 0..MAX_FETCH_WORKERS {
         let coord_rx = coord_rx.clone();
@@ -636,9 +749,37 @@ where
         let height_tiles = plan.height_tiles;
         let square_pixels = plan.square_pixels;
         let total = plan.total;
+        let layout = plan.layout.clone();
         load_handles.push(tokio::spawn(async move {
             while let Ok((tx, ty)) = coord_rx.recv().await {
-                let tile_buf = if needs_bytes {
+                let (tile_buf, arch_tile) = if is_arch {
+                    // Architectural mode: fetch one coalesced range per
+                    // tensor intersecting this tile.
+                    let permit = if any_remote_source {
+                        Some(Throttle::global().acquire().await)
+                    } else {
+                        None
+                    };
+                    let arch_layout = match layout.as_ref() {
+                        Layout::Architectural(a) => a,
+                        _ => unreachable!("is_arch && layout != Architectural"),
+                    };
+                    let result = load_arch_tile_regions(
+                        tx, ty, arch_layout, &source_data, &cumulative_offsets,
+                    ).await;
+                    drop(permit);
+                    match result {
+                        Ok(at) => {
+                            if any_remote_source { Throttle::global().record_success(); }
+                            (None, Some(at))
+                        }
+                        Err(e) => {
+                            log::error!("load_arch_tile_regions({tx},{ty}) failed:\n{e:?}");
+                            coord_rx.close();
+                            return Err::<(), anyhow::Error>(e);
+                        }
+                    }
+                } else if needs_bytes {
                     let permit = if any_remote_source {
                         Some(Throttle::global().acquire().await)
                     } else {
@@ -654,7 +795,7 @@ where
                             if any_remote_source {
                                 Throttle::global().record_success();
                             }
-                            Some(buf)
+                            (Some(buf), None)
                         }
                         Err(e) => {
                             // Fatal: the throttle's per-call retry already
@@ -674,10 +815,10 @@ where
                         }
                     }
                 } else {
-                    None
+                    (None, None)
                 };
                 loaded_count.fetch_add(1, Ordering::Relaxed);
-                if loaded_tx.send(LoadedTile { tx, ty, tile_buf }).await.is_err() {
+                if loaded_tx.send(LoadedTile { tx, ty, tile_buf, arch_tile }).await.is_err() {
                     break;
                 }
             }
@@ -705,11 +846,16 @@ where
         let height_tiles = plan.height_tiles;
         let square_pixels = plan.square_pixels;
         let total = plan.total;
+        let is_arch_local = is_arch;
         process_handles.push(tokio::spawn(async move {
             while let Ok(tile) = loaded_rx.recv().await {
                 let mode = mode.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    render_one(tile, &mode, kh, height_tiles, square_pixels, total, leaf_format)
+                    if is_arch_local {
+                        render_one_arch(tile, &mode, leaf_format)
+                    } else {
+                        render_one(tile, &mode, kh, height_tiles, square_pixels, total, leaf_format)
+                    }
                 })
                 .await;
                 let encoded = match result {
@@ -796,7 +942,7 @@ fn render_one(
     total: u64,
     fmt: TileFormat,
 ) -> Result<EncodedTile, String> {
-    let LoadedTile { tx, ty, tile_buf } = tile;
+    let LoadedTile { tx, ty, tile_buf, arch_tile: _ } = tile;
     let (image, bytes) = match mode {
         LeafMode::Plain { pixel_lut } => {
             let buf = tile_buf.as_deref().expect("plain mode needs tile_buf");
@@ -825,6 +971,30 @@ fn render_one(
                 tx, ty, kh, height_tiles, square_pixels, total,
                 buf, xorb_ranges, tableau, dtype_ranges, fmt,
             )?
+        }
+    };
+    Ok(EncodedTile { tx, ty, image, bytes })
+}
+
+/// Architectural-layout render dispatch. Same set of `LeafMode` variants;
+/// each routes to a `leaf_arch::render_arch_tile_*` rather than the
+/// byte-Hilbert renderer.
+fn render_one_arch(
+    tile: LoadedTile,
+    mode: &LeafMode,
+    fmt: TileFormat,
+) -> Result<EncodedTile, String> {
+    let LoadedTile { tx, ty, tile_buf: _, arch_tile } = tile;
+    let at = arch_tile.unwrap_or_default();
+    let (image, bytes) = match mode {
+        LeafMode::Plain { pixel_lut } => render_arch_tile_plain(&at, pixel_lut, fmt)?,
+        LeafMode::Xet { pixel_lut, xorb_ranges, tableau } => {
+            render_arch_tile_xet(&at, pixel_lut, xorb_ranges, tableau, fmt)?
+        }
+        LeafMode::Dtype { .. } => render_arch_tile_dtype(&at, fmt)?,
+        LeafMode::Diff { pixel_lut, fills: _, plain_lut: _, tints: _ } => render_arch_tile_diff(&at, pixel_lut, fmt)?,
+        LeafMode::XetDtype { xorb_ranges, tableau, dtype_ranges: _ } => {
+            render_arch_tile_xet_dtype(&at, xorb_ranges, tableau, fmt)?
         }
     };
     Ok(EncodedTile { tx, ty, image, bytes })
@@ -863,8 +1033,9 @@ pub async fn run_tiles(
     show_xet_xorbs: bool,
     leaf_format: TileFormat,
     pyramid_format: TileFormat,
+    layout_mode: LayoutMode,
 ) -> anyhow::Result<()> {
-    let plan = build_tile_plan(sources, total, diff_mode, show_xet_xorbs).await?;
+    let plan = build_tile_plan(sources, total, diff_mode, show_xet_xorbs, layout_mode).await?;
 
     let leaf_format = derive_leaf_format(leaf_format, &plan.mode);
     let max_zoom = plan.max_zoom;
@@ -928,11 +1099,12 @@ pub async fn run_tiles_hf_streaming(
     show_xet_xorbs: bool,
     leaf_format: TileFormat,
     pyramid_format: TileFormat,
+    layout_mode: LayoutMode,
 ) -> anyhow::Result<Vec<u8>> {
     crate::hf_url::require_token()?;
     let client = crate::hf_url::client()?;
 
-    let plan = build_tile_plan(sources, total, diff_mode, show_xet_xorbs).await?;
+    let plan = build_tile_plan(sources, total, diff_mode, show_xet_xorbs, layout_mode).await?;
     let leaf_format = derive_leaf_format(leaf_format, &plan.mode);
     let tile_size = TILE;
     let max_zoom = plan.max_zoom;

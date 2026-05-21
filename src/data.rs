@@ -11,9 +11,10 @@ use image::Rgb;
 use indicatif::ProgressBar;
 use memmap2::Mmap;
 
+use crate::layout::model_config::{ModelConfig, SafetensorsIndex};
 use crate::progress::{counter_style, multi};
 use crate::safetensors::{self, DiffFill, TensorMeta};
-use crate::hf_url::{RemoteFileSpec, RemoteRepo};
+use crate::hf_url::{self, RemoteFileSpec, RemoteRepo};
 use crate::xet::{self, XetReader, XetTerm};
 
 /// Bounded concurrency for setup-time HTTP loops (xet reconstruction,
@@ -1679,4 +1680,117 @@ async fn build_safetensors_diff_sources(
         is_finetune,
         metric,
     ).await
+}
+
+/// Sidecar metadata fetched alongside a safetensors source. Both fields are
+/// optional — the architectural layout works without them by inferring
+/// everything from tensor names + shapes; when present they let the layout
+/// validate inferred layer counts and reserve canonical slots for tensors
+/// that live in shards we didn't load.
+#[derive(Default, Debug, Clone)]
+pub struct SourceMeta {
+    pub config: Option<ModelConfig>,
+    pub index: Option<SafetensorsIndex>,
+}
+
+impl SourceMeta {
+    pub fn is_empty(&self) -> bool {
+        self.config.is_none() && self.index.is_none()
+    }
+}
+
+/// Best-effort opportunistic load of `config.json` and
+/// `model.safetensors.index.json` for a single source. Local sources read
+/// their parent directory; HF Hub sources fetch the file from the same repo;
+/// other kinds return empty.
+///
+/// Errors are swallowed and logged at debug level — sidecar info is advisory,
+/// and a missing sidecar must not break rendering.
+pub async fn try_load_source_meta(source: &Source) -> SourceMeta {
+    match &source.kind {
+        SourceKind::File(p) => {
+            if let Some(dir) = p.parent() {
+                SourceMeta {
+                    config: ModelConfig::try_from_dir(dir),
+                    index: SafetensorsIndex::try_from_dir(dir),
+                }
+            } else {
+                SourceMeta::default()
+            }
+        }
+        SourceKind::Http(spec) => {
+            // Fetch config.json and model.safetensors.index.json from the
+            // same repo via a raw GET. Both files are small enough that we
+            // don't bother streaming.
+            let config = fetch_hf_sidecar(&spec.repo, &spec.revision, "config.json")
+                .await
+                .ok()
+                .and_then(|b| ModelConfig::from_bytes(&b));
+            let index = fetch_hf_sidecar(&spec.repo, &spec.revision, "model.safetensors.index.json")
+                .await
+                .ok()
+                .and_then(|b| SafetensorsIndex::from_bytes(&b));
+            SourceMeta { config, index }
+        }
+        _ => SourceMeta::default(),
+    }
+}
+
+/// Load sidecar meta for every source, de-duplicated by HF Hub repo+revision
+/// (so a 4-shard model triggers one config.json fetch, not four). Returns a
+/// `Vec` parallel to `sources`.
+pub async fn load_meta_for_sources(sources: &[Source]) -> Vec<SourceMeta> {
+    // Group sources by (repo_id, revision) for HF Hub; by parent dir for
+    // local. Each group gets one fetch.
+    let mut keys: Vec<Option<String>> = Vec::with_capacity(sources.len());
+    for s in sources {
+        let key = match &s.kind {
+            SourceKind::File(p) => p.parent().map(|d| format!("local:{}", d.display())),
+            SourceKind::Http(spec) => Some(format!("hf:{}@{}", spec.repo.repo_id(), spec.revision)),
+            _ => None,
+        };
+        keys.push(key);
+    }
+    let mut cache: HashMap<String, SourceMeta> = HashMap::new();
+    let mut result: Vec<SourceMeta> = Vec::with_capacity(sources.len());
+    for (s, k) in sources.iter().zip(keys.iter()) {
+        match k {
+            Some(k) => {
+                if let Some(m) = cache.get(k) {
+                    result.push(m.clone());
+                } else {
+                    let m = try_load_source_meta(s).await;
+                    cache.insert(k.clone(), m.clone());
+                    result.push(m);
+                }
+            }
+            None => result.push(SourceMeta::default()),
+        }
+    }
+    result
+}
+
+/// Fetch a small sidecar file (e.g. `config.json`) from an HF Hub repo via
+/// a raw GET to `{endpoint}/{repo_id}/resolve/{revision}/{filename}`.
+/// Returns the raw bytes on success.
+async fn fetch_hf_sidecar(repo: &RemoteRepo, revision: &str, filename: &str) -> anyhow::Result<Vec<u8>> {
+    let url = format!(
+        "{}/{}/resolve/{}/{}",
+        hf_url::endpoint(),
+        repo.repo_id(),
+        revision,
+        filename,
+    );
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .with_context(|| format!("building reqwest client for {filename}"))?;
+    let mut req = client.get(&url);
+    if let Some(tok) = hf_url::read_token() {
+        req = req.bearer_auth(tok);
+    }
+    let resp = req.send().await.with_context(|| format!("fetching {url}"))?;
+    let resp = resp.error_for_status().with_context(|| format!("non-2xx for {filename}"))?;
+    let bytes = resp.bytes().await.with_context(|| format!("reading body of {filename}"))?;
+    Ok(bytes.to_vec())
 }

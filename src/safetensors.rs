@@ -230,6 +230,37 @@ pub struct TensorMeta {
 }
 
 impl TensorMeta {
+    /// 2D pixel-grid shape used by the architectural layout. Distinct from
+    /// `shape`, which is the raw tensor shape: this collapses to exactly two
+    /// dimensions so a tensor occupies a flat rectangle on the canvas.
+    ///
+    /// - 0-D (scalar) → `(1, 1)`
+    /// - 1-D `(n)` → `(1, n)` (one-pixel-tall strip)
+    /// - 2-D `(r, c)` → `(r, c)` (preserved)
+    /// - ≥3-D `(a, b, c, …)` → `(a, b*c*…)` (last dims collapsed into the
+    ///   column axis). The element index within the resulting rect uses
+    ///   row-major order, which matches the byte order in the safetensors
+    ///   file: element `(row, col)` lives at byte offset
+    ///   `file_start + (row*cols + col) * elem_size`.
+    pub fn element_shape(&self) -> (u64, u64) {
+        match self.shape.len() {
+            0 => (1, 1),
+            1 => (1, self.shape[0]),
+            2 => (self.shape[0], self.shape[1]),
+            _ => {
+                let rows = self.shape[0];
+                let cols: u64 = self.shape[1..].iter().product();
+                (rows, cols)
+            }
+        }
+    }
+
+    /// Total element count = rows × cols of `element_shape`.
+    pub fn element_count(&self) -> u64 {
+        let (r, c) = self.element_shape();
+        r * c
+    }
+
     pub fn label(&self) -> String {
         let shape_str: Vec<String> = self.shape.iter().map(|d| d.to_string()).collect();
         let dtype_str = match self.dtype {
@@ -255,7 +286,7 @@ impl TensorMeta {
 }
 
 /// Decode a single element from a little-endian byte slice.
-fn decode_element(dtype: Dtype, bytes: &[u8]) -> f32 {
+pub fn decode_element(dtype: Dtype, bytes: &[u8]) -> f32 {
     match dtype {
         Dtype::F32 => f32::from_le_bytes(bytes.try_into().unwrap()),
         Dtype::F16 => half::f16::from_le_bytes(bytes.try_into().unwrap()).to_f32(),

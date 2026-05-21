@@ -83,7 +83,18 @@ pub fn run_single(
             "architectural single-image layout requires local non-diff non-xet inputs; falling back to hilbert"
         );
     }
-    run_single_hilbert(files, output, sources, total, diff_mode, show_xet_xorbs)
+    // Open each source as a `Data` handle (sync — mmap / lightweight clone)
+    // before dispatching, so the rayon workers can be handed ready-to-use
+    // borrows. The captured tokio `Handle` lets those workers drive
+    // `Data::fetch_range` for `Http` / `Xet` / `LazyDiff` sources (which
+    // panic on `Deref`) — that's what makes `--diff --output` work for any
+    // LazyDiff source, including JSON.
+    let source_data: Vec<Data> = sources
+        .iter()
+        .map(load_source_data)
+        .collect::<anyhow::Result<_>>()?;
+    let rt = tokio::runtime::Handle::current();
+    run_single_hilbert(files, output, sources, source_data, total, diff_mode, show_xet_xorbs, rt)
 }
 
 /// Synchronous architectural-mode single-image render. Renders every tensor
@@ -184,15 +195,21 @@ fn run_single_arch(
     Ok(())
 }
 
-/// Legacy Hilbert-curve single-image renderer. Body unchanged from the
-/// pre-architectural code; only renamed.
+/// Legacy Hilbert-curve single-image renderer.
+///
+/// `source_data` is parallel to `sources`. Lazy/remote `Data` variants are
+/// read per chunk by blocking on `rt`, which lets this otherwise-synchronous
+/// rayon pipeline drive `--diff` and other `LazyDiff`-backed sources that
+/// can't be `Deref`d.
 fn run_single_hilbert(
     files: &[PathBuf],
     output: Option<PathBuf>,
     sources: Vec<Source>,
+    source_data: Vec<Data>,
     total: u64,
     diff_mode: bool,
     show_xet_xorbs: bool,
+    rt: tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
     let num_files = files.len().max(1);
     let total_usize = (total as usize).max(1);
@@ -300,9 +317,9 @@ fn run_single_hilbert(
         let canvas_u = canvas_size as u64;
 
         let chunk_results = render_chunks(
-            &sources, &chunks_by_source,
+            &sources, &source_data, &chunks_by_source,
             &cancelled, img_base, pf_base, canvas_u, canvas_size, side, k, stride,
-            &pixel_lut, &xorb_map, &tableau, &pb_shared,
+            &pixel_lut, &xorb_map, &tableau, &pb_shared, &rt,
         )?;
 
         for (fi, bbox) in chunk_results {
@@ -356,9 +373,9 @@ fn run_single_hilbert(
 
         let bg_thread = std::thread::spawn(move || {
             let result = render_chunks(
-                &sources, &chunks_by_source,
+                &sources, &source_data, &chunks_by_source,
                 &cancelled_bg, img_ptr, pf_ptr, canvas_u, canvas_size, side, k, stride,
-                &pixel_lut, &xorb_map, &tableau, &pb_shared,
+                &pixel_lut, &xorb_map, &tableau, &pb_shared, &rt,
             );
 
             let chunk_results = match result {
@@ -471,6 +488,7 @@ fn run_single_hilbert(
 #[allow(clippy::too_many_arguments)]
 fn render_chunks(
     sources: &[Source],
+    source_data: &[Data],
     chunks_by_source: &[Vec<(usize, u64, u64, u64, u64)>],
     cancelled: &AtomicBool,
     img_base: usize,
@@ -484,6 +502,7 @@ fn render_chunks(
     xorb_map: &XorbMap,
     tableau: &[Rgb<u8>; 20],
     pb_shared: &Option<Arc<ProgressBar>>,
+    rt: &tokio::runtime::Handle,
 ) -> anyhow::Result<Vec<(usize, Option<(u32, u32, u32, u32)>)>> {
     let xet_mode = !xorb_map.is_empty();
     // Per-pixel color combining (optional) xorb hue, (optional) dtype hue, and
@@ -542,16 +561,12 @@ fn render_chunks(
                 // position-only.
                 let needs_bytes = unmatched_fill.is_none()
                     && (xet_mode || dtype_ranges.is_none());
-                let data = if needs_bytes {
-                    Some(load_source_data(&sources[src_idx])?)
-                } else {
-                    None
-                };
-                let results = source_chunks
+                let data: &Data = &source_data[src_idx];
+                let results: anyhow::Result<Vec<(usize, Option<(u32, u32, u32, u32)>)>> = source_chunks
                     .par_iter()
-                    .map(|&(fi, src_global_start, chunk_b_start, chunk_b_end, chunk_pixel_start)| {
+                    .map(|&(fi, src_global_start, chunk_b_start, chunk_b_end, chunk_pixel_start)| -> anyhow::Result<(usize, Option<(u32, u32, u32, u32)>)> {
                         if chunk_pixel_start >= canvas_u || cancelled.load(Ordering::Acquire) {
-                            return (fi, None);
+                            return Ok((fi, None));
                         }
 
                         let mut cur_pixel = chunk_pixel_start as usize;
@@ -620,10 +635,26 @@ fn render_chunks(
                                 cur_pixel += 1;
                             }
                         } else {
-                            let data = data.as_ref().unwrap();
                             let local_start = (chunk_b_start - src_global_start) as usize;
                             let local_end = (chunk_b_end - src_global_start) as usize;
-                            let bytes = &data[local_start..local_end];
+                            let chunk_len = local_end - local_start;
+                            // Local-backed Data (`Mapped` / `Owned` /
+                            // `ZeroFill`) is Deref'd zero-copy; remote/lazy
+                            // Data (`Http`, `Xet`, `LazyDiff`) is fetched per
+                            // chunk via `block_on` so this sync rayon worker
+                            // can drive the async fetcher without panicking
+                            // on Deref.
+                            let fetched: Option<Vec<u8>> = if data.is_local() {
+                                None
+                            } else {
+                                Some(rt.block_on(
+                                    data.fetch_range(local_start as u64, chunk_len),
+                                )?)
+                            };
+                            let bytes: &[u8] = match &fetched {
+                                Some(v) => v,
+                                None => &data[local_start..local_end],
+                            };
                             let mut cur_byte = chunk_b_start;
 
                             for &b in bytes {
@@ -659,10 +690,10 @@ fn render_chunks(
                         if let Some(ref pb) = pb_shared {
                             pb.inc(chunk_b_end - chunk_b_start);
                         }
-                        (fi, bbox)
+                        Ok((fi, bbox))
                     })
                     .collect();
-                Ok(results)
+                results
             },
         )
         .collect::<anyhow::Result<Vec<_>>>()?

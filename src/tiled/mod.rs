@@ -163,10 +163,15 @@ enum LeafMode {
     /// Diff mode: byte → color via the signed-diff LUT, *plus* a crosshatch
     /// overlay for byte ranges that map to `UnmatchedRegion` sources (tensors
     /// or files that exist on only one side). `fills` is sorted by start
-    /// offset, non-overlapping.
+    /// offset, non-overlapping. `tints` carries byte ranges from
+    /// `OneSidedRange` sources (JSON / JSONL structure-aware diff): those
+    /// bytes are real file bytes and are rendered via the plain LUT, blended
+    /// 50/50 with the fill color so the side of origin is still legible.
     Diff {
         pixel_lut: Arc<[image::Rgb<u8>; 256]>,
+        plain_lut: Arc<[image::Rgb<u8>; 256]>,
         fills: Arc<Vec<(u64, u64, DiffFill)>>,
+        tints: Arc<Vec<(u64, u64, DiffFill)>>,
     },
     /// Combined xet + safetensors: blend dtype hue with xorb tableau hue,
     /// modulated by byte intensity. Produces a single image where both tensor
@@ -472,24 +477,29 @@ async fn build_tile_plan(
     }
 
     // For diff mode: collect crosshatch fills from any UnmatchedRegion
-    // sources. Their byte_size already accounts for their canvas footprint;
-    // we just translate each source's cumulative offset + size into a fill
-    // range. Sources are listed in canvas order, so the resulting list is
-    // already sorted by start.
-    let diff_fills: Vec<(u64, u64, DiffFill)> = if diff_mode {
+    // sources and tinted ranges from OneSidedRange sources. Their byte_size
+    // already accounts for their canvas footprint; we just translate each
+    // source's cumulative offset + size into a range. Sources are listed in
+    // canvas order, so each resulting list is already sorted by start.
+    let (diff_fills, diff_tints): (Vec<(u64, u64, DiffFill)>, Vec<(u64, u64, DiffFill)>) = if diff_mode {
         let mut fills = Vec::new();
+        let mut tints = Vec::new();
         let mut cumulative = 0u64;
         for source in &sources {
-            if let SourceKind::UnmatchedRegion { fill } = &source.kind {
-                if source.byte_size > 0 {
+            match &source.kind {
+                SourceKind::UnmatchedRegion { fill } if source.byte_size > 0 => {
                     fills.push((cumulative, cumulative + source.byte_size, *fill));
                 }
+                SourceKind::OneSidedRange { fill, .. } if source.byte_size > 0 => {
+                    tints.push((cumulative, cumulative + source.byte_size, *fill));
+                }
+                _ => {}
             }
             cumulative += source.byte_size;
         }
-        fills
+        (fills, tints)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
 
     let mode = if xet_mode && has_safetensors {
@@ -509,7 +519,9 @@ async fn build_tile_plan(
     } else if diff_mode {
         LeafMode::Diff {
             pixel_lut: pixel_lut.clone(),
+            plain_lut: Arc::new(build_pixel_lut()),
             fills: Arc::new(diff_fills),
+            tints: Arc::new(diff_tints),
         }
     } else {
         LeafMode::Plain { pixel_lut: pixel_lut.clone() }
@@ -800,11 +812,11 @@ fn render_one(
         LeafMode::Dtype { ranges } => {
             render_leaf_tile_dtype(tx, ty, kh, height_tiles, square_pixels, total, ranges, fmt)?
         }
-        LeafMode::Diff { pixel_lut, fills } => {
+        LeafMode::Diff { pixel_lut, plain_lut, fills, tints } => {
             let buf = tile_buf.as_deref().expect("diff mode needs tile_buf");
             render_leaf_tile_diff(
                 tx, ty, kh, height_tiles, square_pixels, total,
-                buf, pixel_lut, fills, fmt,
+                buf, pixel_lut, plain_lut, fills, tints, fmt,
             )?
         }
         LeafMode::XetDtype { xorb_ranges, tableau, dtype_ranges } => {

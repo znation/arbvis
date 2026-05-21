@@ -81,6 +81,11 @@ pub enum Data {
     /// anyway, so the underlying bytes are irrelevant — but `fetch_range`
     /// must still return a buffer of the requested length.
     ZeroFill,
+    /// A windowed view onto another `Data`. `fetch_range(s, n)` resolves to
+    /// `inner.fetch_range(base + s, n)`. Used by JSON / JSONL structure-aware
+    /// diff so each one-sided structural span can expose its underlying bytes
+    /// without re-mmapping the file.
+    OffsetSlice { inner: Arc<Data>, base: u64 },
 }
 
 impl std::ops::Deref for Data {
@@ -93,6 +98,7 @@ impl std::ops::Deref for Data {
             Data::Xet(_) => panic!("bug: use fetch_range() for Xet Data, not Deref"),
             Data::LazyDiff(_) => panic!("bug: use fetch_range() for LazyDiff Data, not Deref"),
             Data::ZeroFill => panic!("bug: use fetch_range() for ZeroFill Data, not Deref"),
+            Data::OffsetSlice { inner, base } => &inner[*base as usize..],
         }
     }
 }
@@ -115,6 +121,11 @@ impl Data {
             Data::Xet(reader) => reader.fetch_range(start, len).await,
             Data::LazyDiff(f) => f(start, len).await,
             Data::ZeroFill => Ok(vec![0u8; len]),
+            Data::OffsetSlice { inner, base } => {
+                let inner = Arc::clone(inner);
+                let base = *base;
+                Box::pin(async move { inner.fetch_range(base + start, len).await }).await
+            }
         }
     }
 
@@ -125,7 +136,11 @@ impl Data {
     /// could hit the Hub — otherwise mmap reads would be artificially capped
     /// at the throttle's initial 4-way concurrency.
     pub fn is_local(&self) -> bool {
-        matches!(self, Data::Mapped(_) | Data::Owned(_) | Data::ZeroFill)
+        match self {
+            Data::Mapped(_) | Data::Owned(_) | Data::ZeroFill => true,
+            Data::OffsetSlice { inner, .. } => inner.is_local(),
+            Data::Http { .. } | Data::Xet(_) | Data::LazyDiff(_) => false,
+        }
     }
 }
 
@@ -156,6 +171,26 @@ pub enum SourceKind {
     /// space it takes; the underlying bytes are zero (the renderer paints a
     /// crosshatch pattern based on `fill` instead of using the byte LUT).
     UnmatchedRegion { fill: DiffFill },
+    /// Byte-for-byte signed diff over a sub-range of two whole-file Data
+    /// sources. Identical rendering semantics to `SourceKind::Diff` (signed
+    /// byte delta) but parameterised over (Arc<Data>, start_offset) so each
+    /// structurally-aligned span emitted by the JSON / JSONL aligner becomes
+    /// one Source over its byte range.
+    RangeDiff {
+        orig: Arc<Data>,
+        mod_: Arc<Data>,
+        orig_start: u64,
+        mod_start: u64,
+    },
+    /// Bytes from a single side of the diff (insertion or deletion). The
+    /// renderer paints the real bytes through the plain byte LUT and then
+    /// blends `fill` over the top so the side of origin is clear while the
+    /// content remains legible.
+    OneSidedRange {
+        data: Arc<Data>,
+        start: u64,
+        fill: DiffFill,
+    },
 }
 
 /// Input specification: local file path or resolved remote HF file.
@@ -202,6 +237,12 @@ impl Source {
             }
             SourceKind::UnmatchedRegion { .. } => {
                 unreachable!("UnmatchedRegion sources always have name_override set")
+            }
+            SourceKind::RangeDiff { .. } => {
+                unreachable!("RangeDiff sources always have name_override set")
+            }
+            SourceKind::OneSidedRange { .. } => {
+                unreachable!("OneSidedRange sources always have name_override set")
             }
         }
     }
@@ -327,6 +368,28 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
             revision: Arc::clone(&spec.revision),
         }),
         SourceKind::UnmatchedRegion { .. } => Ok(Data::ZeroFill),
+        SourceKind::RangeDiff { orig, mod_, orig_start, mod_start } => {
+            let orig = Arc::clone(orig);
+            let mod_ = Arc::clone(mod_);
+            let orig_start = *orig_start;
+            let mod_start = *mod_start;
+            Ok(Data::LazyDiff(Arc::new(move |start: u64, len: usize| {
+                let orig = Arc::clone(&orig);
+                let mod_ = Arc::clone(&mod_);
+                Box::pin(async move {
+                    let a = orig.fetch_range(orig_start + start, len).await?;
+                    let b = mod_.fetch_range(mod_start + start, len).await?;
+                    Ok(a.iter().zip(b.iter()).map(|(&a, &b)| {
+                        let delta = b as i16 - a as i16;
+                        let brightness = (delta.unsigned_abs() as f32 / 255.0 * 127.0).round() as u8;
+                        if delta >= 0 { 127u8 + brightness } else { 127u8 - brightness }
+                    }).collect())
+                })
+            })))
+        }
+        SourceKind::OneSidedRange { data, start, .. } => {
+            Ok(Data::OffsetSlice { inner: Arc::clone(data), base: *start })
+        }
         SourceKind::TensorDiff { orig, mod_, orig_start, mod_start, orig_dtype, mod_dtype, metric, scale_orig } => {
             let orig = Arc::clone(orig);
             let mod_ = Arc::clone(mod_);
@@ -666,7 +729,19 @@ pub async fn prepare_diff_sources(
         p.extension().and_then(|e| e.to_str()) == Some("safetensors")
     };
 
+    let is_json = |p: &Path| -> bool {
+        matches!(
+            p.extension().and_then(|e| e.to_str()),
+            Some("json") | Some("jsonl")
+        )
+    };
+
     if orig_is_file && mod_is_file {
+        // JSON / JSONL: structure-aware diff so unchanged bytes line up on the
+        // canvas even when an edit shifts subsequent positions.
+        if is_json(original) && is_json(modified) {
+            return crate::json_diff::build_json_diff_sources(original, modified, is_finetune).await;
+        }
         // Safetensors diff: expand into per-tensor diff Sources (one per matched pair).
         if is_st(original) && is_st(modified) {
             return build_safetensors_diff_sources(original, modified, is_finetune, metric).await;

@@ -4,6 +4,7 @@ mod deploy;
 mod geometry;
 mod hf_upload;
 mod hf_url;
+mod json_diff;
 mod label;
 mod perf_monitor;
 mod progress;

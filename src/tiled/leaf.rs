@@ -238,11 +238,19 @@ fn is_crosshatch_stripe(px: u32, py: u32) -> bool {
     a < CROSSHATCH_STRIPE_WIDTH || b < CROSSHATCH_STRIPE_WIDTH
 }
 
-/// Render a diff-mode leaf tile. Same as `render_leaf_tile_from_buf` but with
-/// an overlay: byte positions inside any `fills` range are painted with a
-/// crosshatch pattern instead of going through the byte LUT. Used for tensors
-/// / files that exist on only one side of the diff (and so have no per-byte
-/// signal to encode).
+/// Render a diff-mode leaf tile.
+///
+/// Three pixel paths, in priority order:
+/// 1. `fills` — byte positions belonging to an `UnmatchedRegion` source.
+///    Painted with a crosshatch pattern from `DiffFill::colors()`; the tile
+///    buffer byte at this position is ignored.
+/// 2. `tints` — byte positions belonging to a `OneSidedRange` source (JSON /
+///    JSONL structure-aware diff). The tile buffer byte is a real file byte;
+///    it's looked up via `plain_lut` then blended 50/50 with the fill's
+///    crosshatch base color so the side of origin is visible while the byte
+///    content stays legible.
+/// 3. Aligned diff region. Byte is a signed delta; looked up via `pixel_lut`
+///    (which the caller built with `build_diff_signed_lut`).
 pub fn render_leaf_tile_diff(
     tx: u32,
     ty: u32,
@@ -252,7 +260,9 @@ pub fn render_leaf_tile_diff(
     total: u64,
     tile_buf: &[u8; TILE_PIXELS],
     pixel_lut: &[Rgb<u8>; 256],
+    plain_lut: &[Rgb<u8>; 256],
     fills: &[(u64, u64, DiffFill)],
+    tints: &[(u64, u64, DiffFill)],
     fmt: TileFormat,
 ) -> TileResult {
     let sq = (tx / height_tiles) as u64;
@@ -272,6 +282,13 @@ pub fn render_leaf_tile_diff(
         .copied()
         .collect();
 
+    let first_tint = tints.partition_point(|r| r.1 <= tile_pixel_start);
+    let local_tints: Vec<(u64, u64, DiffFill)> = tints[first_tint..]
+        .iter()
+        .take_while(|r| r.0 < tile_pixel_end)
+        .copied()
+        .collect();
+
     let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
     for py in 0..TILE {
         let ly = ty * TILE + py;
@@ -282,22 +299,42 @@ pub fn render_leaf_tile_diff(
             let color = if pixel_idx >= total {
                 Rgb([0u8, 0, 0])
             } else {
+                let byte = tile_buf[(local_idx - base) as usize];
                 let mut fill: Option<DiffFill> = None;
                 for &(start, end, f) in &local_fills {
                     if pixel_idx >= start && pixel_idx < end { fill = Some(f); break; }
                 }
-                match fill {
-                    Some(f) => {
-                        let (stripe, base_c) = f.colors();
-                        if is_crosshatch_stripe(px, py) { stripe } else { base_c }
+                if let Some(f) = fill {
+                    let (stripe, base_c) = f.colors();
+                    if is_crosshatch_stripe(px, py) { stripe } else { base_c }
+                } else {
+                    let mut tint: Option<DiffFill> = None;
+                    for &(start, end, f) in &local_tints {
+                        if pixel_idx >= start && pixel_idx < end { tint = Some(f); break; }
                     }
-                    None => pixel_lut[tile_buf[(local_idx - base) as usize] as usize],
+                    match tint {
+                        Some(t) => blend_with_tint(plain_lut[byte as usize], t),
+                        None => pixel_lut[byte as usize],
+                    }
                 }
             };
             img.put_pixel(px, py, color);
         }
     }
     encode_tile(img, fmt)
+}
+
+/// 50/50 blend of a byte-LUT color with a `DiffFill`'s base crosshatch color.
+/// Keeps both the byte content (modulates luminance) and the side-of-origin
+/// (the tint dominates the hue).
+#[inline]
+fn blend_with_tint(c: Rgb<u8>, fill: DiffFill) -> Rgb<u8> {
+    let (_stripe, base_c) = fill.colors();
+    Rgb([
+        ((c[0] as u16 + base_c[0] as u16) / 2) as u8,
+        ((c[1] as u16 + base_c[1] as u16) / 2) as u8,
+        ((c[2] as u16 + base_c[2] as u16) / 2) as u8,
+    ])
 }
 
 /// Render one `TILE×TILE` leaf tile using position-based dtype coloring (safetensors mode).

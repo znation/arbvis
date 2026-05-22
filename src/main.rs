@@ -584,8 +584,7 @@ async fn resolve_input(path: PathBuf) -> anyhow::Result<PathBuf> {
         .with_context(|| format!("resolving {display}"))
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // anyhow only captures backtraces when this env var is set. Default it
     // on so any error that bubbles up shows where it originated — we'd
     // rather pay the per-`anyhow!()` backtrace cost than debug blind.
@@ -616,6 +615,20 @@ async fn main() -> anyhow::Result<()> {
     // throttle + CAS HTTP counters. Used to localise pipeline stalls.
     let _perf_monitor_stop = perf_monitor::spawn_if_enabled();
 
+    // Custom tokio runtime so we can hand both worker and blocking threads an
+    // 8 MB stack. The default is Rust's std::thread default (2 MB on macOS),
+    // which is below the ~4 MB minimum that the AVIF encoder underneath
+    // `image::codecs::avif::AvifEncoder` (rav1e) needs per encode call. Once
+    // the architectural pyramid actually drains (16 K → 1 tile), enough AVIF
+    // encodes run concurrently on blocking threads that hitting the 2 MB
+    // ceiling becomes inevitable — manifests as a `thread '<unknown>' has
+    // overflowed its stack` panic mid-pyramid.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()
+        .map_err(|e| anyhow::anyhow!("building tokio runtime: {e}"))?;
+
     let args = Args::parse();
-    run(args).await
+    rt.block_on(run(args))
 }

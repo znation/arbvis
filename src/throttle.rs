@@ -3,10 +3,11 @@
 //! All Hub-bound HTTP in this crate goes through [`Throttle::global`]. Tasks
 //! `acquire().await` a permit before sending a request and report the outcome:
 //!
-//! - [`Throttle::record_success`] — gradually scale up (+1 worker every ≥10s
-//!   after 50 successes, gated by 60s cooldowns since last 429/timeout).
-//! - [`Throttle::record_rate_limit`] — halve the active limit immediately (floor
-//!   `max(4, max/64)`) and reset cooldown timers.
+//! - [`Throttle::record_success`] — scale up by ~25% (step `max(2, current/4)`)
+//!   every ≥5s after 5 successes, gated by short cooldowns since the last
+//!   429/timeout.
+//! - [`Throttle::record_rate_limit`] — reduce by 25% (floor `max(4, max/64)`)
+//!   and reset cooldown timers.
 //! - [`Throttle::record_timeout`] — reduce by 10% (floor `max(4, max/16)`) and
 //!   reset cooldown timers.
 //!
@@ -17,8 +18,6 @@
 //! `max_workers` defaults to [`MAX_FETCH_WORKERS`] (128) — well above num_cpus —
 //! so the network parallelism is decoupled from CPU parallelism. Fetch
 //! workers above `active_limit` park on `scale_up_notify`.
-//!
-//! The math is a direct port of `xetcas/sizzle_sync/src/commands/subscriber.rs`.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -34,18 +33,18 @@ const INITIAL_WORKERS: usize = 4;
 pub const MAX_FETCH_WORKERS: usize = 128;
 /// Successful fetches required before each scale-up tick. Acts as a sanity
 /// check: if requests aren't actually completing, don't scale up.
-const SUCCESSES_TO_SCALE_UP: usize = 10;
-/// Minimum interval between scale-ups. Combined with multiplicative
-/// slow-start (`×2` per tick) and 5 doublings from 4 → 128, this gives a
-/// total scale-up time of roughly `5 × SCALE_UP_INTERVAL_SECS` seconds.
-/// 90 s yields ~7.5 min to reach max — fast enough to recover from a long
-/// run, slow enough to give the upstream room to push back via 429s if it
-/// doesn't like the load.
-const SCALE_UP_INTERVAL_SECS: i64 = 90;
+const SUCCESSES_TO_SCALE_UP: usize = 5;
+/// Minimum interval between scale-ups. Combined with the +25% step (with a
+/// floor of 2), the ladder 4 → 6 → 8 → 10 → 12 → 15 → 18 → 22 → 27 → 33 →
+/// 41 → 51 → 63 → 78 → 97 → 121 → 128 takes ~17 ticks, so 5 s yields ~85 s
+/// to reach max from a cold start — fast enough that long runs spend most
+/// of their time at full concurrency, slow enough for the upstream to push
+/// back via 429s if it doesn't like the load.
+const SCALE_UP_INTERVAL_SECS: i64 = 5;
 /// Cooldown after a rate limit before scaling up resumes.
-const RATE_LIMIT_COOLDOWN_SECS: i64 = 60;
+const RATE_LIMIT_COOLDOWN_SECS: i64 = 15;
 /// Cooldown after a timeout before scaling up resumes.
-const TIMEOUT_COOLDOWN_SECS: i64 = 60;
+const TIMEOUT_COOLDOWN_SECS: i64 = 10;
 /// Maximum 429 retries for a single operation before giving up.
 const MAX_RATE_LIMIT_RETRIES: u32 = 10;
 /// Maximum transient/timeout retries for a single operation before giving up.
@@ -204,41 +203,35 @@ impl Throttle {
             return;
         }
 
-        // TCP-slow-start: while we've never seen a 429 or timeout, *double*
-        // active_limit each scale-up tick (capped at max_workers). After any
-        // backoff event we switch to additive +1 — the multiplicative-decrease
-        // half of AIMD then dominates and we conservatively probe upward.
-        // Without slow-start, getting from 4 → 128 workers would take ~124
-        // ticks; with it, only ~5.
-        let in_slow_start = last_rate_limit == 0 && last_timeout == 0;
+        // Smooth +25% step (floor of 2). Replaces an older bimodal slow-start
+        // (×2 in clean runs, +1 forever after the first 429/timeout) that
+        // permanently kneecapped any run that ever saw one transient blip.
         let scaled =
             self.active_limit
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                     if current >= self.max_workers {
                         return None;
                     }
-                    let next = if in_slow_start {
-                        current.saturating_mul(2).min(self.max_workers)
-                    } else {
-                        current + 1
-                    };
-                    Some(next)
+                    let step = (current / 4).max(2);
+                    Some(current.saturating_add(step).min(self.max_workers))
                 });
         if let Ok(prev) = scaled {
             let new_limit = self.active_limit.load(Ordering::SeqCst);
             self.last_scale_up.store(now, Ordering::SeqCst);
             log::info!(
-                "throttle: scaled up to {} workers (max {}, prev {}{})",
+                "throttle: scaled up to {} workers (max {}, prev {})",
                 new_limit,
                 self.max_workers,
                 prev,
-                if in_slow_start { ", slow-start" } else { "" },
             );
             self.wake_waiters();
         }
     }
 
-    /// Record a rate-limit (429). Halve the active limit with a tight floor.
+    /// Record a rate-limit (429). Reduce the active limit by 25% with a tight
+    /// floor. Symmetric with the +25% scale-up step so steady-state probing
+    /// oscillates evenly around the upstream's tolerance; a burst of N
+    /// consecutive 429s still drops fast (geometric), just not in one move.
     pub fn record_rate_limit(&self) {
         self.total_rate_limits.fetch_add(1, Ordering::Relaxed);
         let now = unix_now();
@@ -248,7 +241,7 @@ impl Throttle {
         let new_limit =
             self.active_limit
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                    let new = (current / 2).max(floor);
+                    let new = ((current * 3) / 4).max(floor);
                     if new != current {
                         Some(new)
                     } else {
@@ -482,12 +475,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn record_rate_limit_halves_with_floor() {
+    fn record_rate_limit_reduces_25_percent_with_floor() {
         let t = Throttle::new_for_test(640);
         t.active_limit.store(640, Ordering::SeqCst);
         t.record_rate_limit();
-        assert_eq!(t.active_limit(), 320);
-        for _ in 0..20 {
+        assert_eq!(t.active_limit(), 480);
+        for _ in 0..40 {
             t.record_rate_limit();
         }
         assert_eq!(t.active_limit(), 10);
@@ -548,47 +541,46 @@ mod tests {
     }
 
     #[test]
-    fn record_success_doubles_in_slow_start() {
-        // Slow-start: no prior 429 or timeout → multiplicative growth (×2).
+    fn record_success_scales_up_smoothly() {
+        // +25% step with a floor of 2: from 10, the next limit is 12.
         let t = Throttle::new_for_test(64);
         t.active_limit.store(10, Ordering::SeqCst);
         for _ in 0..SUCCESSES_TO_SCALE_UP {
             t.record_success();
         }
-        assert_eq!(t.active_limit(), 20);
+        assert_eq!(t.active_limit(), 12);
         for _ in 0..(SUCCESSES_TO_SCALE_UP - 1) {
             t.record_success();
         }
         assert_eq!(
             t.active_limit(),
-            20,
+            12,
             "should not scale before the next success burst"
         );
     }
 
     #[test]
-    fn record_success_adds_one_after_backoff() {
-        // Once any 429/timeout has been seen, slow-start ends and growth is +1.
+    fn record_success_recovers_after_backoff() {
+        // After a backoff event whose cooldown has elapsed, the +25% step still
+        // applies (no bimodal slow-start vs additive split).
         let t = Throttle::new_for_test(64);
         t.active_limit.store(10, Ordering::SeqCst);
-        // Mark a timeout in the distant past so the cooldown gate is already passed
-        // but slow-start is permanently exited.
         t.last_timeout
             .store(unix_now() - TIMEOUT_COOLDOWN_SECS - 1, Ordering::SeqCst);
         for _ in 0..SUCCESSES_TO_SCALE_UP {
             t.record_success();
         }
-        assert_eq!(t.active_limit(), 11);
+        assert_eq!(t.active_limit(), 12);
     }
 
     #[test]
-    fn slow_start_caps_at_max_workers() {
+    fn scale_up_caps_at_max_workers() {
         let t = Throttle::new_for_test(128);
-        t.active_limit.store(100, Ordering::SeqCst);
+        t.active_limit.store(110, Ordering::SeqCst);
         for _ in 0..SUCCESSES_TO_SCALE_UP {
             t.record_success();
         }
-        // 100 × 2 = 200, clamped to max (128).
+        // 110 + max(2, 110/4=27) = 137, clamped to max (128).
         assert_eq!(t.active_limit(), 128);
     }
 

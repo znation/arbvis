@@ -282,7 +282,16 @@ pub fn regen_html(tile_dir: &Path) -> anyhow::Result<()> {
         leaf_ext.clone()
     };
     let height = height_tiles * TILE;
-    let world_w = (width_tiles / height_tiles.max(1)) * TILE;
+    // Unified Hilbert / arch bounds formula. At leaf zoom `max_zoom` the canvas
+    // covers `width_tiles × height_tiles` tiles; the leaflet view at zoom 0
+    // covers `width_tiles / 2^max_zoom × height_tiles / 2^max_zoom` tiles —
+    // exactly one of which is 1 by construction (Hilbert: kh == max_zoom + 8;
+    // arch: max_zoom = log2(min(w_p2, h_p2))). Multiplying back up by TILE
+    // gives geo extents. For square Hilbert this collapses to `world_h = TILE,
+    // world_w = TILE * 2^(kw-kh)` — the historical formula.
+    let two_pow_mz = 1u32 << max_zoom;
+    let world_w = (width_tiles / two_pow_mz.max(1)).max(1) * TILE;
+    let world_h = (height_tiles / two_pow_mz.max(1)).max(1) * TILE;
 
     let labels_path = tile_dir.join("labels.json");
     let json_str = std::fs::read_to_string(&labels_path)
@@ -339,11 +348,14 @@ pub fn regen_html(tile_dir: &Path) -> anyhow::Result<()> {
         })
         .collect();
 
+    let width = width_tiles * TILE;
     html::write_leaflet_html(
         tile_dir,
         world_w,
+        world_h,
         max_zoom,
         height,
+        width,
         TILE,
         &entities,
         "arbvis",
@@ -365,7 +377,9 @@ struct TilePlan {
     width_tiles: u32,
     height_tiles: u32,
     world_w: u32,
+    world_h: u32,
     height: u32,
+    width: u32,
     max_zoom: u32,
     total_tiles: u64,
     square_pixels: u64,
@@ -397,6 +411,9 @@ async fn build_tile_plan(
     let width_tiles = width / tile_size;
     let height_tiles = height / tile_size;
     let world_w = TILE << (kw - kh);
+    // Hilbert canvases are always width≥height (kw ≥ kh), so the smaller axis
+    // collapses to a single TILE in geo space — i.e. world_h == TILE.
+    let world_h: u32 = TILE;
     let square_pixels: u64 = (height as u64) * (height as u64);
     let total_pixels: u64 = width as u64 * height as u64;
     let num_squares = 1u32 << (kw - kh);
@@ -654,7 +671,9 @@ async fn build_tile_plan(
         width_tiles_out,
         height_tiles_out,
         world_w_out,
+        world_h_out,
         height_out,
+        width_out,
         max_zoom_out,
         total_tiles_out,
         square_pixels_out,
@@ -666,7 +685,9 @@ async fn build_tile_plan(
             width_tiles,
             height_tiles,
             world_w,
+            world_h,
             height,
+            width,
             max_zoom,
             width_tiles as u64 * height_tiles as u64,
             square_pixels,
@@ -708,12 +729,27 @@ async fn build_tile_plan(
             // For architectural the `kh`/`square_pixels`/`total` Hilbert
             // fields are unused at render time; populate them with safe
             // values that won't divide by zero if accidentally read.
+            //
+            // `world_w`/`world_h` are the geographic extents at zoom 0 in
+            // leaflet's coordinate system. At leaf zoom (`max_zoom`) the tile
+            // grid is `width_tiles × height_tiles`; halving each step down to
+            // zoom 0 leaves `width_tiles / 2^max_zoom × height_tiles / 2^max_zoom`
+            // tiles, each TILE px wide in geo space. `try_build` chose
+            // `max_zoom = log2(min(w_p2, h_p2))` so exactly one of the two
+            // ratios collapses to 1 — that's the Hilbert-style "fix the smaller
+            // axis at TILE, scale the other" convention generalised to either
+            // aspect.
+            let two_pow_mz = 1u32 << a.max_zoom;
+            let arch_world_w = (a.width_tiles / two_pow_mz.max(1)).max(1) * TILE;
+            let arch_world_h = (a.height_tiles / two_pow_mz.max(1)).max(1) * TILE;
             (
                 /* kh */ 0u8,
                 a.width_tiles,
                 a.height_tiles,
-                a.width,
+                arch_world_w,
+                arch_world_h,
                 a.height,
+                a.width,
                 a.max_zoom,
                 a.total_tiles,
                 /* square_pixels */ 1u64,
@@ -730,7 +766,9 @@ async fn build_tile_plan(
         width_tiles: width_tiles_out,
         height_tiles: height_tiles_out,
         world_w: world_w_out,
+        world_h: world_h_out,
         height: height_out,
+        width: width_out,
         max_zoom: max_zoom_out,
         total_tiles: total_tiles_out,
         square_pixels: square_pixels_out,
@@ -1252,7 +1290,9 @@ pub async fn run_tiles(
     let leaf_format = derive_leaf_format(leaf_format, &plan.mode);
     let max_zoom = plan.max_zoom;
     let world_w = plan.world_w;
+    let world_h = plan.world_h;
     let height = plan.height;
+    let width = plan.width;
     let total_tiles = plan.total_tiles;
     let leaf_ext = leaf_format.extension();
     let pyramid_ext = pyramid_format.extension();
@@ -1305,8 +1345,10 @@ pub async fn run_tiles(
     html::write_leaflet_html(
         &tile_dir,
         world_w,
+        world_h,
         max_zoom,
         height,
+        width,
         TILE,
         &plan.entities,
         title,
@@ -1340,7 +1382,9 @@ pub async fn run_tiles_hf_streaming(
     let tile_size = TILE;
     let max_zoom = plan.max_zoom;
     let world_w = plan.world_w;
+    let world_h = plan.world_h;
     let height = plan.height;
+    let width = plan.width;
     let total_tiles = plan.total_tiles;
     let leaf_ext = leaf_format.extension();
     let pyramid_ext = pyramid_format.extension();
@@ -1384,8 +1428,10 @@ pub async fn run_tiles_hf_streaming(
     log::info!("Uploading index.html and labels.json...");
     let (html_bytes, labels_bytes) = generate_leaflet_content(
         world_w,
+        world_h,
         max_zoom,
         height,
+        width,
         TILE,
         &plan.entities,
         title,

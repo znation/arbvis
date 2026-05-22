@@ -20,8 +20,10 @@ pub struct FileEntity {
 /// template uses a custom `getTileUrl` to switch on `z`.
 pub fn generate_leaflet_content(
     world_w: u32,
+    world_h: u32,
     max_zoom: u32,
     height: u32,
+    width: u32,
     tile_size: u32,
     entities: &[FileEntity],
     title: &str,
@@ -32,8 +34,10 @@ pub fn generate_leaflet_content(
     let entities_json = build_labels_json(entities);
     let html = build_html(
         world_w,
+        world_h,
         max_zoom,
         height,
+        width,
         tile_size,
         title,
         inputs,
@@ -47,8 +51,10 @@ pub fn generate_leaflet_content(
 pub fn write_leaflet_html(
     dir: &Path,
     world_w: u32,
+    world_h: u32,
     max_zoom: u32,
     height: u32,
+    width: u32,
     tile_size: u32,
     entities: &[FileEntity],
     title: &str,
@@ -61,8 +67,10 @@ pub fn write_leaflet_html(
 
     let html = build_html(
         world_w,
+        world_h,
         max_zoom,
         height,
+        width,
         tile_size,
         title,
         inputs,
@@ -182,8 +190,10 @@ fn build_info_html(title: &str, inputs: &[String]) -> String {
 
 fn build_html(
     world_w: u32,
+    world_h: u32,
     max_zoom: u32,
     height: u32,
+    width: u32,
     tile_size: u32,
     title: &str,
     inputs: &[String],
@@ -257,13 +267,17 @@ fn build_html(
     new ArbvisTileLayer('', {{
       tileSize: {tile_size},
       maxNativeZoom: {max_zoom},
-      bounds: [[-{tile_size}, 0], [0, {world_w}]],
+      bounds: [[-{world_h}, 0], [0, {world_w}]],
       noWrap: true,
       attribution: '<a href="https://github.com/znation/arbvis">arbvis</a>'
     }}).addTo(map);
-    map.fitBounds([[-{tile_size}, 0], [0, {world_w}]]);
+    map.fitBounds([[-{world_h}, 0], [0, {world_w}]]);
 
     var HEIGHT = {height};
+    var WIDTH = {width};
+    var WORLD_W = {world_w};
+    var WORLD_H = {world_h};
+    var MAX_ZOOM = {max_zoom};
 
     var activeOverlays = L.layerGroup().addTo(map);
 
@@ -271,10 +285,15 @@ fn build_html(
       var bounds = map.getBounds();
       var sw = bounds.getSouthWest();
       var ne = bounds.getNorthEast();
-      var minX = sw.lng * HEIGHT / {tile_size};
-      var minY = -ne.lat * HEIGHT / {tile_size};
-      var maxX = ne.lng * HEIGHT / {tile_size};
-      var maxY = -sw.lat * HEIGHT / {tile_size};
+      // Geo↔pixel conversion factors. WORLD_W geo units span WIDTH canvas px
+      // (and likewise for height), so canvas_x = lng * WIDTH / WORLD_W and
+      // canvas_y = -lat * HEIGHT / WORLD_H. Hilbert canvases have
+      // WORLD_W/WIDTH == WORLD_H/HEIGHT (uniform scaling) but arch canvases
+      // can be non-square, so the two axes need separate ratios.
+      var minX = sw.lng * WIDTH / WORLD_W;
+      var minY = -ne.lat * HEIGHT / WORLD_H;
+      var maxX = ne.lng * WIDTH / WORLD_W;
+      var maxY = -sw.lat * HEIGHT / WORLD_H;
 
       var visible = [];
       for (var i = 0; i < labels.length; i++) {{
@@ -297,7 +316,10 @@ fn build_html(
       for (var i = 0; i < visible.length; i++) {{
         var l = visible[i];
         if (l.segs && l.segs.length > 0) {{
-          var scale = ({tile_size} / HEIGHT) * Math.pow(2, map.getZoom());
+          // Viewport pixels per canvas pixel at the current zoom. At the leaf
+          // zoom (MAX_ZOOM) a tile is rendered 1:1, so scale = 1; each level
+          // out halves it. Independent of canvas aspect.
+          var scale = Math.pow(2, map.getZoom() - MAX_ZOOM);
           var minWorld = 2 / scale;
           var ll = l.segs
             .filter(function(s) {{
@@ -306,8 +328,8 @@ fn build_html(
             }})
             .map(function(s) {{
               return [
-                [-(s[1] / HEIGHT) * {tile_size}, (s[0] / HEIGHT) * {tile_size}],
-                [-(s[3] / HEIGHT) * {tile_size}, (s[2] / HEIGHT) * {tile_size}],
+                [-(s[1] / HEIGHT) * WORLD_H, (s[0] / WIDTH) * WORLD_W],
+                [-(s[3] / HEIGHT) * WORLD_H, (s[2] / WIDTH) * WORLD_W],
               ];
             }});
           activeOverlays.addLayer(L.polyline(ll, {{
@@ -318,8 +340,8 @@ fn build_html(
             interactive: false,
           }}));
         }}
-        var lat = -(l.y / HEIGHT) * {tile_size};
-        var lng =  (l.x / HEIGHT) * {tile_size};
+        var lat = -(l.y / HEIGHT) * WORLD_H;
+        var lng =  (l.x / WIDTH) * WORLD_W;
         var pt = map.latLngToContainerPoint([lat, lng]);
         var tw = l.name.length * 7 + 12;
         var th = 22;
@@ -381,7 +403,9 @@ fn build_html(
         max_zoom = max_zoom,
         viewer_max_zoom = viewer_max_zoom,
         world_w = world_w,
+        world_h = world_h,
         height = height,
+        width = width,
         leaf_ext = leaf_ext,
         pyramid_ext = pyramid_ext,
     )

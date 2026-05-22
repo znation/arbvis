@@ -359,16 +359,31 @@ impl ArchLayout {
         }
 
         // Round canvas dimensions UP to tile-size multiples so the tile grid
-        // covers everything.
+        // covers all of the content rectangle…
         let raw_h = cursor_y.saturating_sub(PAD);
-        let canvas_h = align_up(raw_h.max(1), TILE);
-        let canvas_w = align_up(canvas_w, TILE);
-        let width_tiles = canvas_w / TILE;
-        let height_tiles = canvas_h / TILE;
+        let raw_canvas_h = align_up(raw_h.max(1), TILE);
+        let raw_canvas_w = align_up(canvas_w, TILE);
+        let raw_width_tiles = (raw_canvas_w / TILE).max(1);
+        let raw_height_tiles = (raw_canvas_h / TILE).max(1);
 
-        // Pyramid zoom levels: smallest k so 2^k >= max(width_tiles, height_tiles).
-        let max_dim_tiles = width_tiles.max(height_tiles).max(1);
-        let max_zoom = ((max_dim_tiles - 1).max(1) as f64).log2().ceil() as u32;
+        // …then pad both tile counts UP to powers of two. `PyramidAccumulator`
+        // only emits a parent tile when all 4 of its children have contributed,
+        // so any boundary cell whose 2×2 quad isn't fully populated stalls the
+        // cascade — including, eventually, the zoom-0 root. Power-of-two grids
+        // halve cleanly all the way down to (1, k) or (k, 1) tiles at zoom 0.
+        // The padding cells render as PADDING_RGB (no tensor placements
+        // intersect them), so the wasted bytes are tiny on disk.
+        let width_tiles = next_pow2(raw_width_tiles);
+        let height_tiles = next_pow2(raw_height_tiles);
+        let canvas_w = width_tiles * TILE;
+        let canvas_h = height_tiles * TILE;
+
+        // Pyramid bottoms out when the *smaller* dimension hits 1 tile —
+        // halving any further would produce fractional counts and the same
+        // count==4 stall.  At zoom 0 the layout is
+        //   (width_tiles / 2^max_zoom) × (height_tiles / 2^max_zoom)
+        // tiles, exactly one of which equals 1.
+        let max_zoom = (width_tiles.min(height_tiles).max(1) as f64).log2().round() as u32;
 
         let mut sorted_idx: Vec<usize> = (0..tensors.len()).collect();
         sorted_idx.sort_by_key(|&i| {
@@ -510,6 +525,14 @@ fn extract_block_sub_path(name: &str) -> Option<String> {
     Some(caps.get(2)?.as_str().to_string())
 }
 
+/// Smallest power of two ≥ `n`. Returns 1 for `n == 0`.
+fn next_pow2(n: u32) -> u32 {
+    if n <= 1 {
+        return 1;
+    }
+    1u32 << (32 - (n - 1).leading_zeros())
+}
+
 fn name_hue_short(name: &str) -> u16 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -521,6 +544,18 @@ fn name_hue_short(name: &str) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_pow2_basics() {
+        assert_eq!(next_pow2(0), 1);
+        assert_eq!(next_pow2(1), 1);
+        assert_eq!(next_pow2(2), 2);
+        assert_eq!(next_pow2(3), 4);
+        assert_eq!(next_pow2(4), 4);
+        assert_eq!(next_pow2(5), 8);
+        assert_eq!(next_pow2(17), 32);
+        assert_eq!(next_pow2(100), 128);
+    }
 
     /// Build a synthetic tensor for testing. `name`, `shape`.
     fn mk_t(name: &str, shape: Vec<u64>) -> TensorMeta {
@@ -654,5 +689,73 @@ mod tests {
         assert_eq!(with_config.layer_bounds.len(), 8);
         assert!(with_config.architecture.contains("LlamaForCausalLM"));
         assert!(with_config.architecture.contains("8 layers"));
+    }
+
+    /// `PyramidAccumulator` only emits a parent tile once all 4 children
+    /// arrive, so canvas tile counts have to be powers of two on each axis
+    /// AND `max_zoom = log2(min(w_p2, h_p2))` for the pyramid to drain all
+    /// the way down to zoom 0. Without this, the leaflet viewer asks for
+    /// `tiles/0/0/0.avif`, gets a 404, and renders a blank canvas — which is
+    /// exactly the regression this test guards.
+    #[test]
+    fn canvas_dimensions_are_power_of_two() {
+        // A non-square stack: 11 transformer layers, hidden=384, intermediate=1280.
+        // That gives raw tile counts in the high-tens / low-hundreds — neither
+        // a power of two on its own.
+        let mut tensors: Vec<TensorMeta> = Vec::new();
+        let mut off: u64 = 1024;
+        for i in 0..11u64 {
+            for (sub, shape) in [
+                ("self_attn.q_proj.weight", vec![384, 384]),
+                ("self_attn.k_proj.weight", vec![384, 384]),
+                ("self_attn.v_proj.weight", vec![384, 384]),
+                ("self_attn.o_proj.weight", vec![384, 384]),
+                ("mlp.gate_proj.weight", vec![1280, 384]),
+                ("mlp.up_proj.weight", vec![1280, 384]),
+                ("mlp.down_proj.weight", vec![384, 1280]),
+                ("input_layernorm.weight", vec![384]),
+                ("post_attention_layernorm.weight", vec![384]),
+            ] {
+                let n: u64 = shape.iter().product();
+                let bytes = n * 4;
+                tensors.push(TensorMeta {
+                    name: format!("model.layers.{i}.{sub}"),
+                    dtype: Dtype::F32,
+                    shape,
+                    file_start: off,
+                    file_end: off + bytes,
+                });
+                off += bytes;
+            }
+        }
+        let source = synthetic_source(tensors);
+        let cumulative = vec![0u64];
+        let layout = ArchLayout::try_build(&[source], &cumulative, &[]).unwrap();
+
+        assert!(
+            layout.width_tiles.is_power_of_two(),
+            "width_tiles {} must be a power of two for the pyramid to drain",
+            layout.width_tiles,
+        );
+        assert!(
+            layout.height_tiles.is_power_of_two(),
+            "height_tiles {} must be a power of two for the pyramid to drain",
+            layout.height_tiles,
+        );
+        let smaller = layout.width_tiles.min(layout.height_tiles);
+        assert_eq!(
+            layout.max_zoom,
+            smaller.trailing_zeros(),
+            "max_zoom should be log2 of the smaller tile dim so 2^max_zoom divides both",
+        );
+        // Sanity: zoom 0 must have at least one tile in each dim, and exactly
+        // one of the two should be exactly 1 (the smaller axis collapsed).
+        let zoom0_w = layout.width_tiles >> layout.max_zoom;
+        let zoom0_h = layout.height_tiles >> layout.max_zoom;
+        assert!(zoom0_w >= 1 && zoom0_h >= 1);
+        assert!(
+            zoom0_w == 1 || zoom0_h == 1,
+            "zoom 0 grid should be 1xN or Nx1, got {zoom0_w}x{zoom0_h}",
+        );
     }
 }

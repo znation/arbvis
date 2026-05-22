@@ -597,6 +597,18 @@ fn main() -> anyhow::Result<()> {
             std::env::set_var("RUST_BACKTRACE", "1");
         }
     }
+    // Belt-and-suspenders for the rav1e stack appetite (see runtime build
+    // below). RUST_MIN_STACK is read by `std::thread::Builder` whenever a
+    // builder doesn't explicitly set `stack_size` — so any third-party crate
+    // (xet-runtime, hf-xet, …) that spawns its own threads with default
+    // settings inherits this floor. Has to be set before *any* thread is
+    // spawned. SAFETY: same as above — single main thread, pre-spawn.
+    if std::env::var_os("RUST_MIN_STACK").is_none() {
+        // SAFETY: see comment above.
+        unsafe {
+            std::env::set_var("RUST_MIN_STACK", (8 * 1024 * 1024).to_string());
+        }
+    }
 
     // Build env_logger but DON'T install it directly; wrap it in `LogWrapper`
     // so every log line is printed via `MultiProgress::suspend(...)`, which
@@ -615,14 +627,24 @@ fn main() -> anyhow::Result<()> {
     // throttle + CAS HTTP counters. Used to localise pipeline stalls.
     let _perf_monitor_stop = perf_monitor::spawn_if_enabled();
 
-    // Custom tokio runtime so we can hand both worker and blocking threads an
-    // 8 MB stack. The default is Rust's std::thread default (2 MB on macOS),
-    // which is below the ~4 MB minimum that the AVIF encoder underneath
-    // `image::codecs::avif::AvifEncoder` (rav1e) needs per encode call. Once
-    // the architectural pyramid actually drains (16 K → 1 tile), enough AVIF
-    // encodes run concurrently on blocking threads that hitting the 2 MB
-    // ceiling becomes inevitable — manifests as a `thread '<unknown>' has
-    // overflowed its stack` panic mid-pyramid.
+    // The AVIF encoder underneath `image::codecs::avif::AvifEncoder` is rav1e,
+    // which uses `rayon` internally to parallelize AV1 tile encoding. Per-call
+    // rav1e needs ≥4 MB of stack; Rust's default `std::thread` stack is 2 MB
+    // on macOS. We have to bump the stack on EVERY thread that might run rav1e:
+    //   - tokio worker pool + blocking pool (we spawn the AVIF encode via
+    //     `tokio::task::spawn_blocking` from the pyramid accumulator), and
+    //   - rayon's global thread pool (rav1e's internal parallelism).
+    //
+    // The previous fix only handled tokio; the unnamed thread that overflowed
+    // mid-pyramid was a rayon worker spun up the first time rav1e tried to
+    // parallelize. Initialise rayon's global pool with the larger stack BEFORE
+    // any other code touches it (a previous accidental rayon call would lock
+    // in the default-stack pool for the process lifetime).
+    rayon::ThreadPoolBuilder::new()
+        .stack_size(8 * 1024 * 1024)
+        .build_global()
+        .map_err(|e| anyhow::anyhow!("building rayon global pool: {e}"))?;
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(8 * 1024 * 1024)

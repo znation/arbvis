@@ -3,9 +3,13 @@
 //! Every tensor is placed at its natural 2D element shape, 1 pixel per
 //! element. Transformer blocks (`{prefix}.layers.{N}.{sub_path}`) share a
 //! single canonical arrangement: each block draws every sub-tensor in the
-//! same relative position so layer-N and layer-N+1 are pixel-aligned column
-//! for column. Top-level tensors (embed_tokens, lm_head, norms) sit above
-//! and below the block stack.
+//! same relative position. Blocks are arranged in a grid of `cols` columns
+//! chosen to keep the overall canvas near-square (see [`pick_column_count`]);
+//! within a column, consecutive layers stay pixel-aligned column-for-column,
+//! so q_proj at row 0 aligns with q_proj at row 1 etc. Across columns the
+//! alignment is broken but the visualization is no longer absurdly tall.
+//! Top-level tensors (embed_tokens, lm_head, norms) sit above and below the
+//! block grid, centred horizontally.
 //!
 //! The output canvas is queryable per tile via [`ArchLayout::regions_in_tile`].
 
@@ -242,7 +246,19 @@ impl ArchLayout {
             PAD,
         );
 
-        // Decide the canvas width: max of the block-row width and the widest
+        // Pick a column count for the transformer-block grid so the canvas
+        // ends up roughly square. `n_blocks == 0` (degenerate, no layers) and
+        // `n_blocks == 1` collapse to a single-column layout.
+        let n_blocks = blocks.len() as u32;
+        let cols = pick_column_count(n_blocks, layer_w, layer_h, PAD);
+        let grid_w = if cols == 0 {
+            0
+        } else {
+            cols.saturating_mul(layer_w)
+                .saturating_add(cols.saturating_sub(1).saturating_mul(PAD))
+        };
+
+        // Decide the canvas width: max of the grid width and the widest
         // top-level tensor.
         let top_widths: Vec<u32> = top_level
             .iter()
@@ -251,7 +267,7 @@ impl ArchLayout {
                 c.min(u32::MAX as u64) as u32
             })
             .collect();
-        let canvas_w = layer_w
+        let canvas_w = grid_w
             .max(top_widths.iter().copied().max().unwrap_or(0))
             .max(1);
 
@@ -290,21 +306,31 @@ impl ArchLayout {
             cursor_y = cursor_y.saturating_add(h).saturating_add(PAD);
         }
 
-        // 2. Transformer blocks.
-        for (idx, sub_map) in &blocks {
-            let block_y = cursor_y;
-            // Centre the block row inside the canvas width.
-            let block_x_offset = canvas_w.saturating_sub(layer_w) / 2;
+        // 2. Transformer blocks arranged in a `cols`-wide grid. The grid is
+        // centred horizontally inside `canvas_w` so a wider top-level tensor
+        // (e.g. lm_head spanning more cols than the block grid) doesn't push
+        // the grid off-centre.
+        let grid_x_offset = canvas_w.saturating_sub(grid_w) / 2;
+        let grid_y0 = cursor_y;
+        let grid_rows = if cols == 0 {
+            0
+        } else {
+            n_blocks.div_ceil(cols)
+        };
+        for (block_pos, (idx, sub_map)) in blocks.iter().enumerate() {
+            let pos = block_pos as u32;
+            let (col, row) = if cols == 0 {
+                (0, 0)
+            } else {
+                (pos % cols, pos / cols)
+            };
+            let block_x =
+                grid_x_offset.saturating_add(col.saturating_mul(layer_w.saturating_add(PAD)));
+            let block_y = grid_y0.saturating_add(row.saturating_mul(layer_h.saturating_add(PAD)));
             for ((sp, _), pl) in canon_slots.iter().zip(placements.iter()) {
                 if let Some((sidx, t, base_off)) = sub_map.get(sp) {
-                    let (rows, cols) = t.element_shape();
-                    let w = cols.min(u32::MAX as u64) as u32;
-                    let h = rows.min(u32::MAX as u64) as u32;
-                    // Within the slot, anchor at top-left (alignment matters
-                    // more than centring — corresponding sub-tensors across
-                    // layers stay column-aligned).
-                    let _ = (w, h, pl);
-                    let cx = block_x_offset.saturating_add(pl.x);
+                    let (rows, tcols) = t.element_shape();
+                    let cx = block_x.saturating_add(pl.x);
                     let cy = block_y.saturating_add(pl.y);
                     tensors.push(PlacedTensor {
                         source_idx: *sidx,
@@ -313,7 +339,7 @@ impl ArchLayout {
                         dtype: t.dtype,
                         tensor_byte_start: base_off + t.file_start,
                         tensor_rows: rows,
-                        tensor_cols: cols,
+                        tensor_cols: tcols,
                         canvas_x: cx,
                         canvas_y: cy,
                         hue: name_hue_short(sp),
@@ -323,12 +349,15 @@ impl ArchLayout {
             }
             layer_bounds.push(LayerBounds {
                 layer_idx: *idx,
-                canvas_x: block_x_offset,
+                canvas_x: block_x,
                 canvas_y: block_y,
                 width: layer_w,
                 height: layer_h,
             });
-            cursor_y = block_y.saturating_add(layer_h).saturating_add(PAD);
+        }
+        if grid_rows > 0 {
+            cursor_y =
+                grid_y0.saturating_add(grid_rows.saturating_mul(layer_h.saturating_add(PAD)));
         }
 
         // 3. Output-side top-levels.
@@ -522,7 +551,7 @@ fn is_input_side_name(name: &str) -> bool {
 /// from `model.safetensors.index.json` entries that didn't get loaded.
 fn extract_block_sub_path(name: &str) -> Option<String> {
     let caps = name_tree::block_regex_for_arch().captures(name)?;
-    Some(caps.get(2)?.as_str().to_string())
+    Some(caps.get(3)?.as_str().to_string())
 }
 
 /// Smallest power of two ≥ `n`. Returns 1 for `n == 0`.
@@ -531,6 +560,40 @@ fn next_pow2(n: u32) -> u32 {
         return 1;
     }
     1u32 << (32 - (n - 1).leading_zeros())
+}
+
+/// Pick a column count for arranging `n` transformer blocks in a grid so the
+/// total grid width and height land as close to 1:1 as possible. Returns 0
+/// when `n == 0` (no blocks to place) and 1 when `n == 1`.
+///
+/// Each candidate `c ∈ 1..=n` is scored by the absolute log-ratio of grid
+/// width (`c * layer_w + (c-1) * gutter`) to grid height
+/// (`ceil(n/c) * (layer_h + gutter)`). Ties broken in favour of the smaller
+/// `c` so small models don't get fragmented across many narrow columns.
+fn pick_column_count(n: u32, layer_w: u32, layer_h: u32, gutter: u32) -> u32 {
+    if n == 0 {
+        return 0;
+    }
+    if n == 1 || layer_w == 0 || layer_h == 0 {
+        return 1;
+    }
+    let mut best_c: u32 = 1;
+    let mut best_score = f64::INFINITY;
+    for c in 1..=n {
+        let rows = n.div_ceil(c);
+        let total_w =
+            (c as u64) * (layer_w as u64) + (c.saturating_sub(1) as u64) * (gutter as u64);
+        let total_h = (rows as u64) * (layer_h as u64 + gutter as u64);
+        if total_w == 0 || total_h == 0 {
+            continue;
+        }
+        let score = (total_w as f64 / total_h as f64).log2().abs();
+        if score < best_score {
+            best_score = score;
+            best_c = c;
+        }
+    }
+    best_c
 }
 
 fn name_hue_short(name: &str) -> u16 {
@@ -555,6 +618,49 @@ mod tests {
         assert_eq!(next_pow2(5), 8);
         assert_eq!(next_pow2(17), 32);
         assert_eq!(next_pow2(100), 128);
+    }
+
+    #[test]
+    fn pick_column_count_degenerate_and_trivial() {
+        // No blocks → 0 columns.
+        assert_eq!(pick_column_count(0, 1000, 1000, PAD), 0);
+        // Single block → 1 column (no grid to balance).
+        assert_eq!(pick_column_count(1, 1000, 1000, PAD), 1);
+        // Defensive: zero-sized blocks fall back to a single column rather
+        // than dividing by zero.
+        assert_eq!(pick_column_count(5, 0, 100, PAD), 1);
+        assert_eq!(pick_column_count(5, 100, 0, PAD), 1);
+    }
+
+    #[test]
+    fn pick_column_count_two_square_blocks_prefers_two_cols() {
+        // Two identically-shaped blocks: 1×2 stack is taller than wide
+        // (height ≈ 2*W), 2×1 row is wider than tall (width ≈ 2*W); both
+        // sit equally far from square *without* gutters, but the gutter row
+        // tips it toward 2 columns.
+        assert_eq!(pick_column_count(2, 1000, 1000, PAD), 2);
+    }
+
+    #[test]
+    fn pick_column_count_tall_many_blocks() {
+        // 70 transformer blocks where each block is much wider than tall.
+        // 1 column would be 1× : 70× tall (catastrophically vertical);
+        // ideal is around sqrt(70 * layer_h / layer_w) = sqrt(70 * 0.2) ≈ 3.7,
+        // so 4 columns gets us a near-square grid.
+        let c = pick_column_count(70, 10_000, 2_000, PAD);
+        assert_eq!(
+            c, 4,
+            "70 blocks of 10000×2000 should pick 4 columns to balance aspect; got {c}",
+        );
+    }
+
+    #[test]
+    fn pick_column_count_wide_blocks_stays_at_one_col() {
+        // When each block is itself much wider than tall, even four of them
+        // stack into a roughly-square canvas in a single column — adding more
+        // columns would create a strip far wider than tall.
+        let c = pick_column_count(4, 4_000, 1_000, PAD);
+        assert_eq!(c, 1, "wide blocks already balance horizontally; got {c}");
     }
 
     /// Build a synthetic tensor for testing. `name`, `shape`.
@@ -758,5 +864,94 @@ mod tests {
             zoom0_w == 1 || zoom0_h == 1,
             "zoom 0 grid should be 1xN or Nx1, got {zoom0_w}x{zoom0_h}",
         );
+    }
+
+    /// With the multi-column grid, layers should arrange themselves into N×M
+    /// blocks so that within a column corresponding sub-tensors stay
+    /// pixel-aligned across rows (q_proj-in-layer-0 shares an x with
+    /// q_proj-in-layer-cols, etc.). This is the alignment property the module
+    /// comment promises — guards against regressions in the column/row math.
+    #[test]
+    fn multi_column_grid_preserves_within_column_alignment() {
+        // 30 layers — same sub-tensors per layer (matches SmolLM2-135M's per-layer
+        // shape). Picker chooses cols so the canvas trends toward near-square.
+        let mut tensors: Vec<TensorMeta> = Vec::new();
+        let mut off: u64 = 1024;
+        for i in 0..30u64 {
+            for (sub, shape) in [
+                ("self_attn.q_proj.weight", vec![576, 576]),
+                ("self_attn.k_proj.weight", vec![192, 576]),
+                ("self_attn.v_proj.weight", vec![192, 576]),
+                ("self_attn.o_proj.weight", vec![576, 576]),
+                ("mlp.gate_proj.weight", vec![1536, 576]),
+                ("mlp.up_proj.weight", vec![1536, 576]),
+                ("mlp.down_proj.weight", vec![576, 1536]),
+                ("input_layernorm.weight", vec![576]),
+                ("post_attention_layernorm.weight", vec![576]),
+            ] {
+                let n: u64 = shape.iter().product();
+                let bytes = n * 2; // BF16 is 2 bytes/elem
+                tensors.push(TensorMeta {
+                    name: format!("model.layers.{i}.{sub}"),
+                    dtype: Dtype::BF16,
+                    shape,
+                    file_start: off,
+                    file_end: off + bytes,
+                });
+                off += bytes;
+            }
+        }
+        let source = synthetic_source(tensors);
+        let cumulative = vec![0u64];
+        let layout = ArchLayout::try_build(&[source], &cumulative, &[]).unwrap();
+
+        // Picker should have spread the 30 layers across more than one column —
+        // a single column for 30 nearly-square blocks would be ~30× taller than
+        // wide, which is the bug we're fixing.
+        assert_eq!(layout.layer_bounds.len(), 30);
+        let unique_xs: std::collections::BTreeSet<u32> =
+            layout.layer_bounds.iter().map(|b| b.canvas_x).collect();
+        let unique_ys: std::collections::BTreeSet<u32> =
+            layout.layer_bounds.iter().map(|b| b.canvas_y).collect();
+        let cols = unique_xs.len();
+        let rows = unique_ys.len();
+        assert!(
+            cols > 1,
+            "30 layers should spread across multiple columns; got {cols}",
+        );
+        assert!(cols * rows >= 30, "{cols}x{rows} can't hold 30 layers");
+
+        // Within each column, every layer's q_proj must share an x-coordinate.
+        // Equivalently, blocks at the same column index must have the same
+        // canvas_x.
+        let mut x_by_col: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+        for b in &layout.layer_bounds {
+            x_by_col.entry(b.canvas_x).or_default().push(b.canvas_y);
+        }
+        // Every column should have a consistent x, by construction (each
+        // canvas_x is itself a "column key"). The check that matters: layers
+        // sharing canvas_x should ALSO have grid-spaced canvas_y values (i.e.
+        // they're stacked rows in the same column).
+        let row_pitch = layout
+            .layer_bounds
+            .iter()
+            .map(|b| b.height)
+            .next()
+            .expect("at least one layer")
+            + PAD;
+        for (col_x, ys) in &x_by_col {
+            let mut sorted_ys = ys.clone();
+            sorted_ys.sort();
+            for w in sorted_ys.windows(2) {
+                assert_eq!(
+                    w[1] - w[0],
+                    row_pitch,
+                    "layers in column at x={col_x} must be row-aligned at pitch {row_pitch}; got {} between {} and {}",
+                    w[1] - w[0],
+                    w[0],
+                    w[1],
+                );
+            }
+        }
     }
 }

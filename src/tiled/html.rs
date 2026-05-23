@@ -202,6 +202,15 @@ fn build_html(
 ) -> String {
     let info_html = build_info_html(title, inputs);
     let viewer_max_zoom = max_zoom + 3;
+    // For non-square canvases the pyramid bottoms out with the smaller axis at
+    // 1 tile and the larger axis at `aspect_max/aspect_min` tiles, so even at
+    // Leaflet's zoom 0 we can't see the whole thing. Let the viewer keep
+    // shrinking past the pyramid root by one zoom level per 2× aspect skew.
+    // `minNativeZoom: 0` on the tile layer keeps tile fetches valid — Leaflet
+    // CSS-scales the zoom-0 tiles for negative zooms.
+    let aspect_max = world_w.max(world_h);
+    let aspect_min = world_w.min(world_h).max(1);
+    let viewer_min_zoom = -((aspect_max as f64 / aspect_min as f64).log2().ceil() as i32);
     format!(
         r#"<!DOCTYPE html>
 <html>
@@ -254,7 +263,7 @@ fn build_html(
   <script>
     var map = L.map('map', {{
       crs: L.CRS.Simple,
-      minZoom: 0,
+      minZoom: {viewer_min_zoom},
       maxZoom: {viewer_max_zoom},
       preferCanvas: true,
     }});
@@ -266,6 +275,7 @@ fn build_html(
     }});
     new ArbvisTileLayer('', {{
       tileSize: {tile_size},
+      minNativeZoom: 0,
       maxNativeZoom: {max_zoom},
       bounds: [[-{world_h}, 0], [0, {world_w}]],
       noWrap: true,
@@ -402,6 +412,7 @@ fn build_html(
         info_html = info_html,
         max_zoom = max_zoom,
         viewer_max_zoom = viewer_max_zoom,
+        viewer_min_zoom = viewer_min_zoom,
         world_w = world_w,
         world_h = world_h,
         height = height,

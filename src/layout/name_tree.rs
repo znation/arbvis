@@ -65,15 +65,24 @@ pub fn block_regex_for_arch() -> &'static Regex {
     block_regex()
 }
 
-/// `(model|transformer|backbone)?\.?(layers|h|blocks|encoder.layer|decoder.layer|blk)\.(\d+)\.(.*)`
-/// matches the conventional naming for repeated transformer blocks across
-/// llama-family, gpt-family, bert-family, and t5-family checkpoints. `blk`
-/// covers the llama.cpp / GGUF convention (e.g. `blk.0.attn_q.weight`).
+/// Matches transformer-block tensor names like `prefix.layers.N.sub_path` for
+/// arbitrary dotted prefixes — so the standard llama/gpt/bert/t5 patterns
+/// (`model.layers.N.*`, `transformer.h.N.*`, `encoder.layer.N.*`) all match,
+/// nested wrappers like `model.language_model.layers.N.*` (Qwen3.5-style VLMs)
+/// and bare `mtp.layers.0.*` sidecar streams also match, and the llama.cpp /
+/// GGUF convention `blk.N.*` (e.g. `blk.0.attn_q.weight`) too. Pick the
+/// dominant prefix in [`classify`] to avoid conflating sidecars with the
+/// main stack.
+///
+/// Captures:
+///   1. block-prefix with trailing dot (possibly empty, e.g. `model.language_model.`),
+///   2. layer index,
+///   3. in-layer sub-path.
 fn block_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"^(?:model\.|transformer\.|backbone\.|module\.)?(?:layers|h|blocks|encoder\.layer|decoder\.layer|blk)\.(\d+)\.(.+)$",
+            r"^((?:[A-Za-z_][A-Za-z_0-9]*\.)*)(?:layers|h|blocks|encoder\.layer|decoder\.layer|blk)\.(\d+)\.(.+)$",
         )
         .expect("static regex compiles")
     })
@@ -85,28 +94,64 @@ pub fn classify(names: &[&str]) -> ArchProfile {
     let prefix = detect_common_prefix(names);
     let re = block_regex();
 
+    // First pass: pull the (block_prefix, idx, sub_path) out of every name
+    // that matches the regex. Names that don't match get a `None`.
+    let captures: Vec<Option<(String, u32, String)>> = names
+        .iter()
+        .map(|n| {
+            re.captures(n).map(|caps| {
+                let bp = caps
+                    .get(1)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default();
+                let idx: u32 = caps.get(2).unwrap().as_str().parse().unwrap_or(0);
+                let sub = caps.get(3).unwrap().as_str().to_string();
+                (bp, idx, sub)
+            })
+        })
+        .collect();
+
+    // Pick the dominant block-prefix: the one with the most distinct layer
+    // indices (tie-break: most total tensor matches). This is how we keep
+    // sidecar layer streams like Qwen3.5's `mtp.layers.0.*` from poisoning
+    // the main transformer stack (`model.language_model.layers.{0..23}.*`):
+    // only tensors under the dominant prefix become `Block`s; the rest fall
+    // through to `TopLevel`.
+    let mut by_prefix: std::collections::HashMap<String, (std::collections::HashSet<u32>, usize)> =
+        std::collections::HashMap::new();
+    for c in captures.iter().flatten() {
+        let entry = by_prefix.entry(c.0.clone()).or_default();
+        entry.0.insert(c.1);
+        entry.1 += 1;
+    }
+    let dominant_prefix: Option<String> = by_prefix
+        .iter()
+        .max_by_key(|(_, (idxs, total))| (idxs.len(), *total))
+        .map(|(bp, _)| bp.clone());
+
     let mut block_matches = 0usize;
     let mut max_idx: u32 = 0;
     let mut slots: Vec<LayerSlot> = Vec::with_capacity(names.len());
 
-    for &n in names {
-        if let Some(caps) = re.captures(n) {
-            let idx: u32 = caps.get(1).unwrap().as_str().parse().unwrap_or(0);
-            let sub = caps.get(2).unwrap().as_str().to_string();
-            block_matches += 1;
-            if idx > max_idx {
-                max_idx = idx;
+    for (&n, c) in names.iter().zip(captures) {
+        match c {
+            Some((bp, idx, sub)) if Some(&bp) == dominant_prefix.as_ref() => {
+                block_matches += 1;
+                if idx > max_idx {
+                    max_idx = idx;
+                }
+                slots.push(LayerSlot::Block { idx, sub_path: sub });
             }
-            slots.push(LayerSlot::Block { idx, sub_path: sub });
-        } else {
-            let stripped = if !prefix.is_empty() && n.starts_with(&prefix) {
-                &n[prefix.len()..]
-            } else {
-                n
-            };
-            slots.push(LayerSlot::TopLevel {
-                name: stripped.to_string(),
-            });
+            _ => {
+                let stripped = if !prefix.is_empty() && n.starts_with(&prefix) {
+                    &n[prefix.len()..]
+                } else {
+                    n
+                };
+                slots.push(LayerSlot::TopLevel {
+                    name: stripped.to_string(),
+                });
+            }
         }
     }
 
@@ -287,19 +332,115 @@ mod tests {
         let caps = re
             .captures("encoder.layer.5.attention.self.query.weight")
             .unwrap();
-        assert_eq!(caps.get(1).unwrap().as_str(), "5");
-        assert_eq!(caps.get(2).unwrap().as_str(), "attention.self.query.weight");
+        // Group 1 = block-prefix (empty here, since `encoder.layer` is itself
+        // the block keyword); group 2 = layer idx; group 3 = sub-path.
+        assert_eq!(caps.get(1).unwrap().as_str(), "");
+        assert_eq!(caps.get(2).unwrap().as_str(), "5");
+        assert_eq!(caps.get(3).unwrap().as_str(), "attention.self.query.weight");
+    }
+
+    #[test]
+    fn block_regex_matches_nested_prefix() {
+        // Qwen3.5-style multimodal wrapper: `model.language_model.layers.N.*`.
+        // The block regex must walk through arbitrary dotted prefixes.
+        let re = block_regex();
+        let caps = re
+            .captures("model.language_model.layers.12.self_attn.q_proj.weight")
+            .unwrap();
+        assert_eq!(caps.get(1).unwrap().as_str(), "model.language_model.");
+        assert_eq!(caps.get(2).unwrap().as_str(), "12");
+        assert_eq!(caps.get(3).unwrap().as_str(), "self_attn.q_proj.weight");
+    }
+
+    #[test]
+    fn classifies_nested_prefix_as_blocks() {
+        // 24-layer language model under a `model.language_model.` wrapper.
+        // Without nested-prefix support, none of these would match the regex
+        // and every tensor would fall to TopLevel — losing the architectural
+        // layout entirely.
+        let mut owned: Vec<String> = vec![
+            "model.language_model.embed_tokens.weight".to_string(),
+            "model.language_model.norm.weight".to_string(),
+            "lm_head.weight".to_string(),
+        ];
+        for i in 0..24 {
+            owned.push(format!(
+                "model.language_model.layers.{i}.self_attn.q_proj.weight"
+            ));
+            owned.push(format!(
+                "model.language_model.layers.{i}.self_attn.k_proj.weight"
+            ));
+            owned.push(format!(
+                "model.language_model.layers.{i}.mlp.gate_proj.weight"
+            ));
+        }
+        let names: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let p = classify(&names);
+        assert!(
+            p.block_regex.is_some(),
+            "nested-prefix model should classify as transformer"
+        );
+        assert_eq!(p.num_layers, 24);
+        let block_count = p
+            .slots
+            .iter()
+            .filter(|s| matches!(s, LayerSlot::Block { .. }))
+            .count();
+        assert_eq!(block_count, 24 * 3);
+    }
+
+    #[test]
+    fn dominant_prefix_wins_over_sidecar_stream() {
+        // Qwen3.5 ships an MTP sidecar with one `mtp.layers.0.*` block
+        // alongside the main 24-layer `model.language_model.layers.{0..23}.*`
+        // stack. If we naively treated every regex match as a Block, the
+        // mtp tensors would collide with layer 0 of the main stack. Instead,
+        // the dominant prefix (most layer indices) wins, and the sidecar
+        // tensors fall through to TopLevel.
+        let mut owned: Vec<String> = Vec::new();
+        for i in 0..24 {
+            owned.push(format!(
+                "model.language_model.layers.{i}.self_attn.q_proj.weight"
+            ));
+        }
+        // Sidecar — single layer index, different prefix.
+        owned.push("mtp.layers.0.self_attn.q_proj.weight".to_string());
+        owned.push("mtp.layers.0.mlp.gate_proj.weight".to_string());
+        let names: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let p = classify(&names);
+        assert_eq!(p.num_layers, 24, "main stack should have 24 layers");
+        // The mtp tensors must NOT have been folded into the main stack: they
+        // should land as TopLevel rather than Block.
+        let mtp_slots: Vec<&LayerSlot> = p
+            .slots
+            .iter()
+            .zip(names.iter())
+            .filter(|(_, n)| n.starts_with("mtp."))
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(mtp_slots.len(), 2);
+        for s in mtp_slots {
+            assert!(
+                matches!(s, LayerSlot::TopLevel { .. }),
+                "sidecar tensor should be TopLevel, got {s:?}",
+            );
+        }
     }
 
     #[test]
     fn block_regex_matches_gguf_blk() {
+        // GGUF uses bare `blk.N.*` with no architecture prefix — capture group
+        // 1 (block-prefix) is empty, group 2 is the layer idx, group 3 is the
+        // in-layer sub-path.
         let re = block_regex();
         let caps = re.captures("blk.0.attn_q.weight").unwrap();
-        assert_eq!(caps.get(1).unwrap().as_str(), "0");
-        assert_eq!(caps.get(2).unwrap().as_str(), "attn_q.weight");
+        assert_eq!(caps.get(1).unwrap().as_str(), "");
+        assert_eq!(caps.get(2).unwrap().as_str(), "0");
+        assert_eq!(caps.get(3).unwrap().as_str(), "attn_q.weight");
         let caps = re.captures("blk.31.ffn_down.weight").unwrap();
-        assert_eq!(caps.get(1).unwrap().as_str(), "31");
-        assert_eq!(caps.get(2).unwrap().as_str(), "ffn_down.weight");
+        assert_eq!(caps.get(1).unwrap().as_str(), "");
+        assert_eq!(caps.get(2).unwrap().as_str(), "31");
+        assert_eq!(caps.get(3).unwrap().as_str(), "ffn_down.weight");
     }
 
     #[test]

@@ -65,14 +65,15 @@ pub fn block_regex_for_arch() -> &'static Regex {
     block_regex()
 }
 
-/// `(model|transformer|backbone)?\.?(layers|h|blocks|encoder.layer|decoder.layer)\.(\d+)\.(.*)`
+/// `(model|transformer|backbone)?\.?(layers|h|blocks|encoder.layer|decoder.layer|blk)\.(\d+)\.(.*)`
 /// matches the conventional naming for repeated transformer blocks across
-/// llama-family, gpt-family, bert-family, and t5-family checkpoints.
+/// llama-family, gpt-family, bert-family, and t5-family checkpoints. `blk`
+/// covers the llama.cpp / GGUF convention (e.g. `blk.0.attn_q.weight`).
 fn block_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"^(?:model\.|transformer\.|backbone\.|module\.)?(?:layers|h|blocks|encoder\.layer|decoder\.layer)\.(\d+)\.(.+)$",
+            r"^(?:model\.|transformer\.|backbone\.|module\.)?(?:layers|h|blocks|encoder\.layer|decoder\.layer|blk)\.(\d+)\.(.+)$",
         )
         .expect("static regex compiles")
     })
@@ -288,5 +289,55 @@ mod tests {
             .unwrap();
         assert_eq!(caps.get(1).unwrap().as_str(), "5");
         assert_eq!(caps.get(2).unwrap().as_str(), "attention.self.query.weight");
+    }
+
+    #[test]
+    fn block_regex_matches_gguf_blk() {
+        let re = block_regex();
+        let caps = re.captures("blk.0.attn_q.weight").unwrap();
+        assert_eq!(caps.get(1).unwrap().as_str(), "0");
+        assert_eq!(caps.get(2).unwrap().as_str(), "attn_q.weight");
+        let caps = re.captures("blk.31.ffn_down.weight").unwrap();
+        assert_eq!(caps.get(1).unwrap().as_str(), "31");
+        assert_eq!(caps.get(2).unwrap().as_str(), "ffn_down.weight");
+    }
+
+    #[test]
+    fn classifies_qwen3_gguf_style_llm() {
+        let names = vec![
+            "token_embd.weight",
+            "blk.0.attn_q.weight",
+            "blk.0.attn_k.weight",
+            "blk.0.attn_v.weight",
+            "blk.0.attn_output.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_up.weight",
+            "blk.0.ffn_down.weight",
+            "blk.0.attn_norm.weight",
+            "blk.0.ffn_norm.weight",
+            "blk.1.attn_q.weight",
+            "blk.1.attn_k.weight",
+            "blk.1.attn_v.weight",
+            "blk.1.attn_output.weight",
+            "blk.1.ffn_gate.weight",
+            "blk.1.ffn_up.weight",
+            "blk.1.ffn_down.weight",
+            "blk.1.attn_norm.weight",
+            "blk.1.ffn_norm.weight",
+            "output_norm.weight",
+            "output.weight",
+        ];
+        let p = classify(&names);
+        assert!(
+            p.block_regex.is_some(),
+            "expected transformer classification"
+        );
+        assert_eq!(p.num_layers, 2);
+        let block_count = p
+            .slots
+            .iter()
+            .filter(|s| matches!(s, LayerSlot::Block { .. }))
+            .count();
+        assert_eq!(block_count, 18);
     }
 }

@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use crate::data::{Data, Source, SourceKind};
-use crate::safetensors::DiffFill;
+use crate::format::DiffFill;
 
 use super::align::AlignmentSpan;
 
@@ -52,7 +52,7 @@ pub fn spans_to_sources(
                             mod_start: mod_.start,
                         },
                         byte_size: common,
-                        safetensors: None,
+                        model_info: None,
                         name_override: Some(format!(
                             "diff @ orig:[{}, {}) vs mod:[{}, {})",
                             orig.start,
@@ -78,7 +78,7 @@ pub fn spans_to_sources(
                             fill: orig_fill,
                         },
                         byte_size: len,
-                        safetensors: None,
+                        model_info: None,
                         name_override: Some(format!(
                             "[only in original] {} @ [{}, {})",
                             orig_label,
@@ -100,7 +100,7 @@ pub fn spans_to_sources(
                             fill: DiffFill::Green,
                         },
                         byte_size: len,
-                        safetensors: None,
+                        model_info: None,
                         name_override: Some(format!(
                             "[only in modified] {} @ [{}, {})",
                             mod_label,
@@ -126,7 +126,7 @@ pub fn spans_to_sources(
                         fill: orig_fill,
                     },
                     byte_size: len,
-                    safetensors: None,
+                    model_info: None,
                     name_override: Some(format!(
                         "[only in original] {} @ [{}, {})",
                         orig_label, orig.start, orig.end
@@ -149,7 +149,7 @@ pub fn spans_to_sources(
                         fill: DiffFill::Green,
                     },
                     byte_size: len,
-                    safetensors: None,
+                    model_info: None,
                     name_override: Some(format!(
                         "[only in modified] {} @ [{}, {})",
                         mod_label, mod_.start, mod_.end

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use memmap2::Mmap;
 
 use crate::data::{Data, Source, SourceKind};
-use crate::safetensors::DiffFill;
+use crate::format::DiffFill;
 
 use align::{align_documents, coalesce, AlignmentSpan};
 use parse::parse;
@@ -306,7 +306,7 @@ fn fallback_byte_diff(
                 modified: mod_path.to_path_buf(),
             },
             byte_size: size,
-            safetensors: None,
+            model_info: None,
             name_override: None,
             xet_terms: None,
         };
@@ -320,7 +320,7 @@ fn fallback_byte_diff(
             file_idx: sources.len(),
             kind: SourceKind::UnmatchedRegion { fill: orig_fill },
             byte_size: size,
-            safetensors: None,
+            model_info: None,
             name_override: Some(format!("[only in original] {}", filename_label(orig_path))),
             xet_terms: None,
         });
@@ -334,7 +334,7 @@ fn fallback_byte_diff(
                 fill: DiffFill::Green,
             },
             byte_size: size,
-            safetensors: None,
+            model_info: None,
             name_override: Some(format!("[only in modified] {}", filename_label(mod_path))),
             xet_terms: None,
         });

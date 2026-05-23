@@ -5,7 +5,7 @@ use image::codecs::avif::AvifEncoder;
 use image::{ImageEncoder, ImageFormat, Rgb};
 
 use crate::data::Data;
-use crate::safetensors::DiffFill;
+use crate::format::DiffFill;
 
 pub const TILE: u32 = 512;
 pub const TILE_LOG2: u8 = TILE.trailing_zeros() as u8;

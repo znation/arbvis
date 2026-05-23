@@ -21,7 +21,7 @@ pub mod name_tree;
 pub mod render;
 
 use crate::data::{Source, SourceMeta};
-use crate::safetensors::Dtype;
+use crate::format::Dtype;
 
 /// One contiguous (row-major) element range of one tensor that overlaps a
 /// tile. The tile renderer fetches `byte_start..byte_end` from the source
@@ -118,8 +118,8 @@ pub fn select_layout(
     // mode it's enough that any source carries safetensors info: the typical
     // case is a model-repo diff where the tensor sources are the point and
     // tokenizer/config diffs are incidental.
-    let all_safetensors = !sources.is_empty() && sources.iter().all(|s| s.safetensors.is_some());
-    let any_safetensors = sources.iter().any(|s| s.safetensors.is_some());
+    let all_safetensors = !sources.is_empty() && sources.iter().all(|s| s.model_info.is_some());
+    let any_safetensors = sources.iter().any(|s| s.model_info.is_some());
     let arch_eligible = if diff_mode {
         any_safetensors
     } else {
@@ -129,7 +129,7 @@ pub fn select_layout(
     if arch_eligible {
         if let Some(arch) = arch::ArchLayout::try_build(sources, cumulative_offsets, metas) {
             if diff_mode && !all_safetensors {
-                let skipped = sources.iter().filter(|s| s.safetensors.is_none()).count();
+                let skipped = sources.iter().filter(|s| s.model_info.is_none()).count();
                 log::info!(
                     "arch layout: {skipped} non-safetensors diff source(s) will not appear on the arch canvas (file-level diffs are only rendered in --layout hilbert)"
                 );

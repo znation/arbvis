@@ -3,6 +3,7 @@
 mod color;
 mod data;
 mod deploy;
+mod format;
 mod geometry;
 mod hf_upload;
 mod hf_url;
@@ -11,7 +12,6 @@ mod label;
 mod layout;
 mod perf_monitor;
 mod progress;
-mod safetensors;
 mod single;
 mod throttle;
 mod tiled;
@@ -25,11 +25,11 @@ use anyhow::Context;
 use clap::{Parser, ValueEnum};
 
 use crate::data::InputSpec;
+use crate::format::DiffMetric;
 use crate::layout::LayoutMode;
-use crate::safetensors::DiffMetric;
 use crate::tiled::leaf::TileFormat;
 
-/// CLI mirror of [`safetensors::DiffMetric`]. Kept separate so the clap
+/// CLI mirror of [`format::DiffMetric`]. Kept separate so the clap
 /// derive doesn't pollute the core type.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum DiffMetricArg {

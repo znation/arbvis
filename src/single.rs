@@ -11,12 +11,12 @@ use rayon::prelude::*;
 
 use crate::color::{build_diff_signed_lut, build_pixel_lut};
 use crate::data::{load_source_data, Data, Source, SourceKind};
+use crate::format::{color_for_pos, DiffFill};
 use crate::geometry::{hilbert_to_xy_u64, sampled_in_range};
 use crate::label::draw_file_label;
 use crate::layout::arch::ArchLayout;
 use crate::layout::render::{plain_element_color, PADDING_RGB};
 use crate::layout::{select_layout, Layout, LayoutMode};
-use crate::safetensors::{color_for_pos, DiffFill};
 use crate::xet::{XorbMap, TABLEAU_20};
 
 /// Two-pixel-wide diagonal crosshatch on (x, y) for unmatched-region sources.
@@ -622,7 +622,7 @@ fn render_chunks(
                     return Ok(vec![]);
                 }
                 let dtype_ranges = sources[src_idx]
-                    .safetensors
+                    .model_info
                     .as_ref()
                     .map(|st| st.color_ranges.as_slice());
                 let unmatched_fill: Option<DiffFill> = match &sources[src_idx].kind {

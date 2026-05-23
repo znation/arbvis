@@ -15,12 +15,12 @@ use indicatif::ProgressBar;
 
 use crate::color::{build_diff_signed_lut, build_pixel_lut};
 use crate::data::{load_source_data, Data, Source, SourceKind};
+use crate::format::DiffFill;
 use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, rects_centroid};
 use crate::hf_upload::HfTileSink;
 use crate::hf_url::HfOutputSpec;
 use crate::layout::{select_layout, Layout, LayoutMode};
 use crate::progress::{counter_style, multi, queue_style, status_style};
-use crate::safetensors::DiffFill;
 use crate::throttle::{Throttle, MAX_FETCH_WORKERS};
 use crate::tiled::html::{generate_leaflet_content, FileEntity};
 use crate::tiled::leaf::{
@@ -467,13 +467,13 @@ async fn build_tile_plan(
         arr
     };
 
-    let has_safetensors = !diff_mode && sources.iter().any(|s| s.safetensors.is_some());
+    let has_safetensors = !diff_mode && sources.iter().any(|s| s.model_info.is_some());
     let dtype_mode = has_safetensors && !xet_mode;
     let combined_dtype_ranges: Vec<(u64, u64, image::Rgb<u8>)> = if has_safetensors {
         let mut ranges = Vec::new();
         let mut cumulative: u64 = 0;
         for source in &sources {
-            if let Some(st) = &source.safetensors {
+            if let Some(st) = &source.model_info {
                 for &(start, end, color) in &st.color_ranges {
                     ranges.push((cumulative + start, cumulative + end, color));
                 }
@@ -489,7 +489,7 @@ async fn build_tile_plan(
     {
         let mut cumulative: u64 = 0;
         for source in &sources {
-            if let Some(st) = &source.safetensors {
+            if let Some(st) = &source.model_info {
                 for tensor in &st.tensors {
                     let t_start = cumulative + tensor.file_start;
                     let t_end = cumulative + tensor.file_end;

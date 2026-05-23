@@ -7,14 +7,13 @@ use std::sync::Arc;
 use anyhow::Context;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt};
-use image::Rgb;
 use indicatif::ProgressBar;
 use memmap2::Mmap;
 
+use crate::format::{self, DiffFill, ModelInfo, SourceFormat};
 use crate::hf_url::{self, RemoteFileSpec, RemoteRepo};
 use crate::layout::model_config::{ModelConfig, SafetensorsIndex};
 use crate::progress::{counter_style, multi};
-use crate::safetensors::{self, DiffFill, TensorMeta};
 use crate::xet::{self, XetReader, XetTerm};
 
 /// Bounded concurrency for setup-time HTTP loops (xet reconstruction,
@@ -47,15 +46,40 @@ fn setup_progress(label: &str, total: u64) -> Option<ProgressBar> {
     Some(pb)
 }
 
+/// Block-aligned byte range for reading `len` consecutive elements starting
+/// at element `start` from a tensor's data.
+///
+/// Returns `(byte_offset_from_tensor_start, byte_length, elem_offset_in_buffer)`.
+/// For fixed-stride dtypes the element offset is always 0; for block-stride
+/// it's the in-block position of `start`, since the buffer must begin on a
+/// block boundary so [`crate::format::TensorElementReader`] can decode it.
+fn block_aligned_byte_range(dtype: format::Dtype, start: u64, len: u64) -> (u64, usize, usize) {
+    use format::ElementStride;
+    match dtype.stride() {
+        ElementStride::Fixed(bpe) => {
+            let bpe = bpe as u64;
+            (start * bpe, (len * bpe) as usize, 0)
+        }
+        ElementStride::Block {
+            block_bytes,
+            block_elements,
+        } => {
+            let be = block_elements as u64;
+            let bb = block_bytes as u64;
+            let first_block = start / be;
+            let last_block_excl = (start + len).div_ceil(be);
+            let byte_off = first_block * bb;
+            let byte_len = (last_block_excl - first_block) * bb;
+            let elem_off = (start - first_block * be) as usize;
+            (byte_off, byte_len as usize, elem_off)
+        }
+    }
+}
+
 /// Async fetcher closure used by [`Data::LazyDiff`]. Captures its inputs by
 /// `Arc` so the returned future is `'static` and can be sent across tasks.
 pub type LazyFetcher =
     Arc<dyn Fn(u64, usize) -> BoxFuture<'static, anyhow::Result<Vec<u8>>> + Send + Sync>;
-
-pub struct SafetensorsInfo {
-    pub tensors: Vec<TensorMeta>,
-    pub color_ranges: Vec<(u64, u64, Rgb<u8>)>,
-}
 
 /// Backing storage for a source's bytes.
 pub enum Data {
@@ -174,9 +198,9 @@ pub enum SourceKind {
         mod_: Arc<Data>,
         orig_start: u64,
         mod_start: u64,
-        orig_dtype: safetensors::Dtype,
-        mod_dtype: safetensors::Dtype,
-        metric: safetensors::DiffMetric,
+        orig_dtype: format::Dtype,
+        mod_dtype: format::Dtype,
+        metric: format::DiffMetric,
         scale_orig: f32,
     },
     /// A canvas region for a tensor / file that exists on only one side of a
@@ -220,7 +244,7 @@ pub struct Source {
     pub kind: SourceKind,
     pub byte_size: u64,
     /// Populated for safetensors sources (including diff buffers derived from them).
-    pub safetensors: Option<SafetensorsInfo>,
+    pub model_info: Option<ModelInfo>,
     /// Override the display name (used when kind is Buffered but has a real filename).
     pub name_override: Option<String>,
     /// Xet reconstruction terms for this source. `Some(vec)` when xet
@@ -268,7 +292,7 @@ impl Source {
 /// Files are opened lazily (one at a time) to avoid exhausting OS fd limits.
 /// Stdin is buffered into memory upfront since its size is unknown.
 ///
-/// For .safetensors files: the header is parsed and attached as SafetensorsInfo
+/// For .safetensors files: the header is parsed and attached as ModelInfo
 /// for dtype coloring. The file is kept as a single Source (one per file) so that
 /// inter-tensor borders are not drawn and the Hilbert curve flows smoothly across
 /// the whole file with color transitions only at tensor boundaries.
@@ -283,7 +307,7 @@ pub fn prepare_sources(files: &[PathBuf]) -> anyhow::Result<(Vec<Source>, u64)> 
                 file_idx: 0,
                 kind: SourceKind::Buffered(buf),
                 byte_size: len,
-                safetensors: None,
+                model_info: None,
                 name_override: None,
                 xet_terms: None,
             }],
@@ -315,15 +339,14 @@ pub fn prepare_sources(files: &[PathBuf]) -> anyhow::Result<(Vec<Source>, u64)> 
             }
         };
 
-        let is_st = path.extension().and_then(|e| e.to_str()) == Some("safetensors");
-
-        let safetensors_info = if is_st {
-            match load_safetensors_info(path, size) {
+        let safetensors_info = if let Some(fmt) = SourceFormat::from_path(path) {
+            match load_model_info(path, size, fmt) {
                 Ok(info) => Some(info),
                 Err(e) => {
                     log::warn!(
-                        "{}: failed to parse safetensors header: {} — treating as plain binary",
+                        "{}: failed to parse {:?} header: {} — treating as plain binary",
                         path.display(),
+                        fmt,
                         e
                     );
                     None
@@ -338,7 +361,7 @@ pub fn prepare_sources(files: &[PathBuf]) -> anyhow::Result<(Vec<Source>, u64)> 
             file_idx: sources.len(),
             kind: SourceKind::File(path.clone()),
             byte_size: size,
-            safetensors: safetensors_info,
+            model_info: safetensors_info,
             name_override: None,
             xet_terms: None,
         });
@@ -460,21 +483,22 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
                 let orig = Arc::clone(&orig);
                 let mod_ = Arc::clone(&mod_);
                 Box::pin(async move {
-                    let orig_elem = orig_dtype.element_size() as u64;
-                    let mod_elem = mod_dtype.element_size() as u64;
+                    // Block-aligned byte ranges: for fixed-stride dtypes
+                    // these are `start * elem`/`len * elem`; for block-
+                    // stride they snap down/up to block boundaries and the
+                    // returned `elem_off` is how many elements into the
+                    // fetched buffer the requested start element lives.
+                    let (o_byte_off, o_byte_len, o_elem_off) =
+                        block_aligned_byte_range(orig_dtype, start, len as u64);
+                    let (m_byte_off, m_byte_len, m_elem_off) =
+                        block_aligned_byte_range(mod_dtype, start, len as u64);
                     let ob = orig
-                        .fetch_range(
-                            orig_start + start * orig_elem,
-                            (len as u64 * orig_elem) as usize,
-                        )
+                        .fetch_range(orig_start + o_byte_off, o_byte_len)
                         .await?;
-                    let mb = mod_
-                        .fetch_range(
-                            mod_start + start * mod_elem,
-                            (len as u64 * mod_elem) as usize,
-                        )
-                        .await?;
-                    Ok(orig_dtype.diff_to_u8(&ob, mod_dtype, &mb, metric, scale_orig))
+                    let mb = mod_.fetch_range(mod_start + m_byte_off, m_byte_len).await?;
+                    Ok(orig_dtype.diff_to_u8(
+                        &ob, o_elem_off, mod_dtype, &mb, m_elem_off, metric, scale_orig, len,
+                    ))
                 })
             })))
         }
@@ -494,7 +518,7 @@ pub fn prepare_sources_from_specs(specs: &[InputSpec]) -> anyhow::Result<(Vec<So
                 file_idx: 0,
                 kind: SourceKind::Buffered(buf),
                 byte_size: len,
-                safetensors: None,
+                model_info: None,
                 name_override: None,
                 xet_terms: None,
             }],
@@ -515,12 +539,16 @@ pub fn prepare_sources_from_specs(specs: &[InputSpec]) -> anyhow::Result<(Vec<So
                         continue;
                     }
                 };
-                let is_st = path.extension().and_then(|e| e.to_str()) == Some("safetensors");
-                let safetensors_info = if is_st {
-                    match load_safetensors_info(path, size) {
+                let safetensors_info = if let Some(fmt) = SourceFormat::from_path(path) {
+                    match load_model_info(path, size, fmt) {
                         Ok(info) => Some(info),
                         Err(e) => {
-                            log::warn!("{}: failed to parse safetensors header: {} — treating as plain binary", path.display(), e);
+                            log::warn!(
+                                "{}: failed to parse {:?} header: {} — treating as plain binary",
+                                path.display(),
+                                fmt,
+                                e
+                            );
                             None
                         }
                     }
@@ -532,7 +560,7 @@ pub fn prepare_sources_from_specs(specs: &[InputSpec]) -> anyhow::Result<(Vec<So
                     file_idx: sources.len(),
                     kind: SourceKind::File(path.clone()),
                     byte_size: size,
-                    safetensors: safetensors_info,
+                    model_info: safetensors_info,
                     name_override: None,
                     xet_terms: None,
                 });
@@ -544,7 +572,7 @@ pub fn prepare_sources_from_specs(specs: &[InputSpec]) -> anyhow::Result<(Vec<So
                     file_idx: sources.len(),
                     kind: SourceKind::Http(spec.clone()),
                     byte_size: size,
-                    safetensors: None,
+                    model_info: None,
                     name_override: None,
                     xet_terms: None,
                 });
@@ -713,46 +741,102 @@ pub async fn populate_xet_terms(sources: &mut [Source]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Read just the header of a safetensors file and return parsed metadata.
-fn load_safetensors_info(path: &Path, file_size: u64) -> anyhow::Result<SafetensorsInfo> {
-    // Read the first 8 bytes to get header_size, then read header_size more bytes.
-    let mut f = File::open(path)?;
-    let mut size_buf = [0u8; 8];
-    f.read_exact(&mut size_buf)?;
-    let header_size = u64::from_le_bytes(size_buf);
-    if header_size > 100 * 1024 * 1024 {
-        anyhow::bail!("header_size={} exceeds 100 MB safety limit", header_size);
-    }
-    let total_header = 8 + header_size as usize;
-    let mut header_buf = vec![0u8; total_header];
-    header_buf[..8].copy_from_slice(&size_buf);
-    f.read_exact(&mut header_buf[8..])?;
+/// Initial header-fetch size for GGUF. Most real-world files fit comfortably;
+/// if `Content::read` errors with "unexpected EOF" we retry with the larger
+/// `GGUF_HEADER_FETCH_LARGE`. 1 MiB is enough for Qwen3-30B-A3B and most other
+/// production models.
+const GGUF_HEADER_FETCH_INITIAL: usize = 1024 * 1024;
+const GGUF_HEADER_FETCH_LARGE: usize = 8 * 1024 * 1024;
 
-    let (tensors, header_end) = safetensors::parse_header(&header_buf)?;
-    let color_ranges = safetensors::build_color_ranges(&tensors, header_end, file_size);
-    Ok(SafetensorsInfo {
-        tensors,
-        color_ranges,
-    })
+/// Read just the header of a recognised model file and return parsed
+/// metadata. Dispatches on `format`.
+fn load_model_info(path: &Path, file_size: u64, fmt: SourceFormat) -> anyhow::Result<ModelInfo> {
+    match fmt {
+        SourceFormat::Safetensors => {
+            // Read the first 8 bytes to get header_size, then read header_size more bytes.
+            let mut f = File::open(path)?;
+            let mut size_buf = [0u8; 8];
+            f.read_exact(&mut size_buf)?;
+            let header_size = u64::from_le_bytes(size_buf);
+            if header_size > 100 * 1024 * 1024 {
+                anyhow::bail!("header_size={} exceeds 100 MB safety limit", header_size);
+            }
+            let total_header = 8 + header_size as usize;
+            let mut header_buf = vec![0u8; total_header];
+            header_buf[..8].copy_from_slice(&size_buf);
+            f.read_exact(&mut header_buf[8..])?;
+            let (tensors, header_end) = format::safetensors::parse_header(&header_buf)?;
+            let color_ranges =
+                format::safetensors::build_color_ranges(&tensors, header_end, file_size);
+            Ok(ModelInfo {
+                format: SourceFormat::Safetensors,
+                tensors,
+                color_ranges,
+            })
+        }
+        SourceFormat::Gguf => {
+            // For GGUF the header size isn't known up-front. Read a 1 MiB
+            // prefix first; if parsing fails on EOF, retry with 8 MiB.
+            let mut buf = vec![0u8; GGUF_HEADER_FETCH_INITIAL.min(file_size as usize)];
+            let mut f = File::open(path)?;
+            f.read_exact(&mut buf)?;
+            let header = match format::gguf::parse_header(&buf) {
+                Ok(h) => h,
+                Err(_) if file_size as usize > buf.len() => {
+                    let mut bigger = vec![0u8; GGUF_HEADER_FETCH_LARGE.min(file_size as usize)];
+                    let mut f = File::open(path)?;
+                    f.read_exact(&mut bigger)?;
+                    format::gguf::parse_header(&bigger)?
+                }
+                Err(e) => return Err(e),
+            };
+            let color_ranges = format::gguf::build_color_ranges(
+                &header.tensors,
+                header.tensor_data_offset,
+                file_size,
+            );
+            Ok(ModelInfo {
+                format: SourceFormat::Gguf,
+                tensors: header.tensors,
+                color_ranges,
+            })
+        }
+    }
 }
 
-/// Fetch and parse the safetensors header from any Data source.
-/// For local sources (Mapped/Owned): zero-copy slice access.
-/// For remote sources (Http): two range requests (8 bytes, then full header).
-async fn fetch_safetensors_header(
+/// Fetch and parse the header from any `Data` source. For local sources
+/// (Mapped/Owned) the fetches are zero-copy slices. For remote sources
+/// (Http/Xet) this issues one or two range requests.
+async fn fetch_model_header(
     data: &Data,
-) -> anyhow::Result<(Vec<safetensors::TensorMeta>, u64)> {
-    let size_bytes = data.fetch_range(0, 8).await?;
-    let header_size = u64::from_le_bytes(size_bytes[..8].try_into().unwrap());
-    if header_size > 100 * 1024 * 1024 {
-        anyhow::bail!(
-            "safetensors header_size={} exceeds 100 MB safety limit",
-            header_size
-        );
+    fmt: SourceFormat,
+) -> anyhow::Result<(Vec<format::TensorMeta>, u64)> {
+    match fmt {
+        SourceFormat::Safetensors => {
+            let size_bytes = data.fetch_range(0, 8).await?;
+            let header_size = u64::from_le_bytes(size_bytes[..8].try_into().unwrap());
+            if header_size > 100 * 1024 * 1024 {
+                anyhow::bail!(
+                    "safetensors header_size={} exceeds 100 MB safety limit",
+                    header_size
+                );
+            }
+            let total_header = 8 + header_size as usize;
+            let header_bytes = data.fetch_range(0, total_header).await?;
+            format::safetensors::parse_header(&header_bytes)
+        }
+        SourceFormat::Gguf => {
+            let buf = data.fetch_range(0, GGUF_HEADER_FETCH_INITIAL).await?;
+            let header = match format::gguf::parse_header(&buf) {
+                Ok(h) => h,
+                Err(_) => {
+                    let bigger = data.fetch_range(0, GGUF_HEADER_FETCH_LARGE).await?;
+                    format::gguf::parse_header(&bigger)?
+                }
+            };
+            Ok((header.tensors, header.tensor_data_offset))
+        }
     }
-    let total_header = 8 + header_size as usize;
-    let header_bytes = data.fetch_range(0, total_header).await?;
-    safetensors::parse_header(&header_bytes)
 }
 
 /// Recursively collect all files under `root`, sorted by path.
@@ -791,15 +875,17 @@ pub async fn prepare_diff_sources(
     original: &Path,
     modified: &Path,
     is_finetune: bool,
-    metric: safetensors::DiffMetric,
+    metric: format::DiffMetric,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     let orig_is_file = original.is_file();
     let mod_is_file = modified.is_file();
     let orig_is_dir = original.is_dir();
     let mod_is_dir = modified.is_dir();
 
-    let is_st =
-        |p: &Path| -> bool { p.extension().and_then(|e| e.to_str()) == Some("safetensors") };
+    // Recognise any model format (.safetensors or .gguf) so the tensor-diff
+    // pipeline kicks in for both. Cross-format pairs (safetensors ↔ gguf) are
+    // matched after name canonicalisation in `find_matched_tensor_pairs`.
+    let is_st = |p: &Path| -> bool { SourceFormat::from_path(p).is_some() };
 
     let is_json = |p: &Path| -> bool {
         matches!(
@@ -838,7 +924,7 @@ pub async fn prepare_diff_sources(
                 modified: modified.to_path_buf(),
             },
             byte_size: size_o,
-            safetensors: None,
+            model_info: None,
             name_override: None,
             xet_terms: None,
         };
@@ -940,7 +1026,7 @@ pub async fn prepare_diff_sources(
                             fill: orig_fill_kind,
                         },
                         byte_size: size_o,
-                        safetensors: None,
+                        model_info: None,
                         name_override: Some(format!("[only in original] {}", rel.display())),
                         xet_terms: None,
                     });
@@ -981,7 +1067,7 @@ pub async fn prepare_diff_sources(
                             modified: mod_abs.clone(),
                         },
                         byte_size: max_size,
-                        safetensors: None,
+                        model_info: None,
                         name_override: None,
                         xet_terms: None,
                     });
@@ -1009,7 +1095,7 @@ pub async fn prepare_diff_sources(
                     fill: DiffFill::Green,
                 },
                 byte_size: size_m,
-                safetensors: None,
+                model_info: None,
                 name_override: Some(format!("[only in modified] {}", rel.display())),
                 xet_terms: None,
             });
@@ -1050,7 +1136,7 @@ pub async fn prepare_diff_sources_from_http(
     orig_specs: &[(String, RemoteFileSpec)],
     mod_specs: &[(String, RemoteFileSpec)],
     is_finetune: bool,
-    metric: safetensors::DiffMetric,
+    metric: format::DiffMetric,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     let is_st = |name: &str| name.ends_with(".safetensors");
 
@@ -1240,7 +1326,7 @@ pub async fn prepare_diff_sources_from_http(
             file_idx: sources.len(),
             kind: SourceKind::Buffered(diff),
             byte_size: size,
-            safetensors: None,
+            model_info: None,
             name_override: Some(fname),
             xet_terms: None,
         });
@@ -1256,7 +1342,7 @@ pub async fn prepare_diff_sources_from_http(
             file_idx: sources.len(),
             kind: SourceKind::UnmatchedRegion { fill },
             byte_size: size,
-            safetensors: None,
+            model_info: None,
             name_override: Some(format!("[only in original] {fname}")),
             xet_terms: None,
         });
@@ -1268,7 +1354,7 @@ pub async fn prepare_diff_sources_from_http(
             file_idx: sources.len(),
             kind: SourceKind::UnmatchedRegion { fill },
             byte_size: size,
-            safetensors: None,
+            model_info: None,
             name_override: Some(format!("[only in modified] {fname}")),
             xet_terms: None,
         });
@@ -1280,7 +1366,7 @@ pub async fn prepare_diff_sources_from_http(
             file_idx: sources.len(),
             kind: SourceKind::UnmatchedRegion { fill },
             byte_size: size,
-            safetensors: None,
+            model_info: None,
             name_override: Some(fname),
             xet_terms: None,
         });
@@ -1496,12 +1582,12 @@ fn find_matched_tensor_pairs(orig_names: &[String], mod_names: &[String]) -> Ten
 /// range fetch per matched tensor at setup, parallelised over the throttle.
 async fn fetch_rms_estimates(
     paired_ok: &[(String, String)],
-    orig_map: &HashMap<String, (usize, safetensors::TensorMeta)>,
+    orig_map: &HashMap<String, (usize, format::TensorMeta)>,
     orig_data: &[Arc<Data>],
 ) -> anyhow::Result<Vec<f32>> {
     const SCALE_SAMPLE_BYTES: u64 = 64 * 1024;
     let pb = setup_progress("orig tensor RMS samples", paired_ok.len() as u64);
-    let inputs: Vec<(usize, usize, u64, u64, safetensors::Dtype)> = paired_ok
+    let inputs: Vec<(usize, usize, u64, u64, format::Dtype)> = paired_ok
         .iter()
         .enumerate()
         .map(|(idx, (orig_full, _))| {
@@ -1524,7 +1610,7 @@ async fn fetch_rms_estimates(
                     0.0
                 } else {
                     match d.fetch_range(start, len as usize).await {
-                        Ok(bytes) => safetensors::rms_from_buf(dtype, &bytes),
+                        Ok(bytes) => format::rms_from_buf(dtype, &bytes),
                         Err(e) => {
                             log::warn!("safetensors diff: orig RMS sample failed ({e}); using 0.0");
                             0.0
@@ -1551,35 +1637,37 @@ async fn fetch_rms_estimates(
 /// build per-tensor TensorDiff Source entries without reading any tensor bytes.
 async fn build_multi_safetensors_diff_sources_inner(
     orig_data: &[Arc<Data>],
+    orig_fmts: &[SourceFormat],
     mod_data: &[Arc<Data>],
+    mod_fmts: &[SourceFormat],
     is_finetune: bool,
-    metric: safetensors::DiffMetric,
+    metric: format::DiffMetric,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
-    // Two HTTP range requests per file (8-byte preamble + variable header).
-    // For sharded models this is dozens of files per side; serializing them
-    // wastes the throttle. Fetch both sides concurrently with bounded
-    // parallelism.
+    // Two HTTP range requests per file (8-byte preamble + variable header
+    // for safetensors; one or two prefix fetches for GGUF). For sharded
+    // models this is dozens of files per side; serializing them wastes the
+    // throttle.
     let total = (orig_data.len() + mod_data.len()) as u64;
-    let pb = setup_progress("source files (safetensors headers)", total);
+    let pb = setup_progress("source files (model headers)", total);
 
     async fn fetch_all(
         data: &[Arc<Data>],
+        fmts: &[SourceFormat],
         side: &'static str,
         pb: &Option<ProgressBar>,
-    ) -> anyhow::Result<Vec<(usize, Vec<safetensors::TensorMeta>)>> {
+    ) -> anyhow::Result<Vec<(usize, Vec<format::TensorMeta>)>> {
         let pb = pb.clone();
-        let mut out: Vec<(usize, anyhow::Result<Vec<safetensors::TensorMeta>>)> =
-            stream::iter(data.iter().enumerate())
-                .map(|(i, d)| {
+        let mut out: Vec<(usize, anyhow::Result<Vec<format::TensorMeta>>)> =
+            stream::iter(data.iter().zip(fmts.iter()).enumerate())
+                .map(|(i, (d, fmt))| {
                     let pb = pb.clone();
                     let d = Arc::clone(d);
+                    let fmt = *fmt;
                     async move {
-                        let r = fetch_safetensors_header(&d)
+                        let r = fetch_model_header(&d, fmt)
                             .await
                             .map(|(t, _)| t)
-                            .with_context(|| {
-                                format!("reading safetensors header for {side} file {i}")
-                            });
+                            .with_context(|| format!("reading {fmt:?} header for {side} file {i}"));
                         if let Some(pb) = pb.as_ref() {
                             pb.inc(1);
                         }
@@ -1593,32 +1681,82 @@ async fn build_multi_safetensors_diff_sources_inner(
         out.into_iter().map(|(i, r)| r.map(|t| (i, t))).collect()
     }
 
-    let orig_headers = fetch_all(orig_data, "orig", &pb).await?;
-    let mod_headers = fetch_all(mod_data, "mod", &pb).await?;
+    let orig_headers = fetch_all(orig_data, orig_fmts, "orig", &pb).await?;
+    let mod_headers = fetch_all(mod_data, mod_fmts, "mod", &pb).await?;
     if let Some(pb) = pb.as_ref() {
         pb.finish_and_clear();
     }
 
-    let mut orig_map: HashMap<String, (usize, safetensors::TensorMeta)> = HashMap::new();
+    // Use the first source's format on each side for name canonicalisation.
+    // In practice all files on one side of a diff share a format; the
+    // canonical name table is identity for safetensors and translates GGUF
+    // tensor names to their HF equivalents.
+    let orig_canon_fmt = orig_fmts
+        .first()
+        .copied()
+        .unwrap_or(SourceFormat::Safetensors);
+    let mod_canon_fmt = mod_fmts
+        .first()
+        .copied()
+        .unwrap_or(SourceFormat::Safetensors);
+
+    let mut orig_map: HashMap<String, (usize, format::TensorMeta)> = HashMap::new();
     for (i, tensors) in orig_headers {
         for t in tensors {
             orig_map.entry(t.name.clone()).or_insert((i, t));
         }
     }
-    let mut mod_map: HashMap<String, (usize, safetensors::TensorMeta)> = HashMap::new();
+    let mut mod_map: HashMap<String, (usize, format::TensorMeta)> = HashMap::new();
     for (i, tensors) in mod_headers {
         for t in tensors {
             mod_map.entry(t.name.clone()).or_insert((i, t));
         }
     }
 
-    let orig_names: Vec<String> = orig_map.keys().cloned().collect();
-    let mod_names: Vec<String> = mod_map.keys().cloned().collect();
+    // Canonical name table: maps raw → canonical for each side.
+    let orig_canon: HashMap<String, String> = orig_map
+        .keys()
+        .map(|n| (n.clone(), orig_canon_fmt.canonical_name(n)))
+        .collect();
+    let mod_canon: HashMap<String, String> = mod_map
+        .keys()
+        .map(|n| (n.clone(), mod_canon_fmt.canonical_name(n)))
+        .collect();
+    // Reverse maps: canonical → raw, so after matching on canonical names we
+    // can look the original name back up.
+    let orig_by_canon: HashMap<String, String> = orig_canon
+        .iter()
+        .map(|(raw, can)| (can.clone(), raw.clone()))
+        .collect();
+    let mod_by_canon: HashMap<String, String> = mod_canon
+        .iter()
+        .map(|(raw, can)| (can.clone(), raw.clone()))
+        .collect();
+    let orig_canon_names: Vec<String> = orig_by_canon.keys().cloned().collect();
+    let mod_canon_names: Vec<String> = mod_by_canon.keys().cloned().collect();
     let TensorMatch {
-        pairs,
-        orig_only,
-        mod_only,
-    } = find_matched_tensor_pairs(&orig_names, &mod_names);
+        pairs: canon_pairs,
+        orig_only: canon_orig_only,
+        mod_only: canon_mod_only,
+    } = find_matched_tensor_pairs(&orig_canon_names, &mod_canon_names);
+    // Translate back to raw names for the rest of the pipeline.
+    let pairs: Vec<(String, String)> = canon_pairs
+        .into_iter()
+        .filter_map(|(co, cm)| {
+            let o = orig_by_canon.get(&co)?.clone();
+            let m = mod_by_canon.get(&cm)?.clone();
+            Some((o, m))
+        })
+        .collect();
+    let orig_only: Vec<String> = canon_orig_only
+        .into_iter()
+        .filter_map(|c| orig_by_canon.get(&c).cloned())
+        .collect();
+    let mod_only: Vec<String> = canon_mod_only
+        .into_iter()
+        .filter_map(|c| mod_by_canon.get(&c).cloned())
+        .collect();
+    let _ = (&orig_canon, &mod_canon); // intentional: keep maps alive above
 
     // Tensors present in both, but with incompatible shapes, can't be diffed
     // element-wise. Treat each side independently: in non-finetune mode both
@@ -1663,7 +1801,7 @@ async fn build_multi_safetensors_diff_sources_inner(
     // up to RMS_SAMPLE_ELEMS elements per tensor via a single range fetch;
     // for HTTP sources this is one extra request per tensor at setup time,
     // for local mmap it's free. AbsLog and Exact don't need a scale.
-    let scales: Vec<f32> = if matches!(metric, safetensors::DiffMetric::Rms) {
+    let scales: Vec<f32> = if matches!(metric, format::DiffMetric::Rms) {
         fetch_rms_estimates(&paired_ok, &orig_map, orig_data).await?
     } else {
         vec![0.0; paired_ok.len()]
@@ -1682,9 +1820,9 @@ async fn build_multi_safetensors_diff_sources_inner(
         // dtype is U8 (the output of `Dtype::diff_to_u8`); the *element shape*
         // tracks the original tensor's so layer-N q_proj stacks pixel-aligned
         // with layer-N+1 q_proj.
-        let diff_meta = safetensors::TensorMeta {
+        let diff_meta = format::TensorMeta {
             name: orig_t.name.clone(),
-            dtype: safetensors::Dtype::U8,
+            dtype: format::Dtype::U8,
             shape: orig_t.shape.clone(),
             file_start: 0,
             file_end: nelem,
@@ -1702,7 +1840,8 @@ async fn build_multi_safetensors_diff_sources_inner(
                 scale_orig: *scale_orig,
             },
             byte_size: nelem,
-            safetensors: Some(SafetensorsInfo {
+            model_info: Some(ModelInfo {
+                format: SourceFormat::Safetensors,
                 tensors: vec![diff_meta],
                 color_ranges: Vec::new(),
             }),
@@ -1721,7 +1860,7 @@ async fn build_multi_safetensors_diff_sources_inner(
         DiffFill::Red
     };
 
-    let mut orig_unmatched: Vec<&safetensors::TensorMeta> = Vec::new();
+    let mut orig_unmatched: Vec<&format::TensorMeta> = Vec::new();
     for name in &orig_only {
         orig_unmatched.push(&orig_map[name].1);
     }
@@ -1738,9 +1877,9 @@ async fn build_multi_safetensors_diff_sources_inner(
         // UnmatchedRegion entries (they're drawn via the crosshatch overlay in
         // the Hilbert path); attaching the synthetic meta keeps future arch
         // crosshatch wiring straightforward.
-        let unmatched_meta = safetensors::TensorMeta {
+        let unmatched_meta = format::TensorMeta {
             name: t.name.clone(),
-            dtype: safetensors::Dtype::U8,
+            dtype: format::Dtype::U8,
             shape: t.shape.clone(),
             file_start: 0,
             file_end: nelem,
@@ -1749,7 +1888,8 @@ async fn build_multi_safetensors_diff_sources_inner(
             file_idx: sources.len(),
             kind: SourceKind::UnmatchedRegion { fill: orig_fill },
             byte_size: nelem,
-            safetensors: Some(SafetensorsInfo {
+            model_info: Some(ModelInfo {
+                format: SourceFormat::Safetensors,
                 tensors: vec![unmatched_meta],
                 color_ranges: Vec::new(),
             }),
@@ -1768,9 +1908,9 @@ async fn build_multi_safetensors_diff_sources_inner(
         if nelem == 0 {
             continue;
         }
-        let unmatched_meta = safetensors::TensorMeta {
+        let unmatched_meta = format::TensorMeta {
             name: t.name.clone(),
-            dtype: safetensors::Dtype::U8,
+            dtype: format::Dtype::U8,
             shape: t.shape.clone(),
             file_start: 0,
             file_end: nelem,
@@ -1781,7 +1921,8 @@ async fn build_multi_safetensors_diff_sources_inner(
                 fill: DiffFill::Green,
             },
             byte_size: nelem,
-            safetensors: Some(SafetensorsInfo {
+            model_info: Some(ModelInfo {
+                format: SourceFormat::Safetensors,
                 tensors: vec![unmatched_meta],
                 color_ranges: Vec::new(),
             }),
@@ -1804,25 +1945,37 @@ async fn build_multi_safetensors_diff_sources_inner(
     Ok((sources, total))
 }
 
-/// Build per-tensor diff Sources from multiple local .safetensors files on each side.
+/// Build per-tensor diff Sources from multiple local model files on each
+/// side. Each path's extension determines its format (`.safetensors` or
+/// `.gguf`); mixed-format pairs are routed through the cross-format name
+/// canonicaliser.
 async fn build_multi_safetensors_diff_sources(
     orig_files: &[PathBuf],
     mod_files: &[PathBuf],
     is_finetune: bool,
-    metric: safetensors::DiffMetric,
+    metric: format::DiffMetric,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
-    let open_arcs = |files: &[PathBuf]| -> anyhow::Result<Vec<Arc<Data>>> {
-        files
-            .iter()
-            .map(|p| {
-                let f = File::open(p).with_context(|| format!("opening {}", p.display()))?;
-                Ok(Arc::new(Data::Mapped(unsafe { Mmap::map(&f) }?)))
-            })
-            .collect()
+    let open_arcs = |files: &[PathBuf]| -> anyhow::Result<(Vec<Arc<Data>>, Vec<SourceFormat>)> {
+        let mut datas = Vec::with_capacity(files.len());
+        let mut fmts = Vec::with_capacity(files.len());
+        for p in files {
+            let f = File::open(p).with_context(|| format!("opening {}", p.display()))?;
+            datas.push(Arc::new(Data::Mapped(unsafe { Mmap::map(&f) }?)));
+            fmts.push(SourceFormat::from_path(p).unwrap_or(SourceFormat::Safetensors));
+        }
+        Ok((datas, fmts))
     };
-    let orig_data = open_arcs(orig_files)?;
-    let mod_data = open_arcs(mod_files)?;
-    build_multi_safetensors_diff_sources_inner(&orig_data, &mod_data, is_finetune, metric).await
+    let (orig_data, orig_fmts) = open_arcs(orig_files)?;
+    let (mod_data, mod_fmts) = open_arcs(mod_files)?;
+    build_multi_safetensors_diff_sources_inner(
+        &orig_data,
+        &orig_fmts,
+        &mod_data,
+        &mod_fmts,
+        is_finetune,
+        metric,
+    )
+    .await
 }
 
 /// Build per-tensor diff Sources from multiple remote .safetensors files on each side.
@@ -1835,8 +1988,16 @@ async fn build_multi_safetensors_diff_sources_from_http(
     orig_specs: &[&(String, RemoteFileSpec)],
     mod_specs: &[&(String, RemoteFileSpec)],
     is_finetune: bool,
-    metric: safetensors::DiffMetric,
+    metric: format::DiffMetric,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
+    let orig_fmts: Vec<SourceFormat> = orig_specs
+        .iter()
+        .map(|(n, _)| SourceFormat::from_name(n).unwrap_or(SourceFormat::Safetensors))
+        .collect();
+    let mod_fmts: Vec<SourceFormat> = mod_specs
+        .iter()
+        .map(|(n, _)| SourceFormat::from_name(n).unwrap_or(SourceFormat::Safetensors))
+        .collect();
     async fn make_arcs(specs: Vec<RemoteFileSpec>) -> anyhow::Result<Vec<Arc<Data>>> {
         let total = specs.len() as u64;
         let pb = setup_progress("source files (xet reconstruction for diff)", total);
@@ -1886,7 +2047,15 @@ async fn build_multi_safetensors_diff_sources_from_http(
     }
     let orig_data = make_arcs(orig_specs.iter().map(|(_, s)| s.clone()).collect()).await?;
     let mod_data = make_arcs(mod_specs.iter().map(|(_, s)| s.clone()).collect()).await?;
-    build_multi_safetensors_diff_sources_inner(&orig_data, &mod_data, is_finetune, metric).await
+    build_multi_safetensors_diff_sources_inner(
+        &orig_data,
+        &orig_fmts,
+        &mod_data,
+        &mod_fmts,
+        is_finetune,
+        metric,
+    )
+    .await
 }
 
 /// Build per-tensor diff Sources from two single .safetensors files.
@@ -1894,7 +2063,7 @@ async fn build_safetensors_diff_sources(
     original: &Path,
     modified: &Path,
     is_finetune: bool,
-    metric: safetensors::DiffMetric,
+    metric: format::DiffMetric,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     build_multi_safetensors_diff_sources(
         &[original.to_path_buf()],
@@ -1926,6 +2095,25 @@ pub struct SourceMeta {
 pub async fn try_load_source_meta(source: &Source) -> SourceMeta {
     match &source.kind {
         SourceKind::File(p) => {
+            // For local GGUF files, the equivalent of `config.json` is
+            // embedded in the binary header. Re-parse the prefix to extract
+            // it; this is cheap (~1 MiB read at setup time only).
+            if matches!(SourceFormat::from_path(p), Some(SourceFormat::Gguf)) {
+                if let Ok(meta_size) = std::fs::metadata(p).map(|m| m.len()) {
+                    let want = GGUF_HEADER_FETCH_INITIAL.min(meta_size as usize);
+                    if let Ok(mut f) = File::open(p) {
+                        let mut buf = vec![0u8; want];
+                        if f.read_exact(&mut buf).is_ok() {
+                            if let Ok(h) = format::gguf::parse_header(&buf) {
+                                return SourceMeta {
+                                    config: Some(ModelConfig::from_gguf_metadata(&h.metadata)),
+                                    index: None,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
             if let Some(dir) = p.parent() {
                 SourceMeta {
                     config: ModelConfig::try_from_dir(dir),
@@ -1936,6 +2124,29 @@ pub async fn try_load_source_meta(source: &Source) -> SourceMeta {
             }
         }
         SourceKind::Http(spec) => {
+            // For remote GGUF files, fetch the header prefix and pull
+            // ModelConfig fields out of its KV table instead of looking for
+            // a sibling config.json (which often doesn't exist for
+            // llama.cpp-style GGUF releases).
+            if matches!(
+                SourceFormat::from_name(&spec.filename),
+                Some(SourceFormat::Gguf)
+            ) {
+                let data = Data::Http {
+                    repo: spec.repo.clone(),
+                    filename: Arc::clone(&spec.filename),
+                    revision: Arc::clone(&spec.revision),
+                };
+                if let Ok(buf) = data.fetch_range(0, GGUF_HEADER_FETCH_INITIAL).await {
+                    if let Ok(h) = format::gguf::parse_header(&buf) {
+                        return SourceMeta {
+                            config: Some(ModelConfig::from_gguf_metadata(&h.metadata)),
+                            index: None,
+                        };
+                    }
+                }
+                return SourceMeta::default();
+            }
             // Fetch config.json and model.safetensors.index.json from the
             // same repo via a raw GET. Both files are small enough that we
             // don't bother streaming.

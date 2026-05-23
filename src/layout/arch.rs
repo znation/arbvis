@@ -12,10 +12,10 @@
 use std::collections::BTreeMap;
 
 use crate::data::{Source, SourceKind, SourceMeta};
+use crate::format::{Dtype, TensorMeta};
 use crate::layout::bin_pack::{align_up, pack, Slot};
 use crate::layout::name_tree::{self, LayerSlot};
 use crate::layout::TileRegion;
-use crate::safetensors::{Dtype, TensorMeta};
 use crate::tiled::leaf::TILE;
 
 /// 8-px gutter between tensor slots inside a layer and between layer rows.
@@ -105,7 +105,7 @@ impl ArchLayout {
             if matches!(s.kind, SourceKind::UnmatchedRegion { .. }) {
                 continue;
             }
-            let Some(st) = s.safetensors.as_ref() else {
+            let Some(st) = s.model_info.as_ref() else {
                 continue;
             };
             let off = cumulative_offsets.get(sidx).copied().unwrap_or(0);
@@ -613,17 +613,18 @@ mod tests {
         assert_eq!(extract_block_sub_path("lm_head.weight"), None);
     }
 
-    /// Build a `Source` whose safetensors header reports the listed
-    /// tensors, with sequential byte offsets. The Source's `kind` is
-    /// `UnmatchedRegion` only so we don't need a real file on disk;
-    /// `ArchLayout::try_build` actually looks only at `safetensors`.
+    /// Build a `Source` whose model header reports the listed tensors with
+    /// sequential byte offsets. The Source's `kind` is `Buffered(empty)`
+    /// only so we don't need a real file on disk; `ArchLayout::try_build`
+    /// actually looks only at `model_info`.
     fn synthetic_source(tensors: Vec<TensorMeta>) -> Source {
         let total: u64 = tensors.iter().map(|t| t.file_end - t.file_start).sum();
         Source {
             file_idx: 0,
             kind: SourceKind::Buffered(Vec::new()),
             byte_size: total,
-            safetensors: Some(crate::data::SafetensorsInfo {
+            model_info: Some(crate::format::ModelInfo {
+                format: crate::format::SourceFormat::Safetensors,
                 tensors,
                 color_ranges: Vec::new(),
             }),

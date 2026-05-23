@@ -15,9 +15,13 @@
 //! - Tag entities in `labels.json` with a model architecture string for the
 //!   viewer to display.
 
+use std::collections::HashMap;
 use std::path::Path;
 
+use candle_core::quantized::gguf_file::Value;
 use serde::Deserialize;
+
+use crate::format::gguf::{metadata_array_len, metadata_string, metadata_u64};
 
 /// Fields we care about from a HuggingFace `config.json`. Everything is
 /// optional because configs vary across architectures — `vocab_size` and
@@ -67,6 +71,46 @@ impl ModelConfig {
         let n = self.num_hidden_layers.unwrap_or(0);
         let h = self.hidden_size.unwrap_or(0);
         format!("{arch} ({n} layers, hidden={h})")
+    }
+
+    /// Populate a `ModelConfig` from a parsed GGUF metadata KV table.
+    ///
+    /// GGUF embeds the equivalent of `config.json` inline; we map the
+    /// architecture name to `architectures` and pull the standard
+    /// `{arch}.block_count` / `embedding_length` / `attention.head_count` /
+    /// `attention.head_count_kv` / `feed_forward_length` keys into the
+    /// matching fields. Missing keys remain `None` — the architectural
+    /// layout already tolerates that.
+    pub fn from_gguf_metadata(metadata: &HashMap<String, Value>) -> Self {
+        let arch_name = metadata_string(metadata, "general.architecture").map(String::from);
+        let architectures = arch_name.iter().cloned().collect::<Vec<_>>();
+        // The per-arch keys are prefixed with the architecture name (e.g.
+        // `llama.block_count`, `qwen3.embedding_length`). If we don't know
+        // the architecture we still try a few common prefixes.
+        let candidates: Vec<&str> = match arch_name.as_deref() {
+            Some(a) => vec![a],
+            None => vec!["llama", "qwen2", "qwen3", "mistral", "mixtral"],
+        };
+        let try_key = |suffix: &str| -> Option<u64> {
+            candidates
+                .iter()
+                .find_map(|a| metadata_u64(metadata, &format!("{a}.{suffix}")))
+        };
+        let num_hidden_layers = try_key("block_count").map(|v| v as u32);
+        let hidden_size = try_key("embedding_length").map(|v| v as u32);
+        let num_attention_heads = try_key("attention.head_count").map(|v| v as u32);
+        let num_key_value_heads = try_key("attention.head_count_kv").map(|v| v as u32);
+        let intermediate_size = try_key("feed_forward_length").map(|v| v as u32);
+        let vocab_size = metadata_array_len(metadata, "tokenizer.ggml.tokens").map(|n| n as u64);
+        ModelConfig {
+            architectures,
+            num_hidden_layers,
+            hidden_size,
+            num_attention_heads,
+            num_key_value_heads,
+            intermediate_size,
+            vocab_size,
+        }
     }
 }
 

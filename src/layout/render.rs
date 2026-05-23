@@ -6,7 +6,7 @@
 
 use image::Rgb;
 
-use crate::safetensors::{decode_element, DiffMetric, Dtype};
+use crate::format::{DiffMetric, Dtype, TensorElementReader};
 
 /// Neutral background colour for canvas pixels that fall outside every
 /// tensor's rectangle in [`crate::layout::arch::ArchLayout`]. Not pure black
@@ -34,12 +34,33 @@ pub fn element_to_byte_proxy(dtype: Dtype, raw: &[u8]) -> u8 {
             raw.first().copied().unwrap_or(0)
         }
         Dtype::I8 | Dtype::U8 | Dtype::Bool | Dtype::Unknown => raw.first().copied().unwrap_or(0),
+        // Quantized dtypes shouldn't reach this function — callers route
+        // through `TensorElementReader` for them. Take the first byte as a
+        // best-effort fallback in case any path slips through.
+        Dtype::Q4_0
+        | Dtype::Q4_1
+        | Dtype::Q5_0
+        | Dtype::Q5_1
+        | Dtype::Q8_0
+        | Dtype::Q8_1
+        | Dtype::Q2K
+        | Dtype::Q3K
+        | Dtype::Q4K
+        | Dtype::Q5K
+        | Dtype::Q6K
+        | Dtype::Q8K => raw.first().copied().unwrap_or(0),
     }
 }
 
-/// Element-aware colour for plain-mode visualisation. Reads one element
-/// from `bytes` at `[idx*elem_size, (idx+1)*elem_size)` and runs it through
-/// `pixel_lut` via the byte-proxy mapping.
+/// Element-aware colour for plain-mode visualisation.
+///
+/// For fixed-stride dtypes: reads `dtype.element_size()` bytes at
+/// `elem_idx * elem_size` and proxies through the LUT. Byte-identical to
+/// the pre-quantisation behaviour for safetensors paths.
+///
+/// For block-quantised dtypes: dequantises element `elem_idx` to f32 via
+/// [`TensorElementReader`] and proxies via the f32's MSB (matching how the
+/// equivalent F32 path lights the LUT).
 #[inline]
 pub fn plain_element_color(
     dtype: Dtype,
@@ -47,17 +68,34 @@ pub fn plain_element_color(
     elem_idx: usize,
     pixel_lut: &[Rgb<u8>; 256],
 ) -> Rgb<u8> {
-    let elem = dtype.element_size();
-    let start = elem_idx * elem;
-    if start + elem > bytes.len() {
-        return PADDING_RGB;
+    use crate::format::ElementStride;
+    match dtype.stride() {
+        ElementStride::Fixed(elem) => {
+            let start = elem_idx * elem;
+            if start + elem > bytes.len() {
+                return PADDING_RGB;
+            }
+            let raw = &bytes[start..start + elem];
+            pixel_lut[element_to_byte_proxy(dtype, raw) as usize]
+        }
+        ElementStride::Block { .. } => {
+            let mut reader = TensorElementReader::new(dtype, bytes);
+            let v = reader.element(elem_idx);
+            if !v.is_finite() {
+                return PADDING_RGB;
+            }
+            // MSB of the f32 representation = sign + exponent bits. Same
+            // bucket the byte-Hilbert renderer would pick if it saw the
+            // dequantised value as a 4-byte LE f32.
+            let byte = (v.to_bits() >> 24) as u8;
+            pixel_lut[byte as usize]
+        }
     }
-    let raw = &bytes[start..start + elem];
-    pixel_lut[element_to_byte_proxy(dtype, raw) as usize]
 }
 
-/// Element-aware diff colour. Decodes one element from each side, runs the
-/// shared diff metric, and returns the resulting LUT colour.
+/// Element-aware diff colour. Decodes one element from each side via the
+/// shared [`TensorElementReader`] (so quantised tensors dequant on the fly),
+/// runs the metric, and returns the resulting LUT colour.
 #[inline]
 pub fn diff_element_color(
     orig_dtype: Dtype,
@@ -70,31 +108,22 @@ pub fn diff_element_color(
     scale_orig: f32,
     pixel_lut: &[Rgb<u8>; 256],
 ) -> Rgb<u8> {
-    let orig_elem = orig_dtype.element_size();
-    let mod_elem = mod_dtype.element_size();
-    let os = orig_idx * orig_elem;
-    let ms = mod_idx * mod_elem;
-    if os + orig_elem > orig_bytes.len() || ms + mod_elem > mod_bytes.len() {
-        return PADDING_RGB;
-    }
-    let o = decode_element(orig_dtype, &orig_bytes[os..os + orig_elem]);
-    let m = decode_element(mod_dtype, &mod_bytes[ms..ms + mod_elem]);
-
+    let mut o_reader = TensorElementReader::new(orig_dtype, orig_bytes);
+    let mut m_reader = TensorElementReader::new(mod_dtype, mod_bytes);
+    let o = o_reader.element(orig_idx);
+    let m = m_reader.element(mod_idx);
     if !o.is_finite() || !m.is_finite() {
         return pixel_lut[255];
     }
     let delta = m - o;
     let signed = match metric {
         DiffMetric::Rms => {
-            // Mirror the constants in safetensors.rs::diff_to_u8.
-            const K_RMS_SAT: f32 = 0.5;
-            const RMS_FLOOR: f32 = 1e-6;
+            use crate::format::{K_RMS_SAT, RMS_FLOOR};
             let rms_denom = (K_RMS_SAT * scale_orig.max(RMS_FLOOR)).max(f32::MIN_POSITIVE);
             (delta / rms_denom).clamp(-1.0, 1.0)
         }
         DiffMetric::AbsLog => {
-            const ABS_LOG_MIN: f32 = 1e-6;
-            const ABS_LOG_MAX: f32 = 1e-1;
+            use crate::format::{ABS_LOG_MAX, ABS_LOG_MIN};
             let abs_d = delta.abs();
             if abs_d <= ABS_LOG_MIN {
                 0.0
@@ -140,15 +169,12 @@ pub fn xet_dtype_element_color(
     xorb_ranges: &[(u64, u64, u8)],
     tableau: &[Rgb<u8>; 20],
 ) -> Rgb<u8> {
-    let elem = dtype.element_size();
-    let start = elem_idx * elem;
-    if start + elem > bytes.len() {
+    let (byte, abs_byte_pos) =
+        element_intensity_and_position(dtype, bytes, elem_idx, tensor_byte_start);
+    let Some((byte, abs_byte_pos)) = byte.zip(Some(abs_byte_pos)) else {
         return PADDING_RGB;
-    }
-    let raw = &bytes[start..start + elem];
-    let byte = element_to_byte_proxy(dtype, raw);
+    };
     let d = dtype.to_color();
-    let abs_byte_pos = tensor_byte_start + start as u64;
     match xorb_color_idx(xorb_ranges, abs_byte_pos) {
         Some(idx) => {
             let t = tableau[idx as usize];
@@ -182,14 +208,11 @@ pub fn xet_element_color(
     tableau: &[Rgb<u8>; 20],
     pixel_lut: &[Rgb<u8>; 256],
 ) -> Rgb<u8> {
-    let elem = dtype.element_size();
-    let start = elem_idx * elem;
-    if start + elem > bytes.len() {
+    let (byte, abs_byte_pos) =
+        element_intensity_and_position(dtype, bytes, elem_idx, tensor_byte_start);
+    let Some(byte) = byte else {
         return PADDING_RGB;
-    }
-    let raw = &bytes[start..start + elem];
-    let byte = element_to_byte_proxy(dtype, raw);
-    let abs_byte_pos = tensor_byte_start + start as u64;
+    };
     match xorb_color_idx(xorb_ranges, abs_byte_pos) {
         Some(idx) => {
             let t = tableau[idx as usize];
@@ -201,6 +224,47 @@ pub fn xet_element_color(
             ])
         }
         None => pixel_lut[byte as usize],
+    }
+}
+
+/// Decode element `elem_idx` into an intensity byte (for the byte-LUT path)
+/// and a representative absolute byte position (for the xorb xorb lookup).
+///
+/// For fixed-stride dtypes the byte position is exact (the first byte of the
+/// element). For block-quantised dtypes we return the block's start byte,
+/// so every element within a block shares one xorb hue.
+fn element_intensity_and_position(
+    dtype: Dtype,
+    bytes: &[u8],
+    elem_idx: usize,
+    tensor_byte_start: u64,
+) -> (Option<u8>, u64) {
+    use crate::format::ElementStride;
+    match dtype.stride() {
+        ElementStride::Fixed(elem) => {
+            let start = elem_idx * elem;
+            if start + elem > bytes.len() {
+                return (None, tensor_byte_start);
+            }
+            let raw = &bytes[start..start + elem];
+            (
+                Some(element_to_byte_proxy(dtype, raw)),
+                tensor_byte_start + start as u64,
+            )
+        }
+        ElementStride::Block {
+            block_bytes,
+            block_elements,
+        } => {
+            let mut reader = TensorElementReader::new(dtype, bytes);
+            let v = reader.element(elem_idx);
+            if !v.is_finite() {
+                return (None, tensor_byte_start);
+            }
+            let block_idx = elem_idx / block_elements.max(1);
+            let abs = tensor_byte_start + (block_idx * block_bytes) as u64;
+            (Some((v.to_bits() >> 24) as u8), abs)
+        }
     }
 }
 

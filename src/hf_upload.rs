@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -14,6 +15,17 @@ use crate::hf_url::{self, HfOutputSpec, RepoKind};
 use crate::progress::{counter_style, multi, status_style};
 use crate::throttle::with_throttle;
 use crate::tiled::pyramid_accum::TileSink;
+
+/// Upper bound on files committed in a single Hub commit / bucket upload.
+///
+/// Xet finalizes each commit by uploading a shard that records *every* file
+/// entry; the client that sends that shard has no read timeout (server-side
+/// processing scales with entry count), so an oversized shard can hang the
+/// transfer indefinitely with no progress and no retry. Splitting into batches
+/// of at most this many files bounds each shard, so a stall (a) is far less
+/// likely and (b) only forces a re-send of one small batch rather than the
+/// whole pyramid.
+const MAX_FILES_PER_COMMIT: usize = 1000;
 
 /// Three-bar indicatif progress display fed by hf-hub upload events.
 ///
@@ -68,13 +80,36 @@ impl UploadProgressBars {
 /// the lock keeps the three updates consistent within one event.
 struct UploadProgressLogger {
     bars: Mutex<UploadProgressBars>,
+    /// Current batch (1-indexed) and total batch count, surfaced in the status
+    /// line so multi-commit uploads show "batch 3/44" rather than restarting
+    /// silently each time hf-hub emits a fresh `Start` event.
+    batch: AtomicUsize,
+    total_batches: AtomicUsize,
 }
 
 impl UploadProgressLogger {
     fn new(bars: UploadProgressBars) -> Self {
         Self {
             bars: Mutex::new(bars),
+            batch: AtomicUsize::new(1),
+            total_batches: AtomicUsize::new(1),
         }
+    }
+
+    /// Record which batch is about to upload so the status line can show it.
+    fn set_batch(&self, current: usize, total: usize) {
+        self.batch.store(current, Ordering::Relaxed);
+        self.total_batches.store(total, Ordering::Relaxed);
+    }
+
+    /// `" (batch 3/44)"` when batching, empty string for a single commit.
+    fn batch_suffix(&self) -> String {
+        let total = self.total_batches.load(Ordering::Relaxed);
+        if total <= 1 {
+            return String::new();
+        }
+        let current = self.batch.load(Ordering::Relaxed);
+        format!(" (batch {current}/{total})")
     }
 
     /// Stop the spinners and release the terminal lines. Safe to call when no
@@ -99,7 +134,8 @@ impl ProgressHandler for UploadProgressLogger {
                 bars.logical.set_length(*total_bytes);
                 bars.transfer.set_length(*total_bytes);
                 bars.status.set_message(format!(
-                    "hf upload: {total_files} files, {total_bytes} bytes (uploading)",
+                    "hf upload: {total_files} files, {total_bytes} bytes (uploading){}",
+                    self.batch_suffix(),
                 ));
             }
             ProgressEvent::Upload(UploadEvent::Progress {
@@ -115,8 +151,10 @@ impl ProgressHandler for UploadProgressLogger {
                 bars.transfer.set_position(*transfer_bytes_completed);
             }
             ProgressEvent::Upload(UploadEvent::Committing) => {
-                bars.status
-                    .set_message("hf upload: committing (server-side)");
+                bars.status.set_message(format!(
+                    "hf upload: committing (server-side){}",
+                    self.batch_suffix(),
+                ));
             }
             ProgressEvent::Upload(UploadEvent::Complete) => {
                 bars.status.set_message("hf upload: complete");
@@ -182,9 +220,11 @@ impl HfTileSink {
 
         let (owner, name) = hf_url::split_owner_name(&self.spec.repo_id)?;
         log::info!(
-            "Committing {} files to hf://{}",
+            "Committing {} files to hf://{} in {} batch(es) of up to {}",
             staged.len(),
-            self.spec.repo_id
+            self.spec.repo_id,
+            staged.len().div_ceil(MAX_FILES_PER_COMMIT),
+            MAX_FILES_PER_COMMIT,
         );
 
         let logger = std::sync::Arc::new(UploadProgressLogger::new(UploadProgressBars::new()));
@@ -195,16 +235,27 @@ impl HfTileSink {
                     .into_iter()
                     .map(|t| BucketUpload::new(t.local_path, t.repo_path))
                     .collect();
-                with_throttle(&format!("bucket upload {}", self.spec.repo_id), || async {
-                    self.client
-                        .bucket(owner, name)
-                        .upload_files()
-                        .files(uploads.clone())
-                        .progress(logger.clone())
-                        .send()
-                        .await
-                })
-                .await?;
+                let total_batches = uploads.len().div_ceil(MAX_FILES_PER_COMMIT);
+                for (i, chunk) in uploads.chunks(MAX_FILES_PER_COMMIT).enumerate() {
+                    logger.set_batch(i + 1, total_batches);
+                    let batch = chunk.to_vec();
+                    let label = format!(
+                        "bucket upload {} (batch {}/{})",
+                        self.spec.repo_id,
+                        i + 1,
+                        total_batches
+                    );
+                    with_throttle(&label, || async {
+                        self.client
+                            .bucket(owner, name)
+                            .upload_files()
+                            .files(batch.clone())
+                            .progress(logger.clone())
+                            .send()
+                            .await
+                    })
+                    .await?;
+                }
             }
             kind => {
                 let ops: Vec<CommitOperation> = staged
@@ -212,47 +263,63 @@ impl HfTileSink {
                     .map(|t| CommitOperation::add_file(t.repo_path, t.local_path))
                     .collect();
                 let revision = self.spec.revision.clone();
-                let message = summary.to_string();
-                let label = format!("create_commit {}", self.spec.repo_id);
-                with_throttle(&label, || async {
-                    match kind {
-                        RepoKind::Model => self
-                            .client
-                            .model(owner, name)
-                            .create_commit()
-                            .operations(ops.clone())
-                            .commit_message(message.clone())
-                            .revision(revision.clone())
-                            .progress(logger.clone())
-                            .send()
-                            .await
-                            .map(|_| ()),
-                        RepoKind::Dataset => self
-                            .client
-                            .dataset(owner, name)
-                            .create_commit()
-                            .operations(ops.clone())
-                            .commit_message(message.clone())
-                            .revision(revision.clone())
-                            .progress(logger.clone())
-                            .send()
-                            .await
-                            .map(|_| ()),
-                        RepoKind::Space => self
-                            .client
-                            .space(owner, name)
-                            .create_commit()
-                            .operations(ops.clone())
-                            .commit_message(message.clone())
-                            .revision(revision.clone())
-                            .progress(logger.clone())
-                            .send()
-                            .await
-                            .map(|_| ()),
-                        RepoKind::Bucket => unreachable!(),
-                    }
-                })
-                .await?;
+                let total_batches = ops.len().div_ceil(MAX_FILES_PER_COMMIT);
+                for (i, chunk) in ops.chunks(MAX_FILES_PER_COMMIT).enumerate() {
+                    logger.set_batch(i + 1, total_batches);
+                    let batch = chunk.to_vec();
+                    // Each batch is its own git commit; tag the message when
+                    // there's more than one so the repo history is legible.
+                    let message = if total_batches > 1 {
+                        format!("{summary} (batch {}/{})", i + 1, total_batches)
+                    } else {
+                        summary.to_string()
+                    };
+                    let label = format!(
+                        "create_commit {} (batch {}/{})",
+                        self.spec.repo_id,
+                        i + 1,
+                        total_batches
+                    );
+                    with_throttle(&label, || async {
+                        match kind {
+                            RepoKind::Model => self
+                                .client
+                                .model(owner, name)
+                                .create_commit()
+                                .operations(batch.clone())
+                                .commit_message(message.clone())
+                                .revision(revision.clone())
+                                .progress(logger.clone())
+                                .send()
+                                .await
+                                .map(|_| ()),
+                            RepoKind::Dataset => self
+                                .client
+                                .dataset(owner, name)
+                                .create_commit()
+                                .operations(batch.clone())
+                                .commit_message(message.clone())
+                                .revision(revision.clone())
+                                .progress(logger.clone())
+                                .send()
+                                .await
+                                .map(|_| ()),
+                            RepoKind::Space => self
+                                .client
+                                .space(owner, name)
+                                .create_commit()
+                                .operations(batch.clone())
+                                .commit_message(message.clone())
+                                .revision(revision.clone())
+                                .progress(logger.clone())
+                                .send()
+                                .await
+                                .map(|_| ()),
+                            RepoKind::Bucket => unreachable!(),
+                        }
+                    })
+                    .await?;
+                }
             }
         }
 

@@ -67,7 +67,7 @@ fn region_byte_span(r: &TileRegion) -> (u64, usize, usize) {
             // GGUF convention).
             let col_first_aligned = (r.col_first / be) * be;
             let col_last_aligned = r.col_last_exclusive.div_ceil(be) * be;
-            let bytes_per_row = (r.tensor_cols / be) * bb;
+            let bytes_per_row = r.dtype.stride().bytes_per_row(r.tensor_cols);
             let first =
                 r.tensor_byte_start + r.row_first * bytes_per_row + (col_first_aligned / be) * bb;
             let last = r.tensor_byte_start
@@ -96,7 +96,7 @@ fn region_byte_span(r: &TileRegion) -> (u64, usize, usize) {
             let slot_bytes = pack_dtype_bytes as u64;
             let col_first_aligned = (r.col_first / elems_per_slot) * elems_per_slot;
             let col_last_aligned = r.col_last_exclusive.div_ceil(elems_per_slot) * elems_per_slot;
-            let bytes_per_row = (r.tensor_cols / elems_per_slot) * slot_bytes;
+            let bytes_per_row = r.dtype.stride().bytes_per_row(r.tensor_cols);
             let first = r.tensor_byte_start
                 + r.row_first * bytes_per_row
                 + (col_first_aligned / elems_per_slot) * slot_bytes;

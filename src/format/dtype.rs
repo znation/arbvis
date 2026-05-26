@@ -88,6 +88,42 @@ impl ElementStride {
             }
         }
     }
+
+    /// Bytes spanned by one full row of `cols` elements in a row-major tensor.
+    /// For fixed: `cols * bytes_per_element`. For block/packed: the whole-row
+    /// stride, assuming `cols` is a multiple of the block/slot element count
+    /// (true for canonical GGUF and AWQ/GPTQ layouts). Used to address the
+    /// start of an arbitrary row without re-deriving the packing math.
+    pub fn bytes_per_row(self, cols: u64) -> u64 {
+        match self {
+            ElementStride::Fixed(b) => cols * b as u64,
+            ElementStride::Block {
+                block_bytes,
+                block_elements,
+            } => {
+                if block_elements == 0 {
+                    0
+                } else {
+                    (cols / block_elements as u64) * block_bytes as u64
+                }
+            }
+            ElementStride::Packed {
+                bits,
+                pack_dtype_bytes,
+                ..
+            } => {
+                if bits == 0 {
+                    return 0;
+                }
+                let elems_per_slot = (pack_dtype_bytes as u64 * 8) / bits as u64;
+                if elems_per_slot == 0 {
+                    0
+                } else {
+                    (cols / elems_per_slot) * pack_dtype_bytes as u64
+                }
+            }
+        }
+    }
 }
 
 /// Tensor element data type.
@@ -297,6 +333,14 @@ impl Dtype {
                 }
             }
         }
+    }
+
+    /// Byte offset of the first element of row `row` in a row-major tensor of
+    /// `cols` columns. Accounts for packed/block strides — never assume
+    /// `cols * element_size()`, which is wrong for quantised dtypes. Used to
+    /// re-base a tensor onto a contiguous sub-range of whole rows.
+    pub fn row_byte_offset(self, cols: u64, row: u64) -> u64 {
+        self.stride().bytes_per_row(cols) * row
     }
 
     #[allow(dead_code)]

@@ -48,7 +48,13 @@ pub fn element_to_byte_proxy(dtype: Dtype, raw: &[u8]) -> u8 {
         | Dtype::Q4K
         | Dtype::Q5K
         | Dtype::Q6K
-        | Dtype::Q8K => raw.first().copied().unwrap_or(0),
+        | Dtype::Q8K
+        // Packed-int dtypes (AWQ/GPTQ) also reach this only by accident —
+        // sidecar-aware dequant flows through `TensorElementReader::with_sidecars`.
+        // First-byte fallback gives a plausible legacy hilbert hue.
+        | Dtype::Int4Packed
+        | Dtype::Int3Packed
+        | Dtype::Int8Packed => raw.first().copied().unwrap_or(0),
     }
 }
 
@@ -90,6 +96,11 @@ pub fn plain_element_color(
             let byte = (v.to_bits() >> 24) as u8;
             pixel_lut[byte as usize]
         }
+        // Packed-int dtypes need scales/zeros sidecar buffers which this
+        // renderer entry point doesn't have. Paint as padding so the
+        // viewer sees "we recognise the tensor but can't dequant per-element
+        // here yet" rather than a misleading false-color signal.
+        ElementStride::Packed { .. } => PADDING_RGB,
     }
 }
 
@@ -264,6 +275,28 @@ fn element_intensity_and_position(
             let block_idx = elem_idx / block_elements.max(1);
             let abs = tensor_byte_start + (block_idx * block_bytes) as u64;
             (Some((v.to_bits() >> 24) as u8), abs)
+        }
+        // Packed-int dtypes: report the packed-slot byte position so the
+        // xorb hue stays stable across the elements within a slot. We can't
+        // dequant without sidecars, so the intensity byte is None (renders
+        // as padding).
+        ElementStride::Packed {
+            bits,
+            pack_dtype_bytes,
+            ..
+        } => {
+            if bits == 0 {
+                (None, tensor_byte_start)
+            } else {
+                let elems_per_slot = (pack_dtype_bytes as usize * 8) / bits as usize;
+                let slot_idx = if elems_per_slot == 0 {
+                    0
+                } else {
+                    elem_idx / elems_per_slot
+                };
+                let abs = tensor_byte_start + (slot_idx * pack_dtype_bytes as usize) as u64;
+                (None, abs)
+            }
         }
     }
 }

@@ -77,6 +77,36 @@ fn region_byte_span(r: &TileRegion) -> (u64, usize, usize) {
             let leading_elems = (r.col_first - col_first_aligned) as usize;
             (first, (last - first) as usize, leading_elems)
         }
+        // Packed-int dtypes: snap to packed-slot boundaries the same way
+        // Block does to block boundaries. Each slot holds `elems_per_slot`
+        // elements; `cols` is assumed to be a multiple of `elems_per_slot`
+        // (true for canonical AWQ/GPTQ layouts with group_size ≥ elems_per_slot).
+        ElementStride::Packed {
+            bits,
+            pack_dtype_bytes,
+            ..
+        } => {
+            if bits == 0 {
+                return (r.tensor_byte_start, 0, 0);
+            }
+            let elems_per_slot = ((pack_dtype_bytes as u64) * 8) / bits as u64;
+            if elems_per_slot == 0 {
+                return (r.tensor_byte_start, 0, 0);
+            }
+            let slot_bytes = pack_dtype_bytes as u64;
+            let col_first_aligned = (r.col_first / elems_per_slot) * elems_per_slot;
+            let col_last_aligned = r.col_last_exclusive.div_ceil(elems_per_slot) * elems_per_slot;
+            let bytes_per_row = (r.tensor_cols / elems_per_slot) * slot_bytes;
+            let first = r.tensor_byte_start
+                + r.row_first * bytes_per_row
+                + (col_first_aligned / elems_per_slot) * slot_bytes;
+            let last = r.tensor_byte_start
+                + (r.row_last_exclusive - 1) * bytes_per_row
+                + (col_last_aligned / elems_per_slot) * slot_bytes;
+            debug_assert!(last >= first);
+            let leading_elems = (r.col_first - col_first_aligned) as usize;
+            (first, (last - first) as usize, leading_elems)
+        }
     }
 }
 

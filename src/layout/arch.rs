@@ -673,6 +673,7 @@ mod tests {
             shape,
             file_start: 0,
             file_end: n * elem_size,
+            packed_sidecars: None,
         }
     }
 
@@ -755,6 +756,7 @@ mod tests {
                 shape: vec![8, 8],
                 file_start: off,
                 file_end: off + bytes,
+                packed_sidecars: None,
             });
             off += bytes;
         }
@@ -778,6 +780,7 @@ mod tests {
                 shape: vec![8, 8],
                 file_start: off2,
                 file_end: off2 + bytes,
+                packed_sidecars: None,
             });
             off2 += bytes;
         }
@@ -831,6 +834,7 @@ mod tests {
                     shape,
                     file_start: off,
                     file_end: off + bytes,
+                    packed_sidecars: None,
                 });
                 off += bytes;
             }
@@ -897,6 +901,7 @@ mod tests {
                     shape,
                     file_start: off,
                     file_end: off + bytes,
+                    packed_sidecars: None,
                 });
                 off += bytes;
             }

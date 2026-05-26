@@ -30,12 +30,32 @@ pub enum ElementStride {
         block_bytes: usize,
         block_elements: usize,
     },
+    /// AWQ/GPTQ-style bit-packed integers with out-of-band scales/zeros.
+    ///
+    /// `bits` low-bits-per-element are packed into a `pack_dtype_bytes`-wide
+    /// integer (typically int32, so `pack_dtype_bytes = 4`). Every
+    /// `group_size` consecutive elements share one scale (and, for GPTQ,
+    /// one zero-point) drawn from sidecar tensors. The dequant formula is
+    /// `(q - zero) * scale` for GPTQ, `q * scale` for AWQ.
+    ///
+    /// Unlike `Block`, the scale/zero data is NOT inline with the quants —
+    /// it lives in separately-named tensors. The
+    /// [`TensorElementReader::with_sidecars`] builder threads those buffers
+    /// through. Element `k` resolves to packed slot
+    /// `k / (pack_dtype_bytes * 8 / bits)` with intra-slot position
+    /// `k % (pack_dtype_bytes * 8 / bits)`.
+    Packed {
+        bits: u8,
+        pack_dtype_bytes: u8,
+        group_size: u32,
+    },
 }
 
 impl ElementStride {
     /// Bytes spanned by `n` consecutive elements starting from a block
     /// boundary. For fixed: `n * bytes_per_element`. For block: rounded up
-    /// to the nearest whole block.
+    /// to the nearest whole block. For packed: rounded up to the nearest
+    /// whole pack-slot (e.g. 8 elements for int4-in-int32).
     #[allow(dead_code)]
     pub fn bytes_for_elements(self, n: usize) -> usize {
         match self {
@@ -48,6 +68,22 @@ impl ElementStride {
                     0
                 } else {
                     n.div_ceil(block_elements) * block_bytes
+                }
+            }
+            ElementStride::Packed {
+                bits,
+                pack_dtype_bytes,
+                ..
+            } => {
+                if bits == 0 {
+                    0
+                } else {
+                    let elems_per_slot = (pack_dtype_bytes as usize * 8) / bits as usize;
+                    if elems_per_slot == 0 {
+                        0
+                    } else {
+                        n.div_ceil(elems_per_slot) * pack_dtype_bytes as usize
+                    }
                 }
             }
         }
@@ -91,6 +127,21 @@ pub enum Dtype {
     Q5K,
     Q6K,
     Q8K,
+    // AWQ/GPTQ/EXL2-style bit-packed quants. The element bytes live
+    // inline; the per-group `scales` and `zeros` tensors live as
+    // sidecar tensors named alongside the quant tensor (see
+    // [`crate::format::safetensors::fuse_packed_quant_triples`]).
+    /// 4 bits per element, packed 8-per-int32 with f16/f32 scales (+ zeros).
+    Int4Packed,
+    /// 3 bits per element, packed ~10-per-int32 with f16 scales (+ zeros).
+    /// Used by EXL2 mixed-precision layouts. The 4-bit case dominates the
+    /// HF corpus today; 3-bit is held for future EXL2 / GPTQ detection.
+    #[allow(dead_code)]
+    Int3Packed,
+    /// 8 bits per element, packed 4-per-int32 with f16 scales (+ zeros).
+    /// Rarer on the Hub but reserved for future format detection.
+    #[allow(dead_code)]
+    Int8Packed,
 }
 
 impl Dtype {
@@ -196,28 +247,55 @@ impl Dtype {
             | Dtype::Q4K
             | Dtype::Q5K
             | Dtype::Q6K
-            | Dtype::Q8K => 1,
+            | Dtype::Q8K
+            // Same rationale for packed-int dtypes — the real stride lives
+            // in `Dtype::stride()`. (Int4Packed is 0.5 bytes/elem, etc.)
+            | Dtype::Int4Packed
+            | Dtype::Int3Packed
+            | Dtype::Int8Packed => 1,
         }
     }
 
-    /// Real stride information — `Fixed(n)` for plain dtypes,
-    /// `Block { … }` for the GGUF quantised types.
+    /// Real stride information — `Fixed(n)` for plain dtypes, `Block { … }`
+    /// for the GGUF quantised types, `Packed { … }` for AWQ/GPTQ-style
+    /// bit-packed ints. AWQ/GPTQ canonical layout is int4 packed into int32
+    /// with 128-element groups; sub-byte int3/int8 use the same packing
+    /// dtype but different bit widths.
     pub fn stride(self) -> ElementStride {
-        if let Some(g) = self.to_ggml() {
-            // For F32/F16/BF16, type_size == 4/2/2 and block_size == 1, so
-            // this collapses to `Fixed(type_size)`.
-            let bytes = g.type_size();
-            let elems = g.block_size();
-            if elems <= 1 {
-                ElementStride::Fixed(bytes)
-            } else {
-                ElementStride::Block {
-                    block_bytes: bytes,
-                    block_elements: elems,
+        match self {
+            Dtype::Int4Packed => ElementStride::Packed {
+                bits: 4,
+                pack_dtype_bytes: 4,
+                group_size: 128,
+            },
+            Dtype::Int3Packed => ElementStride::Packed {
+                bits: 3,
+                pack_dtype_bytes: 4,
+                group_size: 128,
+            },
+            Dtype::Int8Packed => ElementStride::Packed {
+                bits: 8,
+                pack_dtype_bytes: 4,
+                group_size: 128,
+            },
+            _ => {
+                if let Some(g) = self.to_ggml() {
+                    // For F32/F16/BF16, type_size == 4/2/2 and block_size == 1,
+                    // so this collapses to `Fixed(type_size)`.
+                    let bytes = g.type_size();
+                    let elems = g.block_size();
+                    if elems <= 1 {
+                        ElementStride::Fixed(bytes)
+                    } else {
+                        ElementStride::Block {
+                            block_bytes: bytes,
+                            block_elements: elems,
+                        }
+                    }
+                } else {
+                    ElementStride::Fixed(self.element_size())
                 }
             }
-        } else {
-            ElementStride::Fixed(self.element_size())
         }
     }
 
@@ -237,6 +315,20 @@ impl Dtype {
                 | Dtype::Q5K
                 | Dtype::Q6K
                 | Dtype::Q8K
+                | Dtype::Int4Packed
+                | Dtype::Int3Packed
+                | Dtype::Int8Packed
+        )
+    }
+
+    /// True for AWQ/GPTQ-style packed integers whose dequant requires
+    /// out-of-band scales (and, for GPTQ, zero-points) — see
+    /// [`ElementStride::Packed`].
+    #[allow(dead_code)]
+    pub fn is_packed(self) -> bool {
+        matches!(
+            self,
+            Dtype::Int4Packed | Dtype::Int3Packed | Dtype::Int8Packed
         )
     }
 
@@ -270,6 +362,12 @@ impl Dtype {
             Dtype::Q8_0 => Rgb([160, 170, 240]),
             Dtype::Q8_1 => Rgb([180, 160, 240]),
             Dtype::Q8K => Rgb([200, 150, 240]),
+            // AWQ/GPTQ packed-int palette. Magenta family — visually distinct
+            // from the cool GGUF range so a mixed AWQ + base diff reads
+            // unambiguously. Stepped by bit width: int3 darkest, int8 brightest.
+            Dtype::Int3Packed => Rgb([160, 40, 180]),
+            Dtype::Int4Packed => Rgb([200, 60, 200]),
+            Dtype::Int8Packed => Rgb([230, 100, 210]),
         }
     }
 
@@ -306,6 +404,9 @@ impl Dtype {
             Dtype::Q5K => "Q5K",
             Dtype::Q6K => "Q6K",
             Dtype::Q8K => "Q8K",
+            Dtype::Int3Packed => "I3_pack",
+            Dtype::Int4Packed => "I4_pack",
+            Dtype::Int8Packed => "I8_pack",
         }
     }
 
@@ -416,13 +517,124 @@ pub fn decode_element(dtype: Dtype, bytes: &[u8]) -> f32 {
         | Dtype::Q4K
         | Dtype::Q5K
         | Dtype::Q6K
-        | Dtype::Q8K => {
+        | Dtype::Q8K
+        // Packed dtypes need sidecar context — see TensorElementReader::with_sidecars.
+        | Dtype::Int4Packed
+        | Dtype::Int3Packed
+        | Dtype::Int8Packed => {
             panic!(
                 "decode_element: quantized dtype {:?} needs TensorElementReader",
                 dtype
             )
         }
     }
+}
+
+/// Decode one element from an AWQ/GPTQ-style packed-int tensor.
+///
+/// `qweight` is the row-major byte buffer of packed ints (typically int32);
+/// `sc` carries the matching scales / qzeros byte buffers. Element `k` is
+/// the logical (unpacked) element index — row-major across the unpacked
+/// `[rows, cols]` shape, where `cols = sc.cols`.
+///
+/// Layout assumed (GPTQ / AWQ canonical):
+///   - quant slots are arranged row-major across columns, so the slot
+///     containing logical column `c` of row `r` lives at
+///     `(r * (cols / elems_per_slot) + c / elems_per_slot)` packed ints
+///   - within a slot, the `bits`-wide field for in-slot index `i` is at
+///     bit positions `[i*bits, i*bits + bits)`
+///   - scales are `[rows / group_size, cols]` (one scale per (group, col))
+///   - qzeros mirror scales but bit-packed the same way as qweight
+///
+/// Returns NaN on any out-of-range access (the renderer treats that as a
+/// "padding / partial fetch" pixel).
+fn packed_element(
+    qweight: &[u8],
+    sc: PackedSidecarRefs<'_>,
+    k: usize,
+    bits: u8,
+    pack_dtype_bytes: u8,
+    group_size: usize,
+) -> f32 {
+    if bits == 0 || pack_dtype_bytes == 0 || sc.cols == 0 {
+        return f32::NAN;
+    }
+    let bits = bits as usize;
+    let slot_bytes = pack_dtype_bytes as usize;
+    let elems_per_slot = (slot_bytes * 8) / bits;
+    if elems_per_slot == 0 {
+        return f32::NAN;
+    }
+    let cols = sc.cols as usize;
+    if cols == 0 || cols % elems_per_slot != 0 {
+        return f32::NAN;
+    }
+    let row = k / cols;
+    let col = k % cols;
+    let slots_per_row = cols / elems_per_slot;
+    let slot_idx = row * slots_per_row + col / elems_per_slot;
+    let in_slot = col % elems_per_slot;
+
+    // Read packed int (little-endian) from qweight.
+    let off = slot_idx * slot_bytes;
+    if off + slot_bytes > qweight.len() {
+        return f32::NAN;
+    }
+    let packed = read_u32_le(&qweight[off..off + slot_bytes]);
+    let mask: u32 = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
+    let q = ((packed >> (in_slot * bits)) & mask) as i32;
+
+    // Group index and scale lookup.
+    let group_idx = if group_size == 0 { 0 } else { row / group_size };
+    let scale_elem_idx = group_idx * cols + col;
+    let scale = read_scalar(sc.scales, sc.scales_dtype, scale_elem_idx);
+    if !scale.is_finite() {
+        return f32::NAN;
+    }
+
+    // Zero lookup. For AWQ asymmetric: zeros buffer is packed the same way
+    // as qweight; for symmetric variants (no zeros) treat zero as 0.
+    let zero = if let Some(zb) = sc.zeros {
+        if sc.zeros_dtype == Dtype::F16 || sc.zeros_dtype == Dtype::F32 {
+            // EXL2 stores zeros as floats; same indexing as scales.
+            let z = read_scalar(zb, sc.zeros_dtype, scale_elem_idx);
+            if !z.is_finite() {
+                return f32::NAN;
+            }
+            z
+        } else {
+            // GPTQ/AWQ store zeros bit-packed identically to qweight.
+            let zslot = group_idx * slots_per_row + col / elems_per_slot;
+            let zoff = zslot * slot_bytes;
+            if zoff + slot_bytes > zb.len() {
+                return f32::NAN;
+            }
+            let zp = read_u32_le(&zb[zoff..zoff + slot_bytes]);
+            let z = ((zp >> (in_slot * bits)) & mask) as i32;
+            z as f32
+        }
+    } else {
+        0.0
+    };
+
+    ((q as f32) - zero) * scale
+}
+
+fn read_u32_le(b: &[u8]) -> u32 {
+    let mut v = 0u32;
+    for (i, &x) in b.iter().take(4).enumerate() {
+        v |= (x as u32) << (i * 8);
+    }
+    v
+}
+
+fn read_scalar(bytes: &[u8], dtype: Dtype, elem_idx: usize) -> f32 {
+    let bpe = dtype.element_size();
+    let off = elem_idx * bpe;
+    if off + bpe > bytes.len() {
+        return f32::NAN;
+    }
+    decode_element(dtype, &bytes[off..off + bpe])
 }
 
 /// Per-element f32 decode with a single-block dequant cache.
@@ -433,12 +645,39 @@ pub fn decode_element(dtype: Dtype, bytes: &[u8]) -> f32 {
 /// For quantized dtypes the reader keeps the most recently dequantized block
 /// in `cache`; sequential `element(k)` calls in the hot per-tile loop hit
 /// cache on every call after the first within each block.
+///
+/// For [`ElementStride::Packed`] dtypes (AWQ / GPTQ) the reader additionally
+/// needs the matching `scales` and `qzeros` byte buffers. Attach them via
+/// [`TensorElementReader::with_sidecars`]; without sidecars, packed dtypes
+/// decode to NaN (so the renderer paints them as a sentinel rather than
+/// returning a wrong f32).
 pub struct TensorElementReader<'a> {
     dtype: Dtype,
     bytes: &'a [u8],
     /// Cached `(block_index, dequantized_block_floats)`. Only populated for
     /// quantized dtypes.
     cache: Option<(usize, Vec<f32>)>,
+    /// AWQ/GPTQ sidecars. `None` for non-packed dtypes; required (else
+    /// `element` returns NaN) for `ElementStride::Packed`.
+    sidecars: Option<PackedSidecarRefs<'a>>,
+}
+
+/// Borrowed sidecar buffers for one packed-int tensor. Attached to a
+/// [`TensorElementReader`] via [`TensorElementReader::with_sidecars`].
+///
+/// Lifetime is tied to the reader so the caller can hold the fetched byte
+/// buffers on the stack alongside the reader without lifetime gymnastics.
+#[derive(Clone, Copy)]
+pub struct PackedSidecarRefs<'a> {
+    pub scales: &'a [u8],
+    pub scales_dtype: Dtype,
+    /// `None` for symmetric quants (e.g. AWQ without zero-points).
+    pub zeros: Option<&'a [u8]>,
+    pub zeros_dtype: Dtype,
+    /// Number of output columns in the unpacked tensor — needed to map a
+    /// logical element index to its (group_index, in_group_pos) pair when
+    /// `group_size` doesn't evenly divide the row stride.
+    pub cols: u32,
 }
 
 impl<'a> TensorElementReader<'a> {
@@ -447,7 +686,17 @@ impl<'a> TensorElementReader<'a> {
             dtype,
             bytes,
             cache: None,
+            sidecars: None,
         }
+    }
+
+    /// Builder: attach AWQ/GPTQ sidecar tensors. Only used by callers
+    /// rendering packed-int tensors; for plain / Block dtypes this is a
+    /// no-op (the sidecars are simply unused).
+    #[allow(dead_code)]
+    pub fn with_sidecars(mut self, refs: PackedSidecarRefs<'a>) -> Self {
+        self.sidecars = Some(refs);
+        self
     }
 
     /// f32 value of element `k`. Returns NaN if `k` is out of range so the
@@ -494,6 +743,25 @@ impl<'a> TensorElementReader<'a> {
                     .map(|(_, v)| v[in_blk])
                     .unwrap_or(f32::NAN)
             }
+            ElementStride::Packed {
+                bits,
+                pack_dtype_bytes,
+                group_size,
+            } => {
+                let Some(sc) = self.sidecars else {
+                    // Without sidecars, packed dtypes can't be dequantized;
+                    // return NaN so the renderer paints a sentinel.
+                    return f32::NAN;
+                };
+                packed_element(
+                    self.bytes,
+                    sc,
+                    k,
+                    bits,
+                    pack_dtype_bytes,
+                    group_size as usize,
+                )
+            }
         }
     }
 
@@ -516,6 +784,22 @@ impl<'a> TensorElementReader<'a> {
                 .checked_div(block_bytes)
                 .map(|nb| sample_elements.min(nb * block_elements))
                 .unwrap_or(0),
+            ElementStride::Packed {
+                bits,
+                pack_dtype_bytes,
+                ..
+            } => {
+                if bits == 0 {
+                    0
+                } else {
+                    let elems_per_slot = (pack_dtype_bytes as usize * 8) / bits as usize;
+                    self.bytes
+                        .len()
+                        .checked_div(pack_dtype_bytes as usize)
+                        .map(|slots| sample_elements.min(slots * elems_per_slot))
+                        .unwrap_or(0)
+                }
+            }
         };
         if n == 0 {
             return 0.0;
@@ -556,6 +840,22 @@ pub fn rms_from_buf(dtype: Dtype, bytes: &[u8]) -> f32 {
             .checked_div(block_bytes)
             .map(|nb| nb * block_elements)
             .unwrap_or(0),
+        ElementStride::Packed {
+            bits,
+            pack_dtype_bytes,
+            ..
+        } => {
+            if bits == 0 {
+                0
+            } else {
+                let elems_per_slot = (pack_dtype_bytes as usize * 8) / bits as usize;
+                bytes
+                    .len()
+                    .checked_div(pack_dtype_bytes as usize)
+                    .map(|slots| slots * elems_per_slot)
+                    .unwrap_or(0)
+            }
+        }
     };
     reader.rms_estimate(n)
 }
@@ -682,6 +982,88 @@ mod tests {
         assert_eq!(Dtype::F32.stride(), ElementStride::Fixed(4));
         assert_eq!(Dtype::F16.stride(), ElementStride::Fixed(2));
         assert_eq!(Dtype::I8.stride(), ElementStride::Fixed(1));
+    }
+
+    #[test]
+    fn stride_packed_for_awq_dtypes() {
+        match Dtype::Int4Packed.stride() {
+            ElementStride::Packed {
+                bits,
+                pack_dtype_bytes,
+                group_size,
+            } => {
+                assert_eq!(bits, 4);
+                assert_eq!(pack_dtype_bytes, 4);
+                assert_eq!(group_size, 128);
+            }
+            other => panic!("expected Packed for Int4Packed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn packed_int4_dequant_known_values() {
+        // Build a 2-row × 8-col tensor of int4 quants:
+        //   row 0: [1, 2, 3, 4, 5, 6, 7, 8]   (one int32 slot = 0x87654321)
+        //   row 1: [0, 1, 0, 2, 0, 3, 0, 4]   (one int32 slot = 0x40302010)
+        // Two group_size=2 groups per row (well, group_size really applies on
+        // rows for canonical layouts — for this micro test we set group_size = 2
+        // so we exercise the group lookup). Scale = 1.0, zero = 0 ⇒ dequant
+        // returns the int4 value as-is.
+        //
+        // We construct sidecars manually:
+        //   scales: 2 groups × 8 cols, all = 1.0 (f32)
+        //   zeros:  None (symmetric)
+        let qweight: Vec<u8> = {
+            let row0: u32 = 0x8765_4321;
+            let row1: u32 = 0x4030_2010;
+            let mut v = Vec::new();
+            v.extend_from_slice(&row0.to_le_bytes());
+            v.extend_from_slice(&row1.to_le_bytes());
+            v
+        };
+        let scales: Vec<u8> = {
+            let mut v = Vec::new();
+            // 2 groups × 8 cols, but for this single-row-per-group layout
+            // we just need group 0 (covers row 0) and group 1 (covers row 1).
+            // Each group has 8 cols. So 16 scales total.
+            for _ in 0..16 {
+                v.extend_from_slice(&1.0f32.to_le_bytes());
+            }
+            v
+        };
+        let sc = PackedSidecarRefs {
+            scales: &scales,
+            scales_dtype: Dtype::F32,
+            zeros: None,
+            zeros_dtype: Dtype::Unknown,
+            cols: 8,
+        };
+
+        let mut r = TensorElementReader::new(Dtype::Int4Packed, &qweight).with_sidecars(sc);
+        // Override the stride's group_size via construction is not exposed,
+        // but the stride() method returns group_size=128 for Int4Packed by
+        // default. For our 2-row test we set the scales table to a full
+        // 16-element layout (groups 0/1 × cols 0..8) so the group lookup at
+        // row 0 picks scale group 0 = 1.0, row 1 picks group 0 again (since
+        // row 1 / 128 = 0). Either way, scale=1.0.
+        // Row 0 values:
+        assert_eq!(r.element(0), 1.0);
+        assert_eq!(r.element(1), 2.0);
+        assert_eq!(r.element(7), 8.0);
+        // Row 1 values:
+        assert_eq!(r.element(8), 0.0);
+        assert_eq!(r.element(9), 1.0);
+        assert_eq!(r.element(15), 4.0);
+    }
+
+    #[test]
+    fn packed_without_sidecars_returns_nan() {
+        // Same packed buffer, no sidecars attached → NaN per element.
+        let qweight: Vec<u8> = vec![0xFFu8; 4];
+        let mut r = TensorElementReader::new(Dtype::Int4Packed, &qweight);
+        for k in 0..8 {
+            assert!(r.element(k).is_nan(), "k={k}: expected NaN without sidecars");
+        }
     }
 
     #[test]

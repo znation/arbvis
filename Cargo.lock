@@ -184,6 +184,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "xet-core-structures",
+ "zip",
 ]
 
 [[package]]

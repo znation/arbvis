@@ -73,6 +73,35 @@ fn block_aligned_byte_range(dtype: format::Dtype, start: u64, len: u64) -> (u64,
             let elem_off = (start - first_block * be) as usize;
             (byte_off, byte_len as usize, elem_off)
         }
+        // Packed dtypes (AWQ / GPTQ): treat the packed-int slot as the
+        // atomic unit. Snap down to the slot containing `start` and up to
+        // the slot just past `start + len`; report the in-slot element
+        // offset so the reader can skip over `elem_off` elements before
+        // returning the requested range. The sidecar scales/zeros buffers
+        // are fetched separately by the render path — this function only
+        // sizes the qweight read.
+        ElementStride::Packed {
+            bits,
+            pack_dtype_bytes,
+            ..
+        } => {
+            if bits == 0 {
+                (0, 0, 0)
+            } else {
+                let elems_per_slot = ((pack_dtype_bytes as u64) * 8) / bits as u64;
+                if elems_per_slot == 0 {
+                    (0, 0, 0)
+                } else {
+                    let slot_bytes = pack_dtype_bytes as u64;
+                    let first_slot = start / elems_per_slot;
+                    let last_slot_excl = (start + len).div_ceil(elems_per_slot);
+                    let byte_off = first_slot * slot_bytes;
+                    let byte_len = (last_slot_excl - first_slot) * slot_bytes;
+                    let elem_off = (start - first_slot * elems_per_slot) as usize;
+                    (byte_off, byte_len as usize, elem_off)
+                }
+            }
+        }
     }
 }
 
@@ -801,6 +830,22 @@ fn load_model_info(path: &Path, file_size: u64, fmt: SourceFormat) -> anyhow::Re
                 color_ranges,
             })
         }
+        SourceFormat::Pickle => {
+            // Pickle's zip end-of-central-directory lives at the END of the
+            // file, so unlike safetensors/GGUF we can't parse from a prefix.
+            // candle's pickle reader opens the file by path; pass it through.
+            let header = format::pickle::parse_header(path)?;
+            let color_ranges = format::pickle::build_color_ranges(
+                &header.tensors,
+                header.tensor_data_offset,
+                file_size,
+            );
+            Ok(ModelInfo {
+                format: SourceFormat::Pickle,
+                tensors: header.tensors,
+                color_ranges,
+            })
+        }
     }
 }
 
@@ -835,6 +880,17 @@ async fn fetch_model_header(
                 }
             };
             Ok((header.tensors, header.tensor_data_offset))
+        }
+        SourceFormat::Pickle => {
+            // The zip end-of-central-directory record lives at the END of a
+            // pickle file (.bin / .pth / .pt), so we can't parse from a head
+            // prefix the way we do for safetensors/GGUF. Supporting this
+            // would need a tail-first range fetch plus an in-memory zip
+            // parser; for v1 we surface a clear error and let the caller
+            // fall back to "treat as plain bytes".
+            anyhow::bail!(
+                "pickle: remote header fetch not yet supported — download the file first"
+            )
         }
     }
 }
@@ -1826,6 +1882,7 @@ async fn build_multi_safetensors_diff_sources_inner(
             shape: orig_t.shape.clone(),
             file_start: 0,
             file_end: nelem,
+            packed_sidecars: None,
         };
         sources.push(Source {
             file_idx: sources.len(),
@@ -1883,6 +1940,7 @@ async fn build_multi_safetensors_diff_sources_inner(
             shape: t.shape.clone(),
             file_start: 0,
             file_end: nelem,
+            packed_sidecars: None,
         };
         sources.push(Source {
             file_idx: sources.len(),
@@ -1914,6 +1972,7 @@ async fn build_multi_safetensors_diff_sources_inner(
             shape: t.shape.clone(),
             file_start: 0,
             file_end: nelem,
+            packed_sidecars: None,
         };
         sources.push(Source {
             file_idx: sources.len(),

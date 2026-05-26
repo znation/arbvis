@@ -100,6 +100,32 @@ pub struct TensorMeta {
     /// Absolute byte positions in the file [start, end)
     pub file_start: u64,
     pub file_end: u64,
+    /// AWQ / GPTQ packed-int sidecar references. `Some(...)` for tensors
+    /// whose [`Dtype`] is one of `IntNPacked`; `None` for plain / Block
+    /// dtypes. The qweight byte range lives in `file_start`/`file_end`; the
+    /// sidecar struct carries the parallel byte ranges and dtypes for the
+    /// `scales` and `qzeros` tensors needed to dequantise.
+    #[allow(dead_code)]
+    pub packed_sidecars: Option<PackedSidecars>,
+}
+
+/// Byte ranges and dtypes for the `scales` / `qzeros` sidecar tensors that
+/// accompany an AWQ/GPTQ-style packed-int `qweight` tensor in the same file.
+/// Populated by [`crate::format::safetensors::fuse_packed_quant_triples`].
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct PackedSidecars {
+    pub scales_start: u64,
+    pub scales_end: u64,
+    pub scales_dtype: Dtype,
+    /// `None` for AWQ symmetric quants without zero-points. `Some` for
+    /// GPTQ / EXL2 / AWQ-with-qzeros.
+    pub zeros_start: Option<u64>,
+    pub zeros_end: Option<u64>,
+    pub zeros_dtype: Dtype,
+    /// Number of output columns in the unpacked tensor — needed when
+    /// indexing per-element across rows.
+    pub cols: u32,
 }
 
 impl TensorMeta {

@@ -1,14 +1,15 @@
 //! Multi-format model parsing.
 //!
-//! arbvis recognises two model file formats: `.safetensors` (HuggingFace's
-//! reference format) and `.gguf` (llama.cpp's quantised inference format).
-//! Each one has its own header layout, tensor name convention, and dtype
-//! universe, but downstream code only ever sees the format-agnostic types
-//! re-exported here: [`TensorMeta`], [`ModelInfo`], [`Dtype`], [`DiffMetric`],
-//! and [`DiffFill`].
+//! arbvis recognises three model file formats: `.safetensors` (HuggingFace's
+//! reference format), `.gguf` (llama.cpp's quantised inference format), and
+//! PyTorch pickle (`.bin` / `.pth` / `.pt`, the pre-safetensors HF legacy
+//! format). Each one has its own header layout, tensor name convention, and
+//! dtype universe, but downstream code only ever sees the format-agnostic
+//! types re-exported here: [`TensorMeta`], [`ModelInfo`], [`Dtype`],
+//! [`DiffMetric`], and [`DiffFill`].
 //!
 //! Format dispatch is via the [`SourceFormat`] enum. A `match` arm per
-//! format keeps the hot per-tile decode path monomorphic; adding a third
+//! format keeps the hot per-tile decode path monomorphic; adding a fourth
 //! format (MLX, ONNX, …) means adding one variant and one sibling module.
 
 use std::path::Path;
@@ -18,6 +19,7 @@ use image::Rgb;
 pub mod dtype;
 pub mod gguf;
 pub mod name_map;
+pub mod pickle;
 pub mod safetensors;
 pub mod types;
 
@@ -36,6 +38,10 @@ pub use types::{
 pub enum SourceFormat {
     Safetensors,
     Gguf,
+    /// PyTorch pickle (`.bin` / `.pth` / `.pt`) — a zip archive containing
+    /// a `data.pkl` opcode stream and one storage entry per tensor. Decoded
+    /// safely (no Python execution) via `candle_core::pickle`.
+    Pickle,
 }
 
 impl SourceFormat {
@@ -56,6 +62,11 @@ impl SourceFormat {
         match ext.to_ascii_lowercase().as_str() {
             "safetensors" => Some(SourceFormat::Safetensors),
             "gguf" => Some(SourceFormat::Gguf),
+            // PyTorch's three torch.save() extensions. `.bin` is also used
+            // by other formats (HF tokenizer binaries, generic blobs); if
+            // a non-pickle `.bin` slips in the parser will error cleanly
+            // and the data layer falls back to "treat as plain bytes".
+            "bin" | "pth" | "pt" => Some(SourceFormat::Pickle),
             _ => None,
         }
     }
@@ -82,6 +93,7 @@ impl SourceFormat {
                 safetensors::build_color_ranges(tensors, header_end, file_size)
             }
             SourceFormat::Gguf => gguf::build_color_ranges(tensors, header_end, file_size),
+            SourceFormat::Pickle => pickle::build_color_ranges(tensors, header_end, file_size),
         }
     }
 }
@@ -130,10 +142,26 @@ mod tests {
     }
 
     #[test]
+    fn from_path_pickle() {
+        assert_eq!(
+            SourceFormat::from_path(Path::new("pytorch_model.bin")),
+            Some(SourceFormat::Pickle)
+        );
+        assert_eq!(
+            SourceFormat::from_path(Path::new("model.pth")),
+            Some(SourceFormat::Pickle)
+        );
+        assert_eq!(
+            SourceFormat::from_path(Path::new("/tmp/checkpoint.PT")),
+            Some(SourceFormat::Pickle)
+        );
+    }
+
+    #[test]
     fn from_path_unknown() {
         assert_eq!(SourceFormat::from_path(Path::new("/etc/hosts")), None);
-        assert_eq!(SourceFormat::from_path(Path::new("foo.bin")), None);
         assert_eq!(SourceFormat::from_path(Path::new("foo")), None);
+        assert_eq!(SourceFormat::from_path(Path::new("model.onnx")), None);
     }
 
     #[test]

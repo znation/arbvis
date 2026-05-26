@@ -54,6 +54,7 @@ pub fn parse_header(data: &[u8]) -> anyhow::Result<GgufHeader> {
             shape,
             file_start,
             file_end,
+            packed_sidecars: None,
         });
     }
     tensors.sort_by_key(|t| t.file_start);

@@ -12,12 +12,13 @@
 
 use super::SourceFormat;
 
-/// Normalize `name` to its canonical HF-style form. For safetensors this is
-/// a no-op (HF is already canonical). For GGUF this maps `blk.N.attn_q.weight`
-/// → `model.layers.N.self_attn.q_proj.weight` and similar.
+/// Normalize `name` to its canonical HF-style form. For safetensors and
+/// PyTorch pickle this is a no-op (both use the HF state_dict naming
+/// convention directly). For GGUF this maps `blk.N.attn_q.weight` →
+/// `model.layers.N.self_attn.q_proj.weight` and similar.
 pub fn to_canonical(format: SourceFormat, name: &str) -> String {
     match format {
-        SourceFormat::Safetensors => name.to_string(),
+        SourceFormat::Safetensors | SourceFormat::Pickle => name.to_string(),
         SourceFormat::Gguf => gguf_to_hf(name),
     }
 }

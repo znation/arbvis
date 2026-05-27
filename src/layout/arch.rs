@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 
 use crate::data::{Source, SourceKind, SourceMeta};
-use crate::format::{Dtype, TensorMeta};
+use crate::format::{Dtype, ElementStride, TensorMeta};
 use crate::layout::bin_pack::{align_up, pack, Slot};
 use crate::layout::name_tree::{self, LayerSlot};
 use crate::layout::TileRegion;
@@ -259,14 +259,13 @@ impl ArchLayout {
         };
 
         // Decide the canvas width: max of the grid width and the widest
-        // top-level tensor *footprint* (a tall tensor is wrapped into K
-        // side-by-side row-chunks, so its placed width is K columns wide —
-        // see `plan_top_footprint`).
+        // top-level tensor *footprint* (a very-non-square tensor is re-wrapped
+        // to a near-square width — see `plan_top_footprint`).
         let top_widths: Vec<u32> = top_level
             .iter()
             .map(|(_, t, _)| {
                 let (rows, c) = t.element_shape();
-                plan_top_footprint(rows, c).width
+                plan_top_footprint(rows, c, t.dtype).width
             })
             .collect();
         let canvas_w = grid_w
@@ -510,63 +509,72 @@ fn is_input_side_name(name: &str) -> bool {
     l.contains("embed") || l.contains("wte") || l.contains("wpe")
 }
 
-/// Placement footprint for a top-level tensor. Tall tensors (e.g. an
-/// `[vocab, hidden]` embedding) are wrapped into `chunks` side-by-side
-/// row-chunks so they render as a near-square block instead of one strip that
-/// dominates the canvas vertically.
+/// Placement footprint for a top-level tensor. A very-non-square tensor (e.g. a
+/// tall `[vocab, hidden]` embedding or a wide `[hidden, vocab]` lm_head) is
+/// re-wrapped to a near-square width `W` so it renders as a compact block
+/// instead of a strip that dominates the canvas along one axis.
 struct TopFootprint {
-    /// Number of side-by-side row-chunks (1 = no wrapping).
-    chunks: u32,
-    /// Rows in each chunk except possibly a shorter final chunk.
-    chunk_rows: u32,
-    /// Total placed width: `chunks` columns plus inter-chunk gutters.
+    /// Logical width the tensor's flat element buffer is wrapped at (== `cols`
+    /// when the tensor is left unchanged).
     width: u32,
-    /// Total placed height: the (full) height of the first chunk.
+    /// Wrapped height: `ceil(rows * cols / width)`.
     height: u32,
 }
 
-/// Decide how to wrap a top-level tensor of element shape `(rows, cols)` into a
-/// near-square block. The block grid is already balanced toward square via
-/// [`pick_column_count`]; this applies the same idea to a single oversized
-/// tensor by splitting its rows into `K ≈ sqrt(rows / cols)` contiguous chunks
-/// laid out left-to-right. Wraps only when `K >= 2` (clearly taller than wide),
-/// so wide/1-D tensors and already-square tensors are placed unchanged.
-fn plan_top_footprint(rows: u64, cols: u64) -> TopFootprint {
-    let cols_px = cols.min(u32::MAX as u64).max(1) as u32;
-    let rows_px = rows.min(u32::MAX as u64).max(1) as u32;
-    let ideal = ((rows as f64) / (cols.max(1) as f64)).sqrt().round();
-    let k = (ideal as u64).clamp(1, rows.max(1));
-    if k <= 1 {
-        return TopFootprint {
-            chunks: 1,
-            chunk_rows: rows_px,
-            width: cols_px,
-            height: rows_px,
-        };
-    }
-    let chunk_rows = rows.div_ceil(k);
-    // Derive the actual chunk count from chunk_rows so no trailing chunk is
-    // empty (ceil(rows/k) can leave fewer than k non-empty chunks).
-    let chunks = rows.div_ceil(chunk_rows).min(u32::MAX as u64) as u32;
-    let width = ((chunks as u64) * (cols_px as u64)
-        + (chunks.saturating_sub(1) as u64) * (PAD as u64))
-        .min(u32::MAX as u64) as u32;
-    let chunk_rows_px = chunk_rows.min(u32::MAX as u64) as u32;
-    TopFootprint {
-        chunks,
-        chunk_rows: chunk_rows_px,
-        width,
-        height: chunk_rows_px,
+/// Element granularity that a re-wrap width must be a multiple of so the
+/// renderer's per-row byte stride (`bytes_per_row(W)`) stays exact. Fixed-stride
+/// dtypes have no constraint; block/packed dtypes must keep whole blocks/slots
+/// on each visual row (the same assumption the leaf renderer makes about
+/// `cols`).
+fn reshape_unit(dtype: Dtype) -> u64 {
+    match dtype.stride() {
+        ElementStride::Fixed(_) => 1,
+        ElementStride::Block { block_elements, .. } => (block_elements as u64).max(1),
+        ElementStride::Packed {
+            bits,
+            pack_dtype_bytes,
+            ..
+        } => (((pack_dtype_bytes as u64) * 8) / (bits.max(1) as u64)).max(1),
     }
 }
 
-/// Place one top-level tensor centred horizontally at `cursor_y`, emitting one
-/// `PlacedTensor` per row-chunk (see [`plan_top_footprint`]). All chunks of a
-/// tensor share `canvas_y` and `hue` so the tensor still reads as one entity.
-/// Each chunk's `tensor_byte_start` is advanced by the byte offset of its first
-/// row via [`Dtype::row_byte_offset`], which stays correct for packed/block
-/// quantised dtypes (chunks split only on whole-row boundaries). Returns the
-/// advanced cursor.
+/// Decide how to re-wrap a top-level tensor of element shape `(rows, cols)` into
+/// a near-square block. Tensors whose aspect ratio is within `1:5 … 5:1` are
+/// left unchanged (`W == cols`). Anything more extreme — very tall *or* very
+/// wide — is re-wrapped at width `W ≈ sqrt(rows * cols)` (snapped to the dtype's
+/// block/slot granularity so byte strides stay exact), making both axes roughly
+/// equal regardless of the original orientation.
+fn plan_top_footprint(rows: u64, cols: u64, dtype: Dtype) -> TopFootprint {
+    let rows = rows.max(1);
+    let cols = cols.max(1);
+    let n = rows.saturating_mul(cols);
+    // Within 1:5 … 5:1 → leave the raw element shape unchanged.
+    if rows <= 5 * cols && cols <= 5 * rows {
+        return TopFootprint {
+            width: cols.min(u32::MAX as u64) as u32,
+            height: rows.min(u32::MAX as u64) as u32,
+        };
+    }
+    let unit = reshape_unit(dtype);
+    let w0 = (n as f64).sqrt().round() as u64;
+    // Snap to a multiple of `unit` and clamp into `[unit, n]`.
+    let w = ((w0 / unit) * unit).clamp(unit, n);
+    let height = n.div_ceil(w);
+    TopFootprint {
+        width: w.min(u32::MAX as u64) as u32,
+        height: height.min(u32::MAX as u64) as u32,
+    }
+}
+
+/// Place one top-level tensor centred horizontally at `cursor_y`, re-wrapping
+/// its flat element buffer to the near-square width chosen by
+/// [`plan_top_footprint`]. Emits a full-width "body" rectangle plus, when the
+/// element count isn't a whole multiple of the width, a short 1-row "tail" so
+/// every element is still covered. Both pieces share `canvas_y`/`hue` so the
+/// tensor reads as one entity. The tail's `tensor_byte_start` is advanced via
+/// [`Dtype::row_byte_offset`], exact for packed/block dtypes because the width
+/// is a multiple of the dtype's block/slot granularity. Returns the advanced
+/// cursor.
 fn place_top_level(
     tensors: &mut Vec<PlacedTensor>,
     canvas_w: u32,
@@ -576,25 +584,41 @@ fn place_top_level(
     base_off: u64,
 ) -> u32 {
     let (rows, cols) = t.element_shape();
-    let fp = plan_top_footprint(rows, cols);
-    let cols_px = cols.min(u32::MAX as u64) as u32;
+    let fp = plan_top_footprint(rows, cols, t.dtype);
+    let w = fp.width as u64;
+    let n = rows.max(1).saturating_mul(cols.max(1));
+    let body_rows = n / w;
+    let tail = n % w;
     let center_offset = canvas_w.saturating_sub(fp.width) / 2;
-    let chunk_rows = fp.chunk_rows as u64;
-    for k in 0..fp.chunks {
-        let row_start = (k as u64) * chunk_rows;
-        let chunk_h = chunk_rows.min(rows.saturating_sub(row_start));
-        let cx = center_offset.saturating_add(k.saturating_mul(cols_px.saturating_add(PAD)));
+    let hue = name_hue_short(&t.name);
+
+    if body_rows > 0 {
         tensors.push(PlacedTensor {
             source_idx: sidx,
             tensor_id: 0, // filled in by the caller in canvas order
             name: t.name.clone(),
             dtype: t.dtype,
-            tensor_byte_start: base_off + t.file_start + t.dtype.row_byte_offset(cols, row_start),
-            tensor_rows: chunk_h,
-            tensor_cols: cols,
-            canvas_x: cx,
+            tensor_byte_start: base_off + t.file_start,
+            tensor_rows: body_rows,
+            tensor_cols: w,
+            canvas_x: center_offset,
             canvas_y: cursor_y,
-            hue: name_hue_short(&t.name),
+            hue,
+            layer_idx: None,
+        });
+    }
+    if tail > 0 {
+        tensors.push(PlacedTensor {
+            source_idx: sidx,
+            tensor_id: 0,
+            name: t.name.clone(),
+            dtype: t.dtype,
+            tensor_byte_start: base_off + t.file_start + t.dtype.row_byte_offset(w, body_rows),
+            tensor_rows: 1,
+            tensor_cols: tail,
+            canvas_x: center_offset,
+            canvas_y: cursor_y.saturating_add(body_rows.min(u32::MAX as u64) as u32),
+            hue,
             layer_idx: None,
         });
     }
@@ -1020,40 +1044,61 @@ mod tests {
     }
 
     #[test]
-    fn plan_top_footprint_wraps_tall_tensor_near_square() {
-        // A vocab-sized embedding: [152000, 1024]. Should wrap into ~12
-        // side-by-side chunks producing a near-square block.
-        let fp = plan_top_footprint(152_000, 1024);
-        assert!(fp.chunks >= 2, "tall tensor should wrap; got {} chunk(s)", fp.chunks);
-        let log_ratio = (fp.width as f64 / fp.height as f64).log2().abs();
-        assert!(
-            log_ratio < 1.0,
-            "wrapped footprint {}x{} not near-square (|log2 ratio| = {log_ratio})",
-            fp.width,
-            fp.height,
-        );
-        // Chunks cover every row, with no empty trailing chunk.
-        assert!((fp.chunks as u64) * (fp.chunk_rows as u64) >= 152_000);
-        assert!((fp.chunks.saturating_sub(1) as u64) * (fp.chunk_rows as u64) < 152_000);
+    fn plan_top_footprint_reshapes_tall_and_wide_near_square() {
+        // A vocab-sized embedding [152000, 1024] (very tall) and its transpose
+        // [1024, 152000] (very wide) must both collapse to the same near-square
+        // footprint, well under the un-wrapped strip dimension.
+        for (rows, cols) in [(152_000u64, 1024u64), (1024, 152_000)] {
+            let fp = plan_top_footprint(rows, cols, Dtype::F32);
+            let log_ratio = (fp.width as f64 / fp.height as f64).log2().abs();
+            assert!(
+                log_ratio < 1.0,
+                "reshaped footprint {}x{} not near-square (|log2 ratio| = {log_ratio})",
+                fp.width,
+                fp.height,
+            );
+            assert!(
+                (fp.width as u64) < 152_000 && (fp.height as u64) < 152_000,
+                "reshaped {rows}x{cols} should not retain the 152k strip dim",
+            );
+            // Body + tail still cover every element.
+            let w = fp.width as u64;
+            assert!((w * fp.height as u64) >= rows * cols);
+        }
     }
 
     #[test]
-    fn plan_top_footprint_leaves_wide_and_square_unwrapped() {
-        // 1-D norm collapses to (1, hidden) — wide, must not wrap.
-        assert_eq!(plan_top_footprint(1, 4096).chunks, 1);
-        // Exactly square — no benefit to wrapping.
-        assert_eq!(plan_top_footprint(1024, 1024).chunks, 1);
-        // Mildly tall (< ~2.25x) rounds K to 1 — left unchanged.
-        assert_eq!(plan_top_footprint(1500, 1024).chunks, 1);
-        // The single-chunk footprint reproduces the raw element shape.
-        let fp = plan_top_footprint(1500, 1024);
-        assert_eq!((fp.width, fp.height), (1024, 1500));
+    fn plan_top_footprint_leaves_mid_aspect_unchanged() {
+        // Exactly square — left alone.
+        assert_eq!(
+            {
+                let fp = plan_top_footprint(1024, 1024, Dtype::F32);
+                (fp.width, fp.height)
+            },
+            (1024, 1024)
+        );
+        // Within 5:1 either way — reproduces the raw element shape.
+        for (rows, cols) in [(1500u64, 1024u64), (1024, 5000), (5000, 1024)] {
+            let fp = plan_top_footprint(rows, cols, Dtype::F32);
+            assert_eq!(
+                (fp.width as u64, fp.height as u64),
+                (cols, rows),
+                "{rows}x{cols} (within 1:5..5:1) should be unchanged",
+            );
+        }
+        // Just past 5:1 — now reshaped (width no longer == cols).
+        let fp = plan_top_footprint(1024, 5200, Dtype::F32);
+        assert_ne!(fp.width as u64, 5200, "5.08:1 wide tensor should reshape");
+        // A 1-D-ish wide vector reshapes into a near-square block.
+        let fp = plan_top_footprint(1, 4096, Dtype::F32);
+        assert_eq!((fp.width, fp.height), (64, 64));
     }
 
     /// Build a checkpoint with a vocab-sized embedding plus a few real layers,
-    /// then assert the embedding is wrapped into multiple contiguous row-chunks
-    /// whose byte offsets respect the dtype's per-row stride — and that the
-    /// canvas is no longer dominated by the embedding's full height.
+    /// then assert the embedding is re-wrapped to a near-square block whose
+    /// body byte offset is the tensor start and whose body+tail cover every
+    /// element — and that the canvas is no longer dominated by the embedding's
+    /// full height.
     #[test]
     fn embedding_wraps_into_contiguous_chunks() {
         const VOCAB: u64 = 152_000;
@@ -1091,26 +1136,30 @@ mod tests {
             .iter()
             .filter(|t| t.name == "model.embed_tokens.weight")
             .collect();
-        assert!(chunks.len() >= 2, "embedding should split; got {} chunk(s)", chunks.len());
+        assert!(
+            (1..=2).contains(&chunks.len()),
+            "embedding should be a body (+ optional tail); got {} piece(s)",
+            chunks.len(),
+        );
 
-        let fp = plan_top_footprint(VOCAB, HIDDEN);
-        let bpr = Dtype::F32.row_byte_offset(HIDDEN, 1); // bytes per row
-        assert_eq!(bpr, HIDDEN * 4);
+        let fp = plan_top_footprint(VOCAB, HIDDEN, Dtype::F32);
+        let w = fp.width as u64;
+        assert_ne!(w, HIDDEN, "tall embedding must be re-wrapped to a new width");
 
-        // Chunks are ordered left-to-right; verify each one's byte start and
-        // that together they cover every row exactly once, contiguously.
-        let mut covered_rows: u64 = 0;
-        for (k, c) in chunks.iter().enumerate() {
-            let row_start = (k as u64) * (fp.chunk_rows as u64);
-            let expected_start = embed_start + Dtype::F32.row_byte_offset(HIDDEN, row_start);
-            assert_eq!(
-                c.tensor_byte_start, expected_start,
-                "chunk {k} byte start mismatch",
-            );
-            assert_eq!(c.tensor_cols, HIDDEN);
-            covered_rows += c.tensor_rows;
+        // The body starts at the tensor's byte start; body + tail cover every
+        // element exactly, contiguously.
+        let body = chunks[0];
+        assert_eq!(body.tensor_byte_start, embed_start, "body byte start mismatch");
+        assert_eq!(body.tensor_cols, w);
+        let mut covered: u64 = body.tensor_rows * body.tensor_cols;
+        if let Some(tail) = chunks.get(1) {
+            let expected_tail_start =
+                embed_start + Dtype::F32.row_byte_offset(w, body.tensor_rows);
+            assert_eq!(tail.tensor_byte_start, expected_tail_start, "tail byte start mismatch");
+            assert_eq!(tail.tensor_rows, 1);
+            covered += tail.tensor_cols;
         }
-        assert_eq!(covered_rows, VOCAB, "chunks must cover all vocab rows");
+        assert_eq!(covered, VOCAB * HIDDEN, "body + tail must cover all elements");
 
         // Canvas height must be far below the un-wrapped 152k-px strip.
         assert!(
@@ -1120,13 +1169,14 @@ mod tests {
         );
         assert!(
             chunks.iter().all(|c| c.tensor_rows < VOCAB / 2),
-            "no chunk should retain anywhere near the full vocab height",
+            "no piece should retain anywhere near the full vocab height",
         );
     }
 
-    /// The chunk byte stride must come from the packed-dtype stride, not a
-    /// naive `cols * element_size`. A 4-bit-packed embedding packs 8 elements
-    /// per int32, so a 1024-col row is only 512 bytes, not 4096.
+    /// The re-wrap width must stay a multiple of the packed-dtype slot size and
+    /// the byte stride must come from the packed-dtype stride, not a naive
+    /// `cols * element_size`. A 4-bit-packed dtype packs 8 elements per int32,
+    /// so the re-wrap width must be a multiple of 8.
     #[test]
     fn packed_embedding_chunks_use_packed_stride() {
         const VOCAB: u64 = 152_000;
@@ -1152,14 +1202,20 @@ mod tests {
             .iter()
             .filter(|t| t.name == "model.embed_tokens.weight")
             .collect();
-        assert!(chunks.len() >= 2);
-        let fp = plan_top_footprint(VOCAB, HIDDEN);
-        for (k, c) in chunks.iter().enumerate() {
-            let row_start = (k as u64) * (fp.chunk_rows as u64);
+        assert!((1..=2).contains(&chunks.len()));
+        let fp = plan_top_footprint(VOCAB, HIDDEN, Dtype::Int4Packed);
+        let w = fp.width as u64;
+        // Int4Packed slots hold 8 elements, so the re-wrap width must align.
+        assert_eq!(w % 8, 0, "packed re-wrap width must be a multiple of the slot size");
+
+        let body = chunks[0];
+        assert_eq!(body.tensor_byte_start, embed_start);
+        assert_eq!(body.tensor_cols, w);
+        if let Some(tail) = chunks.get(1) {
             assert_eq!(
-                c.tensor_byte_start,
-                embed_start + row_start * expected_bpr,
-                "packed chunk {k} must use the packed per-row stride",
+                tail.tensor_byte_start,
+                embed_start + body.tensor_rows * Dtype::Int4Packed.row_byte_offset(w, 1),
+                "packed tail must use the packed per-row stride",
             );
         }
     }

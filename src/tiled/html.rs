@@ -22,6 +22,7 @@ pub fn generate_leaflet_content(
     world_w: u32,
     world_h: u32,
     max_zoom: u32,
+    detail_depth: u32,
     height: u32,
     width: u32,
     tile_size: u32,
@@ -31,11 +32,12 @@ pub fn generate_leaflet_content(
     leaf_ext: &str,
     pyramid_ext: &str,
 ) -> (Vec<u8>, Vec<u8>) {
-    let entities_json = build_labels_json(entities);
+    let entities_json = build_labels_json(entities, max_zoom, detail_depth);
     let html = build_html(
         world_w,
         world_h,
         max_zoom,
+        detail_depth,
         height,
         width,
         tile_size,
@@ -53,6 +55,7 @@ pub fn write_leaflet_html(
     world_w: u32,
     world_h: u32,
     max_zoom: u32,
+    detail_depth: u32,
     height: u32,
     width: u32,
     tile_size: u32,
@@ -62,13 +65,14 @@ pub fn write_leaflet_html(
     leaf_ext: &str,
     pyramid_ext: &str,
 ) -> anyhow::Result<()> {
-    let entities_json = build_labels_json(entities);
+    let entities_json = build_labels_json(entities, max_zoom, detail_depth);
     std::fs::write(dir.join("labels.json"), &entities_json)?;
 
     let html = build_html(
         world_w,
         world_h,
         max_zoom,
+        detail_depth,
         height,
         width,
         tile_size,
@@ -106,10 +110,17 @@ fn entities_to_json(entities: &[FileEntity]) -> String {
     format!("[{}]", entries.join(","))
 }
 
-/// Schema: `{ "files": [...] }`. The old bare-array schema is still readable
-/// by the regen path.
-fn build_labels_json(entities: &[FileEntity]) -> String {
-    format!("{{\"files\":{}}}", entities_to_json(entities))
+/// Schema: `{ "files": [...], "max_zoom": M, "detail_depth": D }`. The
+/// `max_zoom`/`detail_depth` fields let [`crate::tiled::regen_html`] tell the
+/// dense overview levels apart from the sparse variable-depth detail levels
+/// (which otherwise look like extra zoom dirs and corrupt the derived
+/// geometry). The old bare-array and `{files}`-only schemas are still readable
+/// by the regen path (it falls back to detail_depth = 0).
+fn build_labels_json(entities: &[FileEntity], max_zoom: u32, detail_depth: u32) -> String {
+    format!(
+        "{{\"files\":{},\"max_zoom\":{max_zoom},\"detail_depth\":{detail_depth}}}",
+        entities_to_json(entities)
+    )
 }
 
 /// Convert an `hf://` path to its huggingface.co web URL, or return `None` for
@@ -192,6 +203,7 @@ fn build_html(
     world_w: u32,
     world_h: u32,
     max_zoom: u32,
+    detail_depth: u32,
     height: u32,
     width: u32,
     tile_size: u32,
@@ -201,7 +213,41 @@ fn build_html(
     pyramid_ext: &str,
 ) -> String {
     let info_html = build_info_html(title, inputs);
-    let viewer_max_zoom = max_zoom + 3;
+    // Real tiles exist up to `max_zoom + detail_depth`; allow 3 more zoom
+    // levels of CSS upsampling past that (the historical "+3" headroom).
+    let viewer_max_zoom = max_zoom + detail_depth + 3;
+    // Variable-depth detail layer: a second tile layer carrying source-resolution
+    // tiles over shrunk tensors at zooms `max_zoom+1 ..= max_zoom+detail_depth`.
+    // Missing (sparse) tiles fall through to the base layer's upsample via a
+    // transparent `errorTileUrl`. Empty when nothing was shrunk.
+    let detail_layer_js = if detail_depth > 0 {
+        format!(
+            r#"
+    var DetailTileLayer = L.TileLayer.extend({{
+      getTileUrl: function(coords) {{
+        return 'tiles/' + coords.z + '/' + coords.x + '/' + coords.y + '.{leaf_ext}';
+      }}
+    }});
+    new DetailTileLayer('', {{
+      tileSize: {tile_size},
+      minNativeZoom: {detail_min},
+      maxNativeZoom: {detail_max},
+      minZoom: {detail_min},
+      bounds: [[-{world_h}, 0], [0, {world_w}]],
+      noWrap: true,
+      errorTileUrl: 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7',
+    }}).addTo(map);
+"#,
+            leaf_ext = leaf_ext,
+            tile_size = tile_size,
+            detail_min = max_zoom + 1,
+            detail_max = max_zoom + detail_depth,
+            world_h = world_h,
+            world_w = world_w,
+        )
+    } else {
+        String::new()
+    };
     // For non-square canvases the pyramid bottoms out with the smaller axis at
     // 1 tile and the larger axis at `aspect_max/aspect_min` tiles, so even at
     // Leaflet's zoom 0 we can't see the whole thing. Let the viewer keep
@@ -281,6 +327,7 @@ fn build_html(
       noWrap: true,
       attribution: '<a href="https://github.com/znation/arbvis">arbvis</a>'
     }}).addTo(map);
+{detail_layer_js}
     map.fitBounds([[-{world_h}, 0], [0, {world_w}]]);
 
     var HEIGHT = {height};
@@ -411,6 +458,7 @@ fn build_html(
         title_escaped = escape_html(title),
         info_html = info_html,
         max_zoom = max_zoom,
+        detail_layer_js = detail_layer_js,
         viewer_max_zoom = viewer_max_zoom,
         viewer_min_zoom = viewer_min_zoom,
         world_w = world_w,

@@ -160,50 +160,54 @@ fn run_single_arch(
     for t in &layout.tensors {
         let cols = t.tensor_cols;
         let rows = t.tensor_rows;
-        let elem = t.dtype.element_size() as u64;
-        let stride = cols * elem;
+        // On-canvas footprint (element grid scaled by the per-tensor display
+        // scale); output pixels map back to elements through this footprint.
+        let disp_w = t.disp_w as u64;
+        let disp_h = t.disp_h as u64;
         let src_idx = t.source_idx;
         let src_bytes: &[u8] = match &data[src_idx] {
             Data::Mapped(m) => m,
             Data::Owned(v) => v,
             _ => continue,
         };
-        // Tensor byte start, local to its source.
+        // Tensor byte start, local to its source. The tensor's element data runs
+        // contiguously from here; `plain_element_color` indexes it by *element*
+        // index, decoding the dtype's natural stride (fixed / block-quantised) —
+        // so we pass the whole tail slice and a flat element index rather than a
+        // hand-computed byte offset, which would be wrong for block/packed dtypes.
         let local_off = t
             .tensor_byte_start
-            .saturating_sub(sources[..src_idx].iter().map(|s| s.byte_size).sum::<u64>());
+            .saturating_sub(sources[..src_idx].iter().map(|s| s.byte_size).sum::<u64>())
+            as usize;
+        if local_off >= src_bytes.len() {
+            continue;
+        }
+        let tensor_bytes = &src_bytes[local_off..];
 
-        // Output rect after scaling.
+        // Output rect after scaling, in terms of the display footprint.
         let out_x0 = t.canvas_x / scale;
         let out_y0 = t.canvas_y / scale;
-        let out_x1 = ((t.canvas_x + cols.min(u32::MAX as u64) as u32) / scale).min(out_w);
-        let out_y1 = ((t.canvas_y + rows.min(u32::MAX as u64) as u32) / scale).min(out_h);
+        let out_x1 = ((t.canvas_x + disp_w.min(u32::MAX as u64) as u32) / scale).min(out_w);
+        let out_y1 = ((t.canvas_y + disp_h.min(u32::MAX as u64) as u32) / scale).min(out_h);
         if out_x1 <= out_x0 || out_y1 <= out_y0 {
             continue;
         }
 
         for oy in out_y0..out_y1 {
-            // Map output y back to a representative tensor row.
-            let dy = (oy - out_y0) as u64 * scale as u64;
-            if dy >= rows {
+            // Output y → display-pixel offset within the footprint → element row.
+            let disp_y = (oy - out_y0) as u64 * scale as u64;
+            if disp_y >= disp_h {
                 break;
             }
-            let row_off = local_off + dy * stride;
+            let er = disp_y * rows / disp_h.max(1);
             for ox in out_x0..out_x1 {
-                let dx = (ox - out_x0) as u64 * scale as u64;
-                if dx >= cols {
+                let disp_x = (ox - out_x0) as u64 * scale as u64;
+                if disp_x >= disp_w {
                     break;
                 }
-                let elem_off = (row_off + dx * elem) as usize;
-                if elem_off + elem as usize > src_bytes.len() {
-                    continue;
-                }
-                let color = plain_element_color(
-                    t.dtype,
-                    &src_bytes[elem_off..elem_off + elem as usize],
-                    0,
-                    &pixel_lut,
-                );
+                let ec = disp_x * cols / disp_w.max(1);
+                let flat = (er * cols + ec) as usize;
+                let color = plain_element_color(t.dtype, tensor_bytes, flat, &pixel_lut);
                 img.put_pixel(ox, oy, color);
             }
         }

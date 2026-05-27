@@ -335,14 +335,6 @@ impl Dtype {
         }
     }
 
-    /// Byte offset of the first element of row `row` in a row-major tensor of
-    /// `cols` columns. Accounts for packed/block strides — never assume
-    /// `cols * element_size()`, which is wrong for quantised dtypes. Used to
-    /// re-base a tensor onto a contiguous sub-range of whole rows.
-    pub fn row_byte_offset(self, cols: u64, row: u64) -> u64 {
-        self.stride().bytes_per_row(cols) * row
-    }
-
     #[allow(dead_code)]
     pub fn is_quantized(self) -> bool {
         matches!(

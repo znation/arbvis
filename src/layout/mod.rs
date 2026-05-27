@@ -26,6 +26,15 @@ use crate::format::Dtype;
 /// One contiguous (row-major) element range of one tensor that overlaps a
 /// tile. The tile renderer fetches `byte_start..byte_end` from the source
 /// and decodes elements at the natural dtype stride.
+///
+/// The tensor is drawn at a per-tensor display footprint that may differ from
+/// its element grid (see [`crate::layout::arch::PlacedTensor`]): shrunk for
+/// huge tensors, enlarged for thin vectors. At a given zoom level the footprint
+/// is additionally multiplied by `2^(zoom - max_zoom)`. The renderer maps each
+/// painted output pixel back to an element via the footprint→element ratio:
+/// `element = floor((samp_off + delta_px) * tensor_dim / footprint_dim)`. The
+/// `row_first`/`col_first` element bounds are the floor at the first painted
+/// pixel, so they anchor both the byte fetch and the per-pixel offset.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TileRegion {
@@ -45,6 +54,14 @@ pub struct TileRegion {
     pub col_last_exclusive: u64,
     /// Byte offset within the source where this tensor's element data starts.
     pub tensor_byte_start: u64,
+    /// Display footprint of the whole tensor at this tile's zoom level, in
+    /// pixels (`disp_w/h * 2^(zoom - max_zoom)`). Drives the pixel→element map.
+    pub footprint_w: u64,
+    pub footprint_h: u64,
+    /// Display-pixel offset, within the tensor's footprint, of the first
+    /// painted pixel (`tile_x0`/`tile_y0`).
+    pub samp_x0: u64,
+    pub samp_y0: u64,
     /// Canvas pixel rectangle this region paints into, in *tile-local* (px, py)
     /// coordinates `[x0, x1) × [y0, y1)`.
     pub tile_x0: u32,

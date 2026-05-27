@@ -138,6 +138,26 @@ impl PipelineProgress {
     }
 }
 
+/// Which tiles a pipeline pass should render. The overview pass walks the dense
+/// leaf grid (streamed, so a huge canvas doesn't materialise a giant coord
+/// vec); detail passes render a sparse, explicitly-listed set of tiles.
+enum TileCoords {
+    Dense { width_tiles: u32, height_tiles: u32 },
+    Sparse(Vec<(u32, u32)>),
+}
+
+impl TileCoords {
+    fn len(&self) -> u64 {
+        match self {
+            TileCoords::Dense {
+                width_tiles,
+                height_tiles,
+            } => *width_tiles as u64 * *height_tiles as u64,
+            TileCoords::Sparse(v) => v.len() as u64,
+        }
+    }
+}
+
 /// Per-tile data flowing through the pipeline after the load stage.
 struct LoadedTile {
     tx: u32,
@@ -254,12 +274,42 @@ fn sniff_ext_for_zoom(tiles_dir: &std::path::Path, zoom: u32) -> Option<String> 
 pub fn regen_html(tile_dir: &Path) -> anyhow::Result<()> {
     let tiles_dir = tile_dir.join("tiles");
 
-    let max_zoom = std::fs::read_dir(&tiles_dir)
+    // Read labels.json first. Newer outputs persist `max_zoom`/`detail_depth` so
+    // we can tell the dense overview levels apart from the sparse variable-depth
+    // detail levels — without that, the deepest *detail* zoom dir would be
+    // mistaken for the overview leaf and corrupt every derived dimension.
+    let labels_path = tile_dir.join("labels.json");
+    let json_str = std::fs::read_to_string(&labels_path)
+        .with_context(|| format!("cannot read {}", labels_path.display()))?;
+    let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+    let detail_depth = parsed
+        .get("detail_depth")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let values: Vec<serde_json::Value> = match &parsed {
+        serde_json::Value::Array(a) => a.clone(),
+        serde_json::Value::Object(o) => o
+            .get("files")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
+        _ => anyhow::bail!("labels.json: unexpected JSON shape (expected array or object)"),
+    };
+
+    // Overview leaf zoom: prefer the persisted value; else fall back to the
+    // deepest zoom dir minus any detail levels (and minus 0 for legacy outputs
+    // that predate the persisted fields).
+    let deepest = std::fs::read_dir(&tiles_dir)
         .with_context(|| format!("cannot read {}", tiles_dir.display()))?
         .filter_map(|e| e.ok())
         .filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
         .max()
         .ok_or_else(|| anyhow::anyhow!("no zoom levels found in {}", tiles_dir.display()))?;
+    let max_zoom = parsed
+        .get("max_zoom")
+        .and_then(|v| v.as_u64())
+        .map(|m| m as u32)
+        .unwrap_or_else(|| deepest.saturating_sub(detail_depth));
 
     let zoom_dir = tiles_dir.join(format!("{max_zoom}"));
     let width_tiles = std::fs::read_dir(&zoom_dir)
@@ -293,19 +343,6 @@ pub fn regen_html(tile_dir: &Path) -> anyhow::Result<()> {
     let world_w = (width_tiles / two_pow_mz.max(1)).max(1) * TILE;
     let world_h = (height_tiles / two_pow_mz.max(1)).max(1) * TILE;
 
-    let labels_path = tile_dir.join("labels.json");
-    let json_str = std::fs::read_to_string(&labels_path)
-        .with_context(|| format!("cannot read {}", labels_path.display()))?;
-    let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-    let values: Vec<serde_json::Value> = match parsed {
-        serde_json::Value::Array(a) => a,
-        serde_json::Value::Object(ref o) => o
-            .get("files")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default(),
-        _ => anyhow::bail!("labels.json: unexpected JSON shape (expected array or object)"),
-    };
     let entities: Vec<html::FileEntity> = values
         .into_iter()
         .map(|v| {
@@ -354,6 +391,7 @@ pub fn regen_html(tile_dir: &Path) -> anyhow::Result<()> {
         world_w,
         world_h,
         max_zoom,
+        detail_depth,
         height,
         width,
         TILE,
@@ -364,7 +402,7 @@ pub fn regen_html(tile_dir: &Path) -> anyhow::Result<()> {
         &pyramid_ext,
     )?;
     log::info!(
-        "Regenerated index.html in {} (zoom 0–{max_zoom}, {width_tiles}×{height_tiles} tiles, height={height})",
+        "Regenerated index.html in {} (zoom 0–{max_zoom}, +{detail_depth} detail, {width_tiles}×{height_tiles} tiles, height={height})",
         tile_dir.display()
     );
     Ok(())
@@ -381,6 +419,9 @@ struct TilePlan {
     height: u32,
     width: u32,
     max_zoom: u32,
+    /// Extra zoom levels carrying variable-depth detail (0 for Hilbert / no
+    /// shrunk tensors). Mirrors `ArchLayout::detail_depth`.
+    detail_depth: u32,
     total_tiles: u64,
     square_pixels: u64,
     total: u64,
@@ -699,8 +740,10 @@ async fn build_tile_plan(
             // Skip Hilbert-decomposition: each entity is a single rect.
             let mut ents: Vec<FileEntity> = Vec::with_capacity(a.tensors.len());
             for t in &a.tensors {
-                let w = t.tensor_cols.min(u32::MAX as u64) as u32;
-                let h = t.tensor_rows.min(u32::MAX as u64) as u32;
+                // Overlay rectangles use the on-canvas *display* footprint, not
+                // the element grid, so labels/segments line up with what's drawn.
+                let w = t.disp_w;
+                let h = t.disp_h;
                 let x0 = t.canvas_x;
                 let y0 = t.canvas_y;
                 let x1 = x0.saturating_add(w);
@@ -761,6 +804,11 @@ async fn build_tile_plan(
 
     let entities = arch_entities.unwrap_or(entities);
 
+    let detail_depth = match &layout {
+        Layout::Architectural(a) => a.detail_depth,
+        Layout::HilbertGlobal(_) => 0,
+    };
+
     Ok(TilePlan {
         kh: kh_out,
         width_tiles: width_tiles_out,
@@ -770,6 +818,7 @@ async fn build_tile_plan(
         height: height_out,
         width: width_out,
         max_zoom: max_zoom_out,
+        detail_depth,
         total_tiles: total_tiles_out,
         square_pixels: square_pixels_out,
         total: total_out,
@@ -791,6 +840,8 @@ async fn build_tile_plan(
 async fn drive_pipeline<W>(
     plan: &TilePlan,
     leaf_format: TileFormat,
+    zoom: u32,
+    coords: TileCoords,
     mut on_tile: W,
 ) -> anyhow::Result<()>
 where
@@ -801,14 +852,11 @@ where
     let (loaded_tx, loaded_rx): (Sender<LoadedTile>, Receiver<LoadedTile>) = bounded(cap);
     let (encoded_tx, encoded_rx): (Sender<EncodedTile>, Receiver<EncodedTile>) = bounded(cap);
 
-    let width_tiles = plan.width_tiles;
-    let height_tiles = plan.height_tiles;
-
     // Bars are added to the global `progress::multi()`; in non-TTY runs that
     // draws to a hidden target, so all updates here are no-ops but the rest
     // of the pipeline code stays branchless.
     let progress = Arc::new(PipelineProgress::new(
-        plan.total_tiles,
+        coords.len() as u64,
         cap,
         MAX_FETCH_WORKERS,
     ));
@@ -855,12 +903,27 @@ where
         })
     };
 
-    // Stage 1: coord enumerator.
+    // Stage 1: coord enumerator. Drives whatever tile set this pass covers —
+    // the dense overview grid (streamed), or a sparse set of detail tiles.
     let coord_task = tokio::spawn(async move {
-        for ty in 0..height_tiles {
-            for tx in 0..width_tiles {
-                if coord_tx.send((tx, ty)).await.is_err() {
-                    return; // downstream closed
+        match coords {
+            TileCoords::Dense {
+                width_tiles,
+                height_tiles,
+            } => {
+                for ty in 0..height_tiles {
+                    for tx in 0..width_tiles {
+                        if coord_tx.send((tx, ty)).await.is_err() {
+                            return; // downstream closed
+                        }
+                    }
+                }
+            }
+            TileCoords::Sparse(v) => {
+                for (tx, ty) in v {
+                    if coord_tx.send((tx, ty)).await.is_err() {
+                        return;
+                    }
                 }
             }
         }
@@ -889,6 +952,7 @@ where
         let square_pixels = plan.square_pixels;
         let total = plan.total;
         let layout = plan.layout.clone();
+        let zoom = zoom;
         load_handles.push(tokio::spawn(async move {
             while let Ok((tx, ty)) = coord_rx.recv().await {
                 let (tile_buf, arch_tile) = if is_arch {
@@ -904,6 +968,7 @@ where
                         _ => unreachable!("is_arch && layout != Architectural"),
                     };
                     let result = load_arch_tile_regions(
+                        zoom,
                         tx,
                         ty,
                         arch_layout,
@@ -1101,6 +1166,104 @@ where
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Tile coords (at zoom `zoom = max_zoom + k`) covered by the footprints of the
+/// tensors that still carry genuine detail at *this* level — i.e. those whose
+/// own `detail_depth_for_scale(scale) >= k`. A tensor is dropped from the level
+/// once it has resolved to ≥1px/element, so a mildly-shrunk matrix (which
+/// resolves at k=1) is NOT re-rendered as pure replication at the deeper levels
+/// a vocab embedding needs — without this guard a model with many shrunk
+/// tensors (hidden_size > CAP_HI) would emit millions of redundant detail tiles.
+/// Deduped across tensors. Non-shrunk tensors that fall in a selected tile still
+/// render (replicated), so each detail tile carries the complete scene at higher
+/// resolution and overlays the base layer seamlessly.
+fn detail_coords(layout: &crate::layout::arch::ArchLayout, zoom: u32) -> Vec<(u32, u32)> {
+    use std::collections::BTreeSet;
+    let level = zoom.saturating_sub(layout.max_zoom); // 1-based detail level
+    let f = 1u64 << level;
+    let t_sz = TILE as u64;
+    let mut set: BTreeSet<(u32, u32)> = BTreeSet::new();
+    for t in &layout.tensors {
+        if crate::layout::arch::detail_depth_for_scale(t.scale) < level {
+            continue;
+        }
+        let x0 = t.canvas_x as u64 * f;
+        let y0 = t.canvas_y as u64 * f;
+        let x1 = x0 + t.disp_w as u64 * f;
+        let y1 = y0 + t.disp_h as u64 * f;
+        let tx0 = (x0 / t_sz) as u32;
+        let ty0 = (y0 / t_sz) as u32;
+        let tx1 = ((x1 - 1) / t_sz) as u32;
+        let ty1 = ((y1 - 1) / t_sz) as u32;
+        for ty in ty0..=ty1 {
+            for tx in tx0..=tx1 {
+                set.insert((tx, ty));
+            }
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// Render the variable-depth detail levels (`max_zoom+1 ..= max_zoom+detail_depth`).
+///
+/// Each level is rendered directly from source over a sparse set of tiles (the
+/// shrunk tensors' footprints) — no pyramid accumulation, so this is a no-op for
+/// Hilbert layouts and for arch layouts where nothing was shrunk. `write_tile`
+/// persists one encoded tile at the given zoom (local file or Hub upload).
+///
+/// Each level reads the shrunk tensors' bytes again, but sources are
+/// materialised to local files before tiling (`data::materialize_http_sources`),
+/// so these are mmap memcpys served from the page cache — no HTTP, no throttle.
+/// The only repeated work is per-element decode, bounded by the (sparse) detail
+/// tile count, so accumulating levels into a sparse mini-pyramid isn't worth the
+/// quad-alignment complexity it would add.
+async fn render_detail_levels<F>(
+    plan: &TilePlan,
+    leaf_format: TileFormat,
+    write_tile: &F,
+) -> anyhow::Result<()>
+where
+    F: Fn(&EncodedTile, u32) -> anyhow::Result<()> + Sync,
+{
+    let arch = match plan.layout.as_ref() {
+        Layout::Architectural(a) => a,
+        _ => return Ok(()),
+    };
+    if arch.detail_depth == 0 {
+        return Ok(());
+    }
+    // Detail tiles are an enhancement layer: where they're missing the viewer
+    // falls back to upsampling the base overview (transparent errorTileUrl). So
+    // a detail-pass failure is logged and ends detail rendering, but is NOT
+    // propagated — the already-complete overview output (and, for the HF path,
+    // the whole staged upload) must not be discarded over one bad detail tile.
+    for k in 1..=arch.detail_depth {
+        let zoom = arch.max_zoom + k;
+        let coords = detail_coords(arch, zoom);
+        if coords.is_empty() {
+            continue;
+        }
+        log::info!(
+            "Rendering {} detail tiles at zoom {zoom} (+{k})...",
+            coords.len()
+        );
+        if let Err(e) = drive_pipeline(
+            plan,
+            leaf_format,
+            zoom,
+            TileCoords::Sparse(coords),
+            |t: EncodedTile| write_tile(&t, zoom),
+        )
+        .await
+        {
+            log::warn!(
+                "detail level {zoom} (+{k}) failed ({e:#}); skipping remaining detail levels — the viewer will upsample the overview in those regions"
+            );
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn render_one(
@@ -1323,23 +1486,45 @@ pub async fn run_tiles(
 
     let tile_dir_for_write = tile_dir.clone();
     let pyramid_for_write = pyramid.clone();
-    drive_pipeline(&plan, leaf_format, move |t: EncodedTile| {
-        let path =
-            tile_dir_for_write.join(format!("tiles/{max_zoom}/{}/{}.{leaf_ext}", t.tx, t.ty));
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating tile dir {}", parent.display()))?;
-        }
-        std::fs::write(&path, &t.bytes)
-            .with_context(|| format!("writing tile {}", path.display()))?;
-        pyramid_for_write.contribute(max_zoom, t.tx, t.ty, &t.image);
-        Ok(())
-    })
+    drive_pipeline(
+        &plan,
+        leaf_format,
+        max_zoom,
+        TileCoords::Dense {
+            width_tiles: plan.width_tiles,
+            height_tiles: plan.height_tiles,
+        },
+        move |t: EncodedTile| {
+            let path =
+                tile_dir_for_write.join(format!("tiles/{max_zoom}/{}/{}.{leaf_ext}", t.tx, t.ty));
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating tile dir {}", parent.display()))?;
+            }
+            std::fs::write(&path, &t.bytes)
+                .with_context(|| format!("writing tile {}", path.display()))?;
+            pyramid_for_write.contribute(max_zoom, t.tx, t.ty, &t.image);
+            Ok(())
+        },
+    )
     .await?;
 
     log::info!("Draining pyramid encode tasks...");
     pyramid.drain().await;
     drop(pyramid);
+
+    // Variable-depth detail tiles: sparse deeper levels rendered directly from
+    // source over the shrunk tensors' footprints (no pyramid accumulation).
+    let detail_dir = tile_dir.clone();
+    render_detail_levels(&plan, leaf_format, &move |t: &EncodedTile, z| {
+        let path = detail_dir.join(format!("tiles/{z}/{}/{}.{leaf_ext}", t.tx, t.ty));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, &t.bytes)?;
+        Ok(())
+    })
+    .await?;
 
     log::info!("Writing HTML viewer...");
     html::write_leaflet_html(
@@ -1347,6 +1532,7 @@ pub async fn run_tiles(
         world_w,
         world_h,
         max_zoom,
+        plan.detail_depth,
         height,
         width,
         TILE,
@@ -1413,23 +1599,42 @@ pub async fn run_tiles_hf_streaming(
     let sink_for_write = sink.clone();
     let pyramid_for_write = pyramid.clone();
     let hf_out_for_write = hf_out.clone();
-    drive_pipeline(&plan, leaf_format, move |t: EncodedTile| {
-        let repo_path = hf_out_for_write.tile_repo_path(max_zoom, t.tx, t.ty, leaf_ext);
-        sink_for_write.upload_tile(repo_path, t.bytes)?;
-        pyramid_for_write.contribute(max_zoom, t.tx, t.ty, &t.image);
-        Ok(())
-    })
+    drive_pipeline(
+        &plan,
+        leaf_format,
+        max_zoom,
+        TileCoords::Dense {
+            width_tiles: plan.width_tiles,
+            height_tiles: plan.height_tiles,
+        },
+        move |t: EncodedTile| {
+            let repo_path = hf_out_for_write.tile_repo_path(max_zoom, t.tx, t.ty, leaf_ext);
+            sink_for_write.upload_tile(repo_path, t.bytes)?;
+            pyramid_for_write.contribute(max_zoom, t.tx, t.ty, &t.image);
+            Ok(())
+        },
+    )
     .await?;
 
     // Await any in-flight pyramid encode/upload tasks before commit so every
     // staged file is on disk by the time hf-hub takes the snapshot.
     pyramid.drain().await;
 
+    // Variable-depth detail tiles (sparse deeper levels, no accumulation).
+    let detail_sink = sink.clone();
+    let detail_hf_out = hf_out.clone();
+    render_detail_levels(&plan, leaf_format, &move |t: &EncodedTile, z| {
+        let repo_path = detail_hf_out.tile_repo_path(z, t.tx, t.ty, leaf_ext);
+        detail_sink.upload_tile(repo_path, t.bytes.clone())
+    })
+    .await?;
+
     log::info!("Uploading index.html and labels.json...");
     let (html_bytes, labels_bytes) = generate_leaflet_content(
         world_w,
         world_h,
         max_zoom,
+        plan.detail_depth,
         height,
         width,
         TILE,

@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 
 use crate::data::{Source, SourceKind, SourceMeta};
-use crate::format::{Dtype, ElementStride, TensorMeta};
+use crate::format::{Dtype, TensorMeta};
 use crate::layout::bin_pack::{align_up, pack, Slot};
 use crate::layout::name_tree::{self, LayerSlot};
 use crate::layout::TileRegion;
@@ -31,6 +31,77 @@ const PAD: u32 = 8;
 /// in one row while still pushing wider blocks to multi-line layouts.
 const MAX_LAYER_WIDTH: u32 = 65_536;
 
+/// Upper bound on a tensor's longer display axis, in overview pixels. Any
+/// tensor whose longest element axis exceeds this is shrunk (`scale < 1`) so it
+/// can't dominate the canvas; the lost detail is recovered by the variable-
+/// depth detail tiles (`ArchLayout::detail_depth`).
+const CAP_HI: u32 = 2048;
+
+/// Minimum display thickness, in overview pixels, that a tensor's *shorter*
+/// axis is enlarged toward (`scale > 1`) so a thin 1×N vector reads as visible
+/// data rather than a 1px sliver lost in the gutter. Bounded by `CAP_HI` on the
+/// long axis, so an extreme aspect ratio caps the enlargement rather than
+/// blowing the footprint up.
+const MIN_THICK: u32 = 6;
+
+/// Safety cap on how many extra (deeper-than-overview) zoom levels the
+/// variable-depth pyramid will generate. Each level is a 2× finer sampling, so
+/// `D_MAX = 12` resolves up to a 4096× shrink back to ≥1px/element — far beyond
+/// any realistic vocab axis (e.g. a 512k-token embedding shrunk to `CAP_HI`
+/// needs only 8 levels). Per-tensor inclusion ([`detail_depth_for_scale`]) means
+/// the deepest levels carry only the genuinely-most-shrunk tensors, so this
+/// generous cap doesn't inflate tile counts for tensors that resolve sooner.
+const D_MAX: u32 = 12;
+
+/// Number of extra zoom levels (beyond the overview leaf) at which a tensor of
+/// display `scale` still carries finer detail — i.e. how deep the variable-depth
+/// pyramid must go before that tensor reaches ≥1 display px per element. `0` for
+/// tensors at or above 1:1 (`scale >= 1`). Capped at [`D_MAX`] as a safety bound.
+///
+/// Used both for the layout-wide [`ArchLayout::detail_depth`] (the max over all
+/// tensors) and, per tensor, to decide at which detail levels a tensor should be
+/// rendered — a tensor is only included at level `k` while `k <= its depth`, so a
+/// mildly-shrunk matrix isn't redundantly re-rendered (as pure replication) at
+/// the deep levels a vocab embedding needs.
+pub fn detail_depth_for_scale(scale: f32) -> u32 {
+    if !scale.is_finite() || scale <= 0.0 || scale >= 1.0 {
+        return 0;
+    }
+    ((1.0 / scale).log2().ceil() as u32).clamp(1, D_MAX)
+}
+
+/// Uniform display scale (display px per element, linear) for a tensor of
+/// element shape `(rows, cols)`. Preserves the true 2D aspect ratio (same scale
+/// on both axes) while decoupling the on-canvas footprint from the element
+/// count:
+///   * longest axis `> CAP_HI` → `scale = CAP_HI / longest` (shrink).
+///   * otherwise enlarge toward `MIN_THICK` on the shorter axis, but never push
+///     the longer axis past `CAP_HI`.
+/// Mid-sized square-ish tensors land at `scale == 1`.
+fn pick_scale(rows: u64, cols: u64) -> f32 {
+    let long = rows.max(cols).max(1) as f32;
+    let short = rows.min(cols).max(1) as f32;
+    let cap = CAP_HI as f32 / long; // <1 shrinks; >1 is the enlarge ceiling
+    if long >= CAP_HI as f32 {
+        return cap; // shrink so the long axis lands at CAP_HI
+    }
+    // long < CAP_HI: enlarge thin tensors toward MIN_THICK thickness, but the
+    // long axis must stay within CAP_HI, so clamp by `cap` (which is > 1 here).
+    let thick = (MIN_THICK as f32 / short).max(1.0);
+    thick.min(cap)
+}
+
+/// Display footprint `(width, height)` in overview pixels for element shape
+/// `(rows, cols)` at scale `s`. Each axis is at least 1px.
+fn disp_dims(rows: u64, cols: u64, s: f32) -> (u32, u32) {
+    let w = ((cols as f32 * s).round() as u64).max(1);
+    let h = ((rows as f32 * s).round() as u64).max(1);
+    (
+        w.min(u32::MAX as u64) as u32,
+        h.min(u32::MAX as u64) as u32,
+    )
+}
+
 /// One placed tensor in the architectural canvas.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -40,10 +111,19 @@ pub struct PlacedTensor {
     pub name: String,
     pub dtype: Dtype,
     pub tensor_byte_start: u64,
-    /// `element_shape` = (rows, cols).
+    /// `element_shape` = (rows, cols). The true element grid; drives byte
+    /// mapping. May differ from the on-canvas footprint (`disp_w`/`disp_h`).
     pub tensor_rows: u64,
     pub tensor_cols: u64,
-    /// Top-left of the tensor's element-pixel rectangle on the canvas.
+    /// On-canvas display footprint, in overview pixels. `disp = round(element *
+    /// scale)`. Shrunk (`scale < 1`) for huge tensors, enlarged (`scale > 1`)
+    /// for thin vectors. This is what the layout packs and what the viewer
+    /// draws at the overview zoom.
+    pub disp_w: u32,
+    pub disp_h: u32,
+    /// Uniform display scale (display px per element). See [`pick_scale`].
+    pub scale: f32,
+    /// Top-left of the tensor's display-footprint rectangle on the canvas.
     pub canvas_x: u32,
     pub canvas_y: u32,
     /// Hue used for entity labelling.
@@ -74,6 +154,11 @@ pub struct ArchLayout {
     pub height_tiles: u32,
     pub total_tiles: u64,
     pub max_zoom: u32,
+    /// Extra zoom levels (beyond `max_zoom`) the variable-depth pyramid carries
+    /// genuine source-resolution detail for, so shrunk tensors can be resolved
+    /// to individual elements. `0` when no tensor was shrunk. See [`pick_scale`]
+    /// and [`D_MAX`].
+    pub detail_depth: u32,
     pub tensors: Vec<PlacedTensor>,
     pub layer_bounds: Vec<LayerBounds>,
     /// Architecture description from any `config.json` we found
@@ -211,29 +296,27 @@ impl ArchLayout {
         // arrangement reads attention-first, MLP-second, norms-last.
         canonical_subpaths.sort_by_key(|s| sub_path_order_key(s));
 
-        // For each sub-path, the slot size is the max (rows, cols) across all
-        // layers — guarantees every layer's slot fits. Round up to a 16-px
-        // alignment so adjacent layers' grid lines stay aligned even when
-        // dimensions differ subtly.
+        // For each sub-path, the slot size is the max *display footprint*
+        // across all layers — guarantees every layer's slot fits. Each tensor's
+        // footprint is its element shape scaled by `pick_scale` (preserving
+        // aspect). Round up to a 16-px alignment so adjacent layers' grid lines
+        // stay aligned even when dimensions differ subtly.
         let canon_slots: Vec<(String, Slot)> = canonical_subpaths
             .iter()
             .map(|sp| {
-                let mut max_w: u64 = 1;
-                let mut max_h: u64 = 1;
+                let mut max_w: u32 = 1;
+                let mut max_h: u32 = 1;
                 for sub in blocks.values() {
                     if let Some((_, t, _)) = sub.get(sp) {
                         let (r, c) = t.element_shape();
-                        if r > max_h {
-                            max_h = r;
-                        }
-                        if c > max_w {
-                            max_w = c;
-                        }
+                        let (dw, dh) = disp_dims(r, c, pick_scale(r, c));
+                        max_w = max_w.max(dw);
+                        max_h = max_h.max(dh);
                     }
                 }
                 let slot = Slot {
-                    width: align_up(max_w.min(u32::MAX as u64) as u32, 16),
-                    height: align_up(max_h.min(u32::MAX as u64) as u32, 16),
+                    width: align_up(max_w, 16),
+                    height: align_up(max_h, 16),
                 };
                 (sp.clone(), slot)
             })
@@ -259,13 +342,13 @@ impl ArchLayout {
         };
 
         // Decide the canvas width: max of the grid width and the widest
-        // top-level tensor *footprint* (a very-non-square tensor is re-wrapped
-        // to a near-square width — see `plan_top_footprint`).
+        // top-level tensor *display footprint* (a very-wide tensor is shrunk by
+        // `pick_scale` so its footprint width stays bounded by `CAP_HI`).
         let top_widths: Vec<u32> = top_level
             .iter()
             .map(|(_, t, _)| {
                 let (rows, c) = t.element_shape();
-                plan_top_footprint(rows, c, t.dtype).width
+                disp_dims(rows, c, pick_scale(rows, c)).0
             })
             .collect();
         let canvas_w = grid_w
@@ -314,6 +397,8 @@ impl ArchLayout {
             for ((sp, _), pl) in canon_slots.iter().zip(placements.iter()) {
                 if let Some((sidx, t, base_off)) = sub_map.get(sp) {
                     let (rows, tcols) = t.element_shape();
+                    let s = pick_scale(rows, tcols);
+                    let (dw, dh) = disp_dims(rows, tcols, s);
                     let cx = block_x.saturating_add(pl.x);
                     let cy = block_y.saturating_add(pl.y);
                     tensors.push(PlacedTensor {
@@ -324,6 +409,9 @@ impl ArchLayout {
                         tensor_byte_start: base_off + t.file_start,
                         tensor_rows: rows,
                         tensor_cols: tcols,
+                        disp_w: dw,
+                        disp_h: dh,
+                        scale: s,
                         canvas_x: cx,
                         canvas_y: cy,
                         hue: name_hue_short(sp),
@@ -381,6 +469,15 @@ impl ArchLayout {
         // tiles, exactly one of which equals 1.
         let max_zoom = (width_tiles.min(height_tiles).max(1) as f64).log2().round() as u32;
 
+        // How many extra zoom levels the variable-depth pyramid needs: the max
+        // over all tensors of their individual detail depth (the most-shrunk
+        // tensor drives it). `0` when nothing was shrunk.
+        let detail_depth = tensors
+            .iter()
+            .map(|t| detail_depth_for_scale(t.scale))
+            .max()
+            .unwrap_or(0);
+
         let mut sorted_idx: Vec<usize> = (0..tensors.len()).collect();
         sorted_idx.sort_by_key(|&i| {
             let t = &tensors[i];
@@ -394,6 +491,7 @@ impl ArchLayout {
             height_tiles,
             total_tiles: width_tiles as u64 * height_tiles as u64,
             max_zoom,
+            detail_depth,
             tensors,
             layer_bounds,
             architecture,
@@ -401,30 +499,40 @@ impl ArchLayout {
         })
     }
 
-    /// All tensor regions that overlap the tile at `(tx, ty)`.
+    /// All tensor regions that overlap the tile at `(zoom, tx, ty)`.
+    ///
+    /// `zoom >= max_zoom`: the overview leaf is at `max_zoom` (footprint drawn
+    /// 1:1 with `disp_w`/`disp_h`); each deeper level multiplies the whole
+    /// canvas — and every tensor's footprint — by `f = 2^(zoom - max_zoom)`, so
+    /// shrunk tensors reveal finer element detail the farther you zoom. The
+    /// pixel→element map per painted pixel is
+    /// `element = floor((samp + delta) * tensor_dim / footprint_dim)`.
     ///
     /// O(n) scan — fine because the architectural canvas typically holds
     /// O(hundreds) of tensors and tile rendering is the dominant cost
     /// downstream anyway. If this ever becomes a hot path, swap for an
     /// interval-tree on `canvas_y`.
-    pub fn regions_in_tile(&self, tx: u32, ty: u32) -> Vec<TileRegion> {
-        let tile_x0 = tx * TILE;
-        let tile_y0 = ty * TILE;
-        let tile_x1 = tile_x0 + TILE;
-        let tile_y1 = tile_y0 + TILE;
+    pub fn regions_in_tile(&self, zoom: u32, tx: u32, ty: u32) -> Vec<TileRegion> {
+        let f = 1u64 << zoom.saturating_sub(self.max_zoom);
+        let tile_x0 = tx as u64 * TILE as u64;
+        let tile_y0 = ty as u64 * TILE as u64;
+        let tile_x1 = tile_x0 + TILE as u64;
+        let tile_y1 = tile_y0 + TILE as u64;
 
         let mut out = Vec::new();
         for &i in &self.sorted_idx {
             let t = &self.tensors[i];
-            let tw = t.tensor_cols.min(u32::MAX as u64) as u32;
-            let th = t.tensor_rows.min(u32::MAX as u64) as u32;
-            let tx0 = t.canvas_x;
-            let ty0 = t.canvas_y;
-            let tx1 = tx0.saturating_add(tw);
-            let ty1 = ty0.saturating_add(th);
+            // Footprint and origin at this zoom level (whole canvas × f).
+            let fw = t.disp_w as u64 * f;
+            let fh = t.disp_h as u64 * f;
+            let tx0 = t.canvas_x as u64 * f;
+            let ty0 = t.canvas_y as u64 * f;
+            let tx1 = tx0 + fw;
+            let ty1 = ty0 + fh;
 
             // Early skip — once a tensor's top edge is past the tile bottom,
-            // every subsequent tensor in sorted order is too (we sorted by y).
+            // every subsequent tensor in sorted order is too (we sorted by y;
+            // the uniform × f preserves that order).
             if ty0 >= tile_y1 {
                 break;
             }
@@ -440,10 +548,20 @@ impl ArchLayout {
             let ix1 = tx1.min(tile_x1);
             let iy1 = ty1.min(tile_y1);
 
-            let col_first = (ix0 - tx0) as u64;
-            let col_last = (ix1 - tx0) as u64;
-            let row_first = (iy0 - ty0) as u64;
-            let row_last = (iy1 - ty0) as u64;
+            // Display-pixel offsets of the painted rect within the footprint.
+            let samp_x0 = ix0 - tx0;
+            let samp_y0 = iy0 - ty0;
+            let paint_w = ix1 - ix0;
+            let paint_h = iy1 - iy0;
+
+            // Element bounding box covered by the painted pixels: floor at the
+            // first painted pixel, +1 past the last sampled element.
+            let cols = t.tensor_cols.max(1);
+            let rows = t.tensor_rows.max(1);
+            let col_first = samp_x0 * cols / fw;
+            let col_last = (samp_x0 + paint_w - 1) * cols / fw + 1;
+            let row_first = samp_y0 * rows / fh;
+            let row_last = (samp_y0 + paint_h - 1) * rows / fh + 1;
 
             out.push(TileRegion {
                 source_idx: t.source_idx,
@@ -456,10 +574,14 @@ impl ArchLayout {
                 col_first,
                 col_last_exclusive: col_last,
                 tensor_byte_start: t.tensor_byte_start,
-                tile_x0: ix0 - tile_x0,
-                tile_y0: iy0 - tile_y0,
-                tile_x1: ix1 - tile_x0,
-                tile_y1: iy1 - tile_y0,
+                footprint_w: fw,
+                footprint_h: fh,
+                samp_x0,
+                samp_y0,
+                tile_x0: (ix0 - tile_x0) as u32,
+                tile_y0: (iy0 - tile_y0) as u32,
+                tile_x1: (ix1 - tile_x0) as u32,
+                tile_y1: (iy1 - tile_y0) as u32,
             });
         }
         out
@@ -509,72 +631,9 @@ fn is_input_side_name(name: &str) -> bool {
     l.contains("embed") || l.contains("wte") || l.contains("wpe")
 }
 
-/// Placement footprint for a top-level tensor. A very-non-square tensor (e.g. a
-/// tall `[vocab, hidden]` embedding or a wide `[hidden, vocab]` lm_head) is
-/// re-wrapped to a near-square width `W` so it renders as a compact block
-/// instead of a strip that dominates the canvas along one axis.
-struct TopFootprint {
-    /// Logical width the tensor's flat element buffer is wrapped at (== `cols`
-    /// when the tensor is left unchanged).
-    width: u32,
-    /// Wrapped height: `ceil(rows * cols / width)`.
-    height: u32,
-}
-
-/// Element granularity that a re-wrap width must be a multiple of so the
-/// renderer's per-row byte stride (`bytes_per_row(W)`) stays exact. Fixed-stride
-/// dtypes have no constraint; block/packed dtypes must keep whole blocks/slots
-/// on each visual row (the same assumption the leaf renderer makes about
-/// `cols`).
-fn reshape_unit(dtype: Dtype) -> u64 {
-    match dtype.stride() {
-        ElementStride::Fixed(_) => 1,
-        ElementStride::Block { block_elements, .. } => (block_elements as u64).max(1),
-        ElementStride::Packed {
-            bits,
-            pack_dtype_bytes,
-            ..
-        } => (((pack_dtype_bytes as u64) * 8) / (bits.max(1) as u64)).max(1),
-    }
-}
-
-/// Decide how to re-wrap a top-level tensor of element shape `(rows, cols)` into
-/// a near-square block. Tensors whose aspect ratio is within `1:5 … 5:1` are
-/// left unchanged (`W == cols`). Anything more extreme — very tall *or* very
-/// wide — is re-wrapped at width `W ≈ sqrt(rows * cols)` (snapped to the dtype's
-/// block/slot granularity so byte strides stay exact), making both axes roughly
-/// equal regardless of the original orientation.
-fn plan_top_footprint(rows: u64, cols: u64, dtype: Dtype) -> TopFootprint {
-    let rows = rows.max(1);
-    let cols = cols.max(1);
-    let n = rows.saturating_mul(cols);
-    // Within 1:5 … 5:1 → leave the raw element shape unchanged.
-    if rows <= 5 * cols && cols <= 5 * rows {
-        return TopFootprint {
-            width: cols.min(u32::MAX as u64) as u32,
-            height: rows.min(u32::MAX as u64) as u32,
-        };
-    }
-    let unit = reshape_unit(dtype);
-    let w0 = (n as f64).sqrt().round() as u64;
-    // Snap to a multiple of `unit` and clamp into `[unit, n]`.
-    let w = ((w0 / unit) * unit).clamp(unit, n);
-    let height = n.div_ceil(w);
-    TopFootprint {
-        width: w.min(u32::MAX as u64) as u32,
-        height: height.min(u32::MAX as u64) as u32,
-    }
-}
-
-/// Place one top-level tensor centred horizontally at `cursor_y`, re-wrapping
-/// its flat element buffer to the near-square width chosen by
-/// [`plan_top_footprint`]. Emits a full-width "body" rectangle plus, when the
-/// element count isn't a whole multiple of the width, a short 1-row "tail" so
-/// every element is still covered. Both pieces share `canvas_y`/`hue` so the
-/// tensor reads as one entity. The tail's `tensor_byte_start` is advanced via
-/// [`Dtype::row_byte_offset`], exact for packed/block dtypes because the width
-/// is a multiple of the dtype's block/slot granularity. Returns the advanced
-/// cursor.
+/// Place one top-level tensor centred horizontally at `cursor_y`, at its
+/// display footprint (element shape scaled by [`pick_scale`], preserving the
+/// true 2D aspect — no row re-wrapping). Returns the advanced cursor.
 fn place_top_level(
     tensors: &mut Vec<PlacedTensor>,
     canvas_w: u32,
@@ -584,45 +643,26 @@ fn place_top_level(
     base_off: u64,
 ) -> u32 {
     let (rows, cols) = t.element_shape();
-    let fp = plan_top_footprint(rows, cols, t.dtype);
-    let w = fp.width as u64;
-    let n = rows.max(1).saturating_mul(cols.max(1));
-    let body_rows = n / w;
-    let tail = n % w;
-    let center_offset = canvas_w.saturating_sub(fp.width) / 2;
-    let hue = name_hue_short(&t.name);
-
-    if body_rows > 0 {
-        tensors.push(PlacedTensor {
-            source_idx: sidx,
-            tensor_id: 0, // filled in by the caller in canvas order
-            name: t.name.clone(),
-            dtype: t.dtype,
-            tensor_byte_start: base_off + t.file_start,
-            tensor_rows: body_rows,
-            tensor_cols: w,
-            canvas_x: center_offset,
-            canvas_y: cursor_y,
-            hue,
-            layer_idx: None,
-        });
-    }
-    if tail > 0 {
-        tensors.push(PlacedTensor {
-            source_idx: sidx,
-            tensor_id: 0,
-            name: t.name.clone(),
-            dtype: t.dtype,
-            tensor_byte_start: base_off + t.file_start + t.dtype.row_byte_offset(w, body_rows),
-            tensor_rows: 1,
-            tensor_cols: tail,
-            canvas_x: center_offset,
-            canvas_y: cursor_y.saturating_add(body_rows.min(u32::MAX as u64) as u32),
-            hue,
-            layer_idx: None,
-        });
-    }
-    cursor_y.saturating_add(fp.height).saturating_add(PAD)
+    let s = pick_scale(rows, cols);
+    let (dw, dh) = disp_dims(rows, cols, s);
+    let center_offset = canvas_w.saturating_sub(dw) / 2;
+    tensors.push(PlacedTensor {
+        source_idx: sidx,
+        tensor_id: 0, // filled in by the caller in canvas order
+        name: t.name.clone(),
+        dtype: t.dtype,
+        tensor_byte_start: base_off + t.file_start,
+        tensor_rows: rows,
+        tensor_cols: cols,
+        disp_w: dw,
+        disp_h: dh,
+        scale: s,
+        canvas_x: center_offset,
+        canvas_y: cursor_y,
+        hue: name_hue_short(&t.name),
+        layer_idx: None,
+    });
+    cursor_y.saturating_add(dh).saturating_add(PAD)
 }
 
 /// Stable hue derived from a tensor's name (or sub-path). Different from
@@ -1044,63 +1084,60 @@ mod tests {
     }
 
     #[test]
-    fn plan_top_footprint_reshapes_tall_and_wide_near_square() {
+    fn pick_scale_shrinks_very_long_axis_to_cap() {
         // A vocab-sized embedding [152000, 1024] (very tall) and its transpose
-        // [1024, 152000] (very wide) must both collapse to the same near-square
-        // footprint, well under the un-wrapped strip dimension.
+        // [1024, 152000] (very wide) both shrink so their *longest* display axis
+        // lands at CAP_HI — preserving the true 2D aspect (no re-wrap).
         for (rows, cols) in [(152_000u64, 1024u64), (1024, 152_000)] {
-            let fp = plan_top_footprint(rows, cols, Dtype::F32);
-            let log_ratio = (fp.width as f64 / fp.height as f64).log2().abs();
+            let s = pick_scale(rows, cols);
+            assert!(s < 1.0, "{rows}x{cols} should shrink (scale {s} < 1)");
+            let (dw, dh) = disp_dims(rows, cols, s);
             assert!(
-                log_ratio < 1.0,
-                "reshaped footprint {}x{} not near-square (|log2 ratio| = {log_ratio})",
-                fp.width,
-                fp.height,
+                dw.max(dh) <= CAP_HI + 1,
+                "longest display axis {} should be ~CAP_HI {CAP_HI}",
+                dw.max(dh),
             );
+            // Aspect ratio is preserved (within rounding): footprint stays a
+            // strip, just a small one — not reshaped toward square.
+            let want = cols as f64 / rows as f64;
+            let got = dw as f64 / dh as f64;
             assert!(
-                (fp.width as u64) < 152_000 && (fp.height as u64) < 152_000,
-                "reshaped {rows}x{cols} should not retain the 152k strip dim",
+                (want.log2() - got.log2()).abs() < 0.05,
+                "aspect not preserved: want {want}, got {got}",
             );
-            // Body + tail still cover every element.
-            let w = fp.width as u64;
-            assert!((w * fp.height as u64) >= rows * cols);
         }
     }
 
     #[test]
-    fn plan_top_footprint_leaves_mid_aspect_unchanged() {
-        // Exactly square — left alone.
-        assert_eq!(
-            {
-                let fp = plan_top_footprint(1024, 1024, Dtype::F32);
-                (fp.width, fp.height)
-            },
-            (1024, 1024)
-        );
-        // Within 5:1 either way — reproduces the raw element shape.
-        for (rows, cols) in [(1500u64, 1024u64), (1024, 5000), (5000, 1024)] {
-            let fp = plan_top_footprint(rows, cols, Dtype::F32);
+    fn pick_scale_enlarges_thin_vectors() {
+        // A 1×576 norm/bias vector renders 1px tall at scale 1; it should be
+        // enlarged so its short axis thickens past 1px, while the long axis
+        // stays bounded by CAP_HI.
+        let s = pick_scale(1, 576);
+        assert!(s > 1.0, "thin vector should enlarge (scale {s} > 1)");
+        let (dw, dh) = disp_dims(1, 576, s);
+        assert!(dh >= 2, "short axis should thicken past 1px (got {dh})");
+        assert!(dw <= CAP_HI, "long axis must stay within CAP_HI (got {dw})");
+    }
+
+    #[test]
+    fn pick_scale_leaves_midsized_unchanged() {
+        // Square-ish tensors well within [CAP_LO-ish, CAP_HI] keep scale 1.
+        for (rows, cols) in [(1024u64, 1024u64), (576, 576), (1536, 576), (576, 1536)] {
             assert_eq!(
-                (fp.width as u64, fp.height as u64),
-                (cols, rows),
-                "{rows}x{cols} (within 1:5..5:1) should be unchanged",
+                pick_scale(rows, cols),
+                1.0,
+                "{rows}x{cols} should keep scale 1",
             );
         }
-        // Just past 5:1 — now reshaped (width no longer == cols).
-        let fp = plan_top_footprint(1024, 5200, Dtype::F32);
-        assert_ne!(fp.width as u64, 5200, "5.08:1 wide tensor should reshape");
-        // A 1-D-ish wide vector reshapes into a near-square block.
-        let fp = plan_top_footprint(1, 4096, Dtype::F32);
-        assert_eq!((fp.width, fp.height), (64, 64));
     }
 
-    /// Build a checkpoint with a vocab-sized embedding plus a few real layers,
-    /// then assert the embedding is re-wrapped to a near-square block whose
-    /// body byte offset is the tensor start and whose body+tail cover every
-    /// element — and that the canvas is no longer dominated by the embedding's
-    /// full height.
+    /// A vocab-sized embedding is placed as a single shrunk rectangle that
+    /// preserves the true element dims (no re-wrap, no body/tail split), with a
+    /// bounded display footprint, and the layout reports a positive
+    /// `detail_depth` so the variable-depth pyramid will recover its detail.
     #[test]
-    fn embedding_wraps_into_contiguous_chunks() {
+    fn embedding_shrinks_to_single_bounded_rect() {
         const VOCAB: u64 = 152_000;
         const HIDDEN: u64 = 1024;
         let mut tensors: Vec<TensorMeta> = Vec::new();
@@ -1136,87 +1173,122 @@ mod tests {
             .iter()
             .filter(|t| t.name == "model.embed_tokens.weight")
             .collect();
+        assert_eq!(chunks.len(), 1, "embedding is one rectangle (no re-wrap split)");
+        let e = chunks[0];
+        // True element dims preserved; byte start is the tensor start.
+        assert_eq!((e.tensor_rows, e.tensor_cols), (VOCAB, HIDDEN));
+        assert_eq!(e.tensor_byte_start, embed_start);
+        // Shrunk: footprint bounded, scale < 1.
+        assert!(e.scale < 1.0, "embedding should be shrunk (scale {})", e.scale);
         assert!(
-            (1..=2).contains(&chunks.len()),
-            "embedding should be a body (+ optional tail); got {} piece(s)",
-            chunks.len(),
+            e.disp_w.max(e.disp_h) <= CAP_HI + 1,
+            "footprint {}x{} should be bounded by CAP_HI",
+            e.disp_w,
+            e.disp_h,
         );
-
-        let fp = plan_top_footprint(VOCAB, HIDDEN, Dtype::F32);
-        let w = fp.width as u64;
-        assert_ne!(w, HIDDEN, "tall embedding must be re-wrapped to a new width");
-
-        // The body starts at the tensor's byte start; body + tail cover every
-        // element exactly, contiguously.
-        let body = chunks[0];
-        assert_eq!(body.tensor_byte_start, embed_start, "body byte start mismatch");
-        assert_eq!(body.tensor_cols, w);
-        let mut covered: u64 = body.tensor_rows * body.tensor_cols;
-        if let Some(tail) = chunks.get(1) {
-            let expected_tail_start =
-                embed_start + Dtype::F32.row_byte_offset(w, body.tensor_rows);
-            assert_eq!(tail.tensor_byte_start, expected_tail_start, "tail byte start mismatch");
-            assert_eq!(tail.tensor_rows, 1);
-            covered += tail.tensor_cols;
-        }
-        assert_eq!(covered, VOCAB * HIDDEN, "body + tail must cover all elements");
-
-        // Canvas height must be far below the un-wrapped 152k-px strip.
+        // Canvas no longer dominated by the 152k strip.
         assert!(
             layout.height < VOCAB as u32,
-            "canvas height {} should be well under the un-wrapped {VOCAB}",
+            "canvas height {} should be well under {VOCAB}",
             layout.height,
         );
+        // Variable-depth detail levels were requested for the shrunk tensor.
         assert!(
-            chunks.iter().all(|c| c.tensor_rows < VOCAB / 2),
-            "no piece should retain anywhere near the full vocab height",
+            layout.detail_depth > 0,
+            "shrinking should request detail levels; got {}",
+            layout.detail_depth,
         );
     }
 
-    /// The re-wrap width must stay a multiple of the packed-dtype slot size and
-    /// the byte stride must come from the packed-dtype stride, not a naive
-    /// `cols * element_size`. A 4-bit-packed dtype packs 8 elements per int32,
-    /// so the re-wrap width must be a multiple of 8.
+    /// With no tensor shrunk (all within CAP_HI), `detail_depth` is 0 — the
+    /// viewer stays single-layer, no detail tiles are emitted.
     #[test]
-    fn packed_embedding_chunks_use_packed_stride() {
-        const VOCAB: u64 = 152_000;
-        const HIDDEN: u64 = 1024;
-        let embed_start: u64 = 4096;
-        // Int4Packed: (1024 / 8) * 4 = 512 bytes per row.
-        let expected_bpr = (HIDDEN / 8) * 4;
-        assert_eq!(Dtype::Int4Packed.row_byte_offset(HIDDEN, 1), expected_bpr);
+    fn no_shrink_means_no_detail_depth() {
+        let mut tensors: Vec<TensorMeta> = Vec::new();
+        let mut off: u64 = 1024;
+        for i in 0..4u64 {
+            for sub in ["self_attn.q_proj.weight", "mlp.gate_proj.weight"] {
+                let bytes = 512 * 512 * 4;
+                tensors.push(TensorMeta {
+                    name: format!("model.layers.{i}.{sub}"),
+                    dtype: Dtype::F32,
+                    shape: vec![512, 512],
+                    file_start: off,
+                    file_end: off + bytes,
+                    packed_sidecars: None,
+                });
+                off += bytes;
+            }
+        }
+        let source = synthetic_source(tensors);
+        let layout = ArchLayout::try_build(&[source], &[0], &[]).unwrap();
+        assert_eq!(layout.detail_depth, 0);
+    }
 
-        let tensors = vec![TensorMeta {
-            name: "model.embed_tokens.weight".to_string(),
-            dtype: Dtype::Int4Packed,
-            shape: vec![VOCAB, HIDDEN],
-            file_start: embed_start,
-            file_end: embed_start + VOCAB * expected_bpr,
-            packed_sidecars: None,
-        }];
+    #[test]
+    fn detail_depth_for_scale_bounds() {
+        // Not shrunk → no detail levels.
+        assert_eq!(detail_depth_for_scale(1.0), 0);
+        assert_eq!(detail_depth_for_scale(1.5), 0);
+        // Shrunk → ceil(log2(1/scale)) levels.
+        assert_eq!(detail_depth_for_scale(0.5), 1); // 2× shrink
+        assert_eq!(detail_depth_for_scale(0.25), 2); // 4× shrink
+        assert_eq!(detail_depth_for_scale(0.1), 4); // 10× → ceil(log2 10)=4
+        // Degenerate inputs are guarded.
+        assert_eq!(detail_depth_for_scale(0.0), 0);
+        assert_eq!(detail_depth_for_scale(f32::NAN), 0);
+        // Never exceeds the safety cap.
+        assert!(detail_depth_for_scale(1e-9) <= D_MAX);
+    }
+
+    /// A vocab embedding plus several moderately-shrunk weight matrices: the
+    /// layout-wide `detail_depth` is driven by the most-shrunk tensor (the
+    /// embedding), while each matrix needs only its own (shallower) depth — the
+    /// property `detail_coords` relies on to avoid re-rendering matrices at the
+    /// deep levels only the embedding needs.
+    #[test]
+    fn detail_depth_driven_by_most_shrunk_tensor() {
+        const VOCAB: u64 = 200_000;
+        const HIDDEN: u64 = 4096; // > CAP_HI → matrices are shrunk too
+        let mut tensors: Vec<TensorMeta> = Vec::new();
+        let mut off: u64 = 0;
+        let mut push = |tensors: &mut Vec<TensorMeta>, off: &mut u64, name: &str, shape: Vec<u64>| {
+            let n: u64 = shape.iter().product();
+            tensors.push(TensorMeta {
+                name: name.to_string(),
+                dtype: Dtype::F32,
+                shape,
+                file_start: *off,
+                file_end: *off + n * 4,
+                packed_sidecars: None,
+            });
+            *off += n * 4;
+        };
+        push(&mut tensors, &mut off, "model.embed_tokens.weight", vec![VOCAB, HIDDEN]);
+        for i in 0..4u64 {
+            push(&mut tensors, &mut off, &format!("model.layers.{i}.self_attn.q_proj.weight"), vec![HIDDEN, HIDDEN]);
+            push(&mut tensors, &mut off, &format!("model.layers.{i}.mlp.gate_proj.weight"), vec![HIDDEN, HIDDEN]);
+        }
         let source = synthetic_source(tensors);
         let layout = ArchLayout::try_build(&[source], &[0], &[]).unwrap();
 
-        let chunks: Vec<&PlacedTensor> = layout
+        let embed = layout
             .tensors
             .iter()
-            .filter(|t| t.name == "model.embed_tokens.weight")
-            .collect();
-        assert!((1..=2).contains(&chunks.len()));
-        let fp = plan_top_footprint(VOCAB, HIDDEN, Dtype::Int4Packed);
-        let w = fp.width as u64;
-        // Int4Packed slots hold 8 elements, so the re-wrap width must align.
-        assert_eq!(w % 8, 0, "packed re-wrap width must be a multiple of the slot size");
+            .find(|t| t.name.contains("embed_tokens"))
+            .unwrap();
+        let matrix = layout
+            .tensors
+            .iter()
+            .find(|t| t.name.contains("q_proj"))
+            .unwrap();
 
-        let body = chunks[0];
-        assert_eq!(body.tensor_byte_start, embed_start);
-        assert_eq!(body.tensor_cols, w);
-        if let Some(tail) = chunks.get(1) {
-            assert_eq!(
-                tail.tensor_byte_start,
-                embed_start + body.tensor_rows * Dtype::Int4Packed.row_byte_offset(w, 1),
-                "packed tail must use the packed per-row stride",
-            );
-        }
+        // 4096×4096 matrix → scale 0.5 → resolves in 1 detail level.
+        assert!(matrix.scale < 1.0 && matrix.scale >= 0.49);
+        assert_eq!(detail_depth_for_scale(matrix.scale), 1);
+        // The embedding is far more shrunk and needs more levels.
+        assert!(detail_depth_for_scale(embed.scale) > 1);
+        // Layout-wide depth == the embedding's (the max).
+        assert_eq!(layout.detail_depth, detail_depth_for_scale(embed.scale));
     }
 }

@@ -171,6 +171,18 @@ struct CasToken {
 static CAS_TOKEN_CACHE: Mutex<Option<HashMap<(String, String, String), CasToken>>> =
     Mutex::new(None);
 
+fn invalidate_cas_token_cache(api_segment: &str, repo_id: &str, revision: &str) {
+    let key = (
+        api_segment.to_string(),
+        repo_id.to_string(),
+        revision.to_string(),
+    );
+    let mut guard = CAS_TOKEN_CACHE.lock().unwrap();
+    if let Some(cache) = guard.as_mut() {
+        cache.remove(&key);
+    }
+}
+
 async fn fetch_cas_token(
     api_segment: &str,
     repo_id: &str,
@@ -418,13 +430,25 @@ struct ReaderTerm {
 /// One signed-URL descriptor: a contiguous chunk range plus its packed-byte
 /// range inside the xorb (HTTP Range header is `bytes=byte_start-byte_end`,
 /// *inclusive end*).
-#[derive(Clone)]
+///
+/// `url` is wrapped in a mutex because the presigned CDN URL expires after a
+/// short window (typically ~1 h) but the same descriptor — keyed by xorb hash
+/// and byte range — is content-addressed and stable across reconstruction
+/// re-fetches. The reader refreshes URLs in place (see [`XetReader::ensure_fresh_urls`])
+/// so callers holding a `&ReaderDescriptor` keep working past the original
+/// signing window.
 struct ReaderDescriptor {
     chunk_start: u32,
     chunk_end: u32,
     byte_start: u64,
     byte_end: u64,
-    url: Arc<String>,
+    url: Mutex<Arc<String>>,
+}
+
+impl ReaderDescriptor {
+    fn current_url(&self) -> Arc<String> {
+        Arc::clone(&self.url.lock().unwrap())
+    }
 }
 
 /// All descriptors for one xorb, sorted by `chunk_start` for binary search.
@@ -503,6 +527,75 @@ pub struct XetReader {
     filename: Arc<String>,
     cache: Mutex<DescriptorCache>,
     inflight: Mutex<HashMap<CacheKey, Arc<tokio::sync::OnceCell<DecodedDescriptor>>>>,
+    /// Data needed to re-call `fetch_cas_token` + `fetch_reconstruction_response`
+    /// when the presigned CDN URLs near expiry. Cheap (small strings) to clone.
+    refresh_meta: RefreshMeta,
+    /// Earliest URL expiry seen across all xorb descriptors (Unix seconds).
+    /// Guarded by a tokio mutex so concurrent fetch paths serialise on a
+    /// single refresh — checks are cheap, and the slow path only runs once
+    /// per ~hour.
+    refresh_state: tokio::sync::Mutex<RefreshState>,
+}
+
+#[derive(Clone)]
+struct RefreshMeta {
+    api_segment: String,
+    repo_id: String,
+    revision: String,
+    xet_hash: String,
+}
+
+struct RefreshState {
+    /// Earliest URL expiry across all descriptors, Unix seconds. `0` means
+    /// "unknown" (no `Expires=` query param parsed) — treated as already
+    /// expired so we refresh on the next call.
+    expires_at: u64,
+}
+
+/// Safety margin: refresh URLs once they have less than this many seconds left.
+/// Generous (10 min) so a slow reconstruction re-fetch — itself two HTTP round
+/// trips against the Hub and CAS — can complete well before any in-flight
+/// descriptor download starts using the new URLs.
+const URL_REFRESH_MARGIN_SECS: u64 = 600;
+
+/// Fallback "valid for this long" assumption when a presigned URL has no
+/// parseable `Expires=` query param (e.g. the CDN signer changed scheme).
+/// Conservative compared to the typical ~1 h CloudFront TTL so we still
+/// refresh well before any plausible expiry, but long enough that a
+/// missing-`Expires` response doesn't trigger refresh-on-every-call.
+const URL_FALLBACK_TTL_SECS: u64 = 30 * 60;
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Parse the CloudFront-style `Expires=<unix-seconds>` query param embedded in
+/// a presigned CDN URL. Returns `None` if the URL doesn't carry that param
+/// (e.g. a different signer or a future scheme change) — callers treat that
+/// the same as "already expired" so refresh kicks in.
+fn expires_at_from_url(url: &str) -> Option<u64> {
+    let needle = "Expires=";
+    let start = url.find(needle)? + needle.len();
+    let tail = &url[start..];
+    let end = tail.find(|c: char| !c.is_ascii_digit()).unwrap_or(tail.len());
+    if end == 0 {
+        return None;
+    }
+    tail[..end].parse::<u64>().ok()
+}
+
+/// Combine the earliest parsed `Expires=` with the "missing param" fallback.
+/// If we saw any URL without `Expires=`, the earliest parsed value is meaningless
+/// (some URL could be expiring sooner), so use the fallback TTL from now.
+fn compute_expires_at(earliest_parsed: u64, any_missing: bool) -> u64 {
+    if any_missing || earliest_parsed == u64::MAX {
+        unix_now_secs().saturating_add(URL_FALLBACK_TTL_SECS)
+    } else {
+        earliest_parsed
+    }
 }
 
 /// Default per-reader cache budget — generous enough to keep hot regions of
@@ -518,19 +611,26 @@ impl XetReader {
             .xet_hash
             .as_deref()
             .ok_or_else(|| anyhow!("{}: not xet-backed, cannot build XetReader", spec.filename))?;
-        let cas = fetch_cas_token(
-            spec.repo.api_segment(),
-            &spec.repo.repo_id(),
-            &spec.revision,
-        )
-        .await?;
+        let api_segment = spec.repo.api_segment().to_string();
+        let repo_id = spec.repo.repo_id();
+        let revision: String = (*spec.revision).clone();
+        let cas = fetch_cas_token(&api_segment, &repo_id, &revision).await?;
         let raw = fetch_reconstruction_response(&cas, hash).await?;
 
-        // Build the per-xorb descriptor lookup (sorted by chunk_start).
+        // Build the per-xorb descriptor lookup (sorted by chunk_start). Track
+        // the earliest URL expiry so the reader knows when to refresh; if any
+        // URL lacks `Expires=` we fall back to a conservative TTL so refresh
+        // still kicks in eventually without hammering CAS on every fetch.
         let mut xorbs: HashMap<String, XorbInfo> = HashMap::with_capacity(raw.xorbs.len());
+        let mut earliest_expiry: u64 = u64::MAX;
+        let mut any_url_missing_expires = false;
         for (xorb_hash, fetches) in raw.xorbs {
             let mut descriptors: Vec<ReaderDescriptor> = Vec::new();
             for fetch in fetches {
+                match expires_at_from_url(&fetch.url) {
+                    Some(ts) => earliest_expiry = earliest_expiry.min(ts),
+                    None => any_url_missing_expires = true,
+                }
                 let url = Arc::new(fetch.url);
                 for desc in fetch.ranges {
                     descriptors.push(ReaderDescriptor {
@@ -538,13 +638,14 @@ impl XetReader {
                         chunk_end: desc.chunks.end,
                         byte_start: desc.bytes.start,
                         byte_end: desc.bytes.end,
-                        url: Arc::clone(&url),
+                        url: Mutex::new(Arc::clone(&url)),
                     });
                 }
             }
             descriptors.sort_by_key(|d| d.chunk_start);
             xorbs.insert(xorb_hash, XorbInfo { descriptors });
         }
+        let expires_at = compute_expires_at(earliest_expiry, any_url_missing_expires);
 
         // Compute cumulative file offsets per term; verify each term's xorb
         // appears in `xorbs` (otherwise the fetch path would silently fail).
@@ -587,6 +688,13 @@ impl XetReader {
             filename: Arc::clone(&spec.filename),
             cache: Mutex::new(DescriptorCache::new(DEFAULT_CACHE_BUDGET_BYTES)),
             inflight: Mutex::new(HashMap::new()),
+            refresh_meta: RefreshMeta {
+                api_segment,
+                repo_id,
+                revision,
+                xet_hash: hash.to_string(),
+            },
+            refresh_state: tokio::sync::Mutex::new(RefreshState { expires_at }),
         }))
     }
 
@@ -595,6 +703,7 @@ impl XetReader {
     /// fetching + decompressing (cached) and concatenating the requested
     /// slice into `out`.
     pub async fn fetch_range(&self, start: u64, len: usize) -> anyhow::Result<Vec<u8>> {
+        self.ensure_fresh_urls().await?;
         let end = start.saturating_add(len as u64);
         if end > self.file_size {
             anyhow::bail!(
@@ -718,6 +827,100 @@ impl XetReader {
         Ok(())
     }
 
+    /// Refresh presigned CDN URLs if any is near expiry.
+    ///
+    /// CAS reconstruction returns CloudFront-signed URLs with a short TTL
+    /// (typically ~1 h). Without proactive refresh, a long-running pipeline
+    /// starts 403'ing on every fetch once the signing window closes. We
+    /// re-call `/v2/reconstructions/{hash}` and swap fresh URLs into the
+    /// existing descriptors in place — the xet hash is content-addressed,
+    /// so the new response's xorbs and byte ranges match what we already
+    /// have. Concurrent callers serialise on the same tokio mutex, so at
+    /// most one refresh is ever in flight.
+    async fn ensure_fresh_urls(&self) -> anyhow::Result<()> {
+        // Fast path: no lock contention if URLs are comfortably fresh.
+        let now = unix_now_secs();
+        {
+            let state = self.refresh_state.lock().await;
+            if state.expires_at > now + URL_REFRESH_MARGIN_SECS {
+                return Ok(());
+            }
+        }
+        // Slow path: serialise refreshes. Re-check after acquiring the lock
+        // — a peer may have refreshed while we were waiting.
+        let mut state = self.refresh_state.lock().await;
+        let now = unix_now_secs();
+        if state.expires_at > now + URL_REFRESH_MARGIN_SECS {
+            return Ok(());
+        }
+
+        // The cached CAS token may itself be expired; if so, the reconstruction
+        // call will 401/403 and we'd never recover. Drop it first so the next
+        // `fetch_cas_token` re-mints from the Hub.
+        let meta = &self.refresh_meta;
+        invalidate_cas_token_cache(&meta.api_segment, &meta.repo_id, &meta.revision);
+        let cas = fetch_cas_token(&meta.api_segment, &meta.repo_id, &meta.revision).await?;
+        let raw = fetch_reconstruction_response(&cas, &meta.xet_hash).await?;
+
+        // Build (xorb_hash, byte_start) → fresh URL. The xet hash is
+        // content-addressed so the server should return the same set of
+        // (xorb, byte range) descriptors — only the signed URLs differ.
+        let mut fresh_urls: HashMap<(String, u64), Arc<String>> = HashMap::new();
+        let mut earliest_expiry: u64 = u64::MAX;
+        let mut any_url_missing_expires = false;
+        for (xorb_hash, fetches) in raw.xorbs {
+            for fetch in fetches {
+                match expires_at_from_url(&fetch.url) {
+                    Some(ts) => earliest_expiry = earliest_expiry.min(ts),
+                    None => any_url_missing_expires = true,
+                }
+                let url = Arc::new(fetch.url);
+                for desc in fetch.ranges {
+                    fresh_urls.insert(
+                        (xorb_hash.clone(), desc.bytes.start),
+                        Arc::clone(&url),
+                    );
+                }
+            }
+        }
+        let new_expires_at = compute_expires_at(earliest_expiry, any_url_missing_expires);
+
+        // Swap each descriptor's URL in place. Any descriptor missing from the
+        // new response is logged but left alone — its old URL will keep
+        // failing, surfacing the layout mismatch instead of hiding it.
+        let mut swapped = 0usize;
+        let mut missing = 0usize;
+        for (xorb_hash, info) in self.xorbs.iter() {
+            for desc in &info.descriptors {
+                match fresh_urls.get(&(xorb_hash.clone(), desc.byte_start)) {
+                    Some(new_url) => {
+                        *desc.url.lock().unwrap() = Arc::clone(new_url);
+                        swapped += 1;
+                    }
+                    None => missing += 1,
+                }
+            }
+        }
+        if missing > 0 {
+            log::warn!(
+                "{}: refresh swapped {} URLs but {} descriptors had no match in the new reconstruction response — those will continue to 403 until process restart",
+                self.filename,
+                swapped,
+                missing,
+            );
+        } else {
+            log::info!(
+                "{}: refreshed {} xorb URLs (new expiry in {}s)",
+                self.filename,
+                swapped,
+                new_expires_at.saturating_sub(unix_now_secs()),
+            );
+        }
+
+        state.expires_at = new_expires_at;
+        Ok(())
+    }
+
     /// Fetch (or cache-hit) a descriptor's decoded chunk segment.
     ///
     /// Concurrent calls for the same `(xorb_hash, descriptor.byte_start)` key
@@ -794,10 +997,11 @@ impl XetReader {
         // concurrency control). Network errors propagate; the load worker
         // surfaces them and aborts the pipeline.
         let range_header = format!("bytes={}-{}", desc.byte_start, desc.byte_end);
+        let url = desc.current_url();
         CAS_INFLIGHT.fetch_add(1, Ordering::Relaxed);
         let bytes_res = async {
             let resp = http_client()
-                .get(desc.url.as_str())
+                .get(url.as_str())
                 .header(reqwest::header::RANGE, &range_header)
                 .send()
                 .await
@@ -885,5 +1089,41 @@ mod tests {
         let b = [t(0, 5, "shared")];
         let m = XorbMap::build(vec![(Some(&a[..]), 0), (Some(&b[..]), 10)]);
         assert_eq!(m.color_idx_at(0), m.color_idx_at(10));
+    }
+
+    #[test]
+    fn expires_at_parses_cloudfront_query_param() {
+        // Mirrors the exact format observed in production 403 errors —
+        // `Expires=` sits between `&repo_id=...` and `&Policy=...`.
+        let url = "https://us.aws.cdn.hf.co/xorbs/default/abcd?repo_id=x&user_id=y&Expires=1780049739&Policy=eyJ...&Signature=ABC&Key-Pair-Id=01KAY";
+        assert_eq!(expires_at_from_url(url), Some(1780049739));
+    }
+
+    #[test]
+    fn expires_at_handles_param_at_end_of_url() {
+        let url = "https://host/path?other=1&Expires=1234567890";
+        assert_eq!(expires_at_from_url(url), Some(1234567890));
+    }
+
+    #[test]
+    fn expires_at_returns_none_when_missing() {
+        let url = "https://host/path?Signature=foo";
+        assert_eq!(expires_at_from_url(url), None);
+    }
+
+    #[test]
+    fn compute_expires_at_uses_fallback_when_any_missing() {
+        let now = unix_now_secs();
+        let parsed_far_future = now + 10_000;
+        // any_missing=true ⇒ ignore the parsed value, use fallback TTL.
+        let v = compute_expires_at(parsed_far_future, true);
+        assert!(v >= now);
+        assert!(v <= now + URL_FALLBACK_TTL_SECS + 5);
+    }
+
+    #[test]
+    fn compute_expires_at_uses_parsed_value_when_all_present() {
+        let v = compute_expires_at(1780049739, false);
+        assert_eq!(v, 1780049739);
     }
 }

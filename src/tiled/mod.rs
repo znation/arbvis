@@ -86,7 +86,7 @@ impl PipelineProgress {
         // Counter bars: pos = tiles completed at this stage, len = total tiles.
         let loaded = add(ProgressBar::new(total_tiles))
             .with_style(counter_style())
-            .with_message("tile bytes loaded");
+            .with_message("tiles loaded");
         let loaded_q = add(ProgressBar::new(queue_cap as u64))
             .with_style(queue_style())
             .with_message("load → render queue");

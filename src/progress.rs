@@ -8,18 +8,29 @@
 //! - [`status_style`]: no bar — just a status message and the elapsed time.
 //!   Used for the AIMD throttle indicator.
 
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-use indicatif::{HumanDuration, MultiProgress, ProgressDrawTarget, ProgressStyle};
+use indicatif::style::ProgressTracker;
+use indicatif::{HumanDuration, MultiProgress, ProgressDrawTarget, ProgressState, ProgressStyle};
 
 /// Threshold above which the rate-based ETA is suppressed.
 ///
 /// Early in a run (or after a stall) the smoothed rate can be near zero, which
-/// makes `indicatif`'s ETA blow up to weeks or months even for jobs that
-/// finish in minutes. We replace those implausible estimates with `--` until
-/// enough samples accumulate for the rate to stabilize.
+/// makes the ETA blow up to weeks or months even for jobs that finish in
+/// minutes. Past this cap we first try a lifetime-average ETA (`(len - pos) *
+/// elapsed / pos`, prefixed with `~`) and fall back to `--` only if even that
+/// exceeds the cap.
 const ETA_DISPLAY_CAP: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Half-life for the smart_eta EWMA, in seconds.
+///
+/// Indicatif's built-in estimator uses a hardcoded 15s window, which makes
+/// ETA over-react to recent stalls or bursts (a 30s stall decays the rate by
+/// 100×). We feed the same `(pos, instant)` samples through a longer-window
+/// estimator so smart_eta stabilizes faster than that. `per_sec` keeps the
+/// short-window default — it's the right tool for spotting current slowness.
+const SMART_ETA_HALF_LIFE_SECS: f64 = 60.0;
 
 /// Process-wide `MultiProgress` that owns every progress bar across the run.
 ///
@@ -50,14 +61,95 @@ pub fn counter_style() -> ProgressStyle {
     )
     .expect("counter_style template parse")
     .progress_chars("=>-")
-    .with_key("smart_eta", |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
-        let eta = state.eta();
-        if eta > ETA_DISPLAY_CAP {
-            let _ = w.write_str("--");
-        } else {
-            let _ = write!(w, "{:#}", HumanDuration(eta));
+    .with_key("smart_eta", SmartEta::new(SMART_ETA_HALF_LIFE_SECS))
+}
+
+/// `ProgressTracker` driving the `smart_eta` template key.
+///
+/// Maintains its own single-EWMA `(pos, instant)` estimator independent of
+/// indicatif's built-in one, so we can pick a longer half-life. On every tick
+/// (position update or steady-tick), the estimator advances using the same
+/// continuous-time weighting formula indicatif uses internally:
+/// `w = 0.1 ^ (Δt / half_life)`. The estimator is the only writer; `write`
+/// reads the latest smoothed rate to render the ETA.
+#[derive(Clone)]
+struct SmartEta {
+    inner: Arc<Mutex<SmartEtaInner>>,
+    half_life_secs: f64,
+}
+
+#[derive(Default)]
+struct SmartEtaInner {
+    smoothed_per_sec: f64,
+    last_sample: Option<(u64, Instant)>,
+}
+
+impl SmartEta {
+    fn new(half_life_secs: f64) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(SmartEtaInner::default())),
+            half_life_secs,
         }
-    })
+    }
+}
+
+impl ProgressTracker for SmartEta {
+    fn clone_box(&self) -> Box<dyn ProgressTracker> {
+        Box::new(self.clone())
+    }
+
+    fn tick(&mut self, state: &ProgressState, now: Instant) {
+        let pos = state.pos();
+        let mut s = self.inner.lock().expect("smart_eta estimator poisoned");
+        if let Some((prev_pos, prev_t)) = s.last_sample {
+            let dt = now.saturating_duration_since(prev_t).as_secs_f64();
+            if dt > 0.0 && pos >= prev_pos {
+                let instant_rate = (pos - prev_pos) as f64 / dt;
+                let weight = 0.1_f64.powf(dt / self.half_life_secs);
+                s.smoothed_per_sec =
+                    s.smoothed_per_sec * weight + instant_rate * (1.0 - weight);
+            }
+        }
+        s.last_sample = Some((pos, now));
+    }
+
+    fn reset(&mut self, _: &ProgressState, _: Instant) {
+        let mut s = self.inner.lock().expect("smart_eta estimator poisoned");
+        s.smoothed_per_sec = 0.0;
+        s.last_sample = None;
+    }
+
+    fn write(&self, state: &ProgressState, w: &mut dyn std::fmt::Write) {
+        let rate = self
+            .inner
+            .lock()
+            .expect("smart_eta estimator poisoned")
+            .smoothed_per_sec;
+        let pos = state.pos();
+        let len = state.len().unwrap_or(0);
+
+        if rate > 0.0 && len > pos {
+            let eta = Duration::from_secs_f64((len - pos) as f64 / rate);
+            if eta <= ETA_DISPLAY_CAP {
+                let _ = write!(w, "{:#}", HumanDuration(eta));
+                return;
+            }
+        }
+        // Long-window estimator has collapsed (e.g. extended stall) or no
+        // samples yet. Fall back to the lifetime-average rate before giving
+        // up. `~` marks the fallback so the reader can tell it isn't reacting
+        // to recent throughput like the adjacent `per_sec`.
+        let elapsed = state.elapsed().as_secs_f64();
+        if pos > 0 && len > pos && elapsed > 0.0 {
+            let lifetime_rate = pos as f64 / elapsed;
+            let fallback = Duration::from_secs_f64((len - pos) as f64 / lifetime_rate);
+            if fallback <= ETA_DISPLAY_CAP {
+                let _ = write!(w, "~{:#}", HumanDuration(fallback));
+                return;
+            }
+        }
+        let _ = w.write_str("--");
+    }
 }
 
 pub fn queue_style() -> ProgressStyle {

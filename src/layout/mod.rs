@@ -129,6 +129,18 @@ pub fn select_layout(
         return Layout::HilbertGlobal(hilbert::HilbertLayout::from_total(total_bytes));
     }
 
+    // MoE-diff: any source carries a `MoeCell` tag → build the expert-vs-expert
+    // matrix layout. Tagged Sources are emitted only by
+    // [`crate::data::prepare_moe_diff_sources`], so this fork can never
+    // collide with a normal arch run.
+    if sources.iter().any(|s| s.moe_cell.is_some()) {
+        if let Some(arch) = arch::ArchLayout::try_build_moe_diff(sources, cumulative_offsets) {
+            return Layout::Architectural(arch);
+        }
+        log::warn!("moe-diff sources present but layout build failed; falling back to hilbert");
+        return Layout::HilbertGlobal(hilbert::HilbertLayout::from_total(total_bytes));
+    }
+
     // Architectural requires safetensors data AND a detectable structure. In
     // non-diff mode every source must be safetensors (otherwise the user has
     // explicitly mixed in non-tensor inputs they'd expect to see). In diff

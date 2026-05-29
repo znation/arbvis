@@ -140,6 +140,20 @@ struct Args {
     #[arg(long, num_args = 2, value_names = ["ORIGINAL", "MODIFIED"])]
     diff: Option<Vec<PathBuf>>,
 
+    /// Visualize an N×N expert-vs-expert diff matrix for each MoE layer of a single
+    /// model. MODEL is a local path or hf:// URL. Each cell (i, j) shows the
+    /// element-wise diff between expert i and expert j for `gate_proj`, `up_proj`,
+    /// and `down_proj`, stacked horizontally; only the upper triangle + diagonal is
+    /// rendered (the raw diff is antisymmetric). Currently supports HF-style
+    /// per-expert safetensors (Mixtral / Qwen3-MoE / OLMoE / DeepSeek routed
+    /// experts); GGUF fused-expert tensors are not yet supported.
+    #[arg(
+        long,
+        value_name = "MODEL",
+        conflicts_with_all = ["diff", "files", "file_list", "finetune", "no_finetune", "show_xet_xorbs"]
+    )]
+    moe_diff: Option<PathBuf>,
+
     /// Force-treat the second --diff argument as a finetune of the first.
     /// In finetune mode, tensors present only on the base side are rendered
     /// as crosshatched grey (informational); anything present only on the
@@ -157,8 +171,9 @@ struct Args {
     #[arg(long = "no-finetune", requires = "diff", conflicts_with = "finetune")]
     no_finetune: bool,
 
-    /// How per-element tensor deltas are encoded for visualization.
-    #[arg(long, value_enum, default_value_t = DiffMetricArg::Rms, requires = "diff")]
+    /// How per-element tensor deltas are encoded for visualization
+    /// (applies to `--diff` and `--moe-diff`).
+    #[arg(long, value_enum, default_value_t = DiffMetricArg::Rms)]
     diff_metric: DiffMetricArg,
 
     /// Render tiles and deploy to this HF Space (e.g. username/my-vis);
@@ -250,6 +265,91 @@ async fn run(args: Args) -> anyhow::Result<()> {
         }
         Some(p) => (None, Some(p), None),
     };
+
+    if let Some(moe_arg) = args.moe_diff {
+        let metric = args.diff_metric.to_metric();
+        let input = moe_arg.to_string_lossy().into_owned();
+        let inputs = vec![input.clone()];
+        let title = args.title.as_deref().unwrap_or("arbvis moe-diff");
+        let (sources, total) = data::prepare_moe_diff_sources(&input, metric)
+            .await
+            .with_context(|| format!("--moe-diff {input}"))?;
+        let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
+        if let Some(ref hf_out_url) = tiles_hf_out {
+            let hf_out = hf_url::parse_hf_output(hf_out_url)?;
+            let _ = tiled::run_tiles_hf_streaming(
+                sources,
+                total,
+                &hf_out,
+                true,
+                title,
+                &inputs,
+                false,
+                leaf_format,
+                pyramid_format,
+                layout_mode,
+            )
+            .await?;
+            return Ok(());
+        }
+        if let Some(ref space_id) = args.space {
+            let bucket_spec = deploy::create_space_bucket(space_id).await?;
+            let html = tiled::run_tiles_hf_streaming(
+                sources,
+                total,
+                &bucket_spec,
+                true,
+                title,
+                &inputs,
+                false,
+                leaf_format,
+                pyramid_format,
+                layout_mode,
+            )
+            .await?;
+            deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html).await?;
+            return Ok(());
+        }
+        if let Some(ref tile_dir) = tiles_arg {
+            tiled::run_tiles(
+                sources,
+                total,
+                tile_dir.clone(),
+                true,
+                title,
+                &inputs,
+                false,
+                leaf_format,
+                pyramid_format,
+                layout_mode,
+            )
+            .await?;
+            if let Some(ref url) = tiles_upload {
+                deploy::upload_dir_to(url, tile_dir).await?;
+            }
+            return Ok(());
+        }
+        let labels = labels.clone();
+        let sources_owned = sources;
+        let output_arg_owned = output_arg.clone();
+        tokio::task::spawn_blocking(move || {
+            single::run_single(
+                &labels,
+                output_arg_owned,
+                sources_owned,
+                total,
+                true,
+                false,
+                layout_mode,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("run_single join failure: {e}"))??;
+        if let (Some(ref url), Some(ref local)) = (&output_upload, &output_arg) {
+            deploy::upload_file_to(url, local).await?;
+        }
+        return Ok(());
+    }
 
     if let Some(raw_diff_args) = args.diff {
         let diff_input_strs: Vec<String> = raw_diff_args

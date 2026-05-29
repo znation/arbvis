@@ -586,7 +586,249 @@ impl ArchLayout {
         }
         out
     }
+
+    /// Build an architectural canvas of per-MoE-layer N×N expert-vs-expert
+    /// matrices. Triggered by [`crate::layout::select_layout`] when any
+    /// source carries a `MoeCell` tag (set by
+    /// [`crate::data::prepare_moe_diff_sources`]).
+    ///
+    /// Inside each cell the three weights `{gate_proj, up_proj, down_proj}`
+    /// sit side-by-side at a uniform per-weight footprint sized so the
+    /// longest tensor axis lands near [`MOE_SUB_AXIS_TARGET`]. Lower-triangle
+    /// cells (`j < i`) are skipped — the raw diff is antisymmetric, so
+    /// they'd just mirror the upper triangle.
+    ///
+    /// Returns `None` if no source carries an MoE tag (let the caller fall
+    /// through to [`ArchLayout::try_build`] or hilbert).
+    pub fn try_build_moe_diff(
+        sources: &[Source],
+        cumulative_offsets: &[u64],
+    ) -> Option<Self> {
+        use crate::format::moe::ExpertWeight;
+
+        // (layer, i, j, weight) → (source_idx, &TensorMeta, base_off)
+        let mut cells: BTreeMap<(u32, u32, u32, ExpertWeight), (usize, &TensorMeta, u64)> =
+            BTreeMap::new();
+        for (sidx, s) in sources.iter().enumerate() {
+            let Some(cell) = s.moe_cell else {
+                continue;
+            };
+            let Some(st) = s.model_info.as_ref() else {
+                continue;
+            };
+            let Some(t) = st.tensors.first() else {
+                continue;
+            };
+            let off = cumulative_offsets.get(sidx).copied().unwrap_or(0);
+            cells.insert((cell.layer, cell.i, cell.j, cell.weight), (sidx, t, off));
+        }
+        if cells.is_empty() {
+            return None;
+        }
+
+        // Distinct layer indices, ascending.
+        let layer_ids: Vec<u32> = {
+            let set: std::collections::BTreeSet<u32> =
+                cells.keys().map(|(l, ..)| *l).collect();
+            set.into_iter().collect()
+        };
+
+        // Per-layer: determine N (max expert idx + 1) and a uniform per-weight
+        // sub-cell footprint, large enough to hold any of the three weights.
+        struct LayerGeom {
+            n_experts: u32,
+            sub_w: u32, // per-weight footprint width
+            sub_h: u32, // per-weight footprint height
+            scale: f32, // uniform scale applied to every per-weight tensor
+            cell_w: u32,
+            cell_h: u32,
+        }
+        let geoms: BTreeMap<u32, LayerGeom> = layer_ids
+            .iter()
+            .map(|&l| {
+                let mut max_axis: u64 = 1;
+                let mut max_rows: u64 = 1;
+                let mut max_cols: u64 = 1;
+                let mut n_experts: u32 = 0;
+                for ((cl, i, j, _w), (_, t, _)) in cells.range(
+                    (l, 0u32, 0u32, ExpertWeight::GateProj)
+                        ..(l + 1, 0u32, 0u32, ExpertWeight::GateProj),
+                ) {
+                    debug_assert_eq!(*cl, l);
+                    let (rows, cols) = t.element_shape();
+                    max_rows = max_rows.max(rows);
+                    max_cols = max_cols.max(cols);
+                    max_axis = max_axis.max(rows.max(cols));
+                    n_experts = n_experts.max(*i + 1).max(*j + 1);
+                }
+                // Per-weight scale: shrink so the long axis lands at
+                // MOE_SUB_AXIS_TARGET. Never up-scale (sub_axis_target is
+                // smaller than every realistic expert dim).
+                let scale =
+                    (MOE_SUB_AXIS_TARGET as f32 / max_axis as f32).min(1.0);
+                let (sub_w, sub_h) = disp_dims(max_rows, max_cols, scale);
+                let sub_w = align_up(sub_w, 4);
+                let sub_h = align_up(sub_h, 4);
+                let cell_w = 3 * sub_w + 2 * MOE_INNER_PAD;
+                let cell_h = sub_h;
+                (
+                    l,
+                    LayerGeom {
+                        n_experts,
+                        sub_w,
+                        sub_h,
+                        scale,
+                        cell_w,
+                        cell_h,
+                    },
+                )
+            })
+            .collect();
+
+        // Canvas-wide tensors and layer bounds. One matrix per layer, stacked
+        // vertically with MOE_LAYER_GAP between.
+        let mut tensors: Vec<PlacedTensor> = Vec::new();
+        let mut layer_bounds: Vec<LayerBounds> = Vec::new();
+        let mut cursor_y: u32 = 0;
+        let mut canvas_w: u32 = 1;
+
+        for &l in &layer_ids {
+            let g = &geoms[&l];
+            let n = g.n_experts;
+            if n == 0 {
+                continue;
+            }
+            let matrix_w = n
+                .saturating_mul(g.cell_w)
+                .saturating_add(n.saturating_sub(1).saturating_mul(MOE_CELL_PAD));
+            let matrix_h = n
+                .saturating_mul(g.cell_h)
+                .saturating_add(n.saturating_sub(1).saturating_mul(MOE_CELL_PAD));
+            canvas_w = canvas_w.max(matrix_w);
+            let matrix_x = 0u32;
+            let matrix_y = cursor_y;
+
+            for i in 0..n {
+                for j in i..n {
+                    let cell_x = matrix_x
+                        .saturating_add(j.saturating_mul(g.cell_w.saturating_add(MOE_CELL_PAD)));
+                    let cell_y = matrix_y
+                        .saturating_add(i.saturating_mul(g.cell_h.saturating_add(MOE_CELL_PAD)));
+                    for (w_idx, weight) in [
+                        ExpertWeight::GateProj,
+                        ExpertWeight::UpProj,
+                        ExpertWeight::DownProj,
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        let Some((sidx, t, base_off)) = cells.get(&(l, i, j, *weight)) else {
+                            continue;
+                        };
+                        let (rows, cols) = t.element_shape();
+                        let (dw, dh) = disp_dims(rows, cols, g.scale);
+                        // Centre each tensor inside its sub_w × sub_h sub-cell
+                        // (shapes may differ slightly between gate/up vs down).
+                        let sub_x = cell_x
+                            .saturating_add((w_idx as u32) * (g.sub_w + MOE_INNER_PAD));
+                        let sub_y = cell_y;
+                        let inset_x = g.sub_w.saturating_sub(dw) / 2;
+                        let inset_y = g.sub_h.saturating_sub(dh) / 2;
+                        tensors.push(PlacedTensor {
+                            source_idx: *sidx,
+                            tensor_id: 0,
+                            name: t.name.clone(),
+                            dtype: t.dtype,
+                            tensor_byte_start: base_off + t.file_start,
+                            tensor_rows: rows,
+                            tensor_cols: cols,
+                            disp_w: dw,
+                            disp_h: dh,
+                            scale: g.scale,
+                            canvas_x: sub_x.saturating_add(inset_x),
+                            canvas_y: sub_y.saturating_add(inset_y),
+                            hue: name_hue_short(weight.label()),
+                            layer_idx: Some(l),
+                        });
+                    }
+                }
+            }
+
+            layer_bounds.push(LayerBounds {
+                layer_idx: l,
+                canvas_x: matrix_x,
+                canvas_y: matrix_y,
+                width: matrix_w,
+                height: matrix_h,
+            });
+            cursor_y = matrix_y.saturating_add(matrix_h).saturating_add(MOE_LAYER_GAP);
+        }
+
+        if tensors.is_empty() {
+            return None;
+        }
+
+        // Assign tensor_ids in canvas order.
+        for (i, t) in tensors.iter_mut().enumerate() {
+            t.tensor_id = i;
+        }
+
+        let raw_h = cursor_y.saturating_sub(MOE_LAYER_GAP).max(1);
+        let raw_canvas_h = align_up(raw_h, TILE);
+        let raw_canvas_w = align_up(canvas_w, TILE);
+        let raw_width_tiles = (raw_canvas_w / TILE).max(1);
+        let raw_height_tiles = (raw_canvas_h / TILE).max(1);
+        let width_tiles = next_pow2(raw_width_tiles);
+        let height_tiles = next_pow2(raw_height_tiles);
+        let canvas_w = width_tiles * TILE;
+        let canvas_h = height_tiles * TILE;
+        let max_zoom = (width_tiles.min(height_tiles).max(1) as f64).log2().round() as u32;
+
+        let detail_depth = tensors
+            .iter()
+            .map(|t| detail_depth_for_scale(t.scale))
+            .max()
+            .unwrap_or(0);
+
+        let mut sorted_idx: Vec<usize> = (0..tensors.len()).collect();
+        sorted_idx.sort_by_key(|&i| {
+            let t = &tensors[i];
+            (t.canvas_y, t.canvas_x)
+        });
+
+        Some(Self {
+            width: canvas_w,
+            height: canvas_h,
+            width_tiles,
+            height_tiles,
+            total_tiles: width_tiles as u64 * height_tiles as u64,
+            max_zoom,
+            detail_depth,
+            tensors,
+            layer_bounds,
+            architecture: format!(
+                "MoE expert diff ({} layer(s), {} expert(s)/layer)",
+                layer_ids.len(),
+                geoms.values().map(|g| g.n_experts).max().unwrap_or(0),
+            ),
+            sorted_idx,
+        })
+    }
 }
+
+/// Target longest-axis size, in overview pixels, for a single per-weight
+/// tensor inside an MoE-diff cell. Picked so a 64-expert × 64-expert matrix
+/// of 3-weight cells lands in a comfortable few-thousand-pixel canvas at the
+/// overview zoom; the variable-depth pyramid recovers element-level detail
+/// on zoom-in.
+const MOE_SUB_AXIS_TARGET: u32 = 64;
+/// Gutter between the three per-weight sub-cells (gate/up/down) inside one
+/// matrix cell.
+const MOE_INNER_PAD: u32 = 4;
+/// Gutter between adjacent matrix cells.
+const MOE_CELL_PAD: u32 = 8;
+/// Gap between stacked per-layer matrices.
+const MOE_LAYER_GAP: u32 = 32;
 
 /// Order key for sub-paths within a layer: attention, then MLP, then norms,
 /// then "other". Within attention, q/k/v/o; within MLP, gate/up/down.
@@ -860,6 +1102,7 @@ mod tests {
             }),
             name_override: None,
             xet_terms: None,
+            moe_cell: None,
         }
     }
 

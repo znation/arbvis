@@ -61,6 +61,7 @@ pub fn spans_to_sources(
                             mod_.start + common
                         )),
                         xet_terms: None,
+                        moe_cell: None,
                     });
                     total += common;
                 }
@@ -86,6 +87,7 @@ pub fn spans_to_sources(
                             orig.end
                         )),
                         xet_terms: None,
+                        moe_cell: None,
                     });
                     total += len;
                 }
@@ -108,6 +110,7 @@ pub fn spans_to_sources(
                             mod_.end
                         )),
                         xet_terms: None,
+                        moe_cell: None,
                     });
                     total += len;
                 }
@@ -132,6 +135,7 @@ pub fn spans_to_sources(
                         orig_label, orig.start, orig.end
                     )),
                     xet_terms: None,
+                    moe_cell: None,
                 });
                 total += len;
             }
@@ -155,6 +159,7 @@ pub fn spans_to_sources(
                         mod_label, mod_.start, mod_.end
                     )),
                     xet_terms: None,
+                    moe_cell: None,
                 });
                 total += len;
             }

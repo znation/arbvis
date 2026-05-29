@@ -18,6 +18,7 @@ use image::Rgb;
 
 pub mod dtype;
 pub mod gguf;
+pub mod moe;
 pub mod name_map;
 pub mod pickle;
 pub mod safetensors;

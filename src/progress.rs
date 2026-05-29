@@ -100,7 +100,7 @@ impl ProgressTracker for SmartEta {
 
     fn tick(&mut self, state: &ProgressState, now: Instant) {
         let pos = state.pos();
-        let mut s = self.inner.lock().expect("smart_eta estimator poisoned");
+        let mut s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((prev_pos, prev_t)) = s.last_sample {
             let dt = now.saturating_duration_since(prev_t).as_secs_f64();
             if dt > 0.0 && pos >= prev_pos {
@@ -114,7 +114,7 @@ impl ProgressTracker for SmartEta {
     }
 
     fn reset(&mut self, _: &ProgressState, _: Instant) {
-        let mut s = self.inner.lock().expect("smart_eta estimator poisoned");
+        let mut s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         s.smoothed_per_sec = 0.0;
         s.last_sample = None;
     }
@@ -123,14 +123,13 @@ impl ProgressTracker for SmartEta {
         let rate = self
             .inner
             .lock()
-            .expect("smart_eta estimator poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .smoothed_per_sec;
         let pos = state.pos();
         let len = state.len().unwrap_or(0);
 
         if rate > 0.0 && len > pos {
-            let eta = Duration::from_secs_f64((len - pos) as f64 / rate);
-            if eta <= ETA_DISPLAY_CAP {
+            if let Some(eta) = duration_within_cap((len - pos) as f64 / rate) {
                 let _ = write!(w, "{:#}", HumanDuration(eta));
                 return;
             }
@@ -142,14 +141,32 @@ impl ProgressTracker for SmartEta {
         let elapsed = state.elapsed().as_secs_f64();
         if pos > 0 && len > pos && elapsed > 0.0 {
             let lifetime_rate = pos as f64 / elapsed;
-            let fallback = Duration::from_secs_f64((len - pos) as f64 / lifetime_rate);
-            if fallback <= ETA_DISPLAY_CAP {
-                let _ = write!(w, "~{:#}", HumanDuration(fallback));
-                return;
+            if lifetime_rate > 0.0 {
+                if let Some(fallback) =
+                    duration_within_cap((len - pos) as f64 / lifetime_rate)
+                {
+                    let _ = write!(w, "~{:#}", HumanDuration(fallback));
+                    return;
+                }
             }
         }
         let _ = w.write_str("--");
     }
+}
+
+/// Build a `Duration` from `secs` only if it's finite and within
+/// [`ETA_DISPLAY_CAP`]. Returns `None` otherwise.
+///
+/// `Duration::from_secs_f64` panics on NaN, negative, infinity, or values
+/// that overflow `Duration`. Any of those slipping into the ETA formatter
+/// poisons indicatif's internal locks (the panic unwinds while a draw lock
+/// is held), which cascades into `PoisonError` panics from every other
+/// thread touching a progress bar. Validate first, construct second.
+fn duration_within_cap(secs: f64) -> Option<Duration> {
+    if !secs.is_finite() || secs < 0.0 || secs > ETA_DISPLAY_CAP.as_secs_f64() {
+        return None;
+    }
+    Some(Duration::from_secs_f64(secs))
 }
 
 pub fn queue_style() -> ProgressStyle {

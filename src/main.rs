@@ -128,11 +128,19 @@ struct Args {
     #[arg(short = 'l', long, conflicts_with = "diff")]
     file_list: Option<PathBuf>,
 
-    /// Write the canvas to this PNG file instead of displaying a window
+    /// Write the canvas to this PNG file instead of displaying a window.
+    /// Accepts a local path or an `hf://` URL (e.g. `hf://datasets/user/repo/path.png`)
+    /// to upload directly to the Hub.
     #[arg(short, long, conflicts_with = "tiles")]
     output: Option<PathBuf>,
 
-    /// Write a tiled pyramid to this directory for Leaflet.js viewing
+    /// Write a tiled pyramid for Leaflet.js viewing. Accepts a local directory
+    /// (open `index.html` in a browser) or an `hf://` URL to upload the viewer
+    /// bundle — `tiles/`, `index.html`, and `labels.json` — to a Hub repo.
+    ///
+    /// Note: `hf://` upload does NOT stand up a Space; the `index.html` lands in
+    /// the target repo but won't render on the Hub on its own. Use `--space` for
+    /// a working visualization URL.
     #[arg(short, long, conflicts_with = "output")]
     tiles: Option<PathBuf>,
 
@@ -176,8 +184,13 @@ struct Args {
     #[arg(long, value_enum, default_value_t = DiffMetricArg::Rms)]
     diff_metric: DiffMetricArg,
 
-    /// Render tiles and deploy to this HF Space (e.g. username/my-vis);
-    /// bucket is auto-named as <namespace>/<repo>_bucket
+    /// Render tiles and deploy a viewable HF Space (e.g. username/my-vis).
+    /// Creates the Space with a Docker app that serves the Leaflet viewer,
+    /// and stores tiles in a sibling bucket auto-named `<namespace>/<repo>_bucket`.
+    ///
+    /// Contrast with `--tiles hf://...`, which uploads only the viewer bundle
+    /// (no Space scaffolding). Combine with `--tiles <local_dir>` and no input
+    /// files to re-deploy an already-rendered tile directory without re-rendering.
     #[arg(long, conflicts_with = "output")]
     space: Option<String>,
 

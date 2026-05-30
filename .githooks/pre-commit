@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Pre-commit hook: enforce cargo fmt and cargo clippy on every commit.
+#
+# Enable for this clone with:
+#   git config core.hooksPath .githooks
+#
+# Skip in emergencies with `git commit --no-verify` (don't make a habit of it).
+
+set -euo pipefail
+
+# Only run if any Rust source files are staged.
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -qE '\.rs$|^Cargo\.(toml|lock)$'; then
+    exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+echo "pre-commit: cargo fmt --all -- --check"
+if ! cargo fmt --all -- --check; then
+    echo
+    echo "pre-commit: formatting check failed. Run \`cargo fmt --all\` and re-stage." >&2
+    exit 1
+fi
+
+echo "pre-commit: cargo clippy --all-targets --all-features -- -D warnings"
+if ! cargo clippy --all-targets --all-features --quiet -- -D warnings; then
+    echo
+    echo "pre-commit: clippy reported warnings. Fix them or add a scoped \`#[allow]\` and re-stage." >&2
+    exit 1
+fi

@@ -116,11 +116,9 @@ impl ElementStride {
                     return 0;
                 }
                 let elems_per_slot = (pack_dtype_bytes as u64 * 8) / bits as u64;
-                if elems_per_slot == 0 {
-                    0
-                } else {
-                    (cols / elems_per_slot) * pack_dtype_bytes as u64
-                }
+                cols.checked_div(elems_per_slot)
+                    .map(|n| n * pack_dtype_bytes as u64)
+                    .unwrap_or(0)
             }
         }
     }
@@ -602,7 +600,7 @@ fn packed_element(
         return f32::NAN;
     }
     let cols = sc.cols as usize;
-    if cols == 0 || cols % elems_per_slot != 0 {
+    if cols == 0 || !cols.is_multiple_of(elems_per_slot) {
         return f32::NAN;
     }
     let row = k / cols;
@@ -617,11 +615,15 @@ fn packed_element(
         return f32::NAN;
     }
     let packed = read_u32_le(&qweight[off..off + slot_bytes]);
-    let mask: u32 = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
+    let mask: u32 = if bits >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << bits) - 1
+    };
     let q = ((packed >> (in_slot * bits)) & mask) as i32;
 
     // Group index and scale lookup.
-    let group_idx = if group_size == 0 { 0 } else { row / group_size };
+    let group_idx = row.checked_div(group_size).unwrap_or(0);
     let scale_elem_idx = group_idx * cols + col;
     let scale = read_scalar(sc.scales, sc.scales_dtype, scale_elem_idx);
     if !scale.is_finite() {
@@ -1098,7 +1100,10 @@ mod tests {
         let qweight: Vec<u8> = vec![0xFFu8; 4];
         let mut r = TensorElementReader::new(Dtype::Int4Packed, &qweight);
         for k in 0..8 {
-            assert!(r.element(k).is_nan(), "k={k}: expected NaN without sidecars");
+            assert!(
+                r.element(k).is_nan(),
+                "k={k}: expected NaN without sidecars"
+            );
         }
     }
 

@@ -77,6 +77,7 @@ pub fn detail_depth_for_scale(scale: f32) -> u32 {
 ///   * longest axis `> CAP_HI` → `scale = CAP_HI / longest` (shrink).
 ///   * otherwise enlarge toward `MIN_THICK` on the shorter axis, but never push
 ///     the longer axis past `CAP_HI`.
+///
 /// Mid-sized square-ish tensors land at `scale == 1`.
 fn pick_scale(rows: u64, cols: u64) -> f32 {
     let long = rows.max(cols).max(1) as f32;
@@ -96,10 +97,7 @@ fn pick_scale(rows: u64, cols: u64) -> f32 {
 fn disp_dims(rows: u64, cols: u64, s: f32) -> (u32, u32) {
     let w = ((cols as f32 * s).round() as u64).max(1);
     let h = ((rows as f32 * s).round() as u64).max(1);
-    (
-        w.min(u32::MAX as u64) as u32,
-        h.min(u32::MAX as u64) as u32,
-    )
+    (w.min(u32::MAX as u64) as u32, h.min(u32::MAX as u64) as u32)
 }
 
 /// One placed tensor in the architectural canvas.
@@ -600,10 +598,7 @@ impl ArchLayout {
     ///
     /// Returns `None` if no source carries an MoE tag (let the caller fall
     /// through to [`ArchLayout::try_build`] or hilbert).
-    pub fn try_build_moe_diff(
-        sources: &[Source],
-        cumulative_offsets: &[u64],
-    ) -> Option<Self> {
+    pub fn try_build_moe_diff(sources: &[Source], cumulative_offsets: &[u64]) -> Option<Self> {
         use crate::format::moe::ExpertWeight;
 
         // (layer, i, j, weight) → (source_idx, &TensorMeta, base_off)
@@ -628,8 +623,7 @@ impl ArchLayout {
 
         // Distinct layer indices, ascending.
         let layer_ids: Vec<u32> = {
-            let set: std::collections::BTreeSet<u32> =
-                cells.keys().map(|(l, ..)| *l).collect();
+            let set: std::collections::BTreeSet<u32> = cells.keys().map(|(l, ..)| *l).collect();
             set.into_iter().collect()
         };
 
@@ -664,8 +658,7 @@ impl ArchLayout {
                 // Per-weight scale: shrink so the long axis lands at
                 // MOE_SUB_AXIS_TARGET. Never up-scale (sub_axis_target is
                 // smaller than every realistic expert dim).
-                let scale =
-                    (MOE_SUB_AXIS_TARGET as f32 / max_axis as f32).min(1.0);
+                let scale = (MOE_SUB_AXIS_TARGET as f32 / max_axis as f32).min(1.0);
                 let (sub_w, sub_h) = disp_dims(max_rows, max_cols, scale);
                 let sub_w = align_up(sub_w, 4);
                 let sub_h = align_up(sub_h, 4);
@@ -729,8 +722,8 @@ impl ArchLayout {
                         let (dw, dh) = disp_dims(rows, cols, g.scale);
                         // Centre each tensor inside its sub_w × sub_h sub-cell
                         // (shapes may differ slightly between gate/up vs down).
-                        let sub_x = cell_x
-                            .saturating_add((w_idx as u32) * (g.sub_w + MOE_INNER_PAD));
+                        let sub_x =
+                            cell_x.saturating_add((w_idx as u32) * (g.sub_w + MOE_INNER_PAD));
                         let sub_y = cell_y;
                         let inset_x = g.sub_w.saturating_sub(dw) / 2;
                         let inset_y = g.sub_h.saturating_sub(dh) / 2;
@@ -761,7 +754,9 @@ impl ArchLayout {
                 width: matrix_w,
                 height: matrix_h,
             });
-            cursor_y = matrix_y.saturating_add(matrix_h).saturating_add(MOE_LAYER_GAP);
+            cursor_y = matrix_y
+                .saturating_add(matrix_h)
+                .saturating_add(MOE_LAYER_GAP);
         }
 
         if tensors.is_empty() {
@@ -1416,13 +1411,21 @@ mod tests {
             .iter()
             .filter(|t| t.name == "model.embed_tokens.weight")
             .collect();
-        assert_eq!(chunks.len(), 1, "embedding is one rectangle (no re-wrap split)");
+        assert_eq!(
+            chunks.len(),
+            1,
+            "embedding is one rectangle (no re-wrap split)"
+        );
         let e = chunks[0];
         // True element dims preserved; byte start is the tensor start.
         assert_eq!((e.tensor_rows, e.tensor_cols), (VOCAB, HIDDEN));
         assert_eq!(e.tensor_byte_start, embed_start);
         // Shrunk: footprint bounded, scale < 1.
-        assert!(e.scale < 1.0, "embedding should be shrunk (scale {})", e.scale);
+        assert!(
+            e.scale < 1.0,
+            "embedding should be shrunk (scale {})",
+            e.scale
+        );
         assert!(
             e.disp_w.max(e.disp_h) <= CAP_HI + 1,
             "footprint {}x{} should be bounded by CAP_HI",
@@ -1477,7 +1480,7 @@ mod tests {
         assert_eq!(detail_depth_for_scale(0.5), 1); // 2× shrink
         assert_eq!(detail_depth_for_scale(0.25), 2); // 4× shrink
         assert_eq!(detail_depth_for_scale(0.1), 4); // 10× → ceil(log2 10)=4
-        // Degenerate inputs are guarded.
+                                                    // Degenerate inputs are guarded.
         assert_eq!(detail_depth_for_scale(0.0), 0);
         assert_eq!(detail_depth_for_scale(f32::NAN), 0);
         // Never exceeds the safety cap.
@@ -1495,7 +1498,7 @@ mod tests {
         const HIDDEN: u64 = 4096; // > CAP_HI → matrices are shrunk too
         let mut tensors: Vec<TensorMeta> = Vec::new();
         let mut off: u64 = 0;
-        let mut push = |tensors: &mut Vec<TensorMeta>, off: &mut u64, name: &str, shape: Vec<u64>| {
+        let push = |tensors: &mut Vec<TensorMeta>, off: &mut u64, name: &str, shape: Vec<u64>| {
             let n: u64 = shape.iter().product();
             tensors.push(TensorMeta {
                 name: name.to_string(),
@@ -1507,10 +1510,25 @@ mod tests {
             });
             *off += n * 4;
         };
-        push(&mut tensors, &mut off, "model.embed_tokens.weight", vec![VOCAB, HIDDEN]);
+        push(
+            &mut tensors,
+            &mut off,
+            "model.embed_tokens.weight",
+            vec![VOCAB, HIDDEN],
+        );
         for i in 0..4u64 {
-            push(&mut tensors, &mut off, &format!("model.layers.{i}.self_attn.q_proj.weight"), vec![HIDDEN, HIDDEN]);
-            push(&mut tensors, &mut off, &format!("model.layers.{i}.mlp.gate_proj.weight"), vec![HIDDEN, HIDDEN]);
+            push(
+                &mut tensors,
+                &mut off,
+                &format!("model.layers.{i}.self_attn.q_proj.weight"),
+                vec![HIDDEN, HIDDEN],
+            );
+            push(
+                &mut tensors,
+                &mut off,
+                &format!("model.layers.{i}.mlp.gate_proj.weight"),
+                vec![HIDDEN, HIDDEN],
+            );
         }
         let source = synthetic_source(tensors);
         let layout = ArchLayout::try_build(&[source], &[0], &[]).unwrap();

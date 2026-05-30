@@ -358,7 +358,13 @@ mod tests {
     fn fuse_packed_quant_triples_no_quant_is_noop() {
         // Plain safetensors with no qweight/scales/qzeros names → no fusion.
         let original = vec![
-            mk_t("model.embed_tokens.weight", Dtype::F16, vec![32000, 4096], 0, 32000 * 4096 * 2),
+            mk_t(
+                "model.embed_tokens.weight",
+                Dtype::F16,
+                vec![32000, 4096],
+                0,
+                32000 * 4096 * 2,
+            ),
             mk_t("model.norm.weight", Dtype::F16, vec![4096], 1, 4096 * 2),
         ];
         let mut v = original.clone();

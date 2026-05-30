@@ -865,11 +865,7 @@ where
     // Bars are added to the global `progress::multi()`; in non-TTY runs that
     // draws to a hidden target, so all updates here are no-ops but the rest
     // of the pipeline code stays branchless.
-    let progress = Arc::new(PipelineProgress::new(
-        coords.len() as u64,
-        cap,
-        MAX_FETCH_WORKERS,
-    ));
+    let progress = Arc::new(PipelineProgress::new(coords.len(), cap, MAX_FETCH_WORKERS));
     let loaded_count = Arc::new(AtomicU64::new(0));
     let rendered_count = Arc::new(AtomicU64::new(0));
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -962,7 +958,6 @@ where
         let square_pixels = plan.square_pixels;
         let total = plan.total;
         let layout = plan.layout.clone();
-        let zoom = zoom;
         load_handles.push(tokio::spawn(async move {
             while let Ok((tx, ty)) = coord_rx.recv().await {
                 let (tile_buf, arch_tile) = if is_arch {

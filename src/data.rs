@@ -87,21 +87,18 @@ fn block_aligned_byte_range(dtype: format::Dtype, start: u64, len: u64) -> (u64,
             ..
         } => {
             if bits == 0 {
-                (0, 0, 0)
-            } else {
-                let elems_per_slot = ((pack_dtype_bytes as u64) * 8) / bits as u64;
-                if elems_per_slot == 0 {
-                    (0, 0, 0)
-                } else {
-                    let slot_bytes = pack_dtype_bytes as u64;
-                    let first_slot = start / elems_per_slot;
-                    let last_slot_excl = (start + len).div_ceil(elems_per_slot);
-                    let byte_off = first_slot * slot_bytes;
-                    let byte_len = (last_slot_excl - first_slot) * slot_bytes;
-                    let elem_off = (start - first_slot * elems_per_slot) as usize;
-                    (byte_off, byte_len as usize, elem_off)
-                }
+                return (0, 0, 0);
             }
+            let elems_per_slot = ((pack_dtype_bytes as u64) * 8) / bits as u64;
+            let Some(first_slot) = start.checked_div(elems_per_slot) else {
+                return (0, 0, 0);
+            };
+            let slot_bytes = pack_dtype_bytes as u64;
+            let last_slot_excl = (start + len).div_ceil(elems_per_slot);
+            let byte_off = first_slot * slot_bytes;
+            let byte_len = (last_slot_excl - first_slot) * slot_bytes;
+            let elem_off = (start - first_slot * elems_per_slot) as usize;
+            (byte_off, byte_len as usize, elem_off)
         }
     }
 }
@@ -686,8 +683,7 @@ pub async fn materialize_http_sources(sources: &mut [Source]) -> anyhow::Result<
 
     let indices: Vec<usize> = jobs.iter().map(|(i, _)| *i).collect();
     let specs: Vec<RemoteFileSpec> = jobs.into_iter().map(|(_, s)| s).collect();
-    let paths =
-        download_specs_to_paths(&specs, "source files (downloading for xet view)").await?;
+    let paths = download_specs_to_paths(&specs, "source files (downloading for xet view)").await?;
 
     for (i, path) in indices.into_iter().zip(paths) {
         // Preserve display name + xet_terms; only the storage kind changes.
@@ -819,10 +815,9 @@ async fn materialize_remote_arcs(
     let paths = download_specs_to_paths(&specs_subset, progress_label).await?;
 
     for (i, path) in indices.into_iter().zip(paths) {
-        let f =
-            File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-        let mmap = unsafe { Mmap::map(&f) }
-            .with_context(|| format!("mmap'ing {}", path.display()))?;
+        let f = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        let mmap =
+            unsafe { Mmap::map(&f) }.with_context(|| format!("mmap'ing {}", path.display()))?;
         arcs[i] = Arc::new(Data::Mapped(mmap));
     }
     Ok(())
@@ -1007,9 +1002,7 @@ async fn fetch_model_header(
             // would need a tail-first range fetch plus an in-memory zip
             // parser; for v1 we surface a clear error and let the caller
             // fall back to "treat as plain bytes".
-            anyhow::bail!(
-                "pickle: remote header fetch not yet supported — download the file first"
-            )
+            anyhow::bail!("pickle: remote header fetch not yet supported — download the file first")
         }
     }
 }
@@ -2249,10 +2242,8 @@ async fn build_multi_safetensors_diff_sources_from_http(
             .map(|(_, r)| r)
             .collect::<anyhow::Result<Vec<_>>>()
     }
-    let orig_specs_owned: Vec<RemoteFileSpec> =
-        orig_specs.iter().map(|(_, s)| s.clone()).collect();
-    let mod_specs_owned: Vec<RemoteFileSpec> =
-        mod_specs.iter().map(|(_, s)| s.clone()).collect();
+    let orig_specs_owned: Vec<RemoteFileSpec> = orig_specs.iter().map(|(_, s)| s.clone()).collect();
+    let mod_specs_owned: Vec<RemoteFileSpec> = mod_specs.iter().map(|(_, s)| s.clone()).collect();
     let (mut orig_data, mut mod_data) = if stream {
         let orig_data = make_streaming_arcs(orig_specs_owned.clone()).await?;
         let mod_data = make_streaming_arcs(mod_specs_owned.clone()).await?;
@@ -2343,9 +2334,7 @@ pub async fn prepare_moe_diff_sources(
             .filter(|(n, _)| SourceFormat::from_name(n).is_some())
             .collect();
         if st_specs.is_empty() {
-            anyhow::bail!(
-                "--moe-diff: no .safetensors / .gguf files in {input}"
-            );
+            anyhow::bail!("--moe-diff: no .safetensors / .gguf files in {input}");
         }
         let fmts: Vec<SourceFormat> = st_specs
             .iter()
@@ -2353,8 +2342,7 @@ pub async fn prepare_moe_diff_sources(
             .collect();
         let names: Vec<String> = st_specs.iter().map(|(n, _)| n.clone()).collect();
 
-        let specs_owned: Vec<RemoteFileSpec> =
-            st_specs.iter().map(|(_, s)| s.clone()).collect();
+        let specs_owned: Vec<RemoteFileSpec> = st_specs.iter().map(|(_, s)| s.clone()).collect();
         // In streaming mode each shard becomes an `Arc<Data::Xet>` (or
         // `Data::Http` fallback) and per-tile diffs go over HTTP. In the
         // disk-backed default we skip the xet reconstruction setup entirely
@@ -2460,7 +2448,11 @@ pub async fn prepare_moe_diff_sources(
             let f = File::open(p).with_context(|| format!("opening {}", p.display()))?;
             datas.push(Arc::new(Data::Mapped(unsafe { Mmap::map(&f) }?)));
             fmts.push(SourceFormat::from_path(p).unwrap_or(SourceFormat::Safetensors));
-            names.push(p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+            names.push(
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
         }
         (datas, fmts, names)
     };
@@ -2481,7 +2473,9 @@ pub async fn prepare_moe_diff_sources(
                         let r = fetch_model_header(&d, fmt)
                             .await
                             .map(|(t, _)| t)
-                            .with_context(|| format!("reading {fmt:?} header for moe-diff file {i}"));
+                            .with_context(|| {
+                                format!("reading {fmt:?} header for moe-diff file {i}")
+                            });
                         if let Some(pb) = pb.as_ref() {
                             pb.inc(1);
                         }
@@ -2503,14 +2497,19 @@ pub async fn prepare_moe_diff_sources(
     // Detect GGUF fused-experts up front and bail with a clear message.
     for (shard_idx, tensors) in &headers {
         if matches!(fmts[*shard_idx], SourceFormat::Gguf)
-            && tensors.iter().any(|t| crate::format::moe::is_fused_gguf_expert(&t.name))
+            && tensors
+                .iter()
+                .any(|t| crate::format::moe::is_fused_gguf_expert(&t.name))
         {
             anyhow::bail!(
                 "--moe-diff: GGUF fused expert tensors are not yet supported \
                  (found `ffn_*_exps.weight` in {}). See src/format/name_map.rs:61-69 — \
                  the canonicaliser would need to either preserve per-expert names or \
                  expose a slice-by-expert path.",
-                file_names.get(*shard_idx).map(String::as_str).unwrap_or("<unknown>"),
+                file_names
+                    .get(*shard_idx)
+                    .map(String::as_str)
+                    .unwrap_or("<unknown>"),
             );
         }
     }
@@ -2537,7 +2536,11 @@ pub async fn prepare_moe_diff_sources(
                         log::warn!(
                             "--moe-diff: shape mismatch within layer {} weight {} expert {}: \
                              {:?} vs {:?} — skipping",
-                            r.layer_idx, r.weight.label(), r.expert_idx, prev_shape, &t.shape,
+                            r.layer_idx,
+                            r.weight.label(),
+                            r.expert_idx,
+                            prev_shape,
+                            &t.shape,
                         );
                         continue;
                     }
@@ -2692,16 +2695,35 @@ pub async fn prepare_moe_diff_sources(
         }
     }
 
-    let n_layers = groups.iter().map(|(k, _)| k.0).collect::<std::collections::BTreeSet<_>>().len();
-    let weight_keys = groups.keys().filter(|(_, w)| matches!(w, EW::GateProj)).count();
+    let n_layers = groups
+        .keys()
+        .map(|k| k.0)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let weight_keys = groups
+        .keys()
+        .filter(|(_, w)| matches!(w, EW::GateProj))
+        .count();
     log::info!(
         "moe-diff: {} layer(s), {} weight slot(s) per layer ({}{} {}), \
          emitted {} cell(s) totalling {} synthetic byte(s)",
         n_layers,
         groups.len() / n_layers.max(1),
-        if groups.contains_key(&(groups.keys().next().unwrap().0, EW::GateProj)) { "gate_proj " } else { "" },
-        if groups.contains_key(&(groups.keys().next().unwrap().0, EW::UpProj)) { "up_proj " } else { "" },
-        if groups.contains_key(&(groups.keys().next().unwrap().0, EW::DownProj)) { "down_proj" } else { "" },
+        if groups.contains_key(&(groups.keys().next().unwrap().0, EW::GateProj)) {
+            "gate_proj "
+        } else {
+            ""
+        },
+        if groups.contains_key(&(groups.keys().next().unwrap().0, EW::UpProj)) {
+            "up_proj "
+        } else {
+            ""
+        },
+        if groups.contains_key(&(groups.keys().next().unwrap().0, EW::DownProj)) {
+            "down_proj"
+        } else {
+            ""
+        },
         sources.len(),
         total,
     );

@@ -106,8 +106,7 @@ impl ProgressTracker for SmartEta {
             if dt > 0.0 && pos >= prev_pos {
                 let instant_rate = (pos - prev_pos) as f64 / dt;
                 let weight = 0.1_f64.powf(dt / self.half_life_secs);
-                s.smoothed_per_sec =
-                    s.smoothed_per_sec * weight + instant_rate * (1.0 - weight);
+                s.smoothed_per_sec = s.smoothed_per_sec * weight + instant_rate * (1.0 - weight);
             }
         }
         s.last_sample = Some((pos, now));
@@ -142,9 +141,7 @@ impl ProgressTracker for SmartEta {
         if pos > 0 && len > pos && elapsed > 0.0 {
             let lifetime_rate = pos as f64 / elapsed;
             if lifetime_rate > 0.0 {
-                if let Some(fallback) =
-                    duration_within_cap((len - pos) as f64 / lifetime_rate)
-                {
+                if let Some(fallback) = duration_within_cap((len - pos) as f64 / lifetime_rate) {
                     let _ = write!(w, "~{:#}", HumanDuration(fallback));
                     return;
                 }

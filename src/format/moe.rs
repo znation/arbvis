@@ -22,6 +22,7 @@
 
 /// Which of the three FFN weights of a single expert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[allow(clippy::enum_variant_names)]
 pub enum ExpertWeight {
     GateProj,
     UpProj,
@@ -132,10 +133,7 @@ mod tests {
         // Router gate (`mlp.gate.weight` in HF / `ffn_gate_inp.weight` in GGUF).
         assert_eq!(parse_hf_expert("model.layers.0.mlp.gate.weight"), None);
         // Non-MoE dense MLP.
-        assert_eq!(
-            parse_hf_expert("model.layers.0.mlp.gate_proj.weight"),
-            None,
-        );
+        assert_eq!(parse_hf_expert("model.layers.0.mlp.gate_proj.weight"), None,);
         // Norms / attention / top-level singletons.
         assert_eq!(
             parse_hf_expert("model.layers.0.input_layernorm.weight"),

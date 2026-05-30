@@ -62,7 +62,13 @@ pub fn parse_header(path: &Path) -> anyhow::Result<PickleHeader> {
     let mut tensors = Vec::with_capacity(infos.len());
     for info in infos {
         let dtype = map_candle_dtype(info.dtype);
-        let shape: Vec<u64> = info.layout.shape().dims().iter().map(|&d| d as u64).collect();
+        let shape: Vec<u64> = info
+            .layout
+            .shape()
+            .dims()
+            .iter()
+            .map(|&d| d as u64)
+            .collect();
         let elem_bytes = info.dtype.size_in_bytes() as u64;
         let elem_count: u64 = info.layout.shape().elem_count() as u64;
 
@@ -203,11 +209,11 @@ mod tests {
     /// (opcode `X`, u32-length-prefixed) rather than `SHORT_BINUNICODE`
     /// (opcode `0x8c`) because candle's reader doesn't decode the latter.
     fn build_pickle() -> Vec<u8> {
-        let mut p = Vec::new();
-        p.push(0x80); // PROTO
-        p.push(0x02);
-        p.push(b'}'); // EMPTY_DICT
-        p.push(b'('); // MARK
+        let mut p = vec![
+            0x80, // PROTO
+            0x02, b'}', // EMPTY_DICT
+            b'(', // MARK
+        ];
 
         write_binunicode(&mut p, "weight");
 

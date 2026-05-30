@@ -580,7 +580,9 @@ fn expires_at_from_url(url: &str) -> Option<u64> {
     let needle = "Expires=";
     let start = url.find(needle)? + needle.len();
     let tail = &url[start..];
-    let end = tail.find(|c: char| !c.is_ascii_digit()).unwrap_or(tail.len());
+    let end = tail
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(tail.len());
     if end == 0 {
         return None;
     }
@@ -876,10 +878,7 @@ impl XetReader {
                 }
                 let url = Arc::new(fetch.url);
                 for desc in fetch.ranges {
-                    fresh_urls.insert(
-                        (xorb_hash.clone(), desc.bytes.start),
-                        Arc::clone(&url),
-                    );
+                    fresh_urls.insert((xorb_hash.clone(), desc.bytes.start), Arc::clone(&url));
                 }
             }
         }

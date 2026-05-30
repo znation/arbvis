@@ -289,11 +289,7 @@ fn element_intensity_and_position(
                 (None, tensor_byte_start)
             } else {
                 let elems_per_slot = (pack_dtype_bytes as usize * 8) / bits as usize;
-                let slot_idx = if elems_per_slot == 0 {
-                    0
-                } else {
-                    elem_idx / elems_per_slot
-                };
+                let slot_idx = elem_idx.checked_div(elems_per_slot).unwrap_or(0);
                 let abs = tensor_byte_start + (slot_idx * pack_dtype_bytes as usize) as u64;
                 (None, abs)
             }

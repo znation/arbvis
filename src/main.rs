@@ -443,7 +443,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         let diff_title = default_title(args.title, "arbvis diff");
         let orig_str = &diff_input_strs[0];
         let mod_str = &diff_input_strs[1];
-        let is_finetune = resolve_finetune(args.finetune, args.no_finetune, orig_str, mod_str).await;
+        let is_finetune =
+            resolve_finetune(args.finetune, args.no_finetune, orig_str, mod_str).await;
         let metric = args.diff_metric.to_metric();
 
         let (sources, total) = if hf_url::is_repo_level(orig_str)?
@@ -642,28 +643,32 @@ async fn resolve_input_sources(
     // to multiple specs; non-hf:// paths stay as `InputSpec::Local`. The
     // result preserves input order so labels and byte offsets are
     // deterministic across runs.
-    let specs: Vec<InputSpec> =
-        futures::stream::iter(files.iter().cloned().map(|p| async move {
-            let s = p.to_string_lossy();
-            if hf_url::is_hf_url(&s) {
-                if hf_url::is_repo_level(&s)? {
-                    let listed = hf_url::list_repo_as_http_specs(&s)
-                        .await
-                        .with_context(|| format!("listing files in {s}"))?;
-                    anyhow::Ok(listed.into_iter().map(|(_, spec)| InputSpec::Remote(spec)).collect::<Vec<_>>())
-                } else {
-                    anyhow::Ok(vec![InputSpec::Remote(hf_url::resolve_to_http(&p).await?)])
-                }
+    let specs: Vec<InputSpec> = futures::stream::iter(files.iter().cloned().map(|p| async move {
+        let s = p.to_string_lossy();
+        if hf_url::is_hf_url(&s) {
+            if hf_url::is_repo_level(&s)? {
+                let listed = hf_url::list_repo_as_http_specs(&s)
+                    .await
+                    .with_context(|| format!("listing files in {s}"))?;
+                anyhow::Ok(
+                    listed
+                        .into_iter()
+                        .map(|(_, spec)| InputSpec::Remote(spec))
+                        .collect::<Vec<_>>(),
+                )
             } else {
-                anyhow::Ok(vec![InputSpec::Local(p)])
+                anyhow::Ok(vec![InputSpec::Remote(hf_url::resolve_to_http(&p).await?)])
             }
-        }))
-        .buffered(RESOLVE_CONCURRENCY)
-        .try_collect::<Vec<_>>()
-        .await?
-        .into_iter()
-        .flatten()
-        .collect();
+        } else {
+            anyhow::Ok(vec![InputSpec::Local(p)])
+        }
+    }))
+    .buffered(RESOLVE_CONCURRENCY)
+    .try_collect::<Vec<_>>()
+    .await?
+    .into_iter()
+    .flatten()
+    .collect();
     let (mut sources, total) = data::prepare_sources_from_specs(&specs)?;
     if show_xet_xorbs {
         data::populate_xet_terms(&mut sources).await?;
@@ -710,7 +715,18 @@ async fn dispatch_render(
             upload_hf,
             space,
             _tempdir,
-        } => render_tiles(sources, total, local.as_deref(), upload_hf, space, cfg, stream).await,
+        } => {
+            render_tiles(
+                sources,
+                total,
+                local.as_deref(),
+                upload_hf,
+                space,
+                cfg,
+                stream,
+            )
+            .await
+        }
     }
 }
 

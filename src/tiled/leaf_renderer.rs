@@ -1,23 +1,29 @@
-//! Tile-renderer plugin surface (step 3 of the arbvis/modelweightvis split).
+//! Tile-loader and tile-renderer plugin surface (step 3 + 4a of the
+//! arbvis/modelweightvis split).
 //!
 //! `LeafTile` describes one tile in terms of what data it needs (raw bytes,
-//! per-tensor regions, or just padding). The render stage looks up a
-//! [`LeafRenderer`] by `LeafTile::renderer_id`, instead of branching on
-//! `Layout::is_architectural()`. Today the registry has two built-ins
-//! (`"hilbert-bytes"`, `"arch"`); once `modelweightvis` is its own crate it
-//! will ship `"arch"` from there and register it on the shared registry.
+//! per-tensor regions, or just padding). Both pipeline stages — load and
+//! render — look up an implementation by `LeafTile::renderer_id` instead of
+//! branching on `Layout::is_architectural()`. Today the registry has two
+//! built-in pairs (`"hilbert-bytes"` and `"arch"`); once `modelweightvis` is
+//! its own crate it will ship `"arch"` from there and register it on the
+//! shared registry.
 //!
-//! The load stage still keys off `Layout::is_architectural()` for now —
-//! lifting that branch is a follow-up step that adds `Layout::describe_tile`
-//! and routes load through the same `LeafTile` descriptor.
+//! Loaders and renderers share the same id so a `LeafTile` resolves both
+//! halves of the pipeline in one lookup.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
+
+use crate::data::Data;
+use crate::layout::Layout;
+
 use super::leaf::TileFormat;
 use super::{EncodedTile, LeafMode, LoadedTile};
 
-/// Per-tile descriptor used to pick a renderer.
+/// Per-tile descriptor used to pick a loader+renderer pair.
 ///
 /// Today the variant is uniform across one plan (every tile in a Hilbert
 /// plan is `Bytes`; every tile in an arch plan is `Regions`). The per-tile
@@ -46,6 +52,26 @@ impl LeafTile {
     }
 }
 
+/// Inputs a loader needs to read bytes (or per-tensor regions) for one tile.
+///
+/// All fields are borrows so the call site can build a `LoadCtx` per
+/// `(tx, ty)` inside the worker loop without copying its captured arcs.
+pub struct LoadCtx<'a> {
+    pub tx: u32,
+    pub ty: u32,
+    /// Pyramid zoom of the current pass. Hilbert ignores; arch uses it to
+    /// scale the per-tensor display footprint.
+    pub zoom: u32,
+    pub kh: u8,
+    pub height_tiles: u32,
+    pub square_pixels: u64,
+    pub total: u64,
+    pub mode: &'a LeafMode,
+    pub layout: &'a Layout,
+    pub source_data: &'a [Data],
+    pub cumulative_offsets: &'a [u64],
+}
+
 /// Inputs a renderer needs beyond the loaded tile.
 ///
 /// Byte-Hilbert renderers consume the geometry fields (`kh`, `height_tiles`,
@@ -60,42 +86,160 @@ pub struct RenderCtx<'a> {
     pub total: u64,
 }
 
+/// One leaf-tile load strategy. Implementers are registered under a string id
+/// in a [`LeafRegistry`] alongside the matching [`LeafRenderer`].
+pub trait LeafLoader: Send + Sync {
+    fn id(&self) -> &'static str;
+
+    /// Whether this loader will perform I/O for the given context. The
+    /// pipeline uses this to decide whether to acquire an HTTP throttle
+    /// permit and record success on `Ok`. Byte-Hilbert returns `false` for
+    /// `LeafMode::Dtype` (positional-only, no bytes needed); arch always
+    /// fetches.
+    fn needs_io(&self, ctx: &LoadCtx<'_>) -> bool;
+
+    fn load<'a>(&'a self, ctx: &'a LoadCtx<'a>) -> BoxFuture<'a, anyhow::Result<LoadedTile>>;
+}
+
 /// One leaf-tile rendering strategy. Implementers are registered under a
-/// string id in a [`LeafRendererRegistry`].
+/// string id in a [`LeafRegistry`] alongside the matching [`LeafLoader`].
 pub trait LeafRenderer: Send + Sync {
     fn id(&self) -> &'static str;
     fn render(&self, tile: LoadedTile, ctx: &RenderCtx<'_>) -> Result<EncodedTile, String>;
 }
 
-/// `id` → `LeafRenderer` lookup used by the tile pipeline. `Clone` is a
+/// `id` → `(loader, renderer)` lookup used by the tile pipeline. `Clone` is a
 /// cheap `Arc` map clone so each worker can hold its own handle.
 #[derive(Default, Clone)]
-pub struct LeafRendererRegistry {
-    map: HashMap<&'static str, Arc<dyn LeafRenderer>>,
+pub struct LeafRegistry {
+    loaders: HashMap<&'static str, Arc<dyn LeafLoader>>,
+    renderers: HashMap<&'static str, Arc<dyn LeafRenderer>>,
 }
 
-impl LeafRendererRegistry {
+impl LeafRegistry {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn register(&mut self, r: Arc<dyn LeafRenderer>) {
-        self.map.insert(r.id(), r);
+    pub fn register_loader(&mut self, l: Arc<dyn LeafLoader>) {
+        self.loaders.insert(l.id(), l);
     }
 
-    pub fn get(&self, id: &str) -> Option<Arc<dyn LeafRenderer>> {
-        self.map.get(id).cloned()
+    pub fn register_renderer(&mut self, r: Arc<dyn LeafRenderer>) {
+        self.renderers.insert(r.id(), r);
     }
 
-    /// Registry pre-populated with the two built-in renderers
+    pub fn loader(&self, id: &str) -> Option<Arc<dyn LeafLoader>> {
+        self.loaders.get(id).cloned()
+    }
+
+    pub fn renderer(&self, id: &str) -> Option<Arc<dyn LeafRenderer>> {
+        self.renderers.get(id).cloned()
+    }
+
+    /// Registry pre-populated with the two built-in loader+renderer pairs
     /// (`"hilbert-bytes"`, `"arch"`). Both ship from arbvis today; once
     /// `modelweightvis` is split out it will own `"arch"` and register it
     /// onto a registry the binary constructs.
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
-        r.register(Arc::new(HilbertBytesRenderer));
-        r.register(Arc::new(ArchRegionsRenderer));
+        r.register_loader(Arc::new(HilbertBytesLoader));
+        r.register_loader(Arc::new(ArchRegionsLoader));
+        r.register_renderer(Arc::new(HilbertBytesRenderer));
+        r.register_renderer(Arc::new(ArchRegionsRenderer));
         r
+    }
+}
+
+/// Byte-Hilbert leaf loader; thin wrapper over [`super::leaf::load_tile_bytes`].
+pub struct HilbertBytesLoader;
+
+impl LeafLoader for HilbertBytesLoader {
+    fn id(&self) -> &'static str {
+        "hilbert-bytes"
+    }
+
+    fn needs_io(&self, ctx: &LoadCtx<'_>) -> bool {
+        // `LeafMode::Dtype` colors purely from positional dtype ranges, so the
+        // Hilbert tile buffer is unused — skip the byte fetch entirely (and
+        // the throttle permit it would consume).
+        ctx.mode.needs_bytes()
+    }
+
+    fn load<'a>(&'a self, ctx: &'a LoadCtx<'a>) -> BoxFuture<'a, anyhow::Result<LoadedTile>> {
+        Box::pin(async move {
+            if !ctx.mode.needs_bytes() {
+                return Ok(LoadedTile {
+                    tx: ctx.tx,
+                    ty: ctx.ty,
+                    tile_buf: None,
+                    arch_tile: None,
+                });
+            }
+            let buf = super::leaf::load_tile_bytes(
+                ctx.tx,
+                ctx.ty,
+                ctx.kh,
+                ctx.height_tiles,
+                ctx.square_pixels,
+                ctx.total,
+                ctx.source_data,
+                ctx.cumulative_offsets,
+            )
+            .await?;
+            Ok(LoadedTile {
+                tx: ctx.tx,
+                ty: ctx.ty,
+                tile_buf: Some(buf),
+                arch_tile: None,
+            })
+        })
+    }
+}
+
+/// Architectural leaf loader; thin wrapper over
+/// [`super::leaf_arch::load_arch_tile_regions`].
+pub struct ArchRegionsLoader;
+
+impl LeafLoader for ArchRegionsLoader {
+    fn id(&self) -> &'static str {
+        "arch"
+    }
+
+    fn needs_io(&self, _ctx: &LoadCtx<'_>) -> bool {
+        // Arch always fetches at least one tensor region per tile — the
+        // renderer needs them regardless of `LeafMode`.
+        true
+    }
+
+    fn load<'a>(&'a self, ctx: &'a LoadCtx<'a>) -> BoxFuture<'a, anyhow::Result<LoadedTile>> {
+        Box::pin(async move {
+            // The arch loader is only registered to handle `LeafTile::Regions`
+            // with `renderer_id == "arch"`; the only producer of that tile
+            // descriptor is the arch layout. A non-`Architectural` layout
+            // reaching here is a registry/plan bug, not a runtime case.
+            let arch = match ctx.layout {
+                Layout::Architectural(a) => a,
+                Layout::HilbertGlobal(_) => {
+                    unreachable!("ArchRegionsLoader dispatched against non-Architectural layout")
+                }
+            };
+            let at = super::leaf_arch::load_arch_tile_regions(
+                ctx.zoom,
+                ctx.tx,
+                ctx.ty,
+                arch,
+                ctx.source_data,
+                ctx.cumulative_offsets,
+            )
+            .await?;
+            Ok(LoadedTile {
+                tx: ctx.tx,
+                ty: ctx.ty,
+                tile_buf: None,
+                arch_tile: Some(at),
+            })
+        })
     }
 }
 

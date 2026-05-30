@@ -24,15 +24,15 @@ use crate::progress::{counter_style, multi, queue_style, status_style};
 use crate::throttle::{Throttle, MAX_FETCH_WORKERS};
 use crate::tiled::html::FileEntity;
 use crate::tiled::leaf::{
-    load_tile_bytes, render_leaf_tile_diff, render_leaf_tile_dtype, render_leaf_tile_from_buf,
+    render_leaf_tile_diff, render_leaf_tile_dtype, render_leaf_tile_from_buf,
     render_leaf_tile_xet_dtype_from_buf, render_leaf_tile_xet_from_buf, TileFormat, TILE,
     TILE_LOG2, TILE_PIXELS,
 };
 use crate::tiled::leaf_arch::{
-    load_arch_tile_regions, render_arch_tile_diff, render_arch_tile_dtype, render_arch_tile_plain,
-    render_arch_tile_xet, render_arch_tile_xet_dtype, LoadedArchTile,
+    render_arch_tile_diff, render_arch_tile_dtype, render_arch_tile_plain, render_arch_tile_xet,
+    render_arch_tile_xet_dtype, LoadedArchTile,
 };
-use crate::tiled::leaf_renderer::{LeafRendererRegistry, LeafTile, RenderCtx};
+use crate::tiled::leaf_renderer::{LeafRegistry, LeafTile, LoadCtx, RenderCtx};
 use crate::tiled::pyramid_accum::{LocalFileSink, PyramidAccumulator};
 use crate::xet::{XorbMap, TABLEAU_20};
 
@@ -445,10 +445,10 @@ pub(super) struct TilePlan {
     cumulative_offsets: Arc<Vec<u64>>,
     pub(super) entities: Vec<FileEntity>,
     layout: Arc<Layout>,
-    /// Renderer registry consulted by the render stage. Constructed with the
-    /// two built-in renderers (`"hilbert-bytes"`, `"arch"`); future plugin
-    /// wiring will let callers extend it before plan construction.
-    renderers: Arc<LeafRendererRegistry>,
+    /// Loader+renderer registry consulted by the load and render stages.
+    /// Constructed with the two built-in pairs (`"hilbert-bytes"`, `"arch"`);
+    /// future plugin wiring will let callers extend it before plan construction.
+    leaf: Arc<LeafRegistry>,
     /// Per-plan tile descriptor; today uniform across every tile in the plan
     /// (one variant per layout). See [`leaf_renderer::LeafTile`].
     leaf_tile: LeafTile,
@@ -858,7 +858,7 @@ pub(super) async fn build_tile_plan(
         cumulative_offsets: Arc::new(cumulative_offsets),
         entities,
         layout: Arc::new(layout),
-        renderers: Arc::new(LeafRendererRegistry::with_defaults()),
+        leaf: Arc::new(LeafRegistry::with_defaults()),
         leaf_tile,
     })
 }
@@ -966,9 +966,23 @@ where
     // — typical after `materialize_http_sources`), the throttle is bypassed
     // so 128-way mmap parallelism isn't capped at the throttle's initial
     // 4-way limit.
-    let needs_bytes = plan.mode.needs_bytes();
+    //
+    // Dispatch is via the `LeafLoader` registry: the plan's `leaf_tile`
+    // descriptor names a renderer id, the registry resolves it once before
+    // spawning the load worker pool, and each worker clones the resulting
+    // `Arc<dyn _>` into its own task. Mirrors the render-stage dispatch
+    // immediately below.
     let any_remote_source = plan.source_data.iter().any(|d| !d.is_local());
-    let is_arch = plan.layout.is_architectural();
+    let loader = plan
+        .leaf_tile
+        .renderer_id()
+        .and_then(|id| plan.leaf.loader(id))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no leaf loader registered for tile descriptor {:?}",
+                plan.leaf_tile
+            )
+        })?;
     let mut load_handles = Vec::new();
     for _ in 0..MAX_FETCH_WORKERS {
         let coord_rx = coord_rx.clone();
@@ -981,99 +995,61 @@ where
         let square_pixels = plan.square_pixels;
         let total = plan.total;
         let layout = plan.layout.clone();
+        let mode = plan.mode.clone();
+        let loader = loader.clone();
         load_handles.push(tokio::spawn(async move {
             while let Ok((tx, ty)) = coord_rx.recv().await {
-                let (tile_buf, arch_tile) = if is_arch {
-                    // Architectural mode: fetch one coalesced range per
-                    // tensor intersecting this tile.
-                    let permit = if any_remote_source {
-                        Some(Throttle::global().acquire().await)
-                    } else {
-                        None
-                    };
-                    let arch_layout = match layout.as_ref() {
-                        Layout::Architectural(a) => a,
-                        _ => unreachable!("is_arch && layout != Architectural"),
-                    };
-                    let result = load_arch_tile_regions(
-                        zoom,
-                        tx,
-                        ty,
-                        arch_layout,
-                        &source_data,
-                        &cumulative_offsets,
-                    )
-                    .await;
-                    drop(permit);
-                    match result {
-                        Ok(at) => {
-                            if any_remote_source {
-                                Throttle::global().record_success();
-                            }
-                            (None, Some(at))
-                        }
-                        Err(e) => {
-                            log::error!("load_arch_tile_regions({tx},{ty}) failed:\n{e:?}");
-                            coord_rx.close();
-                            return Err::<(), anyhow::Error>(e);
-                        }
-                    }
-                } else if needs_bytes {
-                    let permit = if any_remote_source {
-                        Some(Throttle::global().acquire().await)
-                    } else {
-                        None
-                    };
-                    let result = load_tile_bytes(
-                        tx,
-                        ty,
-                        kh,
-                        height_tiles,
-                        square_pixels,
-                        total,
-                        &source_data,
-                        &cumulative_offsets,
-                    )
-                    .await;
-                    drop(permit);
-                    match result {
-                        Ok(buf) => {
-                            if any_remote_source {
-                                Throttle::global().record_success();
-                            }
-                            (Some(buf), None)
-                        }
-                        Err(e) => {
-                            // Fatal: the throttle's per-call retry already
-                            // covered transient HTTP issues; anything reaching
-                            // here is a permanent failure. `{e:?}` (anyhow's
-                            // Debug) prints the full caused-by chain plus the
-                            // captured backtrace (RUST_BACKTRACE is set on by
-                            // main), so the user sees where it originated and
-                            // what wrapped it — not just the topmost context.
-                            log::error!("load_tile_bytes({tx},{ty}) failed:\n{e:?}");
-                            // Close the coord channel so the other 127
-                            // workers see Err once the ~20-entry buffer
-                            // drains, instead of grinding through tens of
-                            // thousands more tiles after a fatal error.
-                            coord_rx.close();
-                            return Err::<(), anyhow::Error>(e);
-                        }
-                    }
+                let ctx = LoadCtx {
+                    tx,
+                    ty,
+                    zoom,
+                    kh,
+                    height_tiles,
+                    square_pixels,
+                    total,
+                    mode: &mode,
+                    layout: &layout,
+                    source_data: &source_data,
+                    cumulative_offsets: &cumulative_offsets,
+                };
+                // Throttle only when the loader will actually do I/O: the
+                // Hilbert loader skips byte fetches in `LeafMode::Dtype`, and
+                // we don't want to hold a permit (or call `record_success`)
+                // for a no-op load.
+                let do_io = loader.needs_io(&ctx);
+                let permit = if any_remote_source && do_io {
+                    Some(Throttle::global().acquire().await)
                 } else {
-                    (None, None)
+                    None
+                };
+                let result = loader.load(&ctx).await;
+                drop(permit);
+                let loaded_tile = match result {
+                    Ok(t) => {
+                        if any_remote_source && do_io {
+                            Throttle::global().record_success();
+                        }
+                        t
+                    }
+                    Err(e) => {
+                        // Fatal: the throttle's per-call retry already
+                        // covered transient HTTP issues; anything reaching
+                        // here is a permanent failure. `{e:?}` (anyhow's
+                        // Debug) prints the full caused-by chain plus the
+                        // captured backtrace (RUST_BACKTRACE is set on by
+                        // main), so the user sees where it originated and
+                        // what wrapped it — not just the topmost context.
+                        log::error!("leaf load `{}` ({tx},{ty}) failed:\n{e:?}", loader.id());
+                        // Close the coord channel so the other 127 workers
+                        // see Err once the ~20-entry buffer drains, instead
+                        // of grinding through tens of thousands more tiles
+                        // after a fatal error.
+                        coord_rx.close();
+                        return Err::<(), anyhow::Error>(e);
+                    }
                 };
                 loaded_count.fetch_add(1, Ordering::Relaxed);
-                if loaded_tx
-                    .send(LoadedTile {
-                        tx,
-                        ty,
-                        tile_buf,
-                        arch_tile,
-                    })
-                    .await
-                    .is_err()
-                {
+                if loaded_tx.send(loaded_tile).await.is_err() {
                     break;
                 }
             }
@@ -1099,7 +1075,7 @@ where
     let renderer = plan
         .leaf_tile
         .renderer_id()
-        .and_then(|id| plan.renderers.get(id))
+        .and_then(|id| plan.leaf.renderer(id))
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no leaf renderer registered for tile descriptor {:?}",

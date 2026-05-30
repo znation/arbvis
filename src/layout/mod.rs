@@ -152,14 +152,7 @@ pub enum Layout {
 }
 
 impl Layout {
-    /// Whether this is the architectural variant (drives a few mode branches
-    /// downstream — e.g. element-per-pixel decoding vs byte-per-pixel LUT).
-    pub fn is_architectural(&self) -> bool {
-        matches!(self, Layout::Architectural(_))
-    }
-
     /// View this layout through the shared `LayoutShape` accessor surface.
-    #[allow(dead_code)]
     pub fn as_shape(&self) -> &dyn LayoutShape {
         match self {
             Layout::HilbertGlobal(h) => h,

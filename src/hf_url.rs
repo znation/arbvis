@@ -293,72 +293,14 @@ pub fn require_token() -> anyhow::Result<()> {
     anyhow::bail!("HF token required for hf:// output; set HF_TOKEN or run `hf auth login`")
 }
 
-/// Auto-detect whether `mod_url` is a HuggingFace-declared finetune of
-/// `orig_url`, by reading the modified-side model card metadata via the HF
-/// Hub API.
+/// Fetch the HF Hub model card metadata for a repo (`/api/models/{repo_id}`).
 ///
-/// Returns:
-/// - `Some(true)` when both args are model URLs **and** the modified side's
-///   `cardData.base_model` (string or list) includes the original side's
-///   repo id **and** `cardData.base_model_relation` is `finetune` (or
-///   unspecified — HF's convention is that relation defaults to finetune
-///   when omitted but a base is declared).
-/// - `Some(false)` when both args are HF model URLs but the metadata
-///   doesn't establish a finetune relation in the orig→mod direction.
-/// - `None` when detection isn't applicable: either side isn't an `hf://`
-///   model URL, or the API call failed (network error, private repo
-///   without token, 404, etc.). Caller falls back to its own default.
-pub async fn detect_finetune_relation(orig_url: &str, mod_url: &str) -> Option<bool> {
-    let orig_hf = parse(orig_url).ok()?;
-    let mod_hf = parse(mod_url).ok()?;
-    // The finetune relation is only meaningful between two model repos.
-    if !matches!(orig_hf.kind, RepoKind::Model) || !matches!(mod_hf.kind, RepoKind::Model) {
-        return None;
-    }
-
-    let info = match fetch_model_info(&mod_hf.repo_id).await {
-        Ok(v) => v,
-        Err(e) => {
-            log::debug!(
-                "finetune auto-detect: HF API lookup for {} failed: {e:#}",
-                mod_hf.repo_id
-            );
-            return None;
-        }
-    };
-
-    let cd = info.get("cardData")?;
-    let base_match = match cd.get("base_model") {
-        Some(serde_json::Value::String(s)) => repo_ids_equal(s, &orig_hf.repo_id),
-        Some(serde_json::Value::Array(a)) => a.iter().any(|v| {
-            v.as_str()
-                .map(|s| repo_ids_equal(s, &orig_hf.repo_id))
-                .unwrap_or(false)
-        }),
-        _ => return Some(false),
-    };
-    if !base_match {
-        return Some(false);
-    }
-    // Per the HF model-card spec the relation defaults to "finetune" when a
-    // base is declared but no explicit relation is given. Anything else
-    // ("quantized", "merge", "adapter", "other", ...) does *not* satisfy the
-    // finetune contract.
-    let relation = cd
-        .get("base_model_relation")
-        .and_then(|v| v.as_str())
-        .unwrap_or("finetune");
-    Some(relation.eq_ignore_ascii_case("finetune"))
-}
-
-/// `owner/name` comparison that tolerates case differences in the owner /
-/// name segments (HF treats these as case-insensitive).
-fn repo_ids_equal(a: &str, b: &str) -> bool {
-    a.eq_ignore_ascii_case(b)
-}
-
-/// Fetch `/api/models/{repo_id}` JSON. Used for finetune auto-detection.
-async fn fetch_model_info(repo_id: &str) -> anyhow::Result<serde_json::Value> {
+/// The interpretation of fields like `cardData.base_model` /
+/// `cardData.base_model_relation` is left to callers — model-specific logic
+/// (e.g. finetune auto-detection) lives in
+/// [`crate::finetune::detect_relation`], which the modelweightvis split will
+/// own.
+pub async fn fetch_model_card(repo_id: &str) -> anyhow::Result<serde_json::Value> {
     let url = format!("{}/api/models/{repo_id}", endpoint());
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -368,14 +310,14 @@ async fn fetch_model_info(repo_id: &str) -> anyhow::Result<serde_json::Value> {
     if let Some(tok) = read_token() {
         req = req.bearer_auth(tok);
     }
-    let resp = req.send().await.context("HF model_info request failed")?;
+    let resp = req.send().await.context("HF model_card request failed")?;
     let resp = resp
         .error_for_status()
-        .context("HF model_info non-2xx status")?;
+        .context("HF model_card non-2xx status")?;
     let json: serde_json::Value = resp
         .json()
         .await
-        .context("HF model_info JSON decode failed")?;
+        .context("HF model_card JSON decode failed")?;
     Ok(json)
 }
 

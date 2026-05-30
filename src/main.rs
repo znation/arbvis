@@ -3,6 +3,7 @@
 mod color;
 mod data;
 mod deploy;
+mod finetune;
 mod format;
 mod geometry;
 mod hf_upload;
@@ -574,7 +575,7 @@ async fn resolve_finetune(
         log::info!("--diff finetune mode: forced off by --no-finetune");
         return false;
     }
-    match hf_url::detect_finetune_relation(orig_str, mod_str).await {
+    match finetune::detect_relation(orig_str, mod_str).await {
         Some(true) => {
             log::info!(
                 "--diff finetune mode: auto-detected ON ({} declares {} as its base in its HF model card)",

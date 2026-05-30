@@ -1213,17 +1213,136 @@ fn collect_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Diff source builders
+//
+// Three built-in `DiffSourceBuilder` impls cover the file-pair diff cases.
+// Directory-pair diffs stay inline in `prepare_diff_sources` for now —
+// they'll move behind the trait when format detection migrates to
+// `modelweightvis` (step 12).
+// ---------------------------------------------------------------------------
+
+fn is_json_path(p: &Path) -> bool {
+    matches!(
+        p.extension().and_then(|e| e.to_str()),
+        Some("json") | Some("jsonl")
+    )
+}
+
+/// JSON / JSONL structure-aware diff. Applies when both paths have a
+/// `.json` or `.jsonl` extension.
+pub struct JsonDiffBuilder;
+
+#[async_trait::async_trait]
+impl crate::registry::DiffSourceBuilder for JsonDiffBuilder {
+    fn id(&self) -> &'static str {
+        "json"
+    }
+    fn priority(&self) -> i32 {
+        200
+    }
+    async fn try_build(
+        &self,
+        ctx: &crate::registry::DiffBuildCtx<'_>,
+    ) -> anyhow::Result<Option<(Vec<Source>, u64)>> {
+        if !(is_json_path(ctx.original) && is_json_path(ctx.modified)) {
+            return Ok(None);
+        }
+        let out =
+            crate::json_diff::build_json_diff_sources(ctx.original, ctx.modified, ctx.is_finetune)
+                .await?;
+        Ok(Some(out))
+    }
+}
+
+/// Tensor-aware diff (safetensors / GGUF). Applies when both paths look
+/// like a recognised model-format file.
+pub struct TensorDiffBuilder;
+
+#[async_trait::async_trait]
+impl crate::registry::DiffSourceBuilder for TensorDiffBuilder {
+    fn id(&self) -> &'static str {
+        "tensor"
+    }
+    fn priority(&self) -> i32 {
+        300
+    }
+    async fn try_build(
+        &self,
+        ctx: &crate::registry::DiffBuildCtx<'_>,
+    ) -> anyhow::Result<Option<(Vec<Source>, u64)>> {
+        let is_st = |p: &Path| -> bool { SourceFormat::from_path(p).is_some() };
+        if !(is_st(ctx.original) && is_st(ctx.modified)) {
+            return Ok(None);
+        }
+        let out =
+            build_safetensors_diff_sources(ctx.original, ctx.modified, ctx.is_finetune, ctx.metric)
+                .await?;
+        Ok(Some(out))
+    }
+}
+
+/// Plain-byte diff: builds one `SourceKind::Diff` source over a same-sized
+/// pair. The floor of the builder priority stack — applies whenever the two
+/// files exist and have the same size, and bails with an error if sizes
+/// differ (matching the original `prepare_diff_sources` contract).
+pub struct PlainBytesDiffBuilder;
+
+#[async_trait::async_trait]
+impl crate::registry::DiffSourceBuilder for PlainBytesDiffBuilder {
+    fn id(&self) -> &'static str {
+        "plain-bytes"
+    }
+    fn priority(&self) -> i32 {
+        0
+    }
+    async fn try_build(
+        &self,
+        ctx: &crate::registry::DiffBuildCtx<'_>,
+    ) -> anyhow::Result<Option<(Vec<Source>, u64)>> {
+        let size_o = std::fs::metadata(ctx.original)?.len();
+        let size_m = std::fs::metadata(ctx.modified)?.len();
+        if size_o != size_m {
+            anyhow::bail!(
+                "--diff: file sizes differ ({} bytes vs {} bytes): {} vs {}",
+                size_o,
+                size_m,
+                ctx.original.display(),
+                ctx.modified.display()
+            );
+        }
+        let source = Source {
+            file_idx: 0,
+            kind: SourceKind::Diff {
+                original: ctx.original.to_path_buf(),
+                modified: ctx.modified.to_path_buf(),
+            },
+            byte_size: size_o,
+            name_override: None,
+            xet_terms: None,
+            extensions: Extensions::default(),
+        };
+        Ok(Some((vec![source], size_o)))
+    }
+}
+
 /// Build diff sources from two files or two directories.
 ///
-/// For files: both must be the same size (error if not), unless both are safetensors
-/// (in which case a tensor-aligned diff buffer is computed).
-/// For directories: files are matched by relative path; pairs with mismatched sizes
-/// or no counterpart on the other side are skipped with a warning.
+/// For files: dispatched through `registry.diffs` by descending priority —
+/// `TensorDiffBuilder` (300) → `JsonDiffBuilder` (200) → `PlainBytesDiffBuilder`
+/// (0). The plain-byte floor always builds for a same-sized pair, so
+/// iteration terminates with a valid diff for any well-formed input.
+///
+/// For directories: files are matched by relative path; pairs with mismatched
+/// sizes or no counterpart on the other side are skipped with a warning. The
+/// safetensors sub-tree is matched by tensor name across both sides. This
+/// branch is still inline pending step 12.
 pub async fn prepare_diff_sources(
     original: &Path,
     modified: &Path,
     is_finetune: bool,
     metric: format::DiffMetric,
+    registry: &crate::registry::Registry,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     let orig_is_file = original.is_file();
     let mod_is_file = modified.is_file();
@@ -1235,48 +1354,26 @@ pub async fn prepare_diff_sources(
     // matched after name canonicalisation in `find_matched_tensor_pairs`.
     let is_st = |p: &Path| -> bool { SourceFormat::from_path(p).is_some() };
 
-    let is_json = |p: &Path| -> bool {
-        matches!(
-            p.extension().and_then(|e| e.to_str()),
-            Some("json") | Some("jsonl")
-        )
-    };
-
     if orig_is_file && mod_is_file {
-        // JSON / JSONL: structure-aware diff so unchanged bytes line up on the
-        // canvas even when an edit shifts subsequent positions.
-        if is_json(original) && is_json(modified) {
-            return crate::json_diff::build_json_diff_sources(original, modified, is_finetune)
-                .await;
-        }
-        // Safetensors diff: expand into per-tensor diff Sources (one per matched pair).
-        if is_st(original) && is_st(modified) {
-            return build_safetensors_diff_sources(original, modified, is_finetune, metric).await;
-        }
-
-        let size_o = std::fs::metadata(original)?.len();
-        let size_m = std::fs::metadata(modified)?.len();
-        if size_o != size_m {
-            anyhow::bail!(
-                "--diff: file sizes differ ({} bytes vs {} bytes): {} vs {}",
-                size_o,
-                size_m,
-                original.display(),
-                modified.display()
-            );
-        }
-        let source = Source {
-            file_idx: 0,
-            kind: SourceKind::Diff {
-                original: original.to_path_buf(),
-                modified: modified.to_path_buf(),
-            },
-            byte_size: size_o,
-            name_override: None,
-            xet_terms: None,
-            extensions: Extensions::default(),
+        let ctx = crate::registry::DiffBuildCtx {
+            original,
+            modified,
+            is_finetune,
+            metric,
         };
-        return Ok((vec![source], size_o));
+        let mut sorted: Vec<&Arc<dyn crate::registry::DiffSourceBuilder>> =
+            registry.diffs.iter().collect();
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.priority()));
+        for builder in &sorted {
+            if let Some(out) = builder.try_build(&ctx).await? {
+                return Ok(out);
+            }
+        }
+        anyhow::bail!(
+            "--diff: no registered builder handled the input pair ({} vs {})",
+            original.display(),
+            modified.display()
+        );
     }
 
     if orig_is_dir && mod_is_dir {
@@ -2013,12 +2110,17 @@ async fn build_multi_safetensors_diff_sources_inner(
         pb: &Option<ProgressBar>,
     ) -> anyhow::Result<Vec<(usize, Vec<format::TensorMeta>)>> {
         let pb = pb.clone();
+        // Collect owned `(Arc<Data>, SourceFormat)` pairs up front so the
+        // per-item closure below doesn't borrow from `data`/`fmts` — that
+        // borrow's lifetime is too narrow to satisfy the higher-ranked
+        // bound required when this helper is reached from
+        // `DiffSourceBuilder::try_build`'s async-trait future.
+        let items: Vec<(Arc<Data>, SourceFormat)> =
+            data.iter().cloned().zip(fmts.iter().copied()).collect();
         let mut out: Vec<(usize, anyhow::Result<Vec<format::TensorMeta>>)> =
-            stream::iter(data.iter().zip(fmts.iter()).enumerate())
+            stream::iter(items.into_iter().enumerate())
                 .map(|(i, (d, fmt))| {
                     let pb = pb.clone();
-                    let d = Arc::clone(d);
-                    let fmt = *fmt;
                     async move {
                         let r = fetch_model_header(&d, fmt)
                             .await

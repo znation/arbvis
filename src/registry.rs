@@ -11,9 +11,13 @@
 //! renderer pairs registered in step 3/4a) — that one *is* consumed today.
 //! The other three slots are placeholders.
 
+use std::path::Path;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 use crate::data::{Source, SourceMeta};
+use crate::format::DiffMetric;
 use crate::layout::{LayoutMode, LayoutShape};
 use crate::tiled::leaf_renderer::LeafRegistry;
 
@@ -60,15 +64,44 @@ pub trait LayoutPlugin: Send + Sync {
     fn build(&self, ctx: &LayoutBuildCtx<'_>) -> Option<Box<dyn LayoutShape>>;
 }
 
+/// Inputs every [`DiffSourceBuilder`] sees for a file-pair `--diff` run.
+///
+/// Directory-pair diffs stay as inline code in `data::prepare_diff_sources`
+/// for now (multiple builders need to contribute their slice of files to the
+/// same output) — they move behind the trait when format detection migrates
+/// to `modelweightvis` (step 12).
+pub struct DiffBuildCtx<'a> {
+    pub original: &'a Path,
+    pub modified: &'a Path,
+    pub is_finetune: bool,
+    pub metric: DiffMetric,
+}
+
 /// Builds diff sources for a `--diff` run when the input pair matches its
 /// shape (JSON / plain bytes / per-tensor / …).
 ///
-/// Consumed in step 9 when `prepare_diff_sources` becomes a priority
-/// iteration over registered builders.
-#[allow(dead_code)]
+/// Plugins are tried in descending `priority()` order; the first that returns
+/// `Some` from `try_build` wins. The `PlainBytesDiffBuilder` floor at
+/// priority 0 always builds when both paths exist with matching sizes, so
+/// iteration terminates with a valid diff for any well-formed pair.
+///
+/// Uses `async_trait` (vs. raw `BoxFuture`) because the underlying tensor
+/// diff helpers contain higher-ranked closures that the manual lifetime
+/// annotation can't generalise — the macro emits a `Box::pin` with the
+/// correct HRTB bounds.
+#[async_trait]
 pub trait DiffSourceBuilder: Send + Sync {
+    /// Stable name used for diagnostic logs and registry lookup.
+    #[allow(dead_code)]
     fn id(&self) -> &'static str;
+    /// Higher wins. Tensor-aware diff is 300; JSON structure-aware is 200;
+    /// plain-byte fallback is 0.
     fn priority(&self) -> i32;
+    /// Returns `Ok(Some((sources, total)))` if this builder can handle the
+    /// pair, `Ok(None)` to skip to the next builder. `Err` is propagated to
+    /// the caller (CLI exit).
+    async fn try_build(&self, ctx: &DiffBuildCtx<'_>)
+        -> anyhow::Result<Option<(Vec<Source>, u64)>>;
 }
 
 /// Plugin slots threaded through [`crate::run`]. The binary `main()` (and
@@ -93,9 +126,10 @@ impl Registry {
     ///
     /// Today: `leaf` carries the `"hilbert-bytes"` + `"arch"` loader/renderer
     /// pairs; `layouts` carries `HilbertLayoutPlugin` (the `i32::MIN` floor),
-    /// `ArchLayoutPlugin`, and `MoeDiffLayoutPlugin`. The `"arch"` parts move
-    /// to modelweightvis in step 12. `formats` and `diffs` remain empty until
-    /// steps 9 and 12 populate them.
+    /// `ArchLayoutPlugin`, and `MoeDiffLayoutPlugin`; `diffs` carries
+    /// `JsonDiffBuilder`, `TensorDiffBuilder`, and `PlainBytesDiffBuilder`.
+    /// The `"arch"` parts and `TensorDiffBuilder` move to modelweightvis in
+    /// step 12. `formats` remains empty until step 12 populates it.
     pub fn with_defaults() -> Self {
         Self {
             formats: Vec::new(),
@@ -105,7 +139,11 @@ impl Registry {
                 Arc::new(crate::layout::MoeDiffLayoutPlugin),
             ],
             leaf: LeafRegistry::with_defaults(),
-            diffs: Vec::new(),
+            diffs: vec![
+                Arc::new(crate::data::TensorDiffBuilder),
+                Arc::new(crate::data::JsonDiffBuilder),
+                Arc::new(crate::data::PlainBytesDiffBuilder),
+            ],
         }
     }
 }

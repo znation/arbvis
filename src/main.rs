@@ -494,7 +494,8 @@ async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()> {
                     .buffered(2)
                     .try_collect()
                     .await?;
-            data::prepare_diff_sources(&diff_args[0], &diff_args[1], is_finetune, metric).await?
+            data::prepare_diff_sources(&diff_args[0], &diff_args[1], is_finetune, metric, &registry)
+                .await?
         };
         let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
         let cfg = RenderConfig {

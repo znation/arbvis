@@ -166,7 +166,7 @@ impl TileCoords {
 ///
 /// `pub(super)` because the `leaf_renderer` submodule's `LeafRenderer` impls
 /// consume one of these and dispatch to the right `render_one*` function.
-pub(super) struct LoadedTile {
+pub struct LoadedTile {
     pub(super) tx: u32,
     pub(super) ty: u32,
     /// `Some` when the mode needs raw byte data AND the layout is the legacy
@@ -180,7 +180,7 @@ pub(super) struct LoadedTile {
 
 /// `pub(super)` because `tiled::streaming`'s pipeline closures destructure
 /// `EncodedTile` (the `tx`/`ty`/`bytes`/`image` fields).
-pub(super) struct EncodedTile {
+pub struct EncodedTile {
     pub(super) tx: u32,
     pub(super) ty: u32,
     pub(super) image: image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
@@ -192,7 +192,7 @@ pub(super) struct EncodedTile {
 /// `pub(super)` because `TilePlan::mode` and `derive_leaf_format` (also
 /// `pub(super)`) expose this type to the `tiled::streaming` submodule.
 #[derive(Clone)]
-pub(super) enum LeafMode {
+pub enum LeafMode {
     Plain {
         pixel_lut: Arc<[image::Rgb<u8>; 256]>,
     },

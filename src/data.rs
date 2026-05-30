@@ -1,3 +1,4 @@
+use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read};
@@ -294,6 +295,49 @@ pub struct MoeCell {
     pub j: u32,
 }
 
+/// Typed extension map for [`Source`].
+///
+/// Holds at most one value per concrete type. Used by format/layout plugins
+/// to attach typed metadata to a source without bolting more fields onto the
+/// `Source` struct itself. Today this carries `ModelInfo` and `MoeCell` (the
+/// step-8 migration target for the legacy fields); future format plugins
+/// (safetensors / GGUF / pickle in `modelweightvis`) will stuff their own
+/// per-source metadata here.
+///
+/// Not `Clone` (the boxed `dyn Any` payload isn't), but `Source` isn't
+/// `Clone` either, so this matches.
+#[derive(Default)]
+pub struct Extensions {
+    map: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
+}
+
+impl Extensions {
+    /// Insert a value keyed by its type. Replaces any prior value of the same
+    /// type.
+    pub fn insert<T: Any + Send + Sync>(&mut self, value: T) {
+        self.map.insert(TypeId::of::<T>(), Box::new(value));
+    }
+
+    /// Lookup the value associated with `T`, if any. Plugin readers (step 8
+    /// onwards) call this to fetch the typed metadata they care about.
+    #[allow(dead_code)]
+    pub fn get<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.map
+            .get(&TypeId::of::<T>())
+            .and_then(|v| v.downcast_ref::<T>())
+    }
+}
+
+impl std::fmt::Debug for Extensions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Don't try to render the boxed payloads — `dyn Any` doesn't expose a
+        // useful representation. Surface the count for diagnostic dumps.
+        f.debug_struct("Extensions")
+            .field("type_count", &self.map.len())
+            .finish()
+    }
+}
+
 /// Metadata and storage descriptor for one input.
 pub struct Source {
     pub file_idx: usize,
@@ -311,6 +355,13 @@ pub struct Source {
     /// Set for sources produced by [`prepare_moe_diff_sources`]; `None` for
     /// every other code path. See [`MoeCell`].
     pub moe_cell: Option<MoeCell>,
+    /// Typed-extensions map: format/layout plugins read & write per-source
+    /// metadata here. Step 7 introduces this; step 8 migrates the legacy
+    /// `model_info` and `moe_cell` fields onto it and deletes those fields.
+    /// Today the dispatch chokepoint in `main::dispatch_render` mirrors the
+    /// legacy fields into here via `populate_extensions_from_fields`.
+    #[allow(dead_code)]
+    pub extensions: Extensions,
 }
 
 impl Source {
@@ -344,6 +395,21 @@ impl Source {
             }
         }
     }
+
+    /// Mirror the legacy `model_info` and `moe_cell` fields into
+    /// [`Source::extensions`]. Called once per source at the
+    /// `main::dispatch_render` chokepoint so plugin-side readers (step 8
+    /// onwards) find the data regardless of which construction path produced
+    /// the source. Step 8 deletes the legacy fields and moves population to
+    /// the format plugins (step 12); this helper goes away then.
+    pub(crate) fn populate_extensions_from_fields(&mut self) {
+        if let Some(ref mi) = self.model_info {
+            self.extensions.insert(mi.clone());
+        }
+        if let Some(mc) = self.moe_cell {
+            self.extensions.insert(mc);
+        }
+    }
 }
 
 /// Build sources and return total byte count.
@@ -370,6 +436,7 @@ pub fn prepare_sources(files: &[PathBuf]) -> anyhow::Result<(Vec<Source>, u64)> 
                 name_override: None,
                 xet_terms: None,
                 moe_cell: None,
+                extensions: Extensions::default(),
             }],
             len,
         ));
@@ -425,6 +492,7 @@ pub fn prepare_sources(files: &[PathBuf]) -> anyhow::Result<(Vec<Source>, u64)> 
             name_override: None,
             xet_terms: None,
             moe_cell: None,
+            extensions: Extensions::default(),
         });
     }
     Ok((sources, total))
@@ -583,6 +651,7 @@ pub fn prepare_sources_from_specs(specs: &[InputSpec]) -> anyhow::Result<(Vec<So
                 name_override: None,
                 xet_terms: None,
                 moe_cell: None,
+                extensions: Extensions::default(),
             }],
             len,
         ));
@@ -643,6 +712,7 @@ pub fn prepare_sources_from_specs(specs: &[InputSpec]) -> anyhow::Result<(Vec<So
                     name_override: None,
                     xet_terms: None,
                     moe_cell: None,
+                    extensions: Extensions::default(),
                 });
             }
             InputSpec::Remote(spec) => {
@@ -656,6 +726,7 @@ pub fn prepare_sources_from_specs(specs: &[InputSpec]) -> anyhow::Result<(Vec<So
                     name_override: None,
                     xet_terms: None,
                     moe_cell: None,
+                    extensions: Extensions::default(),
                 });
             }
         }
@@ -1228,6 +1299,7 @@ pub async fn prepare_diff_sources(
             name_override: None,
             xet_terms: None,
             moe_cell: None,
+            extensions: Extensions::default(),
         };
         return Ok((vec![source], size_o));
     }
@@ -1331,6 +1403,7 @@ pub async fn prepare_diff_sources(
                         name_override: Some(format!("[only in original] {}", rel.display())),
                         xet_terms: None,
                         moe_cell: None,
+                        extensions: Extensions::default(),
                     });
                     total += size_o;
                 }
@@ -1373,6 +1446,7 @@ pub async fn prepare_diff_sources(
                         name_override: None,
                         xet_terms: None,
                         moe_cell: None,
+                        extensions: Extensions::default(),
                     });
                     total += max_size;
                 }
@@ -1402,6 +1476,7 @@ pub async fn prepare_diff_sources(
                 name_override: Some(format!("[only in modified] {}", rel.display())),
                 xet_terms: None,
                 moe_cell: None,
+                extensions: Extensions::default(),
             });
             total += size_m;
         }
@@ -1642,6 +1717,7 @@ pub async fn prepare_diff_sources_from_http(
             name_override: Some(fname),
             xet_terms: None,
             moe_cell: None,
+            extensions: Extensions::default(),
         });
         total += size;
     }
@@ -1659,6 +1735,7 @@ pub async fn prepare_diff_sources_from_http(
             name_override: Some(format!("[only in original] {fname}")),
             xet_terms: None,
             moe_cell: None,
+            extensions: Extensions::default(),
         });
         total += size;
     }
@@ -1672,6 +1749,7 @@ pub async fn prepare_diff_sources_from_http(
             name_override: Some(format!("[only in modified] {fname}")),
             xet_terms: None,
             moe_cell: None,
+            extensions: Extensions::default(),
         });
         total += size;
     }
@@ -1685,6 +1763,7 @@ pub async fn prepare_diff_sources_from_http(
             name_override: Some(fname),
             xet_terms: None,
             moe_cell: None,
+            extensions: Extensions::default(),
         });
         total += size;
     }
@@ -2165,6 +2244,7 @@ async fn build_multi_safetensors_diff_sources_inner(
             name_override: Some(orig_t.label()),
             xet_terms: None,
             moe_cell: None,
+            extensions: Extensions::default(),
         });
         total += nelem;
     }
@@ -2215,6 +2295,7 @@ async fn build_multi_safetensors_diff_sources_inner(
             name_override: Some(format!("[only in original] {}", t.label())),
             xet_terms: None,
             moe_cell: None,
+            extensions: Extensions::default(),
         });
         total += nelem;
     }
@@ -2250,6 +2331,7 @@ async fn build_multi_safetensors_diff_sources_inner(
             name_override: Some(format!("[only in modified] {}", t.label())),
             xet_terms: None,
             moe_cell: None,
+            extensions: Extensions::default(),
         });
         total += nelem;
     }
@@ -2821,6 +2903,7 @@ pub async fn prepare_moe_diff_sources(
                         i: ei,
                         j: ej,
                     }),
+                    extensions: Extensions::default(),
                 });
                 total += nelem;
             }

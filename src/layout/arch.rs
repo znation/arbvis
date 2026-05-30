@@ -960,6 +960,7 @@ fn pick_column_count(n: u32, layer_w: u32, layer_h: u32, gutter: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::Extensions;
 
     #[test]
     fn next_pow2_basics() {
@@ -1091,6 +1092,7 @@ mod tests {
             name_override: None,
             xet_terms: None,
             moe_cell: None,
+            extensions: Extensions::default(),
         }
     }
 

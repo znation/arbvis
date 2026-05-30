@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use memmap2::Mmap;
 
-use crate::data::{Data, Source, SourceKind};
+use crate::data::{Data, Extensions, Source, SourceKind};
 use crate::format::DiffFill;
 
 use align::{align_documents, coalesce, AlignmentSpan};
@@ -310,6 +310,7 @@ fn fallback_byte_diff(
             name_override: None,
             xet_terms: None,
             moe_cell: None,
+            extensions: Extensions::default(),
         };
         return Ok((vec![source], size));
     }
@@ -325,6 +326,7 @@ fn fallback_byte_diff(
             name_override: Some(format!("[only in original] {}", filename_label(orig_path))),
             xet_terms: None,
             moe_cell: None,
+            extensions: Extensions::default(),
         });
         total += size;
     }
@@ -340,6 +342,7 @@ fn fallback_byte_diff(
             name_override: Some(format!("[only in modified] {}", filename_label(mod_path))),
             xet_terms: None,
             moe_cell: None,
+            extensions: Extensions::default(),
         });
         total += size;
     }

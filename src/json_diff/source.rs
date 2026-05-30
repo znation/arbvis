@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::data::{Data, Source, SourceKind};
+use crate::data::{Data, Extensions, Source, SourceKind};
 use crate::format::DiffFill;
 
 use super::align::AlignmentSpan;
@@ -62,6 +62,7 @@ pub fn spans_to_sources(
                         )),
                         xet_terms: None,
                         moe_cell: None,
+                        extensions: Extensions::default(),
                     });
                     total += common;
                 }
@@ -88,6 +89,7 @@ pub fn spans_to_sources(
                         )),
                         xet_terms: None,
                         moe_cell: None,
+                        extensions: Extensions::default(),
                     });
                     total += len;
                 }
@@ -111,6 +113,7 @@ pub fn spans_to_sources(
                         )),
                         xet_terms: None,
                         moe_cell: None,
+                        extensions: Extensions::default(),
                     });
                     total += len;
                 }
@@ -136,6 +139,7 @@ pub fn spans_to_sources(
                     )),
                     xet_terms: None,
                     moe_cell: None,
+                    extensions: Extensions::default(),
                 });
                 total += len;
             }
@@ -160,6 +164,7 @@ pub fn spans_to_sources(
                     )),
                     xet_terms: None,
                     moe_cell: None,
+                    extensions: Extensions::default(),
                 });
                 total += len;
             }

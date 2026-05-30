@@ -577,10 +577,27 @@ pub fn prepare_sources_from_specs(specs: &[InputSpec]) -> anyhow::Result<(Vec<So
         ));
     }
 
+    // Pre-expand `InputSpec::Local(dir)` into one `InputSpec::Local(file)` per
+    // contained file, matching the behaviour of [`prepare_sources`]. Without
+    // this, a local directory pushed into the specs (e.g. by `--stream
+    // ./snapshots/llama-7b/`) would yield a single Source pointing at the
+    // directory itself — load_source_data then mmaps the dir and fails.
+    let expanded: Vec<InputSpec> = specs
+        .iter()
+        .flat_map(|spec| match spec {
+            InputSpec::Local(p) if p.is_dir() => collect_files_recursive(p)
+                .into_iter()
+                .map(InputSpec::Local)
+                .collect::<Vec<_>>(),
+            InputSpec::Local(p) => vec![InputSpec::Local(p.clone())],
+            InputSpec::Remote(s) => vec![InputSpec::Remote(s.clone())],
+        })
+        .collect();
+
     let mut sources = Vec::new();
     let mut total = 0u64;
 
-    for spec in specs {
+    for spec in &expanded {
         match spec {
             InputSpec::Local(path) => {
                 let size = match std::fs::metadata(path) {

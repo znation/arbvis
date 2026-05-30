@@ -17,17 +17,26 @@ mod throttle;
 mod tiled;
 mod xet;
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
+use futures::stream::{StreamExt, TryStreamExt};
+use tempfile::TempDir;
 
-use crate::data::InputSpec;
+use crate::data::{InputSpec, Source};
 use crate::format::DiffMetric;
+use crate::hf_url::HfOutputSpec;
 use crate::layout::LayoutMode;
 use crate::tiled::leaf::TileFormat;
+
+/// Concurrency cap when resolving (downloading) `hf://` inputs at startup.
+/// Mirrors `data::SETUP_FETCH_CONCURRENCY` so user-visible parallelism stays
+/// consistent across the input-resolution and materialisation stages.
+const RESOLVE_CONCURRENCY: usize = 16;
 
 /// CLI mirror of [`format::DiffMetric`]. Kept separate so the clap
 /// derive doesn't pollute the core type.
@@ -227,6 +236,166 @@ struct Args {
     /// pre-architectural output for regression checks.
     #[arg(long, value_enum, default_value_t = LayoutArg::Auto)]
     layout: LayoutArg,
+
+    /// Opt in to streaming I/O for the normal (non-diff) flow: keep `hf://`
+    /// inputs remote (per-tile range fetches instead of an up-front download)
+    /// and — when combined with an `hf://` output or `--space` — push tiles
+    /// to the Hub as they're produced rather than staging through a local
+    /// tempdir. Off by default; the disk-backed path is much faster and
+    /// more recoverable. Use `--stream` when input or output data won't fit
+    /// on local disk.
+    ///
+    /// `--diff` and `--moe-diff` are *not* affected on the input side:
+    /// `data::prepare_diff_sources*` already keeps repo-level hf:// inputs
+    /// remote (LazyDiff), and `prepare_moe_diff_sources` downloads
+    /// unconditionally. `--stream` still controls the output path (tile
+    /// streaming vs. local pyramid) for those modes.
+    #[arg(long)]
+    stream: bool,
+}
+
+/// Bag of parameters shared by every render entrypoint. Avoids the
+/// repeated-argument-list-of-doom that the call sites had before.
+struct RenderConfig {
+    /// Display title for the viewer / single-image label. `Cow` so the
+    /// common default ("arbvis" / "arbvis diff" / "arbvis moe-diff") stays
+    /// as a `&'static str` borrow instead of allocating on every run.
+    title: Cow<'static, str>,
+    inputs: Vec<String>,
+    diff_mode: bool,
+    show_xet_xorbs: bool,
+    layout_mode: LayoutMode,
+    leaf_format: TileFormat,
+    pyramid_format: TileFormat,
+}
+
+/// Where the render output goes after rendering. Owns any temporary
+/// directories so they live until the upload step completes.
+///
+/// `_tempdir: Option<TempDir>` is a **named** binding-with-leading-underscore,
+/// NOT a wildcard pattern. The TempDir's `Drop` impl removes the directory
+/// from disk; we need the binding alive until the post-render upload reads
+/// from `local`. Rust drops named bindings at end-of-scope (in
+/// `dispatch_render`'s match arms that is after the `.await` returns), which
+/// is what keeps the upload reading a real path. If a future refactor renames
+/// `_tempdir` to plain `_`, that becomes a wildcard pattern that drops
+/// IMMEDIATELY at the destructure point — the directory is gone before the
+/// upload starts. Do not rename.
+enum OutputDest {
+    /// No `--output`, no `--tiles`, no `--space`: pop a minifb window.
+    Window,
+    /// `--output <path>`: a single PNG. If `upload_hf` is `Some`, `local` is a
+    /// tempdir path that will be uploaded post-render.
+    SingleImage {
+        local: PathBuf,
+        upload_hf: Option<String>,
+        _tempdir: Option<TempDir>,
+    },
+    /// `--tiles <dir>` and/or `--space`: a tile pyramid.
+    ///
+    /// `local` is the disk path the pyramid renders into (a user dir, or a
+    /// tempdir inside `_tempdir`). It is `None` when `--stream` is set and
+    /// the destination is HF-bound — in that case the streaming path
+    /// uploads tiles as they are produced and never touches local disk.
+    Tiles {
+        local: Option<PathBuf>,
+        upload_hf: Option<String>,
+        space: Option<String>,
+        _tempdir: Option<TempDir>,
+    },
+}
+
+impl OutputDest {
+    /// Resolve the user's `--output`/`--tiles`/`--space` flags into one of
+    /// the three concrete destinations.
+    ///
+    /// Tempdirs are allocated lazily: only when the disk-backed path will
+    /// actually use one (`hf://` output without `--stream`). With `--stream`,
+    /// streaming destinations skip the tempdir entirely so a read-only or
+    /// full `/tmp` doesn't kill the run before it starts — which is exactly
+    /// the environment `--stream` exists for.
+    fn from_args(args: &Args) -> anyhow::Result<Self> {
+        // `--output` always wins (clap forbids combining it with --tiles/--space).
+        // `--stream` does not apply to single-image output — there's no
+        // pyramid to stream, so we still go through a local PNG and upload it.
+        if let Some(ref out) = args.output {
+            return if hf_url::is_hf_path(out) {
+                let td = tempfile::tempdir().context("creating output tempdir")?;
+                let local = td.path().join("output.png");
+                Ok(OutputDest::SingleImage {
+                    local,
+                    upload_hf: Some(out.to_string_lossy().into_owned()),
+                    _tempdir: Some(td),
+                })
+            } else {
+                Ok(OutputDest::SingleImage {
+                    local: out.clone(),
+                    upload_hf: None,
+                    _tempdir: None,
+                })
+            };
+        }
+
+        let tiles_set = args.tiles.is_some();
+        let space_set = args.space.is_some();
+        if !tiles_set && !space_set {
+            return Ok(OutputDest::Window);
+        }
+
+        // Reject `--tiles hf://X --space S`: the two flags are documented
+        // alternatives (see `--space` help: "Contrast with --tiles hf://..."),
+        // and silently picking one over the other would mean the same flags
+        // produce different end-states under `--stream` vs. disk-backed.
+        // `--space` + `--tiles <local_dir>` is fine and used by the
+        // deploy-only shortcut for re-deploys.
+        if let (Some(p), true) = (args.tiles.as_ref(), space_set) {
+            if hf_url::is_hf_path(p) {
+                anyhow::bail!(
+                    "--tiles hf://… and --space are alternatives, not stackable: \
+                     --space deploys via its own bucket; --tiles hf:// uploads to \
+                     a separate repo. Pass one, or combine --space with --tiles \
+                     <local_dir> to (re-)deploy an already-rendered pyramid."
+                );
+            }
+        }
+
+        // Streaming destinations skip the local pyramid entirely.
+        let needs_staging = !args.stream;
+
+        let (local, upload_hf, tempdir) = match &args.tiles {
+            Some(p) => {
+                if hf_url::is_hf_path(p) {
+                    let url = p.to_string_lossy().into_owned();
+                    if needs_staging {
+                        let td = tempfile::tempdir().context("creating tiles tempdir")?;
+                        (Some(td.path().to_path_buf()), Some(url), Some(td))
+                    } else {
+                        (None, Some(url), None)
+                    }
+                } else {
+                    // Local --tiles <dir>: always disk-backed.
+                    (Some(p.clone()), None, None)
+                }
+            }
+            None => {
+                // --space without --tiles: tempdir for disk-backed sync;
+                // nothing for streaming (uploads go through the bucket sink).
+                if needs_staging {
+                    let td = tempfile::tempdir().context("creating tiles tempdir")?;
+                    (Some(td.path().to_path_buf()), None, Some(td))
+                } else {
+                    (None, None, None)
+                }
+            }
+        };
+
+        Ok(OutputDest::Tiles {
+            local,
+            upload_hf,
+            space: args.space.clone(),
+            _tempdir: tempdir,
+        })
+    }
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
@@ -234,292 +403,191 @@ async fn run(args: Args) -> anyhow::Result<()> {
         return tiled::regen_html(tile_dir);
     }
 
-    let xet_vis = args.show_xet_xorbs;
-    let show_xet_xorbs = args.show_xet_xorbs;
-    let (leaf_format, pyramid_format) = args.tile_format.split();
-    let layout_mode = args.layout.to_mode();
-
-    if xet_vis && args.diff.is_some() {
+    if args.show_xet_xorbs && args.diff.is_some() {
         anyhow::bail!("--show-xet-xorbs is incompatible with --diff");
     }
 
-    // Intercept hf:// tiles output: resolve inputs as HTTP specs and stream directly.
-    // For local tiles output: render to disk then optionally upload.
-    // _tiles_tempdir keeps the temp dir alive until upload is done.
-    let tiles_hf_out: Option<String> = match &args.tiles {
-        Some(p) if p.to_string_lossy().starts_with("hf://") => {
-            Some(p.to_string_lossy().into_owned())
-        }
-        _ => None,
-    };
-    let (_tiles_tempdir, tiles_arg, tiles_upload) = match args.tiles {
-        None => (None, None, None),
-        Some(ref p) if p.to_string_lossy().starts_with("hf://") => {
-            let td = tempfile::tempdir()?;
-            let local = td.path().to_path_buf();
-            (
-                Some(td),
-                Some(local),
-                Some(p.to_string_lossy().into_owned()),
-            )
-        }
-        Some(p) => (None, Some(p), None),
-    };
-    let (_output_tempdir, output_arg, output_upload) = match args.output {
-        None => (None, None, None),
-        Some(ref p) if p.to_string_lossy().starts_with("hf://") => {
-            let td = tempfile::tempdir()?;
-            let local = td.path().join("output.png");
-            (
-                Some(td),
-                Some(local),
-                Some(p.to_string_lossy().into_owned()),
-            )
-        }
-        Some(p) => (None, Some(p), None),
-    };
+    let dest = OutputDest::from_args(&args)?;
 
+    let (leaf_format, pyramid_format) = args.tile_format.split();
+    let layout_mode = args.layout.to_mode();
+    let stream = args.stream;
+    let show_xet_xorbs = args.show_xet_xorbs;
+
+    // --- MoE diff ---------------------------------------------------------
     if let Some(moe_arg) = args.moe_diff {
         let metric = args.diff_metric.to_metric();
         let input = moe_arg.to_string_lossy().into_owned();
         let inputs = vec![input.clone()];
-        let title = args.title.as_deref().unwrap_or("arbvis moe-diff");
+        let title = default_title(args.title, "arbvis moe-diff");
         let (sources, total) = data::prepare_moe_diff_sources(&input, metric)
             .await
             .with_context(|| format!("--moe-diff {input}"))?;
         let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
-        if let Some(ref hf_out_url) = tiles_hf_out {
-            let hf_out = hf_url::parse_hf_output(hf_out_url)?;
-            let _ = tiled::run_tiles_hf_streaming(
-                sources,
-                total,
-                &hf_out,
-                true,
-                title,
-                &inputs,
-                false,
-                leaf_format,
-                pyramid_format,
-                layout_mode,
-            )
-            .await?;
-            return Ok(());
-        }
-        if let Some(ref space_id) = args.space {
-            let bucket_spec = deploy::create_space_bucket(space_id).await?;
-            let html = tiled::run_tiles_hf_streaming(
-                sources,
-                total,
-                &bucket_spec,
-                true,
-                title,
-                &inputs,
-                false,
-                leaf_format,
-                pyramid_format,
-                layout_mode,
-            )
-            .await?;
-            deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html).await?;
-            return Ok(());
-        }
-        if let Some(ref tile_dir) = tiles_arg {
-            tiled::run_tiles(
-                sources,
-                total,
-                tile_dir.clone(),
-                true,
-                title,
-                &inputs,
-                false,
-                leaf_format,
-                pyramid_format,
-                layout_mode,
-            )
-            .await?;
-            if let Some(ref url) = tiles_upload {
-                deploy::upload_dir_to(url, tile_dir).await?;
-            }
-            return Ok(());
-        }
-        let labels = labels.clone();
-        let sources_owned = sources;
-        let output_arg_owned = output_arg.clone();
-        tokio::task::spawn_blocking(move || {
-            single::run_single(
-                &labels,
-                output_arg_owned,
-                sources_owned,
-                total,
-                true,
-                false,
-                layout_mode,
-            )
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("run_single join failure: {e}"))??;
-        if let (Some(ref url), Some(ref local)) = (&output_upload, &output_arg) {
-            deploy::upload_file_to(url, local).await?;
-        }
-        return Ok(());
+        let cfg = RenderConfig {
+            title,
+            inputs,
+            diff_mode: true,
+            show_xet_xorbs: false,
+            layout_mode,
+            leaf_format,
+            pyramid_format,
+        };
+        return dispatch_render(sources, total, &labels, &cfg, dest, stream).await;
     }
 
+    // --- Two-input diff ---------------------------------------------------
     if let Some(raw_diff_args) = args.diff {
         let diff_input_strs: Vec<String> = raw_diff_args
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
-        let diff_title = args.title.as_deref().unwrap_or("arbvis diff");
+        let diff_title = default_title(args.title, "arbvis diff");
         let orig_str = &diff_input_strs[0];
         let mod_str = &diff_input_strs[1];
-        let is_finetune = if args.finetune {
-            log::info!("--diff finetune mode: forced on by --finetune");
-            true
-        } else if args.no_finetune {
-            log::info!("--diff finetune mode: forced off by --no-finetune");
-            false
-        } else {
-            match hf_url::detect_finetune_relation(orig_str, mod_str).await {
-                Some(true) => {
-                    log::info!(
-                        "--diff finetune mode: auto-detected ON ({} declares {} as its base in its HF model card)",
-                        mod_str, orig_str
-                    );
-                    true
-                }
-                Some(false) => {
-                    log::info!(
-                        "--diff finetune mode: auto-detected OFF ({} does not declare {} as a finetune base)",
-                        mod_str, orig_str
-                    );
-                    false
-                }
-                None => {
-                    log::info!(
-                        "--diff finetune mode: auto-detect skipped (not both hf:// model URLs or API lookup failed); defaulting to OFF — pass --finetune to override"
-                    );
-                    false
-                }
-            }
-        };
+        let is_finetune = resolve_finetune(args.finetune, args.no_finetune, orig_str, mod_str).await;
         let metric = args.diff_metric.to_metric();
 
         let (sources, total) = if hf_url::is_repo_level(orig_str)?
             && hf_url::is_repo_level(mod_str)?
         {
-            // Both are repo-level hf:// URLs: list files over API, diff lazily over HTTP.
-            // No model weights are downloaded to disk or held in RAM.
-            let orig_specs = hf_url::list_repo_as_http_specs(orig_str)
-                .await
-                .with_context(|| format!("listing files in {orig_str}"))?;
-            let mod_specs = hf_url::list_repo_as_http_specs(mod_str)
-                .await
-                .with_context(|| format!("listing files in {mod_str}"))?;
+            // Both are repo-level hf:// URLs: list files over API, diff lazily
+            // over HTTP. No model weights are downloaded to disk or held in RAM.
+            // The two listings are independent, so run them concurrently.
+            let (orig_specs, mod_specs) = tokio::try_join!(
+                async {
+                    hf_url::list_repo_as_http_specs(orig_str)
+                        .await
+                        .with_context(|| format!("listing files in {orig_str}"))
+                },
+                async {
+                    hf_url::list_repo_as_http_specs(mod_str)
+                        .await
+                        .with_context(|| format!("listing files in {mod_str}"))
+                },
+            )?;
             data::prepare_diff_sources_from_http(&orig_specs, &mod_specs, is_finetune, metric)
                 .await?
         } else {
             // At least one side is a local path or single-file hf:// URL.
-            let mut diff_args: Vec<PathBuf> = Vec::with_capacity(raw_diff_args.len());
-            for p in raw_diff_args {
-                diff_args.push(resolve_input(p).await?);
-            }
+            // Resolve the two sides concurrently; order matters for the
+            // (orig, modified) contract, so use `buffered` not
+            // `buffer_unordered`.
+            let diff_args: Vec<PathBuf> =
+                futures::stream::iter(raw_diff_args.into_iter().map(resolve_input))
+                    .buffered(2)
+                    .try_collect()
+                    .await?;
             data::prepare_diff_sources(&diff_args[0], &diff_args[1], is_finetune, metric).await?
         };
         let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
-        // Stream directly to HF — no tiles written to local disk.
-        if let Some(ref hf_out_url) = tiles_hf_out {
-            let hf_out = hf_url::parse_hf_output(hf_out_url)?;
-            let _ = tiled::run_tiles_hf_streaming(
-                sources,
-                total,
-                &hf_out,
-                true,
-                diff_title,
-                &diff_input_strs,
-                false,
-                leaf_format,
-                pyramid_format,
-                layout_mode,
-            )
-            .await?;
-            return Ok(());
-        }
-        if let Some(ref space_id) = args.space {
-            let bucket_spec = deploy::create_space_bucket(space_id).await?;
-            let html = tiled::run_tiles_hf_streaming(
-                sources,
-                total,
-                &bucket_spec,
-                true,
-                diff_title,
-                &diff_input_strs,
-                false,
-                leaf_format,
-                pyramid_format,
-                layout_mode,
-            )
-            .await?;
-            deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html).await?;
-            return Ok(());
-        }
-        if let Some(ref tile_dir) = tiles_arg {
-            tiled::run_tiles(
-                sources,
-                total,
-                tile_dir.clone(),
-                true,
-                diff_title,
-                &diff_input_strs,
-                false,
-                leaf_format,
-                pyramid_format,
-                layout_mode,
-            )
-            .await?;
-            if let Some(ref url) = tiles_upload {
-                deploy::upload_dir_to(url, tile_dir).await?;
-            }
-            return Ok(());
-        }
-        // single::run_single is sync + rayon. Wrap it in spawn_blocking so the
-        // tokio runtime can keep driving any other tasks meanwhile.
-        let labels = labels.clone();
-        let sources_owned = sources;
-        let output_arg_owned = output_arg.clone();
-        let diff_mode = true;
-        tokio::task::spawn_blocking(move || {
-            single::run_single(
-                &labels,
-                output_arg_owned,
-                sources_owned,
-                total,
-                diff_mode,
-                false,
-                layout_mode,
-            )
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("run_single join failure: {e}"))??;
-        if let (Some(ref url), Some(ref local)) = (&output_upload, &output_arg) {
-            deploy::upload_file_to(url, local).await?;
-        }
-        return Ok(());
+        let cfg = RenderConfig {
+            title: diff_title,
+            inputs: diff_input_strs,
+            diff_mode: true,
+            show_xet_xorbs: false,
+            layout_mode,
+            leaf_format,
+            pyramid_format,
+        };
+        return dispatch_render(sources, total, &labels, &cfg, dest, stream).await;
     }
 
-    // Deploy-only shortcut: --space + --tiles with no input files/list means
-    // the tiles directory is already fully rendered; just deploy it without
-    // re-running the renderer (which would otherwise read empty stdin and
-    // overwrite labels.json with a useless "stdin" entry).
-    // Only applies when --tiles is a local path (not hf://).
-    if args.files.is_empty() && args.file_list.is_none() && tiles_upload.is_none() {
-        if let (Some(ref tile_dir), Some(ref space_id)) = (&tiles_arg, &args.space) {
-            deploy::run_deploy(tile_dir, space_id).await?;
-            return Ok(());
+    // --- Normal flow ------------------------------------------------------
+    // Deploy-only shortcut: `--space` + `--tiles <local>` with no input files
+    // means the tiles directory is already fully rendered; just deploy it.
+    //
+    // The match is the SAME shape as the rest of the dispatch — only the
+    // `local: Some(p)` (user-provided dir) + `_tempdir: None` (we didn't
+    // allocate one) combo distinguishes 'real on-disk pyramid the user wants
+    // re-deployed' from 'tempdir-staged pyramid currently being rendered'.
+    // If `OutputDest::from_args` is ever changed so that `--tiles <local>` +
+    // `--space` allocates a tempdir, this shortcut silently stops firing and
+    // we re-render from empty stdin — the regression the original comment
+    // explicitly warns about (`labels.json` overwritten with a useless
+    // `stdin` entry).
+    if args.files.is_empty() && args.file_list.is_none() {
+        if let OutputDest::Tiles {
+            local: Some(local),
+            upload_hf: None,
+            space: Some(space_id),
+            _tempdir: None,
+        } = &dest
+        {
+            return deploy::run_deploy(local, space_id).await;
         }
     }
 
-    let mut files = args.files;
-    if let Some(list_path) = args.file_list {
+    let files = collect_input_files(args.files, args.file_list)?;
+    let original_inputs: Vec<String> = files
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let (sources, total) = resolve_input_sources(&files, show_xet_xorbs, stream).await?;
+    let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
+    let cfg = RenderConfig {
+        title: default_title(args.title, "arbvis"),
+        inputs: original_inputs,
+        diff_mode: false,
+        show_xet_xorbs,
+        layout_mode,
+        leaf_format,
+        pyramid_format,
+    };
+    dispatch_render(sources, total, &labels, &cfg, dest, stream).await
+}
+
+/// Pick the viewer title: the user's `--title` if set, else a `&'static`
+/// default. `Cow` keeps the default zero-alloc.
+fn default_title(user: Option<String>, fallback: &'static str) -> Cow<'static, str> {
+    user.map_or(Cow::Borrowed(fallback), Cow::Owned)
+}
+
+async fn resolve_finetune(
+    finetune: bool,
+    no_finetune: bool,
+    orig_str: &str,
+    mod_str: &str,
+) -> bool {
+    if finetune {
+        log::info!("--diff finetune mode: forced on by --finetune");
+        return true;
+    }
+    if no_finetune {
+        log::info!("--diff finetune mode: forced off by --no-finetune");
+        return false;
+    }
+    match hf_url::detect_finetune_relation(orig_str, mod_str).await {
+        Some(true) => {
+            log::info!(
+                "--diff finetune mode: auto-detected ON ({} declares {} as its base in its HF model card)",
+                mod_str, orig_str
+            );
+            true
+        }
+        Some(false) => {
+            log::info!(
+                "--diff finetune mode: auto-detected OFF ({} does not declare {} as a finetune base)",
+                mod_str, orig_str
+            );
+            false
+        }
+        None => {
+            log::info!(
+                "--diff finetune mode: auto-detect skipped (not both hf:// model URLs or API lookup failed); defaulting to OFF — pass --finetune to override"
+            );
+            false
+        }
+    }
+}
+
+/// Read `--files` and `--file-list` into a single flat path list.
+fn collect_input_files(
+    files: Vec<PathBuf>,
+    file_list: Option<PathBuf>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut out = files;
+    if let Some(list_path) = file_list {
         let reader: Box<dyn Read> = if list_path.as_os_str() == "-" {
             Box::new(io::stdin())
         } else {
@@ -532,160 +600,259 @@ async fn run(args: Args) -> anyhow::Result<()> {
             let line = line?;
             let trimmed = line.trim();
             if !trimmed.is_empty() {
-                files.push(PathBuf::from(trimmed));
+                out.push(PathBuf::from(trimmed));
             }
         }
     }
+    Ok(out)
+}
 
-    // When tiles output is hf://, stream tiles directly to Hub (zero local disk).
-    if let Some(ref hf_out_url) = tiles_hf_out {
-        let input_strs: Vec<String> = files
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let mut specs: Vec<InputSpec> = Vec::with_capacity(files.len());
-        for p in &files {
-            let s = p.to_string_lossy();
-            if s.starts_with("hf://") {
-                specs.push(InputSpec::Remote(hf_url::resolve_to_http(p).await?));
-            } else {
-                specs.push(InputSpec::Local(p.clone()));
-            }
-        }
-        let (mut sources, total) = data::prepare_sources_from_specs(&specs)?;
-        if xet_vis {
-            data::populate_xet_terms(&mut sources).await?;
-        }
-        // Materialize remote sources to local cache — see materialize_http_sources
-        // for why per-range hf-hub xet calls are too expensive for the tile workload.
-        data::materialize_http_sources(&mut sources).await?;
-        let hf_out = hf_url::parse_hf_output(hf_out_url)?;
-        let stream_title = args.title.as_deref().unwrap_or("arbvis");
-        let _ = tiled::run_tiles_hf_streaming(
-            sources,
-            total,
-            &hf_out,
-            false,
-            stream_title,
-            &input_strs,
-            show_xet_xorbs,
-            leaf_format,
-            pyramid_format,
-            layout_mode,
-        )
-        .await?;
-        return Ok(());
+/// Build `Source`s for the normal (non-diff) flow.
+///
+/// In disk-backed mode (the default), every `hf://` input is downloaded to
+/// the local hf-hub cache via [`data::materialize_http_sources`]. In
+/// `--stream` mode the sources stay remote and per-tile reads hit HTTP
+/// directly; that's only useful when inputs don't fit on local disk and is
+/// substantially slower otherwise. `--show-xet-xorbs` captures xet term
+/// metadata before materialization (the post-download file lacks the remote
+/// spec needed to query it).
+async fn resolve_input_sources(
+    files: &[PathBuf],
+    show_xet_xorbs: bool,
+    stream: bool,
+) -> anyhow::Result<(Vec<Source>, u64)> {
+    // Streaming mode keeps hf:// inputs remote; show-xet-xorbs is the other
+    // case that has to start from specs (it needs the remote spec to look up
+    // xet metadata). Otherwise we can fast-path through `prepare_sources`
+    // which downloads via hf_url::resolve and mmaps the local file.
+    if !stream && !show_xet_xorbs {
+        let resolved: Vec<PathBuf> =
+            futures::stream::iter(files.iter().cloned().map(resolve_input))
+                .buffered(RESOLVE_CONCURRENCY)
+                .try_collect()
+                .await?;
+        return data::prepare_sources(&resolved);
     }
 
-    let original_inputs: Vec<String> = files
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-
-    // With xet visualization, we keep hf:// inputs as remote specs (no
-    // download, so the file's xet_hash and per-tile byte ranges are
-    // available). Without xet, we download to the local cache as before.
-    let tile_title = args.title.as_deref().unwrap_or("arbvis");
-    let (sources, total) = if xet_vis {
-        let mut specs: Vec<InputSpec> = Vec::new();
-        for p in &files {
+    // Resolve `hf://` paths into specs concurrently. Repo-level URLs expand
+    // to multiple specs; non-hf:// paths stay as `InputSpec::Local`. The
+    // result preserves input order so labels and byte offsets are
+    // deterministic across runs.
+    let specs: Vec<InputSpec> =
+        futures::stream::iter(files.iter().cloned().map(|p| async move {
             let s = p.to_string_lossy();
-            if s.starts_with("hf://") {
+            if hf_url::is_hf_url(&s) {
                 if hf_url::is_repo_level(&s)? {
                     let listed = hf_url::list_repo_as_http_specs(&s)
                         .await
                         .with_context(|| format!("listing files in {s}"))?;
-                    for (_, spec) in listed {
-                        specs.push(InputSpec::Remote(spec));
-                    }
+                    anyhow::Ok(listed.into_iter().map(|(_, spec)| InputSpec::Remote(spec)).collect::<Vec<_>>())
                 } else {
-                    specs.push(InputSpec::Remote(hf_url::resolve_to_http(p).await?));
+                    anyhow::Ok(vec![InputSpec::Remote(hf_url::resolve_to_http(&p).await?)])
                 }
             } else {
-                specs.push(InputSpec::Local(p.clone()));
+                anyhow::Ok(vec![InputSpec::Local(p)])
             }
-        }
-        let (mut sources, total) = data::prepare_sources_from_specs(&specs)?;
-        // Capture xet term metadata while the source is still remote, then
-        // materialize each file to local cache. Per-range hf-hub xet calls
-        // are too expensive for the tile workload — one whole-file download
-        // amortises the xet setup over the entire file (which we read every
-        // byte of anyway during render).
+        }))
+        .buffered(RESOLVE_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
+    let (mut sources, total) = data::prepare_sources_from_specs(&specs)?;
+    if show_xet_xorbs {
         data::populate_xet_terms(&mut sources).await?;
+    }
+    if !stream {
+        // Per-range hf-hub xet calls are too expensive for the tile workload
+        // — one whole-file download amortises the xet setup over the entire
+        // file (which we read every byte of anyway during render). See
+        // `materialize_http_sources` for the full story.
         data::materialize_http_sources(&mut sources).await?;
-        (sources, total)
-    } else {
-        let mut resolved: Vec<PathBuf> = Vec::with_capacity(files.len());
-        for p in files {
-            resolved.push(resolve_input(p).await?);
-        }
-        data::prepare_sources(&resolved)?
-    };
-    let display_files: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
-
-    if let Some(ref tile_dir) = tiles_arg {
-        tiled::run_tiles(
-            sources,
-            total,
-            tile_dir.clone(),
-            false,
-            tile_title,
-            &original_inputs,
-            show_xet_xorbs,
-            leaf_format,
-            pyramid_format,
-            layout_mode,
-        )
-        .await?;
-        if let Some(ref space_id) = args.space {
-            deploy::run_deploy(tile_dir, space_id).await?;
-        }
-        if let Some(ref url) = tiles_upload {
-            deploy::upload_dir_to(url, tile_dir).await?;
-        }
-        return Ok(());
     }
+    Ok((sources, total))
+}
 
-    if let Some(ref space_id) = args.space {
-        let bucket_spec = deploy::create_space_bucket(space_id).await?;
-        let html = tiled::run_tiles_hf_streaming(
-            sources,
-            total,
-            &bucket_spec,
-            false,
-            tile_title,
-            &original_inputs,
-            show_xet_xorbs,
-            leaf_format,
-            pyramid_format,
-            layout_mode,
-        )
-        .await?;
-        deploy::deploy_space_app(space_id, &bucket_spec.repo_id, html).await?;
-        return Ok(());
+/// Drive the renderer for one of the four output destinations, optionally
+/// through the streaming path. Centralises the cascade that used to be
+/// duplicated three times in `run()`.
+async fn dispatch_render(
+    sources: Vec<Source>,
+    total: u64,
+    labels: &[PathBuf],
+    cfg: &RenderConfig,
+    dest: OutputDest,
+    stream: bool,
+) -> anyhow::Result<()> {
+    match dest {
+        OutputDest::Window => {
+            run_single_blocking(labels.to_vec(), None, sources, total, cfg).await?;
+            Ok(())
+        }
+        OutputDest::SingleImage {
+            local,
+            upload_hf,
+            _tempdir,
+        } => {
+            run_single_blocking(labels.to_vec(), Some(local.clone()), sources, total, cfg).await?;
+            if let Some(url) = upload_hf {
+                deploy::upload_file_to(&url, &local).await?;
+            }
+            Ok(())
+        }
+        OutputDest::Tiles {
+            local,
+            upload_hf,
+            space,
+            _tempdir,
+        } => render_tiles(sources, total, local.as_deref(), upload_hf, space, cfg, stream).await,
     }
+}
 
-    // single::run_single is sync + rayon. spawn_blocking keeps the tokio
-    // runtime responsive.
-    let display_files_owned = display_files.clone();
-    let sources_owned = sources;
-    let output_arg_owned = output_arg.clone();
+/// Run the synchronous single-image pipeline on the tokio blocking pool so
+/// the tokio runtime stays responsive for any async helpers (`Data::Xet`,
+/// `Data::LazyDiff`) the renderer calls into.
+async fn run_single_blocking(
+    labels: Vec<PathBuf>,
+    output: Option<PathBuf>,
+    sources: Vec<Source>,
+    total: u64,
+    cfg: &RenderConfig,
+) -> anyhow::Result<()> {
+    let diff_mode = cfg.diff_mode;
+    let show_xet_xorbs = cfg.show_xet_xorbs;
+    let layout_mode = cfg.layout_mode;
     tokio::task::spawn_blocking(move || {
         single::run_single(
-            &display_files_owned,
-            output_arg_owned,
-            sources_owned,
+            &labels,
+            output,
+            sources,
             total,
-            false,
+            diff_mode,
             show_xet_xorbs,
             layout_mode,
         )
     })
     .await
-    .map_err(|e| anyhow::anyhow!("run_single join failure: {e}"))??;
-    if let (Some(ref url), Some(ref local)) = (&output_upload, &output_arg) {
-        deploy::upload_file_to(url, local).await?;
+    .map_err(|e| anyhow::anyhow!("run_single join failure: {e}"))?
+}
+
+/// Tile-pyramid render + upload + Space-deploy fan-out.
+///
+/// When `stream` is true and the destination is HF-bound (`upload_hf` or
+/// `space`), tiles are pushed directly to the Hub without staging through
+/// `local` — the off-by-default streaming path. Local-only destinations
+/// always go through disk-backed `run_tiles`, even with `--stream`; the
+/// stream flag still cuts the input-side download (see
+/// [`resolve_input_sources`]).
+///
+/// `local` is `Some(_)` for every disk-backed call; `None` only when
+/// `OutputDest::from_args` skipped the tempdir because `--stream` was set
+/// and the destination is HF-bound.
+async fn render_tiles(
+    sources: Vec<Source>,
+    total: u64,
+    local: Option<&Path>,
+    upload_hf: Option<String>,
+    space: Option<String>,
+    cfg: &RenderConfig,
+    stream: bool,
+) -> anyhow::Result<()> {
+    let hf_destined = upload_hf.is_some() || space.is_some();
+    if stream && hf_destined {
+        return render_tiles_streaming(sources, total, upload_hf, space, cfg).await;
     }
+
+    let local = local.ok_or_else(|| {
+        anyhow::anyhow!(
+            "internal: disk-backed tile render without a local path \
+             (OutputDest::from_args should have allocated one)"
+        )
+    })?;
+
+    // Migration hint: large hf:// outputs that used to stream now stage
+    // through a tempdir. Tell the user how to opt back into streaming so a
+    // /tmp ENOSPC isn't the first signal of the changed default.
+    if hf_destined {
+        log::info!(
+            "Disk-backed tile render: staging full pyramid in {} before upload. \
+             Pass --stream to skip local staging when the pyramid won't fit on disk.",
+            local.display()
+        );
+    }
+
+    tiled::run_tiles(
+        sources,
+        total,
+        local.to_path_buf(),
+        cfg.diff_mode,
+        &cfg.title,
+        &cfg.inputs,
+        cfg.show_xet_xorbs,
+        cfg.leaf_format,
+        cfg.pyramid_format,
+        cfg.layout_mode,
+    )
+    .await?;
+    if let Some(ref space_id) = space {
+        deploy::run_deploy(local, space_id).await?;
+    }
+    if let Some(ref url) = upload_hf {
+        deploy::upload_dir_to(url, local).await?;
+    }
+    Ok(())
+}
+
+/// Streaming variant of [`render_tiles`]: push tiles to the Hub as they're
+/// produced, no local pyramid staging. Off-by-default, gated behind
+/// `--stream` *and* an HF destination.
+async fn render_tiles_streaming(
+    sources: Vec<Source>,
+    total: u64,
+    upload_hf: Option<String>,
+    space: Option<String>,
+    cfg: &RenderConfig,
+) -> anyhow::Result<()> {
+    use crate::tiled::streaming::run_tiles_hf_streaming;
+
+    // --space + --stream: render through the space's bucket and deploy the app.
+    if let Some(space_id) = space {
+        let bucket = deploy::create_space_bucket(&space_id).await?;
+        let html = run_tiles_hf_streaming(
+            sources,
+            total,
+            &bucket,
+            cfg.diff_mode,
+            &cfg.title,
+            &cfg.inputs,
+            cfg.show_xet_xorbs,
+            cfg.leaf_format,
+            cfg.pyramid_format,
+            cfg.layout_mode,
+        )
+        .await?;
+        deploy::deploy_space_app(&space_id, &bucket.repo_id, html).await?;
+        return Ok(());
+    }
+
+    // --tiles hf://… + --stream: push to the named repo, no Space.
+    let hf_url = upload_hf
+        .ok_or_else(|| anyhow::anyhow!("internal: stream dispatch with no HF destination"))?;
+    let hf_out: HfOutputSpec = hf_url::parse_hf_output(&hf_url)?;
+    run_tiles_hf_streaming(
+        sources,
+        total,
+        &hf_out,
+        cfg.diff_mode,
+        &cfg.title,
+        &cfg.inputs,
+        cfg.show_xet_xorbs,
+        cfg.leaf_format,
+        cfg.pyramid_format,
+        cfg.layout_mode,
+    )
+    .await?;
     Ok(())
 }
 

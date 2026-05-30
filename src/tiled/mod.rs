@@ -2,6 +2,7 @@ pub mod html;
 pub mod leaf;
 pub mod leaf_arch;
 pub mod pyramid_accum;
+pub mod streaming;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -17,12 +18,10 @@ use crate::color::{build_diff_signed_lut, build_pixel_lut};
 use crate::data::{load_source_data, Data, Source, SourceKind};
 use crate::format::DiffFill;
 use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, rects_centroid};
-use crate::hf_upload::HfTileSink;
-use crate::hf_url::HfOutputSpec;
 use crate::layout::{select_layout, Layout, LayoutMode};
 use crate::progress::{counter_style, multi, queue_style, status_style};
 use crate::throttle::{Throttle, MAX_FETCH_WORKERS};
-use crate::tiled::html::{generate_leaflet_content, FileEntity};
+use crate::tiled::html::FileEntity;
 use crate::tiled::leaf::{
     load_tile_bytes, render_leaf_tile_diff, render_leaf_tile_dtype, render_leaf_tile_from_buf,
     render_leaf_tile_xet_dtype_from_buf, render_leaf_tile_xet_from_buf, TileFormat, TILE,
@@ -32,7 +31,7 @@ use crate::tiled::leaf_arch::{
     load_arch_tile_regions, render_arch_tile_diff, render_arch_tile_dtype, render_arch_tile_plain,
     render_arch_tile_xet, render_arch_tile_xet_dtype, LoadedArchTile,
 };
-use crate::tiled::pyramid_accum::{LocalFileSink, PyramidAccumulator, TileSink};
+use crate::tiled::pyramid_accum::{LocalFileSink, PyramidAccumulator};
 use crate::xet::{XorbMap, TABLEAU_20};
 
 /// Channel capacity for the fetch→process queue, per CPU core. Keeps memory
@@ -141,7 +140,9 @@ impl PipelineProgress {
 /// Which tiles a pipeline pass should render. The overview pass walks the dense
 /// leaf grid (streamed, so a huge canvas doesn't materialise a giant coord
 /// vec); detail passes render a sparse, explicitly-listed set of tiles.
-enum TileCoords {
+///
+/// `pub(super)` because `tiled::streaming` constructs `Dense` variants directly.
+pub(super) enum TileCoords {
     Dense { width_tiles: u32, height_tiles: u32 },
     Sparse(Vec<(u32, u32)>),
 }
@@ -171,16 +172,21 @@ struct LoadedTile {
     arch_tile: Option<LoadedArchTile>,
 }
 
-struct EncodedTile {
-    tx: u32,
-    ty: u32,
-    image: image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
-    bytes: Vec<u8>,
+/// `pub(super)` because `tiled::streaming`'s pipeline closures destructure
+/// `EncodedTile` (the `tx`/`ty`/`bytes`/`image` fields).
+pub(super) struct EncodedTile {
+    pub(super) tx: u32,
+    pub(super) ty: u32,
+    pub(super) image: image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+    pub(super) bytes: Vec<u8>,
 }
 
 /// Which leaf render to run.
+///
+/// `pub(super)` because `TilePlan::mode` and `derive_leaf_format` (also
+/// `pub(super)`) expose this type to the `tiled::streaming` submodule.
 #[derive(Clone)]
-enum LeafMode {
+pub(super) enum LeafMode {
     Plain {
         pixel_lut: Arc<[image::Rgb<u8>; 256]>,
     },
@@ -410,29 +416,33 @@ pub fn regen_html(tile_dir: &Path) -> anyhow::Result<()> {
 
 /// Shared geometry / entity / mode computation for both `run_tiles` and
 /// `run_tiles_hf_streaming`. Holds everything needed to drive the pipeline.
-struct TilePlan {
+///
+/// `pub(super)` (and its fields are `pub(super)`) because `tiled::streaming`
+/// reads `mode`, `max_zoom`, `world_w`/`world_h`, `entities`, etc. on the plan
+/// it gets back from `build_tile_plan`.
+pub(super) struct TilePlan {
     kh: u8,
-    width_tiles: u32,
-    height_tiles: u32,
-    world_w: u32,
-    world_h: u32,
-    height: u32,
-    width: u32,
-    max_zoom: u32,
+    pub(super) width_tiles: u32,
+    pub(super) height_tiles: u32,
+    pub(super) world_w: u32,
+    pub(super) world_h: u32,
+    pub(super) height: u32,
+    pub(super) width: u32,
+    pub(super) max_zoom: u32,
     /// Extra zoom levels carrying variable-depth detail (0 for Hilbert / no
     /// shrunk tensors). Mirrors `ArchLayout::detail_depth`.
-    detail_depth: u32,
-    total_tiles: u64,
+    pub(super) detail_depth: u32,
+    pub(super) total_tiles: u64,
     square_pixels: u64,
     total: u64,
-    mode: LeafMode,
+    pub(super) mode: LeafMode,
     source_data: Arc<Vec<Data>>,
     cumulative_offsets: Arc<Vec<u64>>,
-    entities: Vec<FileEntity>,
+    pub(super) entities: Vec<FileEntity>,
     layout: Arc<Layout>,
 }
 
-async fn build_tile_plan(
+pub(super) async fn build_tile_plan(
     sources: Vec<Source>,
     total: u64,
     diff_mode: bool,
@@ -837,7 +847,7 @@ async fn build_tile_plan(
 /// The caller's `on_tile` closure is invoked sequentially (the pipeline keeps
 /// a single write task draining the encoded-tile channel) so it can mutate
 /// shared state freely.
-async fn drive_pipeline<W>(
+pub(super) async fn drive_pipeline<W>(
     plan: &TilePlan,
     leaf_format: TileFormat,
     zoom: u32,
@@ -1218,7 +1228,7 @@ fn detail_coords(layout: &crate::layout::arch::ArchLayout, zoom: u32) -> Vec<(u3
 /// The only repeated work is per-element decode, bounded by the (sparse) detail
 /// tile count, so accumulating levels into a sparse mini-pyramid isn't worth the
 /// quad-alignment complexity it would add.
-async fn render_detail_levels<F>(
+pub(super) async fn render_detail_levels<F>(
     plan: &TilePlan,
     leaf_format: TileFormat,
     write_tile: &F,
@@ -1419,7 +1429,7 @@ fn render_one_arch(
 /// substantially (AV1 isn't tuned for palette content). Xet-mode tiles can
 /// exceed 256 colors so they stay on AVIF; truecolor PNG passes through
 /// unchanged.
-fn derive_leaf_format(user_choice: TileFormat, mode: &LeafMode) -> TileFormat {
+pub(super) fn derive_leaf_format(user_choice: TileFormat, mode: &LeafMode) -> TileFormat {
     match (user_choice, mode.is_palette_safe()) {
         (TileFormat::Avif { .. }, true) => TileFormat::IndexedPng,
         (fmt, _) => fmt,
@@ -1547,118 +1557,7 @@ pub async fn run_tiles(
     Ok(())
 }
 
-/// Run the tiled/pyramidal output pipeline, streaming tiles directly to HuggingFace Hub.
-pub async fn run_tiles_hf_streaming(
-    sources: Vec<Source>,
-    total: u64,
-    hf_out: &HfOutputSpec,
-    diff_mode: bool,
-    title: &str,
-    inputs: &[String],
-    show_xet_xorbs: bool,
-    leaf_format: TileFormat,
-    pyramid_format: TileFormat,
-    layout_mode: LayoutMode,
-) -> anyhow::Result<Vec<u8>> {
-    crate::hf_url::require_token()?;
-    let client = crate::hf_url::client()?;
-
-    let plan = build_tile_plan(sources, total, diff_mode, show_xet_xorbs, layout_mode).await?;
-    let leaf_format = derive_leaf_format(leaf_format, &plan.mode);
-    let tile_size = TILE;
-    let max_zoom = plan.max_zoom;
-    let world_w = plan.world_w;
-    let world_h = plan.world_h;
-    let height = plan.height;
-    let width = plan.width;
-    let total_tiles = plan.total_tiles;
-    let leaf_ext = leaf_format.extension();
-    let pyramid_ext = pyramid_format.extension();
-
-    let sink = Arc::new(HfTileSink::new(client, hf_out.clone())?);
-    let pyramid_path_fn: Arc<dyn Fn(u32, u32, u32) -> String + Send + Sync> = {
-        let hf_out = hf_out.clone();
-        let ext = pyramid_ext.to_string();
-        Arc::new(move |z, x, y| hf_out.tile_repo_path(z, x, y, &ext))
-    };
-    let pyramid = Arc::new(PyramidAccumulator::new(
-        tile_size,
-        max_zoom,
-        sink.clone(),
-        pyramid_path_fn,
-        pyramid_format,
-    ));
-
-    log::info!(
-        "Rendering and uploading {} leaf tiles ({} leaf / {} pyramid)...",
-        total_tiles,
-        leaf_ext,
-        pyramid_ext
-    );
-
-    let sink_for_write = sink.clone();
-    let pyramid_for_write = pyramid.clone();
-    let hf_out_for_write = hf_out.clone();
-    drive_pipeline(
-        &plan,
-        leaf_format,
-        max_zoom,
-        TileCoords::Dense {
-            width_tiles: plan.width_tiles,
-            height_tiles: plan.height_tiles,
-        },
-        move |t: EncodedTile| {
-            let repo_path = hf_out_for_write.tile_repo_path(max_zoom, t.tx, t.ty, leaf_ext);
-            sink_for_write.upload_tile(repo_path, t.bytes)?;
-            pyramid_for_write.contribute(max_zoom, t.tx, t.ty, &t.image);
-            Ok(())
-        },
-    )
-    .await?;
-
-    // Await any in-flight pyramid encode/upload tasks before commit so every
-    // staged file is on disk by the time hf-hub takes the snapshot.
-    pyramid.drain().await;
-
-    // Variable-depth detail tiles (sparse deeper levels, no accumulation).
-    let detail_sink = sink.clone();
-    let detail_hf_out = hf_out.clone();
-    render_detail_levels(&plan, leaf_format, &move |t: &EncodedTile, z| {
-        let repo_path = detail_hf_out.tile_repo_path(z, t.tx, t.ty, leaf_ext);
-        detail_sink.upload_tile(repo_path, t.bytes.clone())
-    })
-    .await?;
-
-    log::info!("Uploading index.html and labels.json...");
-    let (html_bytes, labels_bytes) = generate_leaflet_content(
-        world_w,
-        world_h,
-        max_zoom,
-        plan.detail_depth,
-        height,
-        width,
-        TILE,
-        &plan.entities,
-        title,
-        inputs,
-        leaf_ext,
-        pyramid_ext,
-    );
-    sink.upload_tile(hf_out.index_html_path(), html_bytes.clone())?;
-    sink.upload_tile(hf_out.labels_json_path(), labels_bytes)?;
-
-    drop(pyramid);
-
-    log::info!("Creating HF Hub commit...");
-    Arc::try_unwrap(sink)
-        .map_err(|_| anyhow::anyhow!("unexpected extra Arc reference to tile sink"))?
-        .commit("Add arbvis visualization tiles")
-        .await?;
-
-    log::info!(
-        "Streaming output committed to hf://{}/{}",
-        hf_out.repo_id,
-        hf_out.path_prefix
-    );
-    Ok(html_bytes)
-}
+// Streaming tile output (`run_tiles_hf_streaming`) lives in the
+// [`streaming`](crate::tiled::streaming) submodule. It uses the same plan and
+// pipeline helpers above; keeping it in its own file makes the "off-by-default"
+// path easy to find and easy to delete if it's ever superseded.

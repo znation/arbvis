@@ -628,10 +628,22 @@ pub async fn resolve_to_http(path: &Path) -> anyhow::Result<RemoteFileSpec> {
 /// `?` to route between the HTTP and local code paths without needing to
 /// pre-gate on the prefix.
 pub fn is_repo_level(url_str: &str) -> anyhow::Result<bool> {
-    if !url_str.starts_with("hf://") {
+    if !is_hf_url(url_str) {
         return Ok(false);
     }
     Ok(parse(url_str)?.path_in_repo.is_empty())
+}
+
+/// True iff `s` is an `hf://` URL. Centralises the prefix check so call sites
+/// don't sprinkle `starts_with("hf://")` everywhere.
+pub fn is_hf_url(s: &str) -> bool {
+    s.starts_with("hf://")
+}
+
+/// Path-typed variant of [`is_hf_url`]: true iff `p`'s textual form starts
+/// with `hf://`. Non-UTF-8 paths return `false` (they can't be hf:// URLs).
+pub fn is_hf_path(p: &Path) -> bool {
+    p.to_str().is_some_and(is_hf_url)
 }
 
 /// List all files in a repo-level hf:// URL as `RemoteFileSpec`s without downloading.

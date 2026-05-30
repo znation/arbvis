@@ -1,6 +1,7 @@
 pub mod html;
 pub mod leaf;
 pub mod leaf_arch;
+pub mod leaf_renderer;
 pub mod pyramid_accum;
 pub mod streaming;
 
@@ -31,6 +32,7 @@ use crate::tiled::leaf_arch::{
     load_arch_tile_regions, render_arch_tile_diff, render_arch_tile_dtype, render_arch_tile_plain,
     render_arch_tile_xet, render_arch_tile_xet_dtype, LoadedArchTile,
 };
+use crate::tiled::leaf_renderer::{LeafRendererRegistry, LeafTile, RenderCtx};
 use crate::tiled::pyramid_accum::{LocalFileSink, PyramidAccumulator};
 use crate::xet::{XorbMap, TABLEAU_20};
 
@@ -160,16 +162,19 @@ impl TileCoords {
 }
 
 /// Per-tile data flowing through the pipeline after the load stage.
-struct LoadedTile {
-    tx: u32,
-    ty: u32,
+///
+/// `pub(super)` because the `leaf_renderer` submodule's `LeafRenderer` impls
+/// consume one of these and dispatch to the right `render_one*` function.
+pub(super) struct LoadedTile {
+    pub(super) tx: u32,
+    pub(super) ty: u32,
     /// `Some` when the mode needs raw byte data AND the layout is the legacy
     /// Hilbert curve (one fixed 256 KiB buffer per tile); `None` for dtype
     /// mode or architectural mode (which uses `arch_tile` instead).
-    tile_buf: Option<Box<[u8; TILE_PIXELS]>>,
+    pub(super) tile_buf: Option<Box<[u8; TILE_PIXELS]>>,
     /// `Some` when the layout is architectural; carries per-region byte
     /// slices for the (typically O(tens)) tensors that intersect this tile.
-    arch_tile: Option<LoadedArchTile>,
+    pub(super) arch_tile: Option<LoadedArchTile>,
 }
 
 /// `pub(super)` because `tiled::streaming`'s pipeline closures destructure
@@ -440,6 +445,13 @@ pub(super) struct TilePlan {
     cumulative_offsets: Arc<Vec<u64>>,
     pub(super) entities: Vec<FileEntity>,
     layout: Arc<Layout>,
+    /// Renderer registry consulted by the render stage. Constructed with the
+    /// two built-in renderers (`"hilbert-bytes"`, `"arch"`); future plugin
+    /// wiring will let callers extend it before plan construction.
+    renderers: Arc<LeafRendererRegistry>,
+    /// Per-plan tile descriptor; today uniform across every tile in the plan
+    /// (one variant per layout). See [`leaf_renderer::LeafTile`].
+    leaf_tile: LeafTile,
 }
 
 pub(super) async fn build_tile_plan(
@@ -819,6 +831,15 @@ pub(super) async fn build_tile_plan(
         Layout::HilbertGlobal(_) => 0,
     };
 
+    let leaf_tile = match &layout {
+        Layout::HilbertGlobal(_) => LeafTile::Bytes {
+            renderer_id: "hilbert-bytes",
+        },
+        Layout::Architectural(_) => LeafTile::Regions {
+            renderer_id: "arch",
+        },
+    };
+
     Ok(TilePlan {
         kh: kh_out,
         width_tiles: width_tiles_out,
@@ -837,6 +858,8 @@ pub(super) async fn build_tile_plan(
         cumulative_offsets: Arc::new(cumulative_offsets),
         entities,
         layout: Arc::new(layout),
+        renderers: Arc::new(LeafRendererRegistry::with_defaults()),
+        leaf_tile,
     })
 }
 
@@ -1067,6 +1090,22 @@ where
     // Stage 3: render workers (= num_cpus). Each pulls a LoadedTile, runs
     // the CPU-bound pixel math + PNG encode inside `spawn_blocking`, and
     // sends the encoded result to the write channel.
+    //
+    // Dispatch is via the `LeafRenderer` registry: the plan's `leaf_tile`
+    // descriptor names a renderer id, the registry resolves it once before
+    // the worker loop, and each worker clones the resulting `Arc<dyn _>`
+    // into its blocking task. Replaces the previous `if is_arch_local`
+    // branch — same call paths underneath, just routed by id.
+    let renderer = plan
+        .leaf_tile
+        .renderer_id()
+        .and_then(|id| plan.renderers.get(id))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no leaf renderer registered for tile descriptor {:?}",
+                plan.leaf_tile
+            )
+        })?;
     let num_proc = num_cpus_for_processing();
     let mut process_handles = Vec::new();
     for _ in 0..num_proc {
@@ -1078,24 +1117,21 @@ where
         let height_tiles = plan.height_tiles;
         let square_pixels = plan.square_pixels;
         let total = plan.total;
-        let is_arch_local = is_arch;
+        let renderer = renderer.clone();
         process_handles.push(tokio::spawn(async move {
             while let Ok(tile) = loaded_rx.recv().await {
                 let mode = mode.clone();
+                let renderer = renderer.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    if is_arch_local {
-                        render_one_arch(tile, &mode, leaf_format)
-                    } else {
-                        render_one(
-                            tile,
-                            &mode,
-                            kh,
-                            height_tiles,
-                            square_pixels,
-                            total,
-                            leaf_format,
-                        )
-                    }
+                    let ctx = RenderCtx {
+                        mode: &mode,
+                        fmt: leaf_format,
+                        kh,
+                        height_tiles,
+                        square_pixels,
+                        total,
+                    };
+                    renderer.render(tile, &ctx)
                 })
                 .await;
                 let encoded = match result {
@@ -1271,7 +1307,7 @@ where
     Ok(())
 }
 
-fn render_one(
+pub(super) fn render_one(
     tile: LoadedTile,
     mode: &LeafMode,
     kh: u8,
@@ -1378,7 +1414,7 @@ fn render_one(
 /// Architectural-layout render dispatch. Same set of `LeafMode` variants;
 /// each routes to a `leaf_arch::render_arch_tile_*` rather than the
 /// byte-Hilbert renderer.
-fn render_one_arch(
+pub(super) fn render_one_arch(
     tile: LoadedTile,
     mode: &LeafMode,
     fmt: TileFormat,

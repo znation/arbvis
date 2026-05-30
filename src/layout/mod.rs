@@ -1,14 +1,14 @@
 //! Mapping from canvas pixel coordinates to tensor element coordinates.
 //!
-//! Two variants:
+//! Two built-in layouts, both exposed through the [`LayoutShape`] trait:
 //!
-//! - [`Layout::HilbertGlobal`] preserves the legacy byte-Hilbert behaviour:
+//! - [`hilbert::HilbertLayout`] preserves the legacy byte-Hilbert behaviour:
 //!   one continuous space-filling curve over the concatenated byte stream of
 //!   every source. 1 px = 1 byte. Used for non-safetensors inputs and when
 //!   the user passes `--layout hilbert`.
 //!
-//! - [`Layout::Architectural`] is the structure-aware mode: each tensor
-//!   occupies a rectangle of its natural 2D element shape (1 px = 1 element);
+//! - [`arch::ArchLayout`] is the structure-aware mode: each tensor occupies a
+//!   rectangle of its natural 2D element shape (1 px = 1 element);
 //!   transformer blocks are stacked vertically and pixel-aligned across the
 //!   stack. Used when every source is safetensors and tensor names look
 //!   transformer-style, unless overridden.
@@ -19,6 +19,8 @@ pub mod hilbert;
 pub mod model_config;
 pub mod name_tree;
 pub mod render;
+
+use std::any::Any;
 
 use crate::data::{Source, SourceMeta};
 use crate::format::Dtype;
@@ -84,106 +86,67 @@ pub enum LayoutMode {
     Hilbert,
 }
 
-/// Shared accessors every concrete layout implementation provides.
+/// Behaviour every concrete layout implementation provides.
 ///
-/// Lets call sites that only need overall canvas / tile-grid dimensions read
-/// them through one interface instead of matching on every [`Layout`] variant.
-/// Variant-specific data (the placed-tensor list for arch, the Hilbert curve
-/// total for hilbert) is still accessed by matching on [`Layout`] for now;
-/// step 3 of the arbvis/modelweightvis split routes those through the
-/// `LeafTile`/`LeafRenderer` plugin surface.
-#[allow(dead_code)]
-pub trait LayoutShape {
-    fn width(&self) -> u32;
-    fn height(&self) -> u32;
-    fn width_tiles(&self) -> u32;
-    fn height_tiles(&self) -> u32;
-    fn max_zoom(&self) -> u32;
-    fn total_tiles(&self) -> u64;
+/// Used as a trait object (`Arc<dyn LayoutShape>`) by the tile pipeline so
+/// the plan stage and the load/render workers can operate uniformly on any
+/// layout. Variant-specific data (the placed-tensor list for arch, etc.) is
+/// reached via [`LayoutShape::as_any`] + `Any::downcast_ref` from the few
+/// call sites that need it (the arch single-image renderer, the arch
+/// detail-tile pass, and the `ArchRegionsLoader` itself).
+///
+/// `id` doubles as the lookup key for the matching `LeafLoader`/`LeafRenderer`
+/// pair in `LeafRegistry`: a layout that returns `"arch"` here dispatches to
+/// the `"arch"` loader and renderer at tile time.
+pub trait LayoutShape: Send + Sync {
+    /// Short stable identifier; also names the `LeafLoader`/`LeafRenderer`
+    /// pair this layout dispatches to (`"hilbert-bytes"`, `"arch"`).
+    fn id(&self) -> &'static str;
+    /// Number of extra zoom levels rendered as sparse detail tiles past
+    /// `max_zoom`. Defaults to 0 for layouts that don't need per-tensor detail
+    /// (Hilbert); arch overrides.
+    fn detail_depth(&self) -> u32 {
+        0
+    }
+    /// `true` when the tile pipeline should fetch a contiguous byte buffer
+    /// per tile (Hilbert), `false` when it should fetch per-tensor regions
+    /// (arch). Drives the [`crate::tiled::leaf_renderer::LeafTile`] variant.
+    fn is_byte_layout(&self) -> bool {
+        false
+    }
+    /// Escape hatch for the few call sites that need the concrete layout
+    /// type — implementations return `self`. Used by `single.rs`,
+    /// `render_detail_levels`, and `ArchRegionsLoader` to downcast to the
+    /// concrete layout via `Any::downcast_ref`.
+    fn as_any(&self) -> &dyn Any;
 }
 
 impl LayoutShape for hilbert::HilbertLayout {
-    fn width(&self) -> u32 {
-        self.world_w
+    fn id(&self) -> &'static str {
+        "hilbert-bytes"
     }
-    fn height(&self) -> u32 {
-        self.height
+    fn is_byte_layout(&self) -> bool {
+        true
     }
-    fn width_tiles(&self) -> u32 {
-        self.width_tiles
-    }
-    fn height_tiles(&self) -> u32 {
-        self.height_tiles
-    }
-    fn max_zoom(&self) -> u32 {
-        self.max_zoom
-    }
-    fn total_tiles(&self) -> u64 {
-        self.total_tiles
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
 impl LayoutShape for arch::ArchLayout {
-    fn width(&self) -> u32 {
-        self.width
+    fn id(&self) -> &'static str {
+        "arch"
     }
-    fn height(&self) -> u32 {
-        self.height
+    fn detail_depth(&self) -> u32 {
+        self.detail_depth
     }
-    fn width_tiles(&self) -> u32 {
-        self.width_tiles
-    }
-    fn height_tiles(&self) -> u32 {
-        self.height_tiles
-    }
-    fn max_zoom(&self) -> u32 {
-        self.max_zoom
-    }
-    fn total_tiles(&self) -> u64 {
-        self.total_tiles
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
-/// The chosen layout for the current run.
-#[allow(dead_code)]
-pub enum Layout {
-    HilbertGlobal(hilbert::HilbertLayout),
-    Architectural(arch::ArchLayout),
-}
-
-impl Layout {
-    /// View this layout through the shared `LayoutShape` accessor surface.
-    pub fn as_shape(&self) -> &dyn LayoutShape {
-        match self {
-            Layout::HilbertGlobal(h) => h,
-            Layout::Architectural(a) => a,
-        }
-    }
-}
-
-impl LayoutShape for Layout {
-    fn width(&self) -> u32 {
-        self.as_shape().width()
-    }
-    fn height(&self) -> u32 {
-        self.as_shape().height()
-    }
-    fn width_tiles(&self) -> u32 {
-        self.as_shape().width_tiles()
-    }
-    fn height_tiles(&self) -> u32 {
-        self.as_shape().height_tiles()
-    }
-    fn max_zoom(&self) -> u32 {
-        self.as_shape().max_zoom()
-    }
-    fn total_tiles(&self) -> u64 {
-        self.as_shape().total_tiles()
-    }
-}
-
-/// Build the layout for the given sources. Returns `Layout::HilbertGlobal`
-/// for non-architectural runs.
+/// Build the layout for the given sources. Returns a byte-Hilbert layout for
+/// non-architectural runs.
 ///
 /// `metas` is an optional list parallel to `sources` carrying opportunistic
 /// `config.json` / `model.safetensors.index.json` data. When non-empty it
@@ -206,10 +169,10 @@ pub fn select_layout(
     mode: LayoutMode,
     metas: &[SourceMeta],
     diff_mode: bool,
-) -> Layout {
+) -> Box<dyn LayoutShape> {
     // Force-hilbert path: use legacy byte-Hilbert geometry as-is.
     if matches!(mode, LayoutMode::Hilbert) {
-        return Layout::HilbertGlobal(hilbert::HilbertLayout::from_total(total_bytes));
+        return Box::new(hilbert::HilbertLayout::from_total(total_bytes));
     }
 
     // MoE-diff: any source carries a `MoeCell` tag → build the expert-vs-expert
@@ -218,10 +181,10 @@ pub fn select_layout(
     // collide with a normal arch run.
     if sources.iter().any(|s| s.moe_cell.is_some()) {
         if let Some(arch) = arch::ArchLayout::try_build_moe_diff(sources, cumulative_offsets) {
-            return Layout::Architectural(arch);
+            return Box::new(arch);
         }
         log::warn!("moe-diff sources present but layout build failed; falling back to hilbert");
-        return Layout::HilbertGlobal(hilbert::HilbertLayout::from_total(total_bytes));
+        return Box::new(hilbert::HilbertLayout::from_total(total_bytes));
     }
 
     // Architectural requires safetensors data AND a detectable structure. In
@@ -246,7 +209,7 @@ pub fn select_layout(
                     "arch layout: {skipped} non-safetensors diff source(s) will not appear on the arch canvas (file-level diffs are only rendered in --layout hilbert)"
                 );
             }
-            return Layout::Architectural(arch);
+            return Box::new(arch);
         }
         if matches!(mode, LayoutMode::Arch) {
             log::warn!(
@@ -259,5 +222,5 @@ pub fn select_layout(
         );
     }
 
-    Layout::HilbertGlobal(hilbert::HilbertLayout::from_total(total_bytes))
+    Box::new(hilbert::HilbertLayout::from_total(total_bytes))
 }

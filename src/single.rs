@@ -16,7 +16,7 @@ use crate::geometry::{hilbert_to_xy_u64, sampled_in_range};
 use crate::label::draw_file_label;
 use crate::layout::arch::ArchLayout;
 use crate::layout::render::{plain_element_color, PADDING_RGB};
-use crate::layout::{select_layout, Layout, LayoutMode};
+use crate::layout::{select_layout, LayoutMode};
 use crate::xet::{XorbMap, TABLEAU_20};
 
 /// Two-pixel-wide diagonal crosshatch on (x, y) for unmatched-region sources.
@@ -79,7 +79,7 @@ pub fn run_single(
         &metas,
         diff_mode,
     );
-    if let Layout::Architectural(arch) = &layout {
+    if let Some(arch) = layout.as_any().downcast_ref::<ArchLayout>() {
         // Arch mode only handles local (mmap'd / owned) data for now. If any
         // source needs an HTTP/Xet/LazyDiff fetch we fall through to the
         // Hilbert path with a warning, since the architectural single-image

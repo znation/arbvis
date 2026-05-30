@@ -19,7 +19,8 @@ use crate::color::{build_diff_signed_lut, build_pixel_lut};
 use crate::data::{load_source_data, Data, Source, SourceKind};
 use crate::format::DiffFill;
 use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, rects_centroid};
-use crate::layout::{select_layout, Layout, LayoutMode};
+use crate::layout::arch::ArchLayout;
+use crate::layout::{select_layout, LayoutMode, LayoutShape};
 use crate::progress::{counter_style, multi, queue_style, status_style};
 use crate::throttle::{Throttle, MAX_FETCH_WORKERS};
 use crate::tiled::html::FileEntity;
@@ -444,7 +445,7 @@ pub(super) struct TilePlan {
     source_data: Arc<Vec<Data>>,
     cumulative_offsets: Arc<Vec<u64>>,
     pub(super) entities: Vec<FileEntity>,
-    layout: Arc<Layout>,
+    layout: Arc<dyn LayoutShape>,
     /// Loader+renderer registry consulted by the load and render stages.
     /// Constructed with the two built-in pairs (`"hilbert-bytes"`, `"arch"`);
     /// future plugin wiring will let callers extend it before plan construction.
@@ -729,6 +730,7 @@ pub(super) async fn build_tile_plan(
         diff_mode,
     );
 
+    let arch_opt = layout.as_any().downcast_ref::<ArchLayout>();
     let (
         kh_out,
         width_tiles_out,
@@ -742,8 +744,72 @@ pub(super) async fn build_tile_plan(
         square_pixels_out,
         total_out,
         arch_entities,
-    ) = match &layout {
-        Layout::HilbertGlobal(_) => (
+    ) = if let Some(a) = arch_opt {
+        // Build per-tensor entities directly from the architectural layout.
+        // Skip Hilbert-decomposition: each entity is a single rect.
+        let mut ents: Vec<FileEntity> = Vec::with_capacity(a.tensors.len());
+        for t in &a.tensors {
+            // Overlay rectangles use the on-canvas *display* footprint, not
+            // the element grid, so labels/segments line up with what's drawn.
+            let w = t.disp_w;
+            let h = t.disp_h;
+            let x0 = t.canvas_x;
+            let y0 = t.canvas_y;
+            let x1 = x0.saturating_add(w);
+            let y1 = y0.saturating_add(h);
+            let segments = vec![
+                (x0, y0, x1, y0),
+                (x1, y0, x1, y1),
+                (x0, y1, x1, y1),
+                (x0, y0, x0, y1),
+            ];
+            let cx = x0 + (x1 - x0) / 2;
+            let cy = y0 + (y1 - y0) / 2;
+            ents.push(FileEntity {
+                name: t.name.clone(),
+                pixel_x: cx,
+                pixel_y: cy,
+                hue: t.hue,
+                byte_size: t
+                    .tensor_rows
+                    .saturating_mul(t.tensor_cols)
+                    .saturating_mul(t.dtype.element_size() as u64),
+                bbox: (x0, y0, x1, y1),
+                segments,
+            });
+        }
+        // For architectural the `kh`/`square_pixels`/`total` Hilbert
+        // fields are unused at render time; populate them with safe
+        // values that won't divide by zero if accidentally read.
+        //
+        // `world_w`/`world_h` are the geographic extents at zoom 0 in
+        // leaflet's coordinate system. At leaf zoom (`max_zoom`) the tile
+        // grid is `width_tiles × height_tiles`; halving each step down to
+        // zoom 0 leaves `width_tiles / 2^max_zoom × height_tiles / 2^max_zoom`
+        // tiles, each TILE px wide in geo space. `try_build` chose
+        // `max_zoom = log2(min(w_p2, h_p2))` so exactly one of the two
+        // ratios collapses to 1 — that's the Hilbert-style "fix the smaller
+        // axis at TILE, scale the other" convention generalised to either
+        // aspect.
+        let two_pow_mz = 1u32 << a.max_zoom;
+        let arch_world_w = (a.width_tiles / two_pow_mz.max(1)).max(1) * TILE;
+        let arch_world_h = (a.height_tiles / two_pow_mz.max(1)).max(1) * TILE;
+        (
+            /* kh */ 0u8,
+            a.width_tiles,
+            a.height_tiles,
+            arch_world_w,
+            arch_world_h,
+            a.height,
+            a.width,
+            a.max_zoom,
+            a.total_tiles,
+            /* square_pixels */ 1u64,
+            /* total */ a.width as u64 * a.height as u64,
+            Some(ents),
+        )
+    } else {
+        (
             kh as u8,
             width_tiles,
             height_tiles,
@@ -756,88 +822,26 @@ pub(super) async fn build_tile_plan(
             square_pixels,
             total,
             None,
-        ),
-        Layout::Architectural(a) => {
-            // Build per-tensor entities directly from the architectural layout.
-            // Skip Hilbert-decomposition: each entity is a single rect.
-            let mut ents: Vec<FileEntity> = Vec::with_capacity(a.tensors.len());
-            for t in &a.tensors {
-                // Overlay rectangles use the on-canvas *display* footprint, not
-                // the element grid, so labels/segments line up with what's drawn.
-                let w = t.disp_w;
-                let h = t.disp_h;
-                let x0 = t.canvas_x;
-                let y0 = t.canvas_y;
-                let x1 = x0.saturating_add(w);
-                let y1 = y0.saturating_add(h);
-                let segments = vec![
-                    (x0, y0, x1, y0),
-                    (x1, y0, x1, y1),
-                    (x0, y1, x1, y1),
-                    (x0, y0, x0, y1),
-                ];
-                let cx = x0 + (x1 - x0) / 2;
-                let cy = y0 + (y1 - y0) / 2;
-                ents.push(FileEntity {
-                    name: t.name.clone(),
-                    pixel_x: cx,
-                    pixel_y: cy,
-                    hue: t.hue,
-                    byte_size: t
-                        .tensor_rows
-                        .saturating_mul(t.tensor_cols)
-                        .saturating_mul(t.dtype.element_size() as u64),
-                    bbox: (x0, y0, x1, y1),
-                    segments,
-                });
-            }
-            // For architectural the `kh`/`square_pixels`/`total` Hilbert
-            // fields are unused at render time; populate them with safe
-            // values that won't divide by zero if accidentally read.
-            //
-            // `world_w`/`world_h` are the geographic extents at zoom 0 in
-            // leaflet's coordinate system. At leaf zoom (`max_zoom`) the tile
-            // grid is `width_tiles × height_tiles`; halving each step down to
-            // zoom 0 leaves `width_tiles / 2^max_zoom × height_tiles / 2^max_zoom`
-            // tiles, each TILE px wide in geo space. `try_build` chose
-            // `max_zoom = log2(min(w_p2, h_p2))` so exactly one of the two
-            // ratios collapses to 1 — that's the Hilbert-style "fix the smaller
-            // axis at TILE, scale the other" convention generalised to either
-            // aspect.
-            let two_pow_mz = 1u32 << a.max_zoom;
-            let arch_world_w = (a.width_tiles / two_pow_mz.max(1)).max(1) * TILE;
-            let arch_world_h = (a.height_tiles / two_pow_mz.max(1)).max(1) * TILE;
-            (
-                /* kh */ 0u8,
-                a.width_tiles,
-                a.height_tiles,
-                arch_world_w,
-                arch_world_h,
-                a.height,
-                a.width,
-                a.max_zoom,
-                a.total_tiles,
-                /* square_pixels */ 1u64,
-                /* total */ a.width as u64 * a.height as u64,
-                Some(ents),
-            )
-        }
+        )
     };
 
     let entities = arch_entities.unwrap_or(entities);
 
-    let detail_depth = match &layout {
-        Layout::Architectural(a) => a.detail_depth,
-        Layout::HilbertGlobal(_) => 0,
-    };
+    let detail_depth = layout.detail_depth();
 
-    let leaf_tile = match &layout {
-        Layout::HilbertGlobal(_) => LeafTile::Bytes {
-            renderer_id: "hilbert-bytes",
-        },
-        Layout::Architectural(_) => LeafTile::Regions {
-            renderer_id: "arch",
-        },
+    // `is_byte_layout()` distinguishes the Hilbert byte-stream pipeline
+    // (`LeafTile::Bytes`, fixed 256 KiB tile buffer) from per-tensor region
+    // pipelines (`LeafTile::Regions`, variable number of small fetches).
+    // `layout.id()` doubles as the registry key for the matching loader+
+    // renderer pair.
+    let leaf_tile = if layout.is_byte_layout() {
+        LeafTile::Bytes {
+            renderer_id: layout.id(),
+        }
+    } else {
+        LeafTile::Regions {
+            renderer_id: layout.id(),
+        }
     };
 
     Ok(TilePlan {
@@ -857,7 +861,7 @@ pub(super) async fn build_tile_plan(
         source_data: Arc::new(source_data),
         cumulative_offsets: Arc::new(cumulative_offsets),
         entities,
-        layout: Arc::new(layout),
+        layout: Arc::from(layout),
         leaf: Arc::new(LeafRegistry::with_defaults()),
         leaf_tile,
     })
@@ -1008,7 +1012,7 @@ where
                     square_pixels,
                     total,
                     mode: &mode,
-                    layout: &layout,
+                    layout: layout.as_ref(),
                     source_data: &source_data,
                     cumulative_offsets: &cumulative_offsets,
                 };
@@ -1243,9 +1247,9 @@ pub(super) async fn render_detail_levels<F>(
 where
     F: Fn(&EncodedTile, u32) -> anyhow::Result<()> + Sync,
 {
-    let arch = match plan.layout.as_ref() {
-        Layout::Architectural(a) => a,
-        _ => return Ok(()),
+    let arch = match plan.layout.as_any().downcast_ref::<ArchLayout>() {
+        Some(a) => a,
+        None => return Ok(()),
     };
     if arch.detail_depth == 0 {
         return Ok(());

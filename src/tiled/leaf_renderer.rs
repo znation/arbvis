@@ -1,13 +1,11 @@
-//! Tile-loader and tile-renderer plugin surface (step 3 + 4a of the
-//! arbvis/modelweightvis split).
+//! Tile-loader and tile-renderer plugin surface.
 //!
 //! `LeafTile` describes one tile in terms of what data it needs (raw bytes,
 //! per-tensor regions, or just padding). Both pipeline stages — load and
 //! render — look up an implementation by `LeafTile::renderer_id` instead of
-//! branching on `Layout::is_architectural()`. Today the registry has two
-//! built-in pairs (`"hilbert-bytes"` and `"arch"`); once `modelweightvis` is
-//! its own crate it will ship `"arch"` from there and register it on the
-//! shared registry.
+//! branching on layout type. Today the registry has two built-in pairs
+//! (`"hilbert-bytes"` and `"arch"`); once `modelweightvis` is its own crate
+//! it will ship `"arch"` from there and register it on the shared registry.
 //!
 //! Loaders and renderers share the same id so a `LeafTile` resolves both
 //! halves of the pipeline in one lookup.
@@ -18,7 +16,8 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 
 use crate::data::Data;
-use crate::layout::Layout;
+use crate::layout::arch::ArchLayout;
+use crate::layout::LayoutShape;
 
 use super::leaf::TileFormat;
 use super::{EncodedTile, LeafMode, LoadedTile};
@@ -67,7 +66,7 @@ pub struct LoadCtx<'a> {
     pub square_pixels: u64,
     pub total: u64,
     pub mode: &'a LeafMode,
-    pub layout: &'a Layout,
+    pub layout: &'a dyn LayoutShape,
     pub source_data: &'a [Data],
     pub cumulative_offsets: &'a [u64],
 }
@@ -214,16 +213,15 @@ impl LeafLoader for ArchRegionsLoader {
 
     fn load<'a>(&'a self, ctx: &'a LoadCtx<'a>) -> BoxFuture<'a, anyhow::Result<LoadedTile>> {
         Box::pin(async move {
-            // The arch loader is only registered to handle `LeafTile::Regions`
-            // with `renderer_id == "arch"`; the only producer of that tile
-            // descriptor is the arch layout. A non-`Architectural` layout
-            // reaching here is a registry/plan bug, not a runtime case.
-            let arch = match ctx.layout {
-                Layout::Architectural(a) => a,
-                Layout::HilbertGlobal(_) => {
-                    unreachable!("ArchRegionsLoader dispatched against non-Architectural layout")
-                }
-            };
+            // The arch loader is only registered against the `"arch"` layout
+            // id, and the plan-build site routes by id; a layout reaching here
+            // that isn't an `ArchLayout` is a registry/plan bug, not a runtime
+            // case.
+            let arch = ctx
+                .layout
+                .as_any()
+                .downcast_ref::<ArchLayout>()
+                .expect("ArchRegionsLoader dispatched against non-ArchLayout");
             let at = super::leaf_arch::load_arch_tile_regions(
                 ctx.zoom,
                 ctx.tx,

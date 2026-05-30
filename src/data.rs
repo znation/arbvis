@@ -220,7 +220,26 @@ impl Data {
     }
 }
 
+/// A `Source` variant supplied by a downstream crate / plugin.
+///
+/// Today the only impl is `TensorDiffSource` (per-tensor diff buffer, was
+/// `SourceKind::TensorDiff`). When `modelweightvis` splits out it'll bring
+/// its tensor-diff impls along; the arbvis core just dispatches by trait.
+pub trait CustomSource: Send + Sync {
+    /// Stable identifier for diagnostic logs and runtime predicates (e.g.
+    /// "is this a tensor-diff source?"). Format: kebab-case.
+    fn id(&self) -> &'static str;
+    /// Byte size of the synthetic stream this source exposes. Drives canvas
+    /// layout (Hilbert + arch both read it).
+    #[allow(dead_code)]
+    fn byte_size(&self) -> u64;
+    /// Open the source for the render pipeline. Returns a `Data` handle the
+    /// load stage can `fetch_range` against.
+    fn open(&self) -> anyhow::Result<Data>;
+}
+
 /// How a source's bytes are stored.
+#[non_exhaustive]
 pub enum SourceKind {
     Buffered(Vec<u8>),
     File(PathBuf),
@@ -230,21 +249,6 @@ pub enum SourceKind {
     },
     /// Remote HF file, accessed via hf-hub range requests per tile.
     Http(RemoteFileSpec),
-    /// Per-tensor diff computed lazily from two whole-file Data sources.
-    /// `byte_size` output bytes are produced on demand. `metric` selects how
-    /// per-element deltas are encoded; `scale_orig` carries any per-tensor
-    /// statistic the metric needs (RMS of `orig` for `DiffMetric::Rms`),
-    /// pre-computed at setup so the per-tile path stays pure-streaming.
-    TensorDiff {
-        orig: Arc<Data>,
-        mod_: Arc<Data>,
-        orig_start: u64,
-        mod_start: u64,
-        orig_dtype: format::Dtype,
-        mod_dtype: format::Dtype,
-        metric: format::DiffMetric,
-        scale_orig: f32,
-    },
     /// A canvas region for a tensor / file that exists on only one side of a
     /// diff. The byte_size on the parent `Source` controls how much canvas
     /// space it takes; the underlying bytes are zero (the renderer paints a
@@ -272,6 +276,72 @@ pub enum SourceKind {
         start: u64,
         fill: DiffFill,
     },
+    /// Source supplied by a [`CustomSource`] impl. The arbvis pipeline only
+    /// touches its `open` / `byte_size` / `id`; everything else is up to the
+    /// impl. Today this carries `TensorDiffSource` for per-tensor `--diff` /
+    /// `--moe-diff` runs.
+    Custom(Box<dyn CustomSource>),
+}
+
+/// Per-tensor diff buffer. The byte stream this exposes is computed lazily
+/// from two whole-file `Data` sources whenever the render pipeline calls
+/// `fetch_range` on the resulting `Data::LazyDiff`. `metric` selects how
+/// per-element deltas are encoded; `scale_orig` carries any per-tensor
+/// statistic the metric needs (RMS of `orig` for `DiffMetric::Rms`),
+/// pre-computed at setup so the per-tile path stays pure-streaming.
+pub struct TensorDiffSource {
+    pub orig: Arc<Data>,
+    pub mod_: Arc<Data>,
+    pub orig_start: u64,
+    pub mod_start: u64,
+    pub orig_dtype: format::Dtype,
+    pub mod_dtype: format::Dtype,
+    pub metric: format::DiffMetric,
+    pub scale_orig: f32,
+    pub byte_size: u64,
+}
+
+impl CustomSource for TensorDiffSource {
+    fn id(&self) -> &'static str {
+        "tensor-diff"
+    }
+
+    fn byte_size(&self) -> u64 {
+        self.byte_size
+    }
+
+    fn open(&self) -> anyhow::Result<Data> {
+        let orig = Arc::clone(&self.orig);
+        let mod_ = Arc::clone(&self.mod_);
+        let orig_start = self.orig_start;
+        let mod_start = self.mod_start;
+        let orig_dtype = self.orig_dtype;
+        let mod_dtype = self.mod_dtype;
+        let metric = self.metric;
+        let scale_orig = self.scale_orig;
+        Ok(Data::LazyDiff(Arc::new(move |start: u64, len: usize| {
+            let orig = Arc::clone(&orig);
+            let mod_ = Arc::clone(&mod_);
+            Box::pin(async move {
+                // Block-aligned byte ranges: for fixed-stride dtypes
+                // these are `start * elem`/`len * elem`; for block-
+                // stride they snap down/up to block boundaries and the
+                // returned `elem_off` is how many elements into the
+                // fetched buffer the requested start element lives.
+                let (o_byte_off, o_byte_len, o_elem_off) =
+                    block_aligned_byte_range(orig_dtype, start, len as u64);
+                let (m_byte_off, m_byte_len, m_elem_off) =
+                    block_aligned_byte_range(mod_dtype, start, len as u64);
+                let ob = orig
+                    .fetch_range(orig_start + o_byte_off, o_byte_len)
+                    .await?;
+                let mb = mod_.fetch_range(mod_start + m_byte_off, m_byte_len).await?;
+                Ok(orig_dtype.diff_to_u8(
+                    &ob, o_elem_off, mod_dtype, &mb, m_elem_off, metric, scale_orig, len,
+                ))
+            })
+        })))
+    }
 }
 
 /// Input specification: local file path or resolved remote HF file.
@@ -375,8 +445,11 @@ impl Source {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| original.to_string_lossy().into_owned()),
             SourceKind::Http(spec) => spec.filename.as_str().to_string(),
-            SourceKind::TensorDiff { .. } => {
-                unreachable!("TensorDiff sources always have name_override set")
+            SourceKind::Custom(cs) => {
+                unreachable!(
+                    "Custom source `{}` reached Source::name without a name_override",
+                    cs.id()
+                )
             }
             SourceKind::UnmatchedRegion { .. } => {
                 unreachable!("UnmatchedRegion sources always have name_override set")
@@ -569,47 +642,7 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
             inner: Arc::clone(data),
             base: *start,
         }),
-        SourceKind::TensorDiff {
-            orig,
-            mod_,
-            orig_start,
-            mod_start,
-            orig_dtype,
-            mod_dtype,
-            metric,
-            scale_orig,
-        } => {
-            let orig = Arc::clone(orig);
-            let mod_ = Arc::clone(mod_);
-            let orig_start = *orig_start;
-            let mod_start = *mod_start;
-            let orig_dtype = *orig_dtype;
-            let mod_dtype = *mod_dtype;
-            let metric = *metric;
-            let scale_orig = *scale_orig;
-            Ok(Data::LazyDiff(Arc::new(move |start: u64, len: usize| {
-                let orig = Arc::clone(&orig);
-                let mod_ = Arc::clone(&mod_);
-                Box::pin(async move {
-                    // Block-aligned byte ranges: for fixed-stride dtypes
-                    // these are `start * elem`/`len * elem`; for block-
-                    // stride they snap down/up to block boundaries and the
-                    // returned `elem_off` is how many elements into the
-                    // fetched buffer the requested start element lives.
-                    let (o_byte_off, o_byte_len, o_elem_off) =
-                        block_aligned_byte_range(orig_dtype, start, len as u64);
-                    let (m_byte_off, m_byte_len, m_elem_off) =
-                        block_aligned_byte_range(mod_dtype, start, len as u64);
-                    let ob = orig
-                        .fetch_range(orig_start + o_byte_off, o_byte_len)
-                        .await?;
-                    let mb = mod_.fetch_range(mod_start + m_byte_off, m_byte_len).await?;
-                    Ok(orig_dtype.diff_to_u8(
-                        &ob, o_elem_off, mod_dtype, &mb, m_elem_off, metric, scale_orig, len,
-                    ))
-                })
-            })))
-        }
+        SourceKind::Custom(cs) => cs.open(),
     }
 }
 
@@ -2294,7 +2327,7 @@ async fn build_multi_safetensors_diff_sources_inner(
         });
         sources.push(Source {
             file_idx: sources.len(),
-            kind: SourceKind::TensorDiff {
+            kind: SourceKind::Custom(Box::new(TensorDiffSource {
                 orig: Arc::clone(&orig_data[*oi]),
                 mod_: Arc::clone(&mod_data[*mi]),
                 orig_start: orig_t.file_start,
@@ -2303,7 +2336,8 @@ async fn build_multi_safetensors_diff_sources_inner(
                 mod_dtype: mod_t.dtype,
                 metric,
                 scale_orig: *scale_orig,
-            },
+                byte_size: nelem,
+            })),
             byte_size: nelem,
             name_override: Some(orig_t.label()),
             xet_terms: None,
@@ -2402,7 +2436,10 @@ async fn build_multi_safetensors_diff_sources_inner(
     if !orig_only.is_empty() || !mod_only.is_empty() || !shape_mismatch.is_empty() {
         log::info!(
             "safetensors diff: {} matched, {} only in original, {} only in modified, {} shape-mismatch",
-            sources.iter().filter(|s| matches!(s.kind, SourceKind::TensorDiff { .. })).count(),
+            sources
+                .iter()
+                .filter(|s| matches!(&s.kind, SourceKind::Custom(c) if c.id() == "tensor-diff"))
+                .count(),
             orig_only.len(),
             mod_only.len(),
             shape_mismatch.len()
@@ -2954,7 +2991,7 @@ pub async fn prepare_moe_diff_sources(
                 });
                 sources.push(Source {
                     file_idx: sources.len(),
-                    kind: SourceKind::TensorDiff {
+                    kind: SourceKind::Custom(Box::new(TensorDiffSource {
                         orig: Arc::clone(&datas[*oi]),
                         mod_: Arc::clone(&datas[*oj]),
                         orig_start: e_i.file_start,
@@ -2963,7 +3000,8 @@ pub async fn prepare_moe_diff_sources(
                         mod_dtype: e_j.dtype,
                         metric,
                         scale_orig,
-                    },
+                        byte_size: nelem,
+                    })),
                     byte_size: nelem,
                     name_override: Some(label),
                     xet_terms: None,

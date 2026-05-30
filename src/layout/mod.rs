@@ -84,6 +84,66 @@ pub enum LayoutMode {
     Hilbert,
 }
 
+/// Shared accessors every concrete layout implementation provides.
+///
+/// Lets call sites that only need overall canvas / tile-grid dimensions read
+/// them through one interface instead of matching on every [`Layout`] variant.
+/// Variant-specific data (the placed-tensor list for arch, the Hilbert curve
+/// total for hilbert) is still accessed by matching on [`Layout`] for now;
+/// step 3 of the arbvis/modelweightvis split routes those through the
+/// `LeafTile`/`LeafRenderer` plugin surface.
+#[allow(dead_code)]
+pub trait LayoutShape {
+    fn width(&self) -> u32;
+    fn height(&self) -> u32;
+    fn width_tiles(&self) -> u32;
+    fn height_tiles(&self) -> u32;
+    fn max_zoom(&self) -> u32;
+    fn total_tiles(&self) -> u64;
+}
+
+impl LayoutShape for hilbert::HilbertLayout {
+    fn width(&self) -> u32 {
+        self.world_w
+    }
+    fn height(&self) -> u32 {
+        self.height
+    }
+    fn width_tiles(&self) -> u32 {
+        self.width_tiles
+    }
+    fn height_tiles(&self) -> u32 {
+        self.height_tiles
+    }
+    fn max_zoom(&self) -> u32 {
+        self.max_zoom
+    }
+    fn total_tiles(&self) -> u64 {
+        self.total_tiles
+    }
+}
+
+impl LayoutShape for arch::ArchLayout {
+    fn width(&self) -> u32 {
+        self.width
+    }
+    fn height(&self) -> u32 {
+        self.height
+    }
+    fn width_tiles(&self) -> u32 {
+        self.width_tiles
+    }
+    fn height_tiles(&self) -> u32 {
+        self.height_tiles
+    }
+    fn max_zoom(&self) -> u32 {
+        self.max_zoom
+    }
+    fn total_tiles(&self) -> u64 {
+        self.total_tiles
+    }
+}
+
 /// The chosen layout for the current run.
 #[allow(dead_code)]
 pub enum Layout {
@@ -96,6 +156,36 @@ impl Layout {
     /// downstream — e.g. element-per-pixel decoding vs byte-per-pixel LUT).
     pub fn is_architectural(&self) -> bool {
         matches!(self, Layout::Architectural(_))
+    }
+
+    /// View this layout through the shared `LayoutShape` accessor surface.
+    #[allow(dead_code)]
+    pub fn as_shape(&self) -> &dyn LayoutShape {
+        match self {
+            Layout::HilbertGlobal(h) => h,
+            Layout::Architectural(a) => a,
+        }
+    }
+}
+
+impl LayoutShape for Layout {
+    fn width(&self) -> u32 {
+        self.as_shape().width()
+    }
+    fn height(&self) -> u32 {
+        self.as_shape().height()
+    }
+    fn width_tiles(&self) -> u32 {
+        self.as_shape().width_tiles()
+    }
+    fn height_tiles(&self) -> u32 {
+        self.as_shape().height_tiles()
+    }
+    fn max_zoom(&self) -> u32 {
+        self.as_shape().max_zoom()
+    }
+    fn total_tiles(&self) -> u64 {
+        self.as_shape().total_tiles()
     }
 }
 

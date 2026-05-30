@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 
 use crate::data::{Source, SourceKind, SourceMeta};
 use crate::format::{Dtype, TensorMeta};
+use crate::geometry::name_hue;
 use crate::layout::bin_pack::{align_up, pack, Slot};
 use crate::layout::name_tree::{self, LayerSlot};
 use crate::layout::TileRegion;
@@ -412,7 +413,7 @@ impl ArchLayout {
                         scale: s,
                         canvas_x: cx,
                         canvas_y: cy,
-                        hue: name_hue_short(sp),
+                        hue: name_hue(sp),
                         layer_idx: Some(*idx),
                     });
                 }
@@ -740,7 +741,7 @@ impl ArchLayout {
                             scale: g.scale,
                             canvas_x: sub_x.saturating_add(inset_x),
                             canvas_y: sub_y.saturating_add(inset_y),
-                            hue: name_hue_short(weight.label()),
+                            hue: name_hue(weight.label()),
                             layer_idx: Some(l),
                         });
                     }
@@ -896,7 +897,7 @@ fn place_top_level(
         scale: s,
         canvas_x: center_offset,
         canvas_y: cursor_y,
-        hue: name_hue_short(&t.name),
+        hue: name_hue(&t.name),
         layer_idx: None,
     });
     cursor_y.saturating_add(dh).saturating_add(PAD)
@@ -954,14 +955,6 @@ fn pick_column_count(n: u32, layer_w: u32, layer_h: u32, gutter: u32) -> u32 {
         }
     }
     best_c
-}
-
-fn name_hue_short(name: &str) -> u16 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    name.hash(&mut h);
-    (h.finish() % 360) as u16
 }
 
 #[cfg(test)]

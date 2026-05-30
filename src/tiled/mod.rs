@@ -532,13 +532,16 @@ pub(super) async fn build_tile_plan(
         arr
     };
 
-    let has_safetensors = !diff_mode && sources.iter().any(|s| s.model_info.is_some());
+    let has_safetensors = !diff_mode
+        && sources
+            .iter()
+            .any(|s| s.extensions.get::<crate::format::ModelInfo>().is_some());
     let dtype_mode = has_safetensors && !xet_mode;
     let combined_dtype_ranges: Vec<(u64, u64, image::Rgb<u8>)> = if has_safetensors {
         let mut ranges = Vec::new();
         let mut cumulative: u64 = 0;
         for source in &sources {
-            if let Some(st) = &source.model_info {
+            if let Some(st) = source.extensions.get::<crate::format::ModelInfo>() {
                 for &(start, end, color) in &st.color_ranges {
                     ranges.push((cumulative + start, cumulative + end, color));
                 }
@@ -554,7 +557,7 @@ pub(super) async fn build_tile_plan(
     {
         let mut cumulative: u64 = 0;
         for source in &sources {
-            if let Some(st) = &source.model_info {
+            if let Some(st) = source.extensions.get::<crate::format::ModelInfo>() {
                 for tensor in &st.tensors {
                     let t_start = cumulative + tensor.file_start;
                     let t_end = cumulative + tensor.file_end;

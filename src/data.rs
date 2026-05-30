@@ -343,8 +343,6 @@ pub struct Source {
     pub file_idx: usize,
     pub kind: SourceKind,
     pub byte_size: u64,
-    /// Populated for safetensors sources (including diff buffers derived from them).
-    pub model_info: Option<ModelInfo>,
     /// Override the display name (used when kind is Buffered but has a real filename).
     pub name_override: Option<String>,
     /// Xet reconstruction terms for this source. `Some(vec)` when xet
@@ -352,15 +350,11 @@ pub struct Source {
     /// when xet visualization is off; `Some(vec![])` when xet vis is on but
     /// this source isn't xet-backed.
     pub xet_terms: Option<Vec<XetTerm>>,
-    /// Set for sources produced by [`prepare_moe_diff_sources`]; `None` for
-    /// every other code path. See [`MoeCell`].
-    pub moe_cell: Option<MoeCell>,
-    /// Typed-extensions map: format/layout plugins read & write per-source
-    /// metadata here. Step 7 introduces this; step 8 migrates the legacy
-    /// `model_info` and `moe_cell` fields onto it and deletes those fields.
-    /// Today the dispatch chokepoint in `main::dispatch_render` mirrors the
-    /// legacy fields into here via `populate_extensions_from_fields`.
-    #[allow(dead_code)]
+    /// Typed per-source metadata that format and layout plugins consume.
+    /// Today this carries `ModelInfo` (safetensors header parse) and
+    /// `MoeCell` (the MoE-diff layout's per-cell tag); future format
+    /// plugins in `modelweightvis` will stuff their own per-source data
+    /// here.
     pub extensions: Extensions,
 }
 
@@ -395,21 +389,6 @@ impl Source {
             }
         }
     }
-
-    /// Mirror the legacy `model_info` and `moe_cell` fields into
-    /// [`Source::extensions`]. Called once per source at the
-    /// `main::dispatch_render` chokepoint so plugin-side readers (step 8
-    /// onwards) find the data regardless of which construction path produced
-    /// the source. Step 8 deletes the legacy fields and moves population to
-    /// the format plugins (step 12); this helper goes away then.
-    pub(crate) fn populate_extensions_from_fields(&mut self) {
-        if let Some(ref mi) = self.model_info {
-            self.extensions.insert(mi.clone());
-        }
-        if let Some(mc) = self.moe_cell {
-            self.extensions.insert(mc);
-        }
-    }
 }
 
 /// Build sources and return total byte count.
@@ -432,10 +411,8 @@ pub fn prepare_sources(files: &[PathBuf]) -> anyhow::Result<(Vec<Source>, u64)> 
                 file_idx: 0,
                 kind: SourceKind::Buffered(buf),
                 byte_size: len,
-                model_info: None,
                 name_override: None,
                 xet_terms: None,
-                moe_cell: None,
                 extensions: Extensions::default(),
             }],
             len,
@@ -484,15 +461,17 @@ pub fn prepare_sources(files: &[PathBuf]) -> anyhow::Result<(Vec<Source>, u64)> 
         };
 
         total += size;
+        let mut extensions = Extensions::default();
+        if let Some(mi) = safetensors_info {
+            extensions.insert(mi);
+        }
         sources.push(Source {
             file_idx: sources.len(),
             kind: SourceKind::File(path.clone()),
             byte_size: size,
-            model_info: safetensors_info,
             name_override: None,
             xet_terms: None,
-            moe_cell: None,
-            extensions: Extensions::default(),
+            extensions,
         });
     }
     Ok((sources, total))
@@ -647,10 +626,8 @@ pub fn prepare_sources_from_specs(specs: &[InputSpec]) -> anyhow::Result<(Vec<So
                 file_idx: 0,
                 kind: SourceKind::Buffered(buf),
                 byte_size: len,
-                model_info: None,
                 name_override: None,
                 xet_terms: None,
-                moe_cell: None,
                 extensions: Extensions::default(),
             }],
             len,
@@ -704,15 +681,17 @@ pub fn prepare_sources_from_specs(specs: &[InputSpec]) -> anyhow::Result<(Vec<So
                     None
                 };
                 total += size;
+                let mut extensions = Extensions::default();
+                if let Some(mi) = safetensors_info {
+                    extensions.insert(mi);
+                }
                 sources.push(Source {
                     file_idx: sources.len(),
                     kind: SourceKind::File(path.clone()),
                     byte_size: size,
-                    model_info: safetensors_info,
                     name_override: None,
                     xet_terms: None,
-                    moe_cell: None,
-                    extensions: Extensions::default(),
+                    extensions,
                 });
             }
             InputSpec::Remote(spec) => {
@@ -722,10 +701,8 @@ pub fn prepare_sources_from_specs(specs: &[InputSpec]) -> anyhow::Result<(Vec<So
                     file_idx: sources.len(),
                     kind: SourceKind::Http(spec.clone()),
                     byte_size: size,
-                    model_info: None,
                     name_override: None,
                     xet_terms: None,
-                    moe_cell: None,
                     extensions: Extensions::default(),
                 });
             }
@@ -1295,10 +1272,8 @@ pub async fn prepare_diff_sources(
                 modified: modified.to_path_buf(),
             },
             byte_size: size_o,
-            model_info: None,
             name_override: None,
             xet_terms: None,
-            moe_cell: None,
             extensions: Extensions::default(),
         };
         return Ok((vec![source], size_o));
@@ -1399,10 +1374,8 @@ pub async fn prepare_diff_sources(
                             fill: orig_fill_kind,
                         },
                         byte_size: size_o,
-                        model_info: None,
                         name_override: Some(format!("[only in original] {}", rel.display())),
                         xet_terms: None,
-                        moe_cell: None,
                         extensions: Extensions::default(),
                     });
                     total += size_o;
@@ -1442,10 +1415,8 @@ pub async fn prepare_diff_sources(
                             modified: mod_abs.clone(),
                         },
                         byte_size: max_size,
-                        model_info: None,
                         name_override: None,
                         xet_terms: None,
-                        moe_cell: None,
                         extensions: Extensions::default(),
                     });
                     total += max_size;
@@ -1472,10 +1443,8 @@ pub async fn prepare_diff_sources(
                     fill: DiffFill::Green,
                 },
                 byte_size: size_m,
-                model_info: None,
                 name_override: Some(format!("[only in modified] {}", rel.display())),
                 xet_terms: None,
-                moe_cell: None,
                 extensions: Extensions::default(),
             });
             total += size_m;
@@ -1713,10 +1682,8 @@ pub async fn prepare_diff_sources_from_http(
             file_idx: sources.len(),
             kind: SourceKind::Buffered(diff),
             byte_size: size,
-            model_info: None,
             name_override: Some(fname),
             xet_terms: None,
-            moe_cell: None,
             extensions: Extensions::default(),
         });
         total += size;
@@ -1731,10 +1698,8 @@ pub async fn prepare_diff_sources_from_http(
             file_idx: sources.len(),
             kind: SourceKind::UnmatchedRegion { fill },
             byte_size: size,
-            model_info: None,
             name_override: Some(format!("[only in original] {fname}")),
             xet_terms: None,
-            moe_cell: None,
             extensions: Extensions::default(),
         });
         total += size;
@@ -1745,10 +1710,8 @@ pub async fn prepare_diff_sources_from_http(
             file_idx: sources.len(),
             kind: SourceKind::UnmatchedRegion { fill },
             byte_size: size,
-            model_info: None,
             name_override: Some(format!("[only in modified] {fname}")),
             xet_terms: None,
-            moe_cell: None,
             extensions: Extensions::default(),
         });
         total += size;
@@ -1759,10 +1722,8 @@ pub async fn prepare_diff_sources_from_http(
             file_idx: sources.len(),
             kind: SourceKind::UnmatchedRegion { fill },
             byte_size: size,
-            model_info: None,
             name_override: Some(fname),
             xet_terms: None,
-            moe_cell: None,
             extensions: Extensions::default(),
         });
         total += size;
@@ -2223,6 +2184,12 @@ async fn build_multi_safetensors_diff_sources_inner(
             file_end: nelem,
             packed_sidecars: None,
         };
+        let mut extensions = Extensions::default();
+        extensions.insert(ModelInfo {
+            format: SourceFormat::Safetensors,
+            tensors: vec![diff_meta],
+            color_ranges: Vec::new(),
+        });
         sources.push(Source {
             file_idx: sources.len(),
             kind: SourceKind::TensorDiff {
@@ -2236,15 +2203,9 @@ async fn build_multi_safetensors_diff_sources_inner(
                 scale_orig: *scale_orig,
             },
             byte_size: nelem,
-            model_info: Some(ModelInfo {
-                format: SourceFormat::Safetensors,
-                tensors: vec![diff_meta],
-                color_ranges: Vec::new(),
-            }),
             name_override: Some(orig_t.label()),
             xet_terms: None,
-            moe_cell: None,
-            extensions: Extensions::default(),
+            extensions,
         });
         total += nelem;
     }
@@ -2283,19 +2244,19 @@ async fn build_multi_safetensors_diff_sources_inner(
             file_end: nelem,
             packed_sidecars: None,
         };
+        let mut extensions = Extensions::default();
+        extensions.insert(ModelInfo {
+            format: SourceFormat::Safetensors,
+            tensors: vec![unmatched_meta],
+            color_ranges: Vec::new(),
+        });
         sources.push(Source {
             file_idx: sources.len(),
             kind: SourceKind::UnmatchedRegion { fill: orig_fill },
             byte_size: nelem,
-            model_info: Some(ModelInfo {
-                format: SourceFormat::Safetensors,
-                tensors: vec![unmatched_meta],
-                color_ranges: Vec::new(),
-            }),
             name_override: Some(format!("[only in original] {}", t.label())),
             xet_terms: None,
-            moe_cell: None,
-            extensions: Extensions::default(),
+            extensions,
         });
         total += nelem;
     }
@@ -2317,21 +2278,21 @@ async fn build_multi_safetensors_diff_sources_inner(
             file_end: nelem,
             packed_sidecars: None,
         };
+        let mut extensions = Extensions::default();
+        extensions.insert(ModelInfo {
+            format: SourceFormat::Safetensors,
+            tensors: vec![unmatched_meta],
+            color_ranges: Vec::new(),
+        });
         sources.push(Source {
             file_idx: sources.len(),
             kind: SourceKind::UnmatchedRegion {
                 fill: DiffFill::Green,
             },
             byte_size: nelem,
-            model_info: Some(ModelInfo {
-                format: SourceFormat::Safetensors,
-                tensors: vec![unmatched_meta],
-                color_ranges: Vec::new(),
-            }),
             name_override: Some(format!("[only in modified] {}", t.label())),
             xet_terms: None,
-            moe_cell: None,
-            extensions: Extensions::default(),
+            extensions,
         });
         total += nelem;
     }
@@ -2877,6 +2838,18 @@ pub async fn prepare_moe_diff_sources(
                         wlabel = weight.label()
                     )
                 };
+                let mut extensions = Extensions::default();
+                extensions.insert(ModelInfo {
+                    format: SourceFormat::Safetensors,
+                    tensors: vec![diff_meta],
+                    color_ranges: Vec::new(),
+                });
+                extensions.insert(MoeCell {
+                    layer: *layer_idx,
+                    weight: *weight,
+                    i: ei,
+                    j: ej,
+                });
                 sources.push(Source {
                     file_idx: sources.len(),
                     kind: SourceKind::TensorDiff {
@@ -2890,20 +2863,9 @@ pub async fn prepare_moe_diff_sources(
                         scale_orig,
                     },
                     byte_size: nelem,
-                    model_info: Some(ModelInfo {
-                        format: SourceFormat::Safetensors,
-                        tensors: vec![diff_meta],
-                        color_ranges: Vec::new(),
-                    }),
                     name_override: Some(label),
                     xet_terms: None,
-                    moe_cell: Some(MoeCell {
-                        layer: *layer_idx,
-                        weight: *weight,
-                        i: ei,
-                        j: ej,
-                    }),
-                    extensions: Extensions::default(),
+                    extensions,
                 });
                 total += nelem;
             }

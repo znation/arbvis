@@ -191,8 +191,15 @@ impl ArchLayoutPlugin {
         if matches!(ctx.mode, LayoutMode::Hilbert) {
             return false;
         }
-        let all = !ctx.sources.is_empty() && ctx.sources.iter().all(|s| s.model_info.is_some());
-        let any = ctx.sources.iter().any(|s| s.model_info.is_some());
+        let all = !ctx.sources.is_empty()
+            && ctx
+                .sources
+                .iter()
+                .all(|s| s.extensions.get::<crate::format::ModelInfo>().is_some());
+        let any = ctx
+            .sources
+            .iter()
+            .any(|s| s.extensions.get::<crate::format::ModelInfo>().is_some());
         if ctx.diff_mode {
             any
         } else {
@@ -217,12 +224,16 @@ impl crate::registry::LayoutPlugin for ArchLayoutPlugin {
         // safetensors info (e.g. tokenizer.json file diffs) — they won't
         // appear on the arch canvas.
         if ctx.diff_mode {
-            let all = !ctx.sources.is_empty() && ctx.sources.iter().all(|s| s.model_info.is_some());
+            let all = !ctx.sources.is_empty()
+                && ctx
+                    .sources
+                    .iter()
+                    .all(|s| s.extensions.get::<crate::format::ModelInfo>().is_some());
             if !all {
                 let skipped = ctx
                     .sources
                     .iter()
-                    .filter(|s| s.model_info.is_none())
+                    .filter(|s| s.extensions.get::<crate::format::ModelInfo>().is_none())
                     .count();
                 log::info!(
                     "arch layout: {skipped} non-safetensors diff source(s) will not appear on the arch canvas (file-level diffs are only rendered in --layout hilbert)"
@@ -249,7 +260,9 @@ impl crate::registry::LayoutPlugin for MoeDiffLayoutPlugin {
         if matches!(ctx.mode, LayoutMode::Hilbert) {
             return false;
         }
-        ctx.sources.iter().any(|s| s.moe_cell.is_some())
+        ctx.sources
+            .iter()
+            .any(|s| s.extensions.get::<crate::data::MoeCell>().is_some())
     }
     fn build(&self, ctx: &crate::registry::LayoutBuildCtx<'_>) -> Option<Box<dyn LayoutShape>> {
         arch::ArchLayout::try_build_moe_diff(ctx.sources, ctx.cumulative_offsets)

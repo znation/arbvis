@@ -628,8 +628,8 @@ fn render_chunks(
                     return Ok(vec![]);
                 }
                 let dtype_ranges = sources[src_idx]
-                    .model_info
-                    .as_ref()
+                    .extensions
+                    .get::<crate::format::ModelInfo>()
                     .map(|st| st.color_ranges.as_slice());
                 let unmatched_fill: Option<DiffFill> = match &sources[src_idx].kind {
                     SourceKind::UnmatchedRegion { fill } => Some(*fill),

@@ -306,10 +306,8 @@ fn fallback_byte_diff(
                 modified: mod_path.to_path_buf(),
             },
             byte_size: size,
-            model_info: None,
             name_override: None,
             xet_terms: None,
-            moe_cell: None,
             extensions: Extensions::default(),
         };
         return Ok((vec![source], size));
@@ -322,10 +320,8 @@ fn fallback_byte_diff(
             file_idx: sources.len(),
             kind: SourceKind::UnmatchedRegion { fill: orig_fill },
             byte_size: size,
-            model_info: None,
             name_override: Some(format!("[only in original] {}", filename_label(orig_path))),
             xet_terms: None,
-            moe_cell: None,
             extensions: Extensions::default(),
         });
         total += size;
@@ -338,10 +334,8 @@ fn fallback_byte_diff(
                 fill: DiffFill::Green,
             },
             byte_size: size,
-            model_info: None,
             name_override: Some(format!("[only in modified] {}", filename_label(mod_path))),
             xet_terms: None,
-            moe_cell: None,
             extensions: Extensions::default(),
         });
         total += size;

@@ -698,7 +698,7 @@ async fn resolve_input_sources(
 /// through the streaming path. Centralises the cascade that used to be
 /// duplicated three times in `run()`.
 async fn dispatch_render(
-    mut sources: Vec<Source>,
+    sources: Vec<Source>,
     total: u64,
     labels: &[PathBuf],
     cfg: &RenderConfig,
@@ -706,14 +706,6 @@ async fn dispatch_render(
     stream: bool,
     registry: &registry::Registry,
 ) -> anyhow::Result<()> {
-    // Mirror the legacy `model_info`/`moe_cell` fields into `Source.extensions`
-    // so plugin readers added in step 8 onwards find their typed metadata
-    // regardless of which `prepare_*` path produced the source. Step 12 moves
-    // population into the format plugins themselves; this chokepoint goes
-    // away with the legacy fields.
-    for s in sources.iter_mut() {
-        s.populate_extensions_from_fields();
-    }
     match dest {
         OutputDest::Window => {
             run_single_blocking(labels.to_vec(), None, sources, total, cfg, registry).await?;

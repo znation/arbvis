@@ -52,7 +52,6 @@ pub fn spans_to_sources(
                             mod_start: mod_.start,
                         },
                         byte_size: common,
-                        model_info: None,
                         name_override: Some(format!(
                             "diff @ orig:[{}, {}) vs mod:[{}, {})",
                             orig.start,
@@ -61,7 +60,6 @@ pub fn spans_to_sources(
                             mod_.start + common
                         )),
                         xet_terms: None,
-                        moe_cell: None,
                         extensions: Extensions::default(),
                     });
                     total += common;
@@ -80,7 +78,6 @@ pub fn spans_to_sources(
                             fill: orig_fill,
                         },
                         byte_size: len,
-                        model_info: None,
                         name_override: Some(format!(
                             "[only in original] {} @ [{}, {})",
                             orig_label,
@@ -88,7 +85,6 @@ pub fn spans_to_sources(
                             orig.end
                         )),
                         xet_terms: None,
-                        moe_cell: None,
                         extensions: Extensions::default(),
                     });
                     total += len;
@@ -104,7 +100,6 @@ pub fn spans_to_sources(
                             fill: DiffFill::Green,
                         },
                         byte_size: len,
-                        model_info: None,
                         name_override: Some(format!(
                             "[only in modified] {} @ [{}, {})",
                             mod_label,
@@ -112,7 +107,6 @@ pub fn spans_to_sources(
                             mod_.end
                         )),
                         xet_terms: None,
-                        moe_cell: None,
                         extensions: Extensions::default(),
                     });
                     total += len;
@@ -132,13 +126,11 @@ pub fn spans_to_sources(
                         fill: orig_fill,
                     },
                     byte_size: len,
-                    model_info: None,
                     name_override: Some(format!(
                         "[only in original] {} @ [{}, {})",
                         orig_label, orig.start, orig.end
                     )),
                     xet_terms: None,
-                    moe_cell: None,
                     extensions: Extensions::default(),
                 });
                 total += len;
@@ -157,13 +149,11 @@ pub fn spans_to_sources(
                         fill: DiffFill::Green,
                     },
                     byte_size: len,
-                    model_info: None,
                     name_override: Some(format!(
                         "[only in modified] {} @ [{}, {})",
                         mod_label, mod_.start, mod_.end
                     )),
                     xet_terms: None,
-                    moe_cell: None,
                     extensions: Extensions::default(),
                 });
                 total += len;

@@ -193,7 +193,7 @@ impl ArchLayout {
             if matches!(s.kind, SourceKind::UnmatchedRegion { .. }) {
                 continue;
             }
-            let Some(st) = s.model_info.as_ref() else {
+            let Some(st) = s.extensions.get::<crate::format::ModelInfo>() else {
                 continue;
             };
             let off = cumulative_offsets.get(sidx).copied().unwrap_or(0);
@@ -606,10 +606,10 @@ impl ArchLayout {
         let mut cells: BTreeMap<(u32, u32, u32, ExpertWeight), (usize, &TensorMeta, u64)> =
             BTreeMap::new();
         for (sidx, s) in sources.iter().enumerate() {
-            let Some(cell) = s.moe_cell else {
+            let Some(cell) = s.extensions.get::<crate::data::MoeCell>().copied() else {
                 continue;
             };
-            let Some(st) = s.model_info.as_ref() else {
+            let Some(st) = s.extensions.get::<crate::format::ModelInfo>() else {
                 continue;
             };
             let Some(t) = st.tensors.first() else {
@@ -1077,22 +1077,22 @@ mod tests {
     /// Build a `Source` whose model header reports the listed tensors with
     /// sequential byte offsets. The Source's `kind` is `Buffered(empty)`
     /// only so we don't need a real file on disk; `ArchLayout::try_build`
-    /// actually looks only at `model_info`.
+    /// actually looks only at the source's `ModelInfo` extension.
     fn synthetic_source(tensors: Vec<TensorMeta>) -> Source {
         let total: u64 = tensors.iter().map(|t| t.file_end - t.file_start).sum();
+        let mut extensions = Extensions::default();
+        extensions.insert(crate::format::ModelInfo {
+            format: crate::format::SourceFormat::Safetensors,
+            tensors,
+            color_ranges: Vec::new(),
+        });
         Source {
             file_idx: 0,
             kind: SourceKind::Buffered(Vec::new()),
             byte_size: total,
-            model_info: Some(crate::format::ModelInfo {
-                format: crate::format::SourceFormat::Safetensors,
-                tensors,
-                color_ranges: Vec::new(),
-            }),
             name_override: None,
             xet_terms: None,
-            moe_cell: None,
-            extensions: Extensions::default(),
+            extensions,
         }
     }
 

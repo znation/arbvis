@@ -12,6 +12,7 @@ mod label;
 mod layout;
 mod perf_monitor;
 mod progress;
+mod registry;
 mod single;
 mod throttle;
 mod tiled;
@@ -396,7 +397,17 @@ impl OutputDest {
     }
 }
 
-async fn run(args: Args) -> anyhow::Result<()> {
+/// Drives the full arbvis pipeline (CLI → sources → layout → tiles/single).
+///
+/// `registry` carries the pluggable surface (formats, layouts, diff builders,
+/// leaf renderers). Today only `registry.leaf` is consumed — by the tile
+/// pipeline at plan construction time. The other slots are placeholders that
+/// later steps will hand off to: `select_layout` (step 6),
+/// `prepare_diff_sources` (step 9), and format detection (step 12). The
+/// binary builds `Registry::with_defaults()` and passes it in; once
+/// `modelweightvis` splits out it will build its own registry by extending
+/// the default one with tensor-format plugins.
+async fn run(args: Args, _registry: registry::Registry) -> anyhow::Result<()> {
     if let Some(ref tile_dir) = args.regen_html {
         return tiled::regen_html(tile_dir);
     }
@@ -952,5 +963,6 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("building tokio runtime: {e}"))?;
 
     let args = Args::parse();
-    rt.block_on(run(args))
+    let registry = registry::Registry::with_defaults();
+    rt.block_on(run(args, registry))
 }

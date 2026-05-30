@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/arbvis"]
+members = ["crates/arbvis", "crates/modelweightvis"]
 
 # `Cargo.lock` and `target/` stay at the workspace root so all members share
 # resolved deps and incremental build artifacts. The pre-commit hook keys off

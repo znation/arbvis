@@ -2532,6 +2532,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "modelweightvis"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arbvis",
+ "clap",
+ "tokio",
+]
+
+[[package]]
 name = "monostate"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"

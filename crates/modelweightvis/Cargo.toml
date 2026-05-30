@@ -1,0 +1,14 @@
+[package]
+name = "modelweightvis"
+version = "0.1.0"
+edition = "2021"
+description = "Tensor-format-aware visualization built on arbvis"
+
+[dependencies]
+# arbvis core. Path-pinned during workspace dev; when this crate splits out
+# into its own repo (step 14) the dep becomes a version pin against published
+# `arbvis`.
+arbvis = { path = "../arbvis", version = "0.1.0" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }

@@ -1,62 +1,8 @@
-[package]
-name = "arbvis"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "2"
+members = ["crates/arbvis"]
 
-[dependencies]
-ab_glyph = "0.2"
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-fast_hilbert = "2.0"
-image = "0.25"
-imageproc = "0.25"
-# Used directly for indexed-color PNG output of Plain/Dtype leaf tiles, which
-# the `image` crate's PNG encoder doesn't support (it only emits truecolor).
-# Indexed PNG cuts leaf tile size 2-4× vs truecolor PNG for the ≤256-color
-# palette content arbvis produces.
-png = "0.18"
-indicatif = "0.17"
-# Routes log::* output through indicatif's MultiProgress so log lines and
-# progress bars never overwrite each other.
-indicatif-log-bridge = "0.2"
-memmap2 = "0.9"
-minifb = "0.27"
-rayon = "1"
-log = "0.4"
-env_logger = "0.11"
-tempfile = "3"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-half = "2"
-hf-hub = "1.0.0-rc.1"
-# xet-core-structures is the chunk/xorb wire format used by hf-hub internally.
-# We pull it in directly so we can decode xorb byte segments after fetching
-# them from CAS URLs ourselves — bypassing hf-hub's per-call xet stream group
-# rebuild, which dominates wall time for per-tile range requests.
-xet-core-structures = "1.5"
-# Byte-bounded LRU cache for decompressed xorb chunk segments, hit per tile.
-lru = "0.12"
-bytes = "1"
-reqwest = { version = "0.13", features = ["json"] }
-tokio = { version = "1", features = ["full"] }
-futures = "0.3"
-async-channel = "2"
-async-trait = "0.1"
-# Used by the architectural layout to parse tensor names (e.g.
-# `model.layers.N.q_proj.weight`) into structural slots.
-regex = "1"
-# GGUF format support: parses the metadata KV table + tensor info table
-# without touching tensor bytes, and exposes a device-free dequant path
-# (`QuantizedType::dequantize`) for the Q* block formats. PyTorch pickle
-# support also lives here (`candle_core::pickle`) — it walks the pickle
-# opcode stream without invoking `__reduce__` / `find_class`, so loading
-# untrusted `.bin` headers is safe. We use only the `quantized::gguf_file`,
-# `quantized::k_quants`, and `pickle` modules — none of the
-# `cuda`/`metal`/`mkl`/`accelerate` features are enabled.
-candle-core = { version = "0.10", default-features = false }
-# Used to resolve the byte offset of each per-tensor storage entry inside a
-# PyTorch `.bin` (`.pth` / `.pt`) zip archive. candle-core's pickle reader
-# gives us tensor names + dtypes + shapes + zip-entry names, but not the
-# absolute file byte ranges arbvis renders against — `ZipFile::data_start`
-# closes that gap. Version locked to candle-core's transitive dep.
-zip = { version = "7.2", default-features = false }
+# `Cargo.lock` and `target/` stay at the workspace root so all members share
+# resolved deps and incremental build artifacts. The pre-commit hook keys off
+# the workspace root, so `cargo fmt --all` and `cargo clippy --all-targets`
+# cover every member from one invocation.

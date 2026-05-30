@@ -670,9 +670,6 @@ pub fn prepare_sources_from_specs(specs: &[InputSpec]) -> anyhow::Result<(Vec<So
 /// `populate_xet_terms` must run *before* this so the xet term metadata is
 /// captured from the still-remote `RemoteFileSpec`.
 pub async fn materialize_http_sources(sources: &mut [Source]) -> anyhow::Result<()> {
-    use crate::hf_url::RemoteRepo;
-    use crate::throttle::with_throttle;
-
     // Snapshot (index, spec) for Http sources so the futures don't borrow `sources`.
     let jobs: Vec<(usize, RemoteFileSpec)> = sources
         .iter()
@@ -687,65 +684,146 @@ pub async fn materialize_http_sources(sources: &mut [Source]) -> anyhow::Result<
         return Ok(());
     }
 
-    let pb = setup_progress("source files (downloading for xet view)", jobs.len() as u64);
-    let pb_for_workers = pb.clone();
+    let indices: Vec<usize> = jobs.iter().map(|(i, _)| *i).collect();
+    let specs: Vec<RemoteFileSpec> = jobs.into_iter().map(|(_, s)| s).collect();
+    let paths =
+        download_specs_to_paths(&specs, "source files (downloading for xet view)").await?;
 
-    let downloads: Vec<(usize, anyhow::Result<PathBuf>)> = stream::iter(jobs)
-        .map(|(i, spec)| {
-            let pb = pb_for_workers.clone();
-            async move {
-                let filename = (*spec.filename).clone();
-                let revision = (*spec.revision).clone();
-                let label = format!("download_file {filename}");
-                let result = with_throttle(&label, || async {
-                    match &spec.repo {
-                        RemoteRepo::Model(r) => {
-                            r.download_file()
-                                .filename(filename.clone())
-                                .revision(revision.clone())
-                                .send()
-                                .await
-                        }
-                        RemoteRepo::Dataset(r) => {
-                            r.download_file()
-                                .filename(filename.clone())
-                                .revision(revision.clone())
-                                .send()
-                                .await
-                        }
-                        RemoteRepo::Space(r) => {
-                            r.download_file()
-                                .filename(filename.clone())
-                                .revision(revision.clone())
-                                .send()
-                                .await
-                        }
-                    }
-                })
-                .await
-                .map_err(anyhow::Error::from);
-                if let Some(pb) = pb.as_ref() {
-                    pb.inc(1);
-                }
-                (i, result)
-            }
-        })
-        .buffer_unordered(SETUP_FETCH_CONCURRENCY)
-        .collect()
-        .await;
-
-    if let Some(pb) = pb.as_ref() {
-        pb.finish_and_clear();
-    }
-
-    for (i, r) in downloads {
-        let path = r?;
+    for (i, path) in indices.into_iter().zip(paths) {
         // Preserve display name + xet_terms; only the storage kind changes.
         let display = sources[i].name();
         sources[i].kind = SourceKind::File(path);
         if sources[i].name_override.is_none() {
             sources[i].name_override = Some(display);
         }
+    }
+    Ok(())
+}
+
+/// Download a batch of [`RemoteFileSpec`]s to the local hf-hub cache and return
+/// the local paths in the same order. Drives the AIMD throttle through
+/// [`crate::throttle::with_throttle`] and reports progress via a one-shot
+/// `setup_progress` bar.
+///
+/// Shared by every disk-backed materialisation path:
+/// [`materialize_http_sources`] (normal flow's `SourceKind::Http` swap) and
+/// [`materialize_remote_arcs`] (the `Arc<Data>`s buried inside
+/// `SourceKind::TensorDiff` for `--diff`/`--moe-diff`).
+async fn download_specs_to_paths(
+    specs: &[RemoteFileSpec],
+    progress_label: &str,
+) -> anyhow::Result<Vec<PathBuf>> {
+    use crate::throttle::with_throttle;
+
+    let pb = setup_progress(progress_label, specs.len() as u64);
+    let pb_for_workers = pb.clone();
+
+    let mut downloads: Vec<(usize, anyhow::Result<PathBuf>)> =
+        stream::iter(specs.iter().cloned().enumerate())
+            .map(|(i, spec)| {
+                let pb = pb_for_workers.clone();
+                async move {
+                    let filename = (*spec.filename).clone();
+                    let revision = (*spec.revision).clone();
+                    let label = format!("download_file {filename}");
+                    let result = with_throttle(&label, || async {
+                        match &spec.repo {
+                            RemoteRepo::Model(r) => {
+                                r.download_file()
+                                    .filename(filename.clone())
+                                    .revision(revision.clone())
+                                    .send()
+                                    .await
+                            }
+                            RemoteRepo::Dataset(r) => {
+                                r.download_file()
+                                    .filename(filename.clone())
+                                    .revision(revision.clone())
+                                    .send()
+                                    .await
+                            }
+                            RemoteRepo::Space(r) => {
+                                r.download_file()
+                                    .filename(filename.clone())
+                                    .revision(revision.clone())
+                                    .send()
+                                    .await
+                            }
+                        }
+                    })
+                    .await
+                    .map_err(anyhow::Error::from);
+                    if let Some(pb) = pb.as_ref() {
+                        pb.inc(1);
+                    }
+                    (i, result)
+                }
+            })
+            .buffer_unordered(SETUP_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+
+    if let Some(pb) = pb.as_ref() {
+        pb.finish_and_clear();
+    }
+
+    downloads.sort_by_key(|(i, _)| *i);
+    downloads
+        .into_iter()
+        .map(|(_, r)| r)
+        .collect::<anyhow::Result<Vec<_>>>()
+}
+
+/// Download every remote `Arc<Data>` in `arcs` (those for which `is_local()`
+/// returns false) to the local hf-hub cache and replace it with a
+/// `Data::Mapped` over the on-disk file. Local entries are left untouched.
+///
+/// `arcs` and `specs` are parallel — `specs[i]` is the remote spec backing
+/// `arcs[i]`. The caller carries the spec alongside the arc precisely because
+/// the arc itself doesn't keep enough information to re-issue the download
+/// (the xet `Data::Xet` variant wraps a `XetReader`, not the original spec).
+///
+/// Used by the disk-backed default for `--diff` and `--moe-diff`: those paths
+/// would otherwise leave `Data::Xet`/`Data::Http` arcs inside
+/// `SourceKind::TensorDiff`, and every per-tile diff would issue HTTP fetches.
+async fn materialize_remote_arcs(
+    arcs: &mut [Arc<Data>],
+    specs: &[RemoteFileSpec],
+    progress_label: &str,
+) -> anyhow::Result<()> {
+    assert_eq!(
+        arcs.len(),
+        specs.len(),
+        "materialize_remote_arcs: arcs and specs must be the same length"
+    );
+
+    let to_download: Vec<(usize, RemoteFileSpec)> = arcs
+        .iter()
+        .zip(specs.iter())
+        .enumerate()
+        .filter_map(|(i, (arc, spec))| {
+            if arc.is_local() {
+                None
+            } else {
+                Some((i, spec.clone()))
+            }
+        })
+        .collect();
+
+    if to_download.is_empty() {
+        return Ok(());
+    }
+
+    let indices: Vec<usize> = to_download.iter().map(|(i, _)| *i).collect();
+    let specs_subset: Vec<RemoteFileSpec> = to_download.into_iter().map(|(_, s)| s).collect();
+    let paths = download_specs_to_paths(&specs_subset, progress_label).await?;
+
+    for (i, path) in indices.into_iter().zip(paths) {
+        let f =
+            File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        let mmap = unsafe { Mmap::map(&f) }
+            .with_context(|| format!("mmap'ing {}", path.display()))?;
+        arcs[i] = Arc::new(Data::Mapped(mmap));
     }
     Ok(())
 }
@@ -1238,6 +1316,7 @@ pub async fn prepare_diff_sources_from_http(
     mod_specs: &[(String, RemoteFileSpec)],
     is_finetune: bool,
     metric: format::DiffMetric,
+    stream: bool,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     let is_st = |name: &str| name.ends_with(".safetensors");
 
@@ -1249,10 +1328,17 @@ pub async fn prepare_diff_sources_from_http(
     let mut sources: Vec<Source> = Vec::new();
     let mut total = 0u64;
 
-    // Safetensors diff — fully lazy, no download.
+    // Safetensors diff — disk-backed by default; pass `stream=true` to keep
+    // shards remote and diff each tile via HTTP range requests instead.
     if !orig_st.is_empty() || !mod_st.is_empty() {
-        match build_multi_safetensors_diff_sources_from_http(&orig_st, &mod_st, is_finetune, metric)
-            .await
+        match build_multi_safetensors_diff_sources_from_http(
+            &orig_st,
+            &mod_st,
+            is_finetune,
+            metric,
+            stream,
+        )
+        .await
         {
             Ok((mut tensor_sources, bytes)) => {
                 let base_idx = sources.len();
@@ -2090,16 +2176,20 @@ async fn build_multi_safetensors_diff_sources(
 }
 
 /// Build per-tensor diff Sources from multiple remote .safetensors files on each side.
-/// Headers are fetched via range requests; tensor data is never downloaded.
 ///
-/// Each xet-backed file gets a `Data::Xet` reader (one V2 reconstruction fetch
-/// per file, then direct-CAS range fetches afterward — see `XetReader`).
-/// Non-xet remote files fall back to `Data::Http` which routes through hf-hub.
+/// When `stream` is false (the default) every shard is downloaded to the
+/// local hf-hub cache and mmapped before any source is constructed, so the
+/// per-tile diff path is pure memcpy. When `stream` is true each xet-backed
+/// file gets a `Data::Xet` reader (one V2 reconstruction fetch per file,
+/// then direct-CAS range fetches afterward — see `XetReader`) and non-xet
+/// remote files fall back to `Data::Http`; every per-tile diff then issues
+/// an HTTP range request.
 async fn build_multi_safetensors_diff_sources_from_http(
     orig_specs: &[&(String, RemoteFileSpec)],
     mod_specs: &[&(String, RemoteFileSpec)],
     is_finetune: bool,
     metric: format::DiffMetric,
+    stream: bool,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     let orig_fmts: Vec<SourceFormat> = orig_specs
         .iter()
@@ -2109,7 +2199,10 @@ async fn build_multi_safetensors_diff_sources_from_http(
         .iter()
         .map(|(n, _)| SourceFormat::from_name(n).unwrap_or(SourceFormat::Safetensors))
         .collect();
-    async fn make_arcs(specs: Vec<RemoteFileSpec>) -> anyhow::Result<Vec<Arc<Data>>> {
+    // Streaming arc construction: per-spec xet reconstruction + Http fallback.
+    // Only used when `stream` is true; the disk-backed branch skips it and
+    // goes straight through `materialize_remote_arcs`.
+    async fn make_streaming_arcs(specs: Vec<RemoteFileSpec>) -> anyhow::Result<Vec<Arc<Data>>> {
         let total = specs.len() as u64;
         let pb = setup_progress("source files (xet reconstruction for diff)", total);
         let pb_for_workers = pb.clone();
@@ -2156,8 +2249,47 @@ async fn build_multi_safetensors_diff_sources_from_http(
             .map(|(_, r)| r)
             .collect::<anyhow::Result<Vec<_>>>()
     }
-    let orig_data = make_arcs(orig_specs.iter().map(|(_, s)| s.clone()).collect()).await?;
-    let mod_data = make_arcs(mod_specs.iter().map(|(_, s)| s.clone()).collect()).await?;
+    let orig_specs_owned: Vec<RemoteFileSpec> =
+        orig_specs.iter().map(|(_, s)| s.clone()).collect();
+    let mod_specs_owned: Vec<RemoteFileSpec> =
+        mod_specs.iter().map(|(_, s)| s.clone()).collect();
+    let (mut orig_data, mut mod_data) = if stream {
+        let orig_data = make_streaming_arcs(orig_specs_owned.clone()).await?;
+        let mod_data = make_streaming_arcs(mod_specs_owned.clone()).await?;
+        (orig_data, mod_data)
+    } else {
+        // Placeholder arcs swapped in place by materialize_remote_arcs.
+        let placeholder = |specs: &[RemoteFileSpec]| -> Vec<Arc<Data>> {
+            specs
+                .iter()
+                .map(|spec| {
+                    Arc::new(Data::Http {
+                        repo: spec.repo.clone(),
+                        filename: Arc::clone(&spec.filename),
+                        revision: Arc::clone(&spec.revision),
+                    })
+                })
+                .collect()
+        };
+        (
+            placeholder(&orig_specs_owned),
+            placeholder(&mod_specs_owned),
+        )
+    };
+    if !stream {
+        materialize_remote_arcs(
+            &mut orig_data,
+            &orig_specs_owned,
+            "source files (downloading for diff: orig side)",
+        )
+        .await?;
+        materialize_remote_arcs(
+            &mut mod_data,
+            &mod_specs_owned,
+            "source files (downloading for diff: modified side)",
+        )
+        .await?;
+    }
     build_multi_safetensors_diff_sources_inner(
         &orig_data,
         &orig_fmts,
@@ -2181,8 +2313,12 @@ async fn build_multi_safetensors_diff_sources_from_http(
 /// of the expert; v1 keeps the source-kind surface untouched.)
 ///
 /// `input` is a local path or `hf://` URL. Repo-level `hf://` URLs are listed
-/// over the HF API and diffed lazily over HTTP; everything else is opened
-/// locally (downloading on demand via `resolve_input`).
+/// over the HF API. When `stream` is false (the default), every shard is
+/// downloaded to the local hf-hub cache and mmapped before any source is
+/// constructed — per-cell diffs then read from local memory. When `stream`
+/// is true, shards stay as `Data::Xet`/`Data::Http` and every per-tile
+/// `fetch_range` issues an HTTP request. Single-file and local inputs always
+/// go through `hf_url::resolve` + mmap regardless of the flag.
 ///
 /// GGUF checkpoints with fused expert tensors (`ffn_*_exps.weight`) are out
 /// of scope for v1 and return a clear error — see
@@ -2190,6 +2326,7 @@ async fn build_multi_safetensors_diff_sources_from_http(
 pub async fn prepare_moe_diff_sources(
     input: &str,
     metric: format::DiffMetric,
+    stream: bool,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     // Open the input as one or more whole-file `Arc<Data>`s plus their formats.
     // Two code paths mirror `prepare_diff_sources` / `_from_http`: repo-level
@@ -2216,55 +2353,87 @@ pub async fn prepare_moe_diff_sources(
             .collect();
         let names: Vec<String> = st_specs.iter().map(|(n, _)| n.clone()).collect();
 
-        let pb = setup_progress("source files (xet reconstruction for moe-diff)", st_specs.len() as u64);
-        let pb_for_workers = pb.clone();
         let specs_owned: Vec<RemoteFileSpec> =
             st_specs.iter().map(|(_, s)| s.clone()).collect();
-        let mut out: Vec<(usize, anyhow::Result<Arc<Data>>)> = stream::iter(
-            specs_owned.into_iter().enumerate(),
-        )
-        .map(|(i, spec)| {
-            let pb = pb_for_workers.clone();
-            async move {
-                let r: anyhow::Result<Arc<Data>> = if spec.xet_hash.is_some() {
-                    match XetReader::new(&spec).await {
-                        Ok(reader) => Ok(Arc::new(Data::Xet(reader))),
-                        Err(e) => {
-                            log::warn!(
-                                "{}: XetReader build failed ({e}); falling back to hf-hub Data::Http",
-                                spec.filename,
-                            );
-                            Ok(Arc::new(Data::Http {
-                                repo: spec.repo.clone(),
-                                filename: Arc::clone(&spec.filename),
-                                revision: Arc::clone(&spec.revision),
-                            }))
+        // In streaming mode each shard becomes an `Arc<Data::Xet>` (or
+        // `Data::Http` fallback) and per-tile diffs go over HTTP. In the
+        // disk-backed default we skip the xet reconstruction setup entirely
+        // — `materialize_remote_arcs` below downloads every shard via
+        // hf-hub and replaces the arc with a `Data::Mapped` mmap, so the
+        // per-tile path is pure memcpy.
+        let mut datas: Vec<Arc<Data>> = if stream {
+            let pb = setup_progress(
+                "source files (xet reconstruction for moe-diff)",
+                specs_owned.len() as u64,
+            );
+            let pb_for_workers = pb.clone();
+            let mut out: Vec<(usize, anyhow::Result<Arc<Data>>)> = stream::iter(
+                specs_owned.iter().cloned().enumerate(),
+            )
+            .map(|(i, spec)| {
+                let pb = pb_for_workers.clone();
+                async move {
+                    let r: anyhow::Result<Arc<Data>> = if spec.xet_hash.is_some() {
+                        match XetReader::new(&spec).await {
+                            Ok(reader) => Ok(Arc::new(Data::Xet(reader))),
+                            Err(e) => {
+                                log::warn!(
+                                    "{}: XetReader build failed ({e}); falling back to hf-hub Data::Http",
+                                    spec.filename,
+                                );
+                                Ok(Arc::new(Data::Http {
+                                    repo: spec.repo.clone(),
+                                    filename: Arc::clone(&spec.filename),
+                                    revision: Arc::clone(&spec.revision),
+                                }))
+                            }
                         }
+                    } else {
+                        Ok(Arc::new(Data::Http {
+                            repo: spec.repo.clone(),
+                            filename: Arc::clone(&spec.filename),
+                            revision: Arc::clone(&spec.revision),
+                        }))
+                    };
+                    if let Some(pb) = pb.as_ref() {
+                        pb.inc(1);
                     }
-                } else {
-                    Ok(Arc::new(Data::Http {
+                    (i, r)
+                }
+            })
+            .buffer_unordered(SETUP_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+            if let Some(pb) = pb.as_ref() {
+                pb.finish_and_clear();
+            }
+            out.sort_by_key(|(i, _)| *i);
+            out.into_iter()
+                .map(|(_, r)| r)
+                .collect::<anyhow::Result<Vec<_>>>()?
+        } else {
+            // Placeholder arcs that materialize_remote_arcs will replace.
+            // Cheap (just an Arc<RemoteRepo> clone per shard); the real
+            // download happens once in the helper.
+            specs_owned
+                .iter()
+                .map(|spec| {
+                    Arc::new(Data::Http {
                         repo: spec.repo.clone(),
                         filename: Arc::clone(&spec.filename),
                         revision: Arc::clone(&spec.revision),
-                    }))
-                };
-                if let Some(pb) = pb.as_ref() {
-                    pb.inc(1);
-                }
-                (i, r)
-            }
-        })
-        .buffer_unordered(SETUP_FETCH_CONCURRENCY)
-        .collect()
-        .await;
-        if let Some(pb) = pb.as_ref() {
-            pb.finish_and_clear();
+                    })
+                })
+                .collect()
+        };
+        if !stream {
+            materialize_remote_arcs(
+                &mut datas,
+                &specs_owned,
+                "source files (downloading for moe-diff)",
+            )
+            .await?;
         }
-        out.sort_by_key(|(i, _)| *i);
-        let datas: Vec<Arc<Data>> = out
-            .into_iter()
-            .map(|(_, r)| r)
-            .collect::<anyhow::Result<Vec<_>>>()?;
         (datas, fmts, names)
     } else {
         // Local path or single-file hf:// URL. Resolve to disk and open.

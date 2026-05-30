@@ -237,19 +237,17 @@ struct Args {
     #[arg(long, value_enum, default_value_t = LayoutArg::Auto)]
     layout: LayoutArg,
 
-    /// Opt in to streaming I/O for the normal (non-diff) flow: keep `hf://`
-    /// inputs remote (per-tile range fetches instead of an up-front download)
-    /// and — when combined with an `hf://` output or `--space` — push tiles
-    /// to the Hub as they're produced rather than staging through a local
-    /// tempdir. Off by default; the disk-backed path is much faster and
-    /// more recoverable. Use `--stream` when input or output data won't fit
-    /// on local disk.
+    /// Opt in to streaming I/O. Keeps `hf://` inputs remote (per-tile range
+    /// fetches instead of an up-front download) and — when combined with an
+    /// `hf://` output or `--space` — pushes tiles to the Hub as they're
+    /// produced rather than staging through a local tempdir. Off by default;
+    /// the disk-backed path is much faster and more recoverable. Use
+    /// `--stream` when input or output data won't fit on local disk.
     ///
-    /// `--diff` and `--moe-diff` are *not* affected on the input side:
-    /// `data::prepare_diff_sources*` already keeps repo-level hf:// inputs
-    /// remote (LazyDiff), and `prepare_moe_diff_sources` downloads
-    /// unconditionally. `--stream` still controls the output path (tile
-    /// streaming vs. local pyramid) for those modes.
+    /// Applies to every flow that takes `hf://` inputs: the normal renderer,
+    /// `--diff` (when both sides are repo-level URLs), and `--moe-diff`.
+    /// Single-file / local-path inputs always resolve through
+    /// `hf_url::resolve` + mmap and are unaffected by `--stream`.
     #[arg(long)]
     stream: bool,
 }
@@ -420,7 +418,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         let input = moe_arg.to_string_lossy().into_owned();
         let inputs = vec![input.clone()];
         let title = default_title(args.title, "arbvis moe-diff");
-        let (sources, total) = data::prepare_moe_diff_sources(&input, metric)
+        let (sources, total) = data::prepare_moe_diff_sources(&input, metric, stream)
             .await
             .with_context(|| format!("--moe-diff {input}"))?;
         let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
@@ -466,8 +464,14 @@ async fn run(args: Args) -> anyhow::Result<()> {
                         .with_context(|| format!("listing files in {mod_str}"))
                 },
             )?;
-            data::prepare_diff_sources_from_http(&orig_specs, &mod_specs, is_finetune, metric)
-                .await?
+            data::prepare_diff_sources_from_http(
+                &orig_specs,
+                &mod_specs,
+                is_finetune,
+                metric,
+                stream,
+            )
+            .await?
         } else {
             // At least one side is a local path or single-file hf:// URL.
             // Resolve the two sides concurrently; order matters for the

@@ -45,6 +45,7 @@ pub fn run_single(
     diff_mode: bool,
     show_xet_xorbs: bool,
     layout_mode: LayoutMode,
+    registry: &crate::registry::Registry,
 ) -> anyhow::Result<()> {
     // Compute cumulative source offsets for layout selection.
     let cumulative_offsets: Vec<u64> = {
@@ -78,6 +79,7 @@ pub fn run_single(
         layout_mode,
         &metas,
         diff_mode,
+        registry,
     );
     if let Some(arch) = layout.as_any().downcast_ref::<ArchLayout>() {
         // Arch mode only handles local (mmap'd / owned) data for now. If any

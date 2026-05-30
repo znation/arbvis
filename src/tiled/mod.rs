@@ -461,6 +461,7 @@ pub(super) async fn build_tile_plan(
     diff_mode: bool,
     show_xet_xorbs: bool,
     layout_mode: LayoutMode,
+    registry: &crate::registry::Registry,
 ) -> anyhow::Result<TilePlan> {
     let mut s = 2 * TILE_LOG2 as u32;
     while (1u64 << s) < total {
@@ -728,7 +729,13 @@ pub(super) async fn build_tile_plan(
         layout_mode,
         &metas,
         diff_mode,
+        registry,
     );
+
+    // Today the per-plan LeafRegistry is the registry's own; in step 12 once
+    // tensor renderers move to modelweightvis it'll be the only path to get
+    // the `"arch"` renderer registered. Clone here so the plan owns its arc.
+    let leaf_registry = registry.leaf.clone();
 
     let arch_opt = layout.as_any().downcast_ref::<ArchLayout>();
     let (
@@ -862,7 +869,7 @@ pub(super) async fn build_tile_plan(
         cumulative_offsets: Arc::new(cumulative_offsets),
         entities,
         layout: Arc::from(layout),
-        leaf: Arc::new(LeafRegistry::with_defaults()),
+        leaf: Arc::new(leaf_registry),
         leaf_tile,
     })
 }
@@ -1468,8 +1475,17 @@ pub async fn run_tiles(
     leaf_format: TileFormat,
     pyramid_format: TileFormat,
     layout_mode: LayoutMode,
+    registry: &crate::registry::Registry,
 ) -> anyhow::Result<()> {
-    let plan = build_tile_plan(sources, total, diff_mode, show_xet_xorbs, layout_mode).await?;
+    let plan = build_tile_plan(
+        sources,
+        total,
+        diff_mode,
+        show_xet_xorbs,
+        layout_mode,
+        registry,
+    )
+    .await?;
 
     let leaf_format = derive_leaf_format(leaf_format, &plan.mode);
     let max_zoom = plan.max_zoom;

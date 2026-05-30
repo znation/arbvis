@@ -400,14 +400,14 @@ impl OutputDest {
 /// Drives the full arbvis pipeline (CLI → sources → layout → tiles/single).
 ///
 /// `registry` carries the pluggable surface (formats, layouts, diff builders,
-/// leaf renderers). Today only `registry.leaf` is consumed — by the tile
-/// pipeline at plan construction time. The other slots are placeholders that
-/// later steps will hand off to: `select_layout` (step 6),
-/// `prepare_diff_sources` (step 9), and format detection (step 12). The
-/// binary builds `Registry::with_defaults()` and passes it in; once
-/// `modelweightvis` splits out it will build its own registry by extending
-/// the default one with tensor-format plugins.
-async fn run(args: Args, _registry: registry::Registry) -> anyhow::Result<()> {
+/// leaf renderers). Today `registry.layouts` drives `select_layout` (step 6)
+/// and `registry.leaf` drives the tile pipeline; the other slots are still
+/// placeholders that later steps will hand off to `prepare_diff_sources`
+/// (step 9) and format detection (step 12). The binary builds
+/// `Registry::with_defaults()` and passes it in; once `modelweightvis` splits
+/// out it will build its own registry by extending the default one with
+/// tensor-format plugins.
+async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()> {
     if let Some(ref tile_dir) = args.regen_html {
         return tiled::regen_html(tile_dir);
     }
@@ -442,7 +442,7 @@ async fn run(args: Args, _registry: registry::Registry) -> anyhow::Result<()> {
             leaf_format,
             pyramid_format,
         };
-        return dispatch_render(sources, total, &labels, &cfg, dest, stream).await;
+        return dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await;
     }
 
     // --- Two-input diff ---------------------------------------------------
@@ -506,7 +506,7 @@ async fn run(args: Args, _registry: registry::Registry) -> anyhow::Result<()> {
             leaf_format,
             pyramid_format,
         };
-        return dispatch_render(sources, total, &labels, &cfg, dest, stream).await;
+        return dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await;
     }
 
     // --- Normal flow ------------------------------------------------------
@@ -550,7 +550,7 @@ async fn run(args: Args, _registry: registry::Registry) -> anyhow::Result<()> {
         leaf_format,
         pyramid_format,
     };
-    dispatch_render(sources, total, &labels, &cfg, dest, stream).await
+    dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await
 }
 
 /// Pick the viewer title: the user's `--title` if set, else a `&'static`
@@ -704,10 +704,11 @@ async fn dispatch_render(
     cfg: &RenderConfig,
     dest: OutputDest,
     stream: bool,
+    registry: &registry::Registry,
 ) -> anyhow::Result<()> {
     match dest {
         OutputDest::Window => {
-            run_single_blocking(labels.to_vec(), None, sources, total, cfg).await?;
+            run_single_blocking(labels.to_vec(), None, sources, total, cfg, registry).await?;
             Ok(())
         }
         OutputDest::SingleImage {
@@ -715,7 +716,15 @@ async fn dispatch_render(
             upload_hf,
             _tempdir,
         } => {
-            run_single_blocking(labels.to_vec(), Some(local.clone()), sources, total, cfg).await?;
+            run_single_blocking(
+                labels.to_vec(),
+                Some(local.clone()),
+                sources,
+                total,
+                cfg,
+                registry,
+            )
+            .await?;
             if let Some(url) = upload_hf {
                 deploy::upload_file_to(&url, &local).await?;
             }
@@ -735,6 +744,7 @@ async fn dispatch_render(
                 space,
                 cfg,
                 stream,
+                registry,
             )
             .await
         }
@@ -750,10 +760,14 @@ async fn run_single_blocking(
     sources: Vec<Source>,
     total: u64,
     cfg: &RenderConfig,
+    registry: &registry::Registry,
 ) -> anyhow::Result<()> {
     let diff_mode = cfg.diff_mode;
     let show_xet_xorbs = cfg.show_xet_xorbs;
     let layout_mode = cfg.layout_mode;
+    // `spawn_blocking` requires a `'static` closure, so clone the registry
+    // (cheap — every slot is an `Arc<…>` clone).
+    let registry = registry.clone();
     tokio::task::spawn_blocking(move || {
         single::run_single(
             &labels,
@@ -763,6 +777,7 @@ async fn run_single_blocking(
             diff_mode,
             show_xet_xorbs,
             layout_mode,
+            &registry,
         )
     })
     .await
@@ -789,10 +804,11 @@ async fn render_tiles(
     space: Option<String>,
     cfg: &RenderConfig,
     stream: bool,
+    registry: &registry::Registry,
 ) -> anyhow::Result<()> {
     let hf_destined = upload_hf.is_some() || space.is_some();
     if stream && hf_destined {
-        return render_tiles_streaming(sources, total, upload_hf, space, cfg).await;
+        return render_tiles_streaming(sources, total, upload_hf, space, cfg, registry).await;
     }
 
     let local = local.ok_or_else(|| {
@@ -824,6 +840,7 @@ async fn render_tiles(
         cfg.leaf_format,
         cfg.pyramid_format,
         cfg.layout_mode,
+        registry,
     )
     .await?;
     if let Some(ref space_id) = space {
@@ -844,6 +861,7 @@ async fn render_tiles_streaming(
     upload_hf: Option<String>,
     space: Option<String>,
     cfg: &RenderConfig,
+    registry: &registry::Registry,
 ) -> anyhow::Result<()> {
     use crate::tiled::streaming::run_tiles_hf_streaming;
 
@@ -861,6 +879,7 @@ async fn render_tiles_streaming(
             cfg.leaf_format,
             cfg.pyramid_format,
             cfg.layout_mode,
+            registry,
         )
         .await?;
         deploy::deploy_space_app(&space_id, &bucket.repo_id, html).await?;
@@ -882,6 +901,7 @@ async fn render_tiles_streaming(
         cfg.leaf_format,
         cfg.pyramid_format,
         cfg.layout_mode,
+        registry,
     )
     .await?;
     Ok(())

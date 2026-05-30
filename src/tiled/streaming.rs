@@ -35,11 +35,20 @@ pub async fn run_tiles_hf_streaming(
     leaf_format: TileFormat,
     pyramid_format: TileFormat,
     layout_mode: LayoutMode,
+    registry: &crate::registry::Registry,
 ) -> anyhow::Result<Vec<u8>> {
     crate::hf_url::require_token()?;
     let client = crate::hf_url::client()?;
 
-    let plan = build_tile_plan(sources, total, diff_mode, show_xet_xorbs, layout_mode).await?;
+    let plan = build_tile_plan(
+        sources,
+        total,
+        diff_mode,
+        show_xet_xorbs,
+        layout_mode,
+        registry,
+    )
+    .await?;
     let leaf_format = derive_leaf_format(leaf_format, &plan.mode);
     let tile_size = TILE;
     let max_zoom = plan.max_zoom;

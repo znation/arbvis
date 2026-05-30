@@ -145,6 +145,118 @@ impl LayoutShape for arch::ArchLayout {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Layout plugins
+//
+// `select_layout` (below) iterates `registry.layouts` in descending priority
+// and returns the first plugin that's `applicable` and whose `build` returns
+// `Some`. The three built-in plugins cover the existing layout selection
+// tree: MoE-diff at priority 200, regular arch at 100, byte-Hilbert at the
+// `i32::MIN` floor.
+// ---------------------------------------------------------------------------
+
+/// Byte-Hilbert plugin — always applies, always builds. The floor of the
+/// priority stack.
+pub struct HilbertLayoutPlugin;
+
+impl crate::registry::LayoutPlugin for HilbertLayoutPlugin {
+    fn id(&self) -> &'static str {
+        "hilbert-bytes"
+    }
+    fn priority(&self) -> i32 {
+        i32::MIN
+    }
+    fn applicable(&self, _ctx: &crate::registry::LayoutBuildCtx<'_>) -> bool {
+        true
+    }
+    fn build(&self, ctx: &crate::registry::LayoutBuildCtx<'_>) -> Option<Box<dyn LayoutShape>> {
+        Some(Box::new(hilbert::HilbertLayout::from_total(
+            ctx.total_bytes,
+        )))
+    }
+}
+
+/// Architectural plugin — applies when sources carry safetensors metadata
+/// and `--layout` doesn't force hilbert. Build returns `None` if no
+/// transformer-style structure is detectable.
+pub struct ArchLayoutPlugin;
+
+impl ArchLayoutPlugin {
+    /// In non-diff mode every source must be safetensors (otherwise the user
+    /// has explicitly mixed in non-tensor inputs they'd expect to see). In
+    /// diff mode it's enough that any source carries safetensors info: the
+    /// typical case is a model-repo diff where the tensor sources are the
+    /// point and tokenizer/config diffs are incidental.
+    fn eligible(ctx: &crate::registry::LayoutBuildCtx<'_>) -> bool {
+        if matches!(ctx.mode, LayoutMode::Hilbert) {
+            return false;
+        }
+        let all = !ctx.sources.is_empty() && ctx.sources.iter().all(|s| s.model_info.is_some());
+        let any = ctx.sources.iter().any(|s| s.model_info.is_some());
+        if ctx.diff_mode {
+            any
+        } else {
+            all
+        }
+    }
+}
+
+impl crate::registry::LayoutPlugin for ArchLayoutPlugin {
+    fn id(&self) -> &'static str {
+        "arch"
+    }
+    fn priority(&self) -> i32 {
+        100
+    }
+    fn applicable(&self, ctx: &crate::registry::LayoutBuildCtx<'_>) -> bool {
+        Self::eligible(ctx)
+    }
+    fn build(&self, ctx: &crate::registry::LayoutBuildCtx<'_>) -> Option<Box<dyn LayoutShape>> {
+        let arch = arch::ArchLayout::try_build(ctx.sources, ctx.cumulative_offsets, ctx.metas)?;
+        // Diff-mode info note: surface tensor sources that don't carry
+        // safetensors info (e.g. tokenizer.json file diffs) — they won't
+        // appear on the arch canvas.
+        if ctx.diff_mode {
+            let all = !ctx.sources.is_empty() && ctx.sources.iter().all(|s| s.model_info.is_some());
+            if !all {
+                let skipped = ctx
+                    .sources
+                    .iter()
+                    .filter(|s| s.model_info.is_none())
+                    .count();
+                log::info!(
+                    "arch layout: {skipped} non-safetensors diff source(s) will not appear on the arch canvas (file-level diffs are only rendered in --layout hilbert)"
+                );
+            }
+        }
+        Some(Box::new(arch))
+    }
+}
+
+/// MoE-diff plugin — applies when any source carries a `MoeCell` tag (only
+/// emitted by [`crate::data::prepare_moe_diff_sources`], so this fork can't
+/// collide with a normal arch run).
+pub struct MoeDiffLayoutPlugin;
+
+impl crate::registry::LayoutPlugin for MoeDiffLayoutPlugin {
+    fn id(&self) -> &'static str {
+        "moe-diff"
+    }
+    fn priority(&self) -> i32 {
+        200
+    }
+    fn applicable(&self, ctx: &crate::registry::LayoutBuildCtx<'_>) -> bool {
+        if matches!(ctx.mode, LayoutMode::Hilbert) {
+            return false;
+        }
+        ctx.sources.iter().any(|s| s.moe_cell.is_some())
+    }
+    fn build(&self, ctx: &crate::registry::LayoutBuildCtx<'_>) -> Option<Box<dyn LayoutShape>> {
+        arch::ArchLayout::try_build_moe_diff(ctx.sources, ctx.cumulative_offsets)
+            .map(|l| Box::new(l) as Box<dyn LayoutShape>)
+    }
+}
+
 /// Build the layout for the given sources. Returns a byte-Hilbert layout for
 /// non-architectural runs.
 ///
@@ -155,13 +267,11 @@ impl LayoutShape for arch::ArchLayout {
 /// subset of shards was loaded; (2) extend the canonical sub-path set with
 /// tensor names listed in the index but not loaded. Pass `&[]` to opt out.
 ///
-/// `diff_mode` relaxes the all-safetensors gate. In a diff run between two
-/// model repos, every per-tensor `TensorDiff` source carries synthetic
-/// safetensors info, but non-tensor file diffs (e.g. tokenizer.json) remain
-/// without it — under the strict all-safetensors gate they'd block arch
-/// selection and force the whole run back to Hilbert. In diff mode we accept
-/// arch as long as *some* source has safetensors; non-safetensors diff
-/// sources stay in the pipeline but aren't placed on the arch canvas.
+/// `diff_mode` relaxes the all-safetensors gate (see `ArchLayoutPlugin`).
+///
+/// Dispatch iterates `registry.layouts` in descending priority. The
+/// `i32::MIN` `HilbertLayoutPlugin` floor always builds, so iteration always
+/// terminates with a layout.
 pub fn select_layout(
     sources: &[Source],
     cumulative_offsets: &[u64],
@@ -169,58 +279,65 @@ pub fn select_layout(
     mode: LayoutMode,
     metas: &[SourceMeta],
     diff_mode: bool,
+    registry: &crate::registry::Registry,
 ) -> Box<dyn LayoutShape> {
-    // Force-hilbert path: use legacy byte-Hilbert geometry as-is.
-    if matches!(mode, LayoutMode::Hilbert) {
-        return Box::new(hilbert::HilbertLayout::from_total(total_bytes));
-    }
-
-    // MoE-diff: any source carries a `MoeCell` tag → build the expert-vs-expert
-    // matrix layout. Tagged Sources are emitted only by
-    // [`crate::data::prepare_moe_diff_sources`], so this fork can never
-    // collide with a normal arch run.
-    if sources.iter().any(|s| s.moe_cell.is_some()) {
-        if let Some(arch) = arch::ArchLayout::try_build_moe_diff(sources, cumulative_offsets) {
-            return Box::new(arch);
-        }
-        log::warn!("moe-diff sources present but layout build failed; falling back to hilbert");
-        return Box::new(hilbert::HilbertLayout::from_total(total_bytes));
-    }
-
-    // Architectural requires safetensors data AND a detectable structure. In
-    // non-diff mode every source must be safetensors (otherwise the user has
-    // explicitly mixed in non-tensor inputs they'd expect to see). In diff
-    // mode it's enough that any source carries safetensors info: the typical
-    // case is a model-repo diff where the tensor sources are the point and
-    // tokenizer/config diffs are incidental.
-    let all_safetensors = !sources.is_empty() && sources.iter().all(|s| s.model_info.is_some());
-    let any_safetensors = sources.iter().any(|s| s.model_info.is_some());
-    let arch_eligible = if diff_mode {
-        any_safetensors
-    } else {
-        all_safetensors
+    let ctx = crate::registry::LayoutBuildCtx {
+        sources,
+        cumulative_offsets,
+        total_bytes,
+        mode,
+        metas,
+        diff_mode,
     };
 
-    if arch_eligible {
-        if let Some(arch) = arch::ArchLayout::try_build(sources, cumulative_offsets, metas) {
-            if diff_mode && !all_safetensors {
-                let skipped = sources.iter().filter(|s| s.model_info.is_none()).count();
-                log::info!(
-                    "arch layout: {skipped} non-safetensors diff source(s) will not appear on the arch canvas (file-level diffs are only rendered in --layout hilbert)"
-                );
-            }
-            return Box::new(arch);
+    // Snapshot plugins ordered by descending priority. A handful of plugins,
+    // sorted once per call — cheap. `Reverse` (not `-p.priority()`) because
+    // the byte-Hilbert floor sits at `i32::MIN` and negating it overflows.
+    let mut sorted: Vec<&std::sync::Arc<dyn crate::registry::LayoutPlugin>> =
+        registry.layouts.iter().collect();
+    sorted.sort_by_key(|p| std::cmp::Reverse(p.priority()));
+
+    let mut chosen: Option<Box<dyn LayoutShape>> = None;
+    let mut moe_applicable_but_failed = false;
+    let mut arch_was_applicable = false;
+    for plugin in &sorted {
+        if !plugin.applicable(&ctx) {
+            continue;
         }
-        if matches!(mode, LayoutMode::Arch) {
+        let pid = plugin.id();
+        match plugin.build(&ctx) {
+            Some(layout) => {
+                chosen = Some(layout);
+                break;
+            }
+            None => {
+                if pid == "moe-diff" {
+                    moe_applicable_but_failed = true;
+                }
+                if pid == "arch" {
+                    arch_was_applicable = true;
+                }
+            }
+        }
+    }
+    let chosen = chosen
+        .expect("registry.layouts must include a floor plugin (HilbertLayoutPlugin at i32::MIN)");
+
+    // Diagnostic logs preserve the original `select_layout` messages.
+    if moe_applicable_but_failed {
+        log::warn!("moe-diff sources present but layout build failed; falling back to hilbert");
+    }
+    if matches!(mode, LayoutMode::Arch) && chosen.id() != "arch" {
+        if arch_was_applicable {
             log::warn!(
                 "--layout arch requested but no recognisable structure; falling back to hilbert"
             );
+        } else {
+            log::warn!(
+                "--layout arch requested but no input carries safetensors data; falling back to hilbert"
+            );
         }
-    } else if matches!(mode, LayoutMode::Arch) {
-        log::warn!(
-            "--layout arch requested but no input carries safetensors data; falling back to hilbert"
-        );
     }
 
-    Box::new(hilbert::HilbertLayout::from_total(total_bytes))
+    chosen
 }

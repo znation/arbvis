@@ -23,6 +23,20 @@ use crate::xet::{self, XetReader, XetTerm};
 /// runtime have enough simultaneous awaiting tasks to keep the throttle full.
 const SETUP_FETCH_CONCURRENCY: usize = 16;
 
+/// Seconds of zero-byte silence before [`download_specs_to_paths`] aborts an
+/// in-flight `hf-hub` `download_file` and treats it as a transient timeout.
+/// hf-hub's `reqwest::Client` is built without `.timeout()` / `.read_timeout()`
+/// and its streaming write loop (`stream_response_to_file_with_progress`) has
+/// no per-chunk timeout, so a CDN edge that silently stops sending bytes hangs
+/// the future forever. A `ProgressHandler` stamps the latest event time and a
+/// sibling watchdog cancels the future after this many seconds of silence.
+///
+/// Override with `ARBVIS_DOWNLOAD_STALL_SECS` if 30 s is too aggressive (very
+/// slow links may legitimately go 30 s between TCP windows under heavy
+/// congestion). The throttle's `Outcome::Timeout` retry budget
+/// (`MAX_TIMEOUT_RETRIES = 5`) gates total wall-time before we give up.
+const DEFAULT_DOWNLOAD_STALL_SECS: u64 = 30;
+
 /// Per-tensor RMS sampling reads each sample as a 64 KB suffix of a
 /// `Data::Xet::fetch_range` call, which decompresses the underlying *xorb
 /// descriptor* — typically 50-65 MB before deduplication. Running 16 of those
@@ -696,10 +710,84 @@ pub async fn materialize_http_sources(sources: &mut [Source]) -> anyhow::Result<
     Ok(())
 }
 
+/// `ProgressHandler` that records the wall-clock time of the most recent
+/// hf-hub progress event into a shared atomic. Paired with the watchdog future
+/// inside [`download_specs_to_paths`] to detect silent body-stream stalls.
+#[derive(Clone)]
+struct StallSentinel {
+    last_event_unix_ms: Arc<std::sync::atomic::AtomicI64>,
+}
+
+impl hf_hub::progress::ProgressHandler for StallSentinel {
+    fn on_progress(&self, _event: &hf_hub::progress::ProgressEvent) {
+        self.last_event_unix_ms
+            .store(unix_now_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn unix_now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Per-attempt error from the closure passed to `with_throttle` inside
+/// [`download_specs_to_paths`]. Wraps `hf-hub`'s `HFError` and adds a `Stalled`
+/// variant that classifies as `Outcome::Timeout`, so the AIMD throttle's
+/// existing retry path (`MAX_TIMEOUT_RETRIES`, backoff, scale-down) handles
+/// connection stalls without any special-case logic above.
+#[derive(Debug)]
+enum DownloadAttemptError {
+    Hf(hf_hub::HFError),
+    Stalled { filename: String, idle_secs: u64 },
+}
+
+impl std::fmt::Display for DownloadAttemptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DownloadAttemptError::Hf(e) => write!(f, "{e}"),
+            DownloadAttemptError::Stalled {
+                filename,
+                idle_secs,
+            } => write!(
+                f,
+                "{filename}: no progress for {idle_secs}s — treating as transient timeout",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DownloadAttemptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DownloadAttemptError::Hf(e) => Some(e),
+            DownloadAttemptError::Stalled { .. } => None,
+        }
+    }
+}
+
+impl crate::throttle::ErrorClassify for DownloadAttemptError {
+    fn classify(&self) -> crate::throttle::Outcome {
+        match self {
+            DownloadAttemptError::Hf(e) => e.classify(),
+            DownloadAttemptError::Stalled { .. } => crate::throttle::Outcome::Timeout,
+        }
+    }
+}
+
 /// Download a batch of [`RemoteFileSpec`]s to the local hf-hub cache and return
 /// the local paths in the same order. Drives the AIMD throttle through
 /// [`crate::throttle::with_throttle`] and reports progress via a one-shot
 /// `setup_progress` bar.
+///
+/// Each attempt is wrapped in a stall watchdog: a [`StallSentinel`] passed as
+/// the hf-hub progress handler stamps every event, and a sibling future
+/// cancels the download if no event arrives for `DEFAULT_DOWNLOAD_STALL_SECS`
+/// (`ARBVIS_DOWNLOAD_STALL_SECS` env override). Stalls surface as
+/// [`DownloadAttemptError::Stalled`], which classifies as `Outcome::Timeout`
+/// and goes through the throttle's normal retry/backoff path.
 ///
 /// Shared by every disk-backed materialisation path:
 /// [`materialize_http_sources`] (normal flow's `SourceKind::Http` swap) and
@@ -710,9 +798,16 @@ async fn download_specs_to_paths(
     progress_label: &str,
 ) -> anyhow::Result<Vec<PathBuf>> {
     use crate::throttle::with_throttle;
+    use std::sync::atomic::{AtomicI64, Ordering};
 
     let pb = setup_progress(progress_label, specs.len() as u64);
     let pb_for_workers = pb.clone();
+
+    let stall_secs: u64 = std::env::var("ARBVIS_DOWNLOAD_STALL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_DOWNLOAD_STALL_SECS);
+    let stall_ms: i64 = (stall_secs as i64).saturating_mul(1000);
 
     let mut downloads: Vec<(usize, anyhow::Result<PathBuf>)> =
         stream::iter(specs.iter().cloned().enumerate())
@@ -722,28 +817,65 @@ async fn download_specs_to_paths(
                     let filename = (*spec.filename).clone();
                     let revision = (*spec.revision).clone();
                     let label = format!("download_file {filename}");
-                    let result = with_throttle(&label, || async {
-                        match &spec.repo {
-                            RemoteRepo::Model(r) => {
-                                r.download_file()
-                                    .filename(filename.clone())
-                                    .revision(revision.clone())
-                                    .send()
-                                    .await
-                            }
-                            RemoteRepo::Dataset(r) => {
-                                r.download_file()
-                                    .filename(filename.clone())
-                                    .revision(revision.clone())
-                                    .send()
-                                    .await
-                            }
-                            RemoteRepo::Space(r) => {
-                                r.download_file()
-                                    .filename(filename.clone())
-                                    .revision(revision.clone())
-                                    .send()
-                                    .await
+                    let result = with_throttle(&label, || {
+                        let spec = spec.clone();
+                        let filename = filename.clone();
+                        let revision = revision.clone();
+                        async move {
+                            let last_event = Arc::new(AtomicI64::new(unix_now_ms()));
+                            let sentinel = StallSentinel {
+                                last_event_unix_ms: Arc::clone(&last_event),
+                            };
+                            let download_fut = async {
+                                match &spec.repo {
+                                    RemoteRepo::Model(r) => {
+                                        r.download_file()
+                                            .filename(filename.clone())
+                                            .revision(revision.clone())
+                                            .progress(sentinel)
+                                            .send()
+                                            .await
+                                    }
+                                    RemoteRepo::Dataset(r) => {
+                                        r.download_file()
+                                            .filename(filename.clone())
+                                            .revision(revision.clone())
+                                            .progress(sentinel)
+                                            .send()
+                                            .await
+                                    }
+                                    RemoteRepo::Space(r) => {
+                                        r.download_file()
+                                            .filename(filename.clone())
+                                            .revision(revision.clone())
+                                            .progress(sentinel)
+                                            .send()
+                                            .await
+                                    }
+                                }
+                            };
+                            let watchdog = async {
+                                loop {
+                                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                    let idle_ms = unix_now_ms()
+                                        .saturating_sub(last_event.load(Ordering::Relaxed));
+                                    if idle_ms >= stall_ms {
+                                        return idle_ms;
+                                    }
+                                }
+                            };
+                            tokio::select! {
+                                r = download_fut => r.map_err(DownloadAttemptError::Hf),
+                                idle_ms = watchdog => {
+                                    let idle_secs = (idle_ms / 1000).max(0) as u64;
+                                    log::warn!(
+                                        "{filename}: download stalled (no bytes for {idle_secs}s); aborting attempt and retrying via throttle"
+                                    );
+                                    Err(DownloadAttemptError::Stalled {
+                                        filename: filename.clone(),
+                                        idle_secs,
+                                    })
+                                }
                             }
                         }
                     })

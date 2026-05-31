@@ -1288,32 +1288,8 @@ impl crate::registry::DiffSourceBuilder for JsonDiffBuilder {
     }
 }
 
-/// Tensor-aware diff (safetensors / GGUF). Applies when both paths look
-/// like a recognised model-format file.
-pub struct TensorDiffBuilder;
-
-#[async_trait::async_trait]
-impl crate::registry::DiffSourceBuilder for TensorDiffBuilder {
-    fn id(&self) -> &'static str {
-        "tensor"
-    }
-    fn priority(&self) -> i32 {
-        300
-    }
-    async fn try_build(
-        &self,
-        ctx: &crate::registry::DiffBuildCtx<'_>,
-    ) -> anyhow::Result<Option<(Vec<Source>, u64)>> {
-        let is_st = |p: &Path| -> bool { SourceFormat::from_path(p).is_some() };
-        if !(is_st(ctx.original) && is_st(ctx.modified)) {
-            return Ok(None);
-        }
-        let out =
-            build_safetensors_diff_sources(ctx.original, ctx.modified, ctx.is_finetune, ctx.metric)
-                .await?;
-        Ok(Some(out))
-    }
-}
+// `TensorDiffBuilder` lives in `modelweightvis::diff` (step 12e). The
+// arbvis default registry no longer wires it up.
 
 /// Plain-byte diff: builds one `SourceKind::Diff` source over a same-sized
 /// pair. The floor of the builder priority stack — applies whenever the two
@@ -3050,7 +3026,7 @@ pub async fn prepare_moe_diff_sources(
 }
 
 /// Build per-tensor diff Sources from two single .safetensors files.
-async fn build_safetensors_diff_sources(
+pub async fn build_safetensors_diff_sources(
     original: &Path,
     modified: &Path,
     is_finetune: bool,

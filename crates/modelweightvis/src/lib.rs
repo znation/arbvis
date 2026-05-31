@@ -1,28 +1,30 @@
 //! Tensor-format-aware visualization built on `arbvis`.
 //!
-//! Today this crate is a thin "extra plugins" layer: `register_all` adds the
-//! tensor-aware layouts (arch, MoE-diff), the tensor-diff source builder,
-//! and the `"arch"` leaf loader+renderer pair on top of an
-//! `arbvis::Registry::with_defaults()`. The plugin TYPES still live in the
-//! arbvis crate (step 12e relocates them along with the heavy deps
-//! `candle-core`, `regex`, `zip`, `half`).
+//! Provides the model-aware plugin set (architectural + MoE-diff layouts,
+//! tensor-diff source builder, arch leaf loader+renderer) layered on top
+//! of `arbvis::Registry::with_defaults`. The binary calls `register_all`
+//! before handing off to `arbvis::run`, which is what makes the
+//! `modelweightvis` binary differ from the byte-only `arbvis` binary.
 //!
-//! The modelweightvis binary calls this before handing off to
-//! `arbvis::run`, which is how the byte-only `arbvis` binary and the
-//! tensor-aware `modelweightvis` binary diverge.
+//! The underlying types these plugins build (`arbvis::ArchLayout`,
+//! `arbvis::TensorDiffSource`, the `format::*` parsers, etc.) still live
+//! in arbvis as pub-exposed items. The full source relocation that would
+//! actually lift the heavy deps (`candle-core`, `regex`, `zip`, `half`)
+//! out of arbvis is deferred — see the workspace README.
+
+mod diff;
+mod layout;
+mod leaf;
+
+pub use diff::TensorDiffBuilder;
+pub use layout::{ArchLayoutPlugin, MoeDiffLayoutPlugin};
+pub use leaf::{ArchRegionsLoader, ArchRegionsRenderer};
 
 use std::sync::Arc;
 
-use arbvis::{
-    ArchLayoutPlugin, ArchRegionsLoader, ArchRegionsRenderer, MoeDiffLayoutPlugin, Registry,
-    TensorDiffBuilder,
-};
+use arbvis::Registry;
 
-/// Register every tensor-aware plugin on `registry`. Idempotent in the
-/// "every-id-replaces" sense: re-registering an id replaces the prior
-/// `LeafLoader`/`LeafRenderer` for that id, and re-pushing a
-/// `LayoutPlugin`/`DiffSourceBuilder` just duplicates it (which the
-/// priority loop tolerates, but you shouldn't do twice in the same run).
+/// Register every tensor-aware plugin on `registry`.
 pub fn register_all(registry: &mut Registry) {
     // Tensor-aware diff (.safetensors / .gguf file pairs) — priority 300 so
     // it wins over the JSON / plain-byte fallbacks for matching pairs.

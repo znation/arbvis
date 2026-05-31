@@ -16,7 +16,6 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 
 use crate::data::Data;
-use crate::layout::arch::ArchLayout;
 use crate::layout::LayoutShape;
 
 use super::leaf::TileFormat;
@@ -196,51 +195,6 @@ impl LeafLoader for HilbertBytesLoader {
     }
 }
 
-/// Architectural leaf loader; thin wrapper over
-/// [`super::leaf_arch::load_arch_tile_regions`].
-pub struct ArchRegionsLoader;
-
-impl LeafLoader for ArchRegionsLoader {
-    fn id(&self) -> &'static str {
-        "arch"
-    }
-
-    fn needs_io(&self, _ctx: &LoadCtx<'_>) -> bool {
-        // Arch always fetches at least one tensor region per tile — the
-        // renderer needs them regardless of `LeafMode`.
-        true
-    }
-
-    fn load<'a>(&'a self, ctx: &'a LoadCtx<'a>) -> BoxFuture<'a, anyhow::Result<LoadedTile>> {
-        Box::pin(async move {
-            // The arch loader is only registered against the `"arch"` layout
-            // id, and the plan-build site routes by id; a layout reaching here
-            // that isn't an `ArchLayout` is a registry/plan bug, not a runtime
-            // case.
-            let arch = ctx
-                .layout
-                .as_any()
-                .downcast_ref::<ArchLayout>()
-                .expect("ArchRegionsLoader dispatched against non-ArchLayout");
-            let at = super::leaf_arch::load_arch_tile_regions(
-                ctx.zoom,
-                ctx.tx,
-                ctx.ty,
-                arch,
-                ctx.source_data,
-                ctx.cumulative_offsets,
-            )
-            .await?;
-            Ok(LoadedTile {
-                tx: ctx.tx,
-                ty: ctx.ty,
-                tile_buf: None,
-                arch_tile: Some(at),
-            })
-        })
-    }
-}
-
 /// Byte-Hilbert leaf renderer; thin wrapper over [`super::render_one`].
 pub struct HilbertBytesRenderer;
 
@@ -262,15 +216,5 @@ impl LeafRenderer for HilbertBytesRenderer {
     }
 }
 
-/// Architectural leaf renderer; thin wrapper over [`super::render_one_arch`].
-pub struct ArchRegionsRenderer;
-
-impl LeafRenderer for ArchRegionsRenderer {
-    fn id(&self) -> &'static str {
-        "arch"
-    }
-
-    fn render(&self, tile: LoadedTile, ctx: &RenderCtx<'_>) -> Result<EncodedTile, String> {
-        super::render_one_arch(tile, ctx.mode, ctx.fmt)
-    }
-}
+// `ArchRegionsLoader` and `ArchRegionsRenderer` live in `modelweightvis::leaf`
+// (step 12e). The arbvis default `LeafRegistry` no longer wires them up.

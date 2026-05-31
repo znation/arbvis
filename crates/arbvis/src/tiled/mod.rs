@@ -28,10 +28,7 @@ use crate::tiled::leaf::{
     render_leaf_tile_xet_dtype_from_buf, render_leaf_tile_xet_from_buf, TileFormat, TILE,
     TILE_LOG2, TILE_PIXELS,
 };
-use crate::tiled::leaf_arch::{
-    render_arch_tile_diff, render_arch_tile_dtype, render_arch_tile_plain, render_arch_tile_xet,
-    render_arch_tile_xet_dtype, LoadedArchTile,
-};
+use crate::tiled::leaf_arch::LoadedArchTile;
 use crate::tiled::leaf_renderer::{LeafRegistry, LeafTile, LoadCtx, RenderCtx};
 use crate::tiled::pyramid_accum::{LocalFileSink, PyramidAccumulator};
 use crate::xet::{XorbMap, TABLEAU_20};
@@ -166,24 +163,22 @@ impl TileCoords {
 /// `pub(super)` because the `leaf_renderer` submodule's `LeafRenderer` impls
 /// consume one of these and dispatch to the right `render_one*` function.
 pub struct LoadedTile {
-    pub(super) tx: u32,
-    pub(super) ty: u32,
+    pub tx: u32,
+    pub ty: u32,
     /// `Some` when the mode needs raw byte data AND the layout is the legacy
     /// Hilbert curve (one fixed 256 KiB buffer per tile); `None` for dtype
     /// mode or architectural mode (which uses `arch_tile` instead).
-    pub(super) tile_buf: Option<Box<[u8; TILE_PIXELS]>>,
+    pub tile_buf: Option<Box<[u8; TILE_PIXELS]>>,
     /// `Some` when the layout is architectural; carries per-region byte
     /// slices for the (typically O(tens)) tensors that intersect this tile.
-    pub(super) arch_tile: Option<LoadedArchTile>,
+    pub arch_tile: Option<LoadedArchTile>,
 }
 
-/// `pub(super)` because `tiled::streaming`'s pipeline closures destructure
-/// `EncodedTile` (the `tx`/`ty`/`bytes`/`image` fields).
 pub struct EncodedTile {
-    pub(super) tx: u32,
-    pub(super) ty: u32,
-    pub(super) image: image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
-    pub(super) bytes: Vec<u8>,
+    pub tx: u32,
+    pub ty: u32,
+    pub image: image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+    pub bytes: Vec<u8>,
 }
 
 /// Which leaf render to run.
@@ -1293,48 +1288,8 @@ pub(super) fn render_one(
     })
 }
 
-/// Architectural-layout render dispatch. Same set of `LeafMode` variants;
-/// each routes to a `leaf_arch::render_arch_tile_*` rather than the
-/// byte-Hilbert renderer.
-pub(super) fn render_one_arch(
-    tile: LoadedTile,
-    mode: &LeafMode,
-    fmt: TileFormat,
-) -> Result<EncodedTile, String> {
-    let LoadedTile {
-        tx,
-        ty,
-        tile_buf: _,
-        arch_tile,
-    } = tile;
-    let at = arch_tile.unwrap_or_default();
-    let (image, bytes) = match mode {
-        LeafMode::Plain { pixel_lut } => render_arch_tile_plain(&at, pixel_lut, fmt)?,
-        LeafMode::Xet {
-            pixel_lut,
-            xorb_ranges,
-            tableau,
-        } => render_arch_tile_xet(&at, pixel_lut, xorb_ranges, tableau, fmt)?,
-        LeafMode::Dtype { .. } => render_arch_tile_dtype(&at, fmt)?,
-        LeafMode::Diff {
-            pixel_lut,
-            fills: _,
-            plain_lut: _,
-            tints: _,
-        } => render_arch_tile_diff(&at, pixel_lut, fmt)?,
-        LeafMode::XetDtype {
-            xorb_ranges,
-            tableau,
-            dtype_ranges: _,
-        } => render_arch_tile_xet_dtype(&at, xorb_ranges, tableau, fmt)?,
-    };
-    Ok(EncodedTile {
-        tx,
-        ty,
-        image,
-        bytes,
-    })
-}
+// `render_one_arch` lives in `modelweightvis::leaf::ArchRegionsRenderer::render`
+// (step 12e). arbvis no longer needs the architectural render dispatch.
 
 /// Pick the actual leaf tile format given the user's request and the render
 /// mode. When the user asked for AVIF and the mode produces ≤256 distinct

@@ -2537,7 +2537,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arbvis",
+ "async-trait",
  "clap",
+ "futures",
+ "log",
  "tokio",
 ]
 

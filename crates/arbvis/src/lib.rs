@@ -19,16 +19,27 @@ mod throttle;
 mod tiled;
 mod xet;
 
-pub use registry::{DiffSourceBuilder, LayoutPlugin, Registry};
-pub use tiled::leaf_renderer::{LeafLoader, LeafRenderer};
-
-// Plugin types still defined in arbvis (step 12e relocates them to
-// modelweightvis with the rest of the model-side code). For now they're
-// pub-exposed so `modelweightvis::register_all` can register them on a
-// registry without pulling them through internal module paths.
-pub use data::TensorDiffBuilder;
-pub use layout::{ArchLayoutPlugin, MoeDiffLayoutPlugin};
-pub use tiled::leaf_renderer::{ArchRegionsLoader, ArchRegionsRenderer};
+// Public plugin/library surface. The tile pipeline, layout-selection, and
+// diff-source-prep plugins all dispatch through these. Step 12e moves the
+// model-aware plugin IMPLS to modelweightvis; the underlying types and
+// helpers stay here (the heavy-dep relocation is deferred — see the README
+// for the workspace status).
+pub use data::{
+    build_safetensors_diff_sources, CustomSource, Extensions, MoeCell, Source, SourceKind,
+    TensorDiffSource,
+};
+pub use format::{DiffFill, DiffMetric, ModelInfo, SourceFormat, TensorMeta};
+pub use layout::{arch::ArchLayout, CanvasGeom, LayoutMode, LayoutShape, TileRegion};
+pub use registry::{DiffBuildCtx, DiffSourceBuilder, LayoutBuildCtx, LayoutPlugin, Registry};
+pub use tiled::leaf::TileFormat;
+pub use tiled::leaf_arch::{
+    load_arch_tile_regions, render_arch_tile_diff, render_arch_tile_dtype, render_arch_tile_plain,
+    render_arch_tile_xet, render_arch_tile_xet_dtype, LoadedArchTile,
+};
+pub use tiled::leaf_renderer::{
+    LeafLoader, LeafRegistry, LeafRenderer, LeafTile, LoadCtx, RenderCtx,
+};
+pub use tiled::{EncodedTile, LeafMode, LoadedTile};
 
 use std::borrow::Cow;
 use std::fs::File;
@@ -42,11 +53,8 @@ use clap::{Parser, ValueEnum};
 use futures::stream::{StreamExt, TryStreamExt};
 use tempfile::TempDir;
 
-use crate::data::{InputSpec, Source};
-use crate::format::DiffMetric;
+use crate::data::InputSpec;
 use crate::hf_url::HfOutputSpec;
-use crate::layout::LayoutMode;
-use crate::tiled::leaf::TileFormat;
 
 /// Concurrency cap when resolving (downloading) `hf://` inputs at startup.
 /// Mirrors `data::SETUP_FETCH_CONCURRENCY` so user-visible parallelism stays

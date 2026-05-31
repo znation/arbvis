@@ -19,7 +19,16 @@ mod throttle;
 mod tiled;
 mod xet;
 
-pub use registry::Registry;
+pub use registry::{DiffSourceBuilder, LayoutPlugin, Registry};
+pub use tiled::leaf_renderer::{LeafLoader, LeafRenderer};
+
+// Plugin types still defined in arbvis (step 12e relocates them to
+// modelweightvis with the rest of the model-side code). For now they're
+// pub-exposed so `modelweightvis::register_all` can register them on a
+// registry without pulling them through internal module paths.
+pub use data::TensorDiffBuilder;
+pub use layout::{ArchLayoutPlugin, MoeDiffLayoutPlugin};
+pub use tiled::leaf_renderer::{ArchRegionsLoader, ArchRegionsRenderer};
 
 use std::borrow::Cow;
 use std::fs::File;

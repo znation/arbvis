@@ -122,25 +122,24 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Registry populated with arbvis's own built-ins.
+    /// Registry populated with arbvis's own (non-tensor) built-ins.
     ///
-    /// Today: `leaf` carries the `"hilbert-bytes"` + `"arch"` loader/renderer
-    /// pairs; `layouts` carries `HilbertLayoutPlugin` (the `i32::MIN` floor),
-    /// `ArchLayoutPlugin`, and `MoeDiffLayoutPlugin`; `diffs` carries
-    /// `JsonDiffBuilder`, `TensorDiffBuilder`, and `PlainBytesDiffBuilder`.
-    /// The `"arch"` parts and `TensorDiffBuilder` move to modelweightvis in
-    /// step 12. `formats` remains empty until step 12 populates it.
+    /// Today: `leaf` carries the `"hilbert-bytes"` loader/renderer pair;
+    /// `layouts` carries `HilbertLayoutPlugin` (the `i32::MIN` floor);
+    /// `diffs` carries `JsonDiffBuilder` and `PlainBytesDiffBuilder`.
+    ///
+    /// The model-aware bits (`"arch"` loader+renderer, `ArchLayoutPlugin`,
+    /// `MoeDiffLayoutPlugin`, `TensorDiffBuilder`) are registered by
+    /// `modelweightvis::register_all` on top of this default. The plugin
+    /// types themselves still live in arbvis (pub-exposed via the lib) —
+    /// step 12e is what actually relocates their source and lifts the heavy
+    /// deps (`candle-core`, `regex`, `zip`, `half`).
     pub fn with_defaults() -> Self {
         Self {
             formats: Vec::new(),
-            layouts: vec![
-                Arc::new(crate::layout::HilbertLayoutPlugin),
-                Arc::new(crate::layout::ArchLayoutPlugin),
-                Arc::new(crate::layout::MoeDiffLayoutPlugin),
-            ],
+            layouts: vec![Arc::new(crate::layout::HilbertLayoutPlugin)],
             leaf: LeafRegistry::with_defaults(),
             diffs: vec![
-                Arc::new(crate::data::TensorDiffBuilder),
                 Arc::new(crate::data::JsonDiffBuilder),
                 Arc::new(crate::data::PlainBytesDiffBuilder),
             ],

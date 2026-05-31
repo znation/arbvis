@@ -1,10 +1,9 @@
 //! Thin binary entrypoint for `modelweightvis`.
 //!
-//! Today this is functionally identical to the `arbvis` binary — it
-//! constructs the same default registry and hands off to `arbvis::run`. Step
-//! 12d moves the tensor-format / arch-layout / tensor-diff plugins out of
-//! arbvis into the `modelweightvis` library and registers them here on top
-//! of arbvis's defaults so the two binaries diverge.
+//! Reuses arbvis's CLI surface, runtime init, and dispatch — diverges from
+//! the byte-only `arbvis` binary by registering tensor-aware plugins
+//! (arch / MoE-diff layouts, tensor-diff source builder, arch leaf
+//! loader+renderer) on top of the default registry.
 
 use clap::Parser;
 
@@ -14,6 +13,7 @@ fn main() -> anyhow::Result<()> {
     // lifetime (drop stops the monitor). See `perf_monitor::spawn_if_enabled`.
     let _perf_monitor_stop = arbvis::perf_monitor_spawn_if_enabled();
     let args = arbvis::Args::parse();
-    let registry = arbvis::Registry::with_defaults();
+    let mut registry = arbvis::Registry::with_defaults();
+    modelweightvis::register_all(&mut registry);
     rt.block_on(arbvis::run(args, registry))
 }

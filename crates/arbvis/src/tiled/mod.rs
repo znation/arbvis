@@ -19,7 +19,6 @@ use crate::color::{build_diff_signed_lut, build_pixel_lut};
 use crate::data::{load_source_data, Data, Source, SourceKind};
 use crate::format::DiffFill;
 use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, rects_centroid};
-use crate::layout::arch::ArchLayout;
 use crate::layout::{select_layout, LayoutMode, LayoutShape};
 use crate::progress::{counter_style, multi, queue_style, status_style};
 use crate::throttle::{Throttle, MAX_FETCH_WORKERS};
@@ -463,6 +462,10 @@ pub(super) async fn build_tile_plan(
     layout_mode: LayoutMode,
     registry: &crate::registry::Registry,
 ) -> anyhow::Result<TilePlan> {
+    // Hilbert geometry derived from the byte total — also drives the
+    // generic file-rects entity path (`file_rects` reads `total_pixels`,
+    // `square_pixels`, `num_squares`, `height`, `kh`). For arch the trait's
+    // `canvas_geom`/`layout_entities` override these downstream.
     let mut s = 2 * TILE_LOG2 as u32;
     while (1u64 << s) < total {
         s += 1;
@@ -471,14 +474,6 @@ pub(super) async fn build_tile_plan(
     let kw = s.div_ceil(2);
     let height = 1u32 << kh;
     let width = 1u32 << kw;
-    let tile_size = TILE;
-    let max_zoom = kh - TILE_LOG2 as u32;
-    let width_tiles = width / tile_size;
-    let height_tiles = height / tile_size;
-    let world_w = TILE << (kw - kh);
-    // Hilbert canvases are always width≥height (kw ≥ kh), so the smaller axis
-    // collapses to a single TILE in geo space — i.e. world_h == TILE.
-    let world_h: u32 = TILE;
     let square_pixels: u64 = (height as u64) * (height as u64);
     let total_pixels: u64 = width as u64 * height as u64;
     let num_squares = 1u32 << (kw - kh);
@@ -740,7 +735,12 @@ pub(super) async fn build_tile_plan(
     // the `"arch"` renderer registered. Clone here so the plan owns its arc.
     let leaf_registry = registry.leaf.clone();
 
-    let arch_opt = layout.as_any().downcast_ref::<ArchLayout>();
+    // Canvas geometry + overlay entities are now layout-supplied: arch
+    // returns per-tensor rects from `layout_entities`; Hilbert falls back to
+    // the generic file-rects path computed above. This keeps `tiled/` free
+    // of concrete arch references — modelweightvis owns the arch layout but
+    // its trait impl populates everything the pipeline reads.
+    let geom = layout.canvas_geom();
     let (
         kh_out,
         width_tiles_out,
@@ -753,89 +753,20 @@ pub(super) async fn build_tile_plan(
         total_tiles_out,
         square_pixels_out,
         total_out,
-        arch_entities,
-    ) = if let Some(a) = arch_opt {
-        // Build per-tensor entities directly from the architectural layout.
-        // Skip Hilbert-decomposition: each entity is a single rect.
-        let mut ents: Vec<FileEntity> = Vec::with_capacity(a.tensors.len());
-        for t in &a.tensors {
-            // Overlay rectangles use the on-canvas *display* footprint, not
-            // the element grid, so labels/segments line up with what's drawn.
-            let w = t.disp_w;
-            let h = t.disp_h;
-            let x0 = t.canvas_x;
-            let y0 = t.canvas_y;
-            let x1 = x0.saturating_add(w);
-            let y1 = y0.saturating_add(h);
-            let segments = vec![
-                (x0, y0, x1, y0),
-                (x1, y0, x1, y1),
-                (x0, y1, x1, y1),
-                (x0, y0, x0, y1),
-            ];
-            let cx = x0 + (x1 - x0) / 2;
-            let cy = y0 + (y1 - y0) / 2;
-            ents.push(FileEntity {
-                name: t.name.clone(),
-                pixel_x: cx,
-                pixel_y: cy,
-                hue: t.hue,
-                byte_size: t
-                    .tensor_rows
-                    .saturating_mul(t.tensor_cols)
-                    .saturating_mul(t.dtype.element_size() as u64),
-                bbox: (x0, y0, x1, y1),
-                segments,
-            });
-        }
-        // For architectural the `kh`/`square_pixels`/`total` Hilbert
-        // fields are unused at render time; populate them with safe
-        // values that won't divide by zero if accidentally read.
-        //
-        // `world_w`/`world_h` are the geographic extents at zoom 0 in
-        // leaflet's coordinate system. At leaf zoom (`max_zoom`) the tile
-        // grid is `width_tiles × height_tiles`; halving each step down to
-        // zoom 0 leaves `width_tiles / 2^max_zoom × height_tiles / 2^max_zoom`
-        // tiles, each TILE px wide in geo space. `try_build` chose
-        // `max_zoom = log2(min(w_p2, h_p2))` so exactly one of the two
-        // ratios collapses to 1 — that's the Hilbert-style "fix the smaller
-        // axis at TILE, scale the other" convention generalised to either
-        // aspect.
-        let two_pow_mz = 1u32 << a.max_zoom;
-        let arch_world_w = (a.width_tiles / two_pow_mz.max(1)).max(1) * TILE;
-        let arch_world_h = (a.height_tiles / two_pow_mz.max(1)).max(1) * TILE;
-        (
-            /* kh */ 0u8,
-            a.width_tiles,
-            a.height_tiles,
-            arch_world_w,
-            arch_world_h,
-            a.height,
-            a.width,
-            a.max_zoom,
-            a.total_tiles,
-            /* square_pixels */ 1u64,
-            /* total */ a.width as u64 * a.height as u64,
-            Some(ents),
-        )
-    } else {
-        (
-            kh as u8,
-            width_tiles,
-            height_tiles,
-            world_w,
-            world_h,
-            height,
-            width,
-            max_zoom,
-            width_tiles as u64 * height_tiles as u64,
-            square_pixels,
-            total,
-            None,
-        )
-    };
-
-    let entities = arch_entities.unwrap_or(entities);
+    ) = (
+        geom.kh,
+        geom.width_tiles,
+        geom.height_tiles,
+        geom.world_w,
+        geom.world_h,
+        geom.height,
+        geom.width,
+        geom.max_zoom,
+        geom.total_tiles,
+        geom.square_pixels,
+        geom.total,
+    );
+    let entities = layout.layout_entities().unwrap_or(entities);
 
     let detail_depth = layout.detail_depth();
 
@@ -1199,43 +1130,6 @@ where
     }
 }
 
-/// Tile coords (at zoom `zoom = max_zoom + k`) covered by the footprints of the
-/// tensors that still carry genuine detail at *this* level — i.e. those whose
-/// own `detail_depth_for_scale(scale) >= k`. A tensor is dropped from the level
-/// once it has resolved to ≥1px/element, so a mildly-shrunk matrix (which
-/// resolves at k=1) is NOT re-rendered as pure replication at the deeper levels
-/// a vocab embedding needs — without this guard a model with many shrunk
-/// tensors (hidden_size > CAP_HI) would emit millions of redundant detail tiles.
-/// Deduped across tensors. Non-shrunk tensors that fall in a selected tile still
-/// render (replicated), so each detail tile carries the complete scene at higher
-/// resolution and overlays the base layer seamlessly.
-fn detail_coords(layout: &crate::layout::arch::ArchLayout, zoom: u32) -> Vec<(u32, u32)> {
-    use std::collections::BTreeSet;
-    let level = zoom.saturating_sub(layout.max_zoom); // 1-based detail level
-    let f = 1u64 << level;
-    let t_sz = TILE as u64;
-    let mut set: BTreeSet<(u32, u32)> = BTreeSet::new();
-    for t in &layout.tensors {
-        if crate::layout::arch::detail_depth_for_scale(t.scale) < level {
-            continue;
-        }
-        let x0 = t.canvas_x as u64 * f;
-        let y0 = t.canvas_y as u64 * f;
-        let x1 = x0 + t.disp_w as u64 * f;
-        let y1 = y0 + t.disp_h as u64 * f;
-        let tx0 = (x0 / t_sz) as u32;
-        let ty0 = (y0 / t_sz) as u32;
-        let tx1 = ((x1 - 1) / t_sz) as u32;
-        let ty1 = ((y1 - 1) / t_sz) as u32;
-        for ty in ty0..=ty1 {
-            for tx in tx0..=tx1 {
-                set.insert((tx, ty));
-            }
-        }
-    }
-    set.into_iter().collect()
-}
-
 /// Render the variable-depth detail levels (`max_zoom+1 ..= max_zoom+detail_depth`).
 ///
 /// Each level is rendered directly from source over a sparse set of tiles (the
@@ -1257,21 +1151,19 @@ pub(super) async fn render_detail_levels<F>(
 where
     F: Fn(&EncodedTile, u32) -> anyhow::Result<()> + Sync,
 {
-    let arch = match plan.layout.as_any().downcast_ref::<ArchLayout>() {
-        Some(a) => a,
-        None => return Ok(()),
-    };
-    if arch.detail_depth == 0 {
+    let detail_depth = plan.layout.detail_depth();
+    if detail_depth == 0 {
         return Ok(());
     }
+    let max_zoom = plan.layout.canvas_geom().max_zoom;
     // Detail tiles are an enhancement layer: where they're missing the viewer
     // falls back to upsampling the base overview (transparent errorTileUrl). So
     // a detail-pass failure is logged and ends detail rendering, but is NOT
     // propagated — the already-complete overview output (and, for the HF path,
     // the whole staged upload) must not be discarded over one bad detail tile.
-    for k in 1..=arch.detail_depth {
-        let zoom = arch.max_zoom + k;
-        let coords = detail_coords(arch, zoom);
+    for k in 1..=detail_depth {
+        let zoom = max_zoom + k;
+        let coords = plan.layout.detail_coords(zoom);
         if coords.is_empty() {
             continue;
         }

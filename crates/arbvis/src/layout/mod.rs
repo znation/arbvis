@@ -24,6 +24,8 @@ use std::any::Any;
 
 use crate::data::{Source, SourceMeta};
 use crate::format::Dtype;
+use crate::tiled::html::FileEntity;
+use crate::tiled::leaf::TILE;
 
 /// One contiguous (row-major) element range of one tensor that overlaps a
 /// tile. The tile renderer fetches `byte_start..byte_end` from the source
@@ -98,10 +100,39 @@ pub enum LayoutMode {
 /// `id` doubles as the lookup key for the matching `LeafLoader`/`LeafRenderer`
 /// pair in `LeafRegistry`: a layout that returns `"arch"` here dispatches to
 /// the `"arch"` loader and renderer at tile time.
+/// Canvas geometry every layout populates. The tile pipeline reads this
+/// once to size the leaflet world, decide pyramid depth, and (for the
+/// Hilbert path) walk the curve.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub struct CanvasGeom {
+    /// Hilbert order in y (`height = 1 << kh`). Zero for non-Hilbert layouts
+    /// — those paths don't index into the curve.
+    pub kh: u8,
+    pub width_tiles: u32,
+    pub height_tiles: u32,
+    /// World extent in leaflet coordinates at zoom 0 (one of the two axes
+    /// always collapses to one tile).
+    pub world_w: u32,
+    pub world_h: u32,
+    pub width: u32,
+    pub height: u32,
+    pub max_zoom: u32,
+    pub total_tiles: u64,
+    /// Pixel count of one Hilbert "square" (`height * height` for Hilbert,
+    /// `1` for arch — the arch path doesn't divide by this value).
+    pub square_pixels: u64,
+    /// Total pixels the canvas covers (the Hilbert curve's byte budget /
+    /// the arch canvas's pixel rectangle).
+    pub total: u64,
+}
+
 pub trait LayoutShape: Send + Sync {
     /// Short stable identifier; also names the `LeafLoader`/`LeafRenderer`
     /// pair this layout dispatches to (`"hilbert-bytes"`, `"arch"`).
     fn id(&self) -> &'static str;
+    /// Canvas dimensions + Hilbert geometry knobs.
+    fn canvas_geom(&self) -> CanvasGeom;
     /// Number of extra zoom levels rendered as sparse detail tiles past
     /// `max_zoom`. Defaults to 0 for layouts that don't need per-tensor detail
     /// (Hilbert); arch overrides.
@@ -114,16 +145,45 @@ pub trait LayoutShape: Send + Sync {
     fn is_byte_layout(&self) -> bool {
         false
     }
+    /// Layout-supplied list of overlay entities (per-tensor rectangles for
+    /// arch; `None` to fall back to the generic `geometry::file_rects` path
+    /// for Hilbert).
+    fn layout_entities(&self) -> Option<Vec<FileEntity>> {
+        None
+    }
+    /// Sparse tile coords this layout wants rendered at the given detail
+    /// zoom (`max_zoom + 1..=max_zoom + detail_depth`). Empty for layouts
+    /// without per-tensor detail levels.
+    fn detail_coords(&self, _zoom: u32) -> Vec<(u32, u32)> {
+        Vec::new()
+    }
     /// Escape hatch for the few call sites that need the concrete layout
-    /// type — implementations return `self`. Used by `single.rs`,
-    /// `render_detail_levels`, and `ArchRegionsLoader` to downcast to the
-    /// concrete layout via `Any::downcast_ref`.
+    /// type — implementations return `self`. Used by the layout's matching
+    /// `LeafLoader` impl to recover its concrete struct.
     fn as_any(&self) -> &dyn Any;
 }
 
 impl LayoutShape for hilbert::HilbertLayout {
     fn id(&self) -> &'static str {
         "hilbert-bytes"
+    }
+    fn canvas_geom(&self) -> CanvasGeom {
+        // Hilbert always has the wider axis on `world_w`, the shorter axis
+        // collapsed to `TILE`. `width` is derived from `width_tiles * TILE`.
+        let width = self.width_tiles * TILE;
+        CanvasGeom {
+            kh: self.kh,
+            width_tiles: self.width_tiles,
+            height_tiles: self.height_tiles,
+            world_w: self.world_w,
+            world_h: TILE,
+            width,
+            height: self.height,
+            max_zoom: self.max_zoom,
+            total_tiles: self.total_tiles,
+            square_pixels: self.square_pixels,
+            total: self.total,
+        }
     }
     fn is_byte_layout(&self) -> bool {
         true
@@ -137,8 +197,96 @@ impl LayoutShape for arch::ArchLayout {
     fn id(&self) -> &'static str {
         "arch"
     }
+    fn canvas_geom(&self) -> CanvasGeom {
+        // `world_w`/`world_h` are the geographic extents at zoom 0 in
+        // leaflet's coordinate system. At leaf zoom (`max_zoom`) the tile
+        // grid is `width_tiles × height_tiles`; halving each step down to
+        // zoom 0 leaves `width_tiles / 2^max_zoom × height_tiles / 2^max_zoom`
+        // tiles, each TILE px wide in geo space.
+        let two_pow_mz = 1u32 << self.max_zoom;
+        let world_w = (self.width_tiles / two_pow_mz.max(1)).max(1) * TILE;
+        let world_h = (self.height_tiles / two_pow_mz.max(1)).max(1) * TILE;
+        CanvasGeom {
+            // arch ignores `kh`/`square_pixels`; populate with safe values
+            // that won't divide by zero if accidentally read.
+            kh: 0,
+            width_tiles: self.width_tiles,
+            height_tiles: self.height_tiles,
+            world_w,
+            world_h,
+            width: self.width,
+            height: self.height,
+            max_zoom: self.max_zoom,
+            total_tiles: self.total_tiles,
+            square_pixels: 1,
+            total: self.width as u64 * self.height as u64,
+        }
+    }
     fn detail_depth(&self) -> u32 {
         self.detail_depth
+    }
+    fn layout_entities(&self) -> Option<Vec<FileEntity>> {
+        let mut ents: Vec<FileEntity> = Vec::with_capacity(self.tensors.len());
+        for t in &self.tensors {
+            // Overlay rectangles use the on-canvas *display* footprint, not
+            // the element grid, so labels/segments line up with what's drawn.
+            let w = t.disp_w;
+            let h = t.disp_h;
+            let x0 = t.canvas_x;
+            let y0 = t.canvas_y;
+            let x1 = x0.saturating_add(w);
+            let y1 = y0.saturating_add(h);
+            let segments = vec![
+                (x0, y0, x1, y0),
+                (x1, y0, x1, y1),
+                (x0, y1, x1, y1),
+                (x0, y0, x0, y1),
+            ];
+            let cx = x0 + (x1 - x0) / 2;
+            let cy = y0 + (y1 - y0) / 2;
+            ents.push(FileEntity {
+                name: t.name.clone(),
+                pixel_x: cx,
+                pixel_y: cy,
+                hue: t.hue,
+                byte_size: t
+                    .tensor_rows
+                    .saturating_mul(t.tensor_cols)
+                    .saturating_mul(t.dtype.element_size() as u64),
+                bbox: (x0, y0, x1, y1),
+                segments,
+            });
+        }
+        Some(ents)
+    }
+    fn detail_coords(&self, zoom: u32) -> Vec<(u32, u32)> {
+        // Tile coords that any shrunk tensor's footprint overlaps at this
+        // detail zoom. Deduped across tensors. Lifted from the prior
+        // free function in `tiled::mod.rs`.
+        use std::collections::BTreeSet;
+        let level = zoom.saturating_sub(self.max_zoom);
+        let f = 1u64 << level;
+        let t_sz = TILE as u64;
+        let mut set: BTreeSet<(u32, u32)> = BTreeSet::new();
+        for t in &self.tensors {
+            if arch::detail_depth_for_scale(t.scale) < level {
+                continue;
+            }
+            let x0 = t.canvas_x as u64 * f;
+            let y0 = t.canvas_y as u64 * f;
+            let x1 = x0 + t.disp_w as u64 * f;
+            let y1 = y0 + t.disp_h as u64 * f;
+            let tx0 = (x0 / t_sz) as u32;
+            let ty0 = (y0 / t_sz) as u32;
+            let tx1 = ((x1 - 1) / t_sz) as u32;
+            let ty1 = ((y1 - 1) / t_sz) as u32;
+            for ty in ty0..=ty1 {
+                for tx in tx0..=tx1 {
+                    set.insert((tx, ty));
+                }
+            }
+        }
+        set.into_iter().collect()
     }
     fn as_any(&self) -> &dyn Any {
         self

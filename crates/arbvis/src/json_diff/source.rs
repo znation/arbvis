@@ -3,8 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::data::{Data, Extensions, Source, SourceKind};
-use crate::format::DiffFill;
+use crate::data::{Data, DiffFill, Extensions, Source, SourceKind};
 
 use super::align::AlignmentSpan;
 

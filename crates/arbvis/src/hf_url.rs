@@ -143,11 +143,11 @@ impl HfOutputSpec {
 }
 
 #[derive(Debug)]
-pub(crate) struct HfUrl {
-    pub(crate) kind: RepoKind,
-    pub(crate) repo_id: String,
-    pub(crate) revision: String,
-    pub(crate) path_in_repo: String,
+pub struct HfUrl {
+    pub kind: RepoKind,
+    pub repo_id: String,
+    pub revision: String,
+    pub path_in_repo: String,
 }
 
 /// Parse an `hf://` URL into its components.
@@ -162,7 +162,7 @@ pub(crate) struct HfUrl {
 ///
 /// Empty path segments — including a trailing slash — are stripped so that
 /// `hf://owner/repo/path/` parses with `path_in_repo = "path"`, not `"path/"`.
-pub(crate) fn parse(raw: &str) -> anyhow::Result<HfUrl> {
+pub fn parse(raw: &str) -> anyhow::Result<HfUrl> {
     let rest = raw
         .strip_prefix("hf://")
         .ok_or_else(|| anyhow::anyhow!("expected hf:// prefix, got {raw:?}"))?;

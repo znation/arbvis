@@ -18,8 +18,7 @@ use std::sync::Arc;
 
 use memmap2::Mmap;
 
-use crate::data::{Data, Extensions, Source, SourceKind};
-use crate::format::DiffFill;
+use crate::data::{Data, DiffFill, Extensions, Source, SourceKind};
 
 use align::{align_documents, coalesce, AlignmentSpan};
 use parse::parse;

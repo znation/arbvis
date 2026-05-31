@@ -171,7 +171,7 @@ impl LeafLoader for HilbertBytesLoader {
                     tx: ctx.tx,
                     ty: ctx.ty,
                     tile_buf: None,
-                    arch_tile: None,
+                    extra: None,
                 });
             }
             let buf = super::leaf::load_tile_bytes(
@@ -189,7 +189,7 @@ impl LeafLoader for HilbertBytesLoader {
                 tx: ctx.tx,
                 ty: ctx.ty,
                 tile_buf: Some(buf),
-                arch_tile: None,
+                extra: None,
             })
         })
     }

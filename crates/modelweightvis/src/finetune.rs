@@ -6,7 +6,7 @@
 //! wholesale in step 12. For now it lives in arbvis and depends only on
 //! [`crate::hf_url`]'s generic `fetch_model_card`.
 
-use crate::hf_url::{self, RepoKind};
+use arbvis::hf_url::{self, RepoKind};
 
 /// Auto-detect whether `mod_url` is a HuggingFace-declared finetune of
 /// `orig_url`, by reading the modified-side model card metadata via the HF

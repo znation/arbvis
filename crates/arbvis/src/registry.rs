@@ -1,32 +1,58 @@
 //! Pluggable surface threaded through [`crate::run`].
 //!
-//! Step 5 of the arbvis/modelweightvis split. Today the trait slots are empty
-//! and the existing hardcoded paths (`select_layout`, `prepare_diff_sources`,
-//! per-format header parsers) still drive behaviour; later steps will move
-//! that logic behind these traits so `modelweightvis` can register tensor
-//! formats, the arch layout, and the tensor-diff source builder without
-//! touching arbvis.
+//! After step 12 + the heavy-dep relocation, arbvis is the byte-only
+//! foundation: it owns the tile pipeline, byte-Hilbert layout, JSON-diff,
+//! plain-byte diff, HF I/O, and Space deploy. Everything model-aware
+//! (tensor-format parsing, architectural / MoE-diff layouts, tensor-diff
+//! source prep, finetune auto-detection, the arch single-image renderer,
+//! the arch tile loader/renderer) lives in `modelweightvis` and registers
+//! against this surface.
 //!
-//! The [`leaf`] field already carries the working `LeafRegistry` (loader+
-//! renderer pairs registered in step 3/4a) — that one *is* consumed today.
-//! The other three slots are placeholders.
+//! The hooks are split into two families:
+//!   - **Vec slots** (`formats`, `layouts`, `diffs`): multiple plugins,
+//!     iterated/priority-ordered. Always present (empty by default).
+//!   - **Option slots** (`moe_diff`, `repo_diff`, `dir_tensor_diff`,
+//!     `finetune_detect`, `single_image_arch`): single tap point per CLI
+//!     dispatch. When `None`, the corresponding feature errors out (or
+//!     defaults) and the rest of arbvis still works.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 
-use crate::data::{Source, SourceMeta};
-use crate::format::DiffMetric;
+use crate::data::{Data, DiffMetric, Extensions, Source};
+use crate::hf_url::RemoteFileSpec;
 use crate::layout::{LayoutMode, LayoutShape};
 use crate::tiled::leaf_renderer::LeafRegistry;
 
-/// Parses format-specific headers (safetensors / GGUF / PyTorch pickle / …).
-///
-/// Consumed in step 12 when format detection moves into modelweightvis.
-#[allow(dead_code)]
+/// Format-aware metadata populator. `prepare_sources` /
+/// `prepare_sources_from_specs` call each registered `FormatPlugin` for
+/// every loaded source — first plugin with `detects_path()` true wins —
+/// and lets it stuff format-specific data (e.g. `ModelInfo` for
+/// safetensors) into `Source.extensions`. Plugin readers (e.g.
+/// `ArchLayoutPlugin`) read from `s.extensions.get::<…>()`.
 pub trait FormatPlugin: Send + Sync {
     fn id(&self) -> &'static str;
+    /// Should this plugin handle `path`? File extension match.
+    fn detects_path(&self, path: &Path) -> bool;
+    /// Mmap `path` and parse its header; populate `exts` with whatever
+    /// the plugin wants attached. Sync (called from `prepare_sources`).
+    fn populate_local(
+        &self,
+        path: &Path,
+        file_size: u64,
+        exts: &mut Extensions,
+    ) -> anyhow::Result<()>;
+    /// Async variant for an already-open `Data` source (HTTP / mmap).
+    /// Called from `prepare_sources_from_specs`.
+    fn populate_remote<'a>(
+        &'a self,
+        data: &'a Data,
+        byte_size: u64,
+        exts: &'a mut Extensions,
+    ) -> BoxFuture<'a, anyhow::Result<()>>;
 }
 
 /// Inputs every [`LayoutPlugin`] sees when deciding whether to apply and
@@ -36,40 +62,18 @@ pub struct LayoutBuildCtx<'a> {
     pub cumulative_offsets: &'a [u64],
     pub total_bytes: u64,
     pub mode: LayoutMode,
-    pub metas: &'a [SourceMeta],
     pub diff_mode: bool,
 }
 
 /// Builds a layout for the given sources, when applicable.
-///
-/// Plugins are tried in descending `priority()` order; the first that returns
-/// `true` from `applicable` and `Some(...)` from `build` wins. The byte-Hilbert
-/// floor (`i32::MIN`) is guaranteed to always build, so iteration always
-/// terminates with a layout.
 pub trait LayoutPlugin: Send + Sync {
-    /// Stable name (also matches the `LayoutShape::id` of the built layout
-    /// when applicable). Used for diagnostic logs and registry lookup.
     fn id(&self) -> &'static str;
-    /// Higher wins. Byte-Hilbert is the floor at `i32::MIN`; arch is 100;
-    /// MoE-diff is 200.
     fn priority(&self) -> i32;
-    /// Cheap check based on `ctx` — returns whether this plugin should be
-    /// considered for the current run. Separate from `build` so a `--layout
-    /// arch`-requested-but-no-tensors case can produce a more specific log.
     fn applicable(&self, ctx: &LayoutBuildCtx<'_>) -> bool;
-    /// Actually build the layout. Returns `None` if applicable but the
-    /// layout couldn't be constructed (e.g. arch is applicable but no
-    /// transformer-style names were detected). The dispatcher then continues
-    /// to the next plugin.
     fn build(&self, ctx: &LayoutBuildCtx<'_>) -> Option<Box<dyn LayoutShape>>;
 }
 
 /// Inputs every [`DiffSourceBuilder`] sees for a file-pair `--diff` run.
-///
-/// Directory-pair diffs stay as inline code in `data::prepare_diff_sources`
-/// for now (multiple builders need to contribute their slice of files to the
-/// same output) — they move behind the trait when format detection migrates
-/// to `modelweightvis` (step 12).
 pub struct DiffBuildCtx<'a> {
     pub original: &'a Path,
     pub modified: &'a Path,
@@ -77,63 +81,101 @@ pub struct DiffBuildCtx<'a> {
     pub metric: DiffMetric,
 }
 
-/// Builds diff sources for a `--diff` run when the input pair matches its
-/// shape (JSON / plain bytes / per-tensor / …).
-///
-/// Plugins are tried in descending `priority()` order; the first that returns
-/// `Some` from `try_build` wins. The `PlainBytesDiffBuilder` floor at
-/// priority 0 always builds when both paths exist with matching sizes, so
-/// iteration terminates with a valid diff for any well-formed pair.
-///
-/// Uses `async_trait` (vs. raw `BoxFuture`) because the underlying tensor
-/// diff helpers contain higher-ranked closures that the manual lifetime
-/// annotation can't generalise — the macro emits a `Box::pin` with the
-/// correct HRTB bounds.
+/// Builds diff sources for a file-pair `--diff` run when the input pair
+/// matches its shape.
 #[async_trait]
 pub trait DiffSourceBuilder: Send + Sync {
-    /// Stable name used for diagnostic logs and registry lookup.
     #[allow(dead_code)]
     fn id(&self) -> &'static str;
-    /// Higher wins. Tensor-aware diff is 300; JSON structure-aware is 200;
-    /// plain-byte fallback is 0.
     fn priority(&self) -> i32;
-    /// Returns `Ok(Some((sources, total)))` if this builder can handle the
-    /// pair, `Ok(None)` to skip to the next builder. `Err` is propagated to
-    /// the caller (CLI exit).
     async fn try_build(&self, ctx: &DiffBuildCtx<'_>)
         -> anyhow::Result<Option<(Vec<Source>, u64)>>;
 }
 
-/// Plugin slots threaded through [`crate::run`]. The binary `main()` (and
-/// `modelweightvis::main` post-split) builds a registry, populates it with
-/// its own plugins, and passes it in.
-///
-/// `Clone` is a cheap shallow clone — every slot is a `Vec<Arc<…>>` or the
-/// `LeafRegistry`'s `Arc<HashMap<…>>`.
+/// Hooks `--moe-diff` CLI flag's source preparation. arbvis errors out
+/// when this flag is passed but no `MoeDiffPrep` is registered.
+#[async_trait]
+pub trait MoeDiffPrep: Send + Sync {
+    async fn prepare(
+        &self,
+        input: &str,
+        metric: DiffMetric,
+        stream: bool,
+    ) -> anyhow::Result<(Vec<Source>, u64)>;
+}
+
+/// Hooks repo-level `--diff` (both args are `hf://owner/repo` URLs).
+/// arbvis errors out when this case is hit and no `RepoDiffPrep` is
+/// registered.
+#[async_trait]
+pub trait RepoDiffPrep: Send + Sync {
+    async fn prepare(
+        &self,
+        orig_specs: &[(String, RemoteFileSpec)],
+        mod_specs: &[(String, RemoteFileSpec)],
+        is_finetune: bool,
+        metric: DiffMetric,
+        stream: bool,
+    ) -> anyhow::Result<(Vec<Source>, u64)>;
+}
+
+/// Hooks the tensor-files-in-directory branch of `--diff <dir> <dir>`.
+/// The non-tensor files are still handled by arbvis's generic byte-diff
+/// + crosshatch path.
+#[async_trait]
+pub trait DirectoryTensorDiffPrep: Send + Sync {
+    /// Which directory entries this preparer takes responsibility for.
+    /// arbvis partitions directory contents on this predicate before
+    /// invoking `prepare`.
+    fn is_tensor_file(&self, p: &Path) -> bool;
+    async fn prepare(
+        &self,
+        orig_files: &[PathBuf],
+        mod_files: &[PathBuf],
+        is_finetune: bool,
+        metric: DiffMetric,
+    ) -> anyhow::Result<(Vec<Source>, u64)>;
+}
+
+/// Hooks the HF "is X a finetune of Y" model-card lookup. arbvis defaults
+/// to "not a finetune" when this hook isn't registered or returns `None`.
+#[async_trait]
+pub trait FinetuneDetect: Send + Sync {
+    async fn detect(&self, orig_url: &str, mod_url: &str) -> Option<bool>;
+}
+
+/// Hooks the single-image arch render path. Invoked from
+/// `single::run_single` when the chosen layout's id is `"arch"`. arbvis
+/// falls back to byte-Hilbert if this hook isn't registered.
+pub trait SingleImageArchHook: Send + Sync {
+    fn render(
+        &self,
+        files: &[PathBuf],
+        output: Option<PathBuf>,
+        sources: &[Source],
+        layout: &dyn LayoutShape,
+    ) -> anyhow::Result<()>;
+}
+
+/// Plugin slots threaded through [`crate::run`].
 #[derive(Clone, Default)]
-#[allow(dead_code)]
 pub struct Registry {
     pub formats: Vec<Arc<dyn FormatPlugin>>,
     pub layouts: Vec<Arc<dyn LayoutPlugin>>,
-    /// Loader+renderer lookup for the tile pipeline. Already populated with
-    /// built-in `"hilbert-bytes"` and `"arch"` pairs by `LeafRegistry::with_defaults`.
     pub leaf: LeafRegistry,
     pub diffs: Vec<Arc<dyn DiffSourceBuilder>>,
+    pub moe_diff: Option<Arc<dyn MoeDiffPrep>>,
+    pub repo_diff: Option<Arc<dyn RepoDiffPrep>>,
+    pub dir_tensor_diff: Option<Arc<dyn DirectoryTensorDiffPrep>>,
+    pub finetune_detect: Option<Arc<dyn FinetuneDetect>>,
+    pub single_image_arch: Option<Arc<dyn SingleImageArchHook>>,
 }
 
 impl Registry {
-    /// Registry populated with arbvis's own (non-tensor) built-ins.
-    ///
-    /// Today: `leaf` carries the `"hilbert-bytes"` loader/renderer pair;
-    /// `layouts` carries `HilbertLayoutPlugin` (the `i32::MIN` floor);
-    /// `diffs` carries `JsonDiffBuilder` and `PlainBytesDiffBuilder`.
-    ///
-    /// The model-aware bits (`"arch"` loader+renderer, `ArchLayoutPlugin`,
-    /// `MoeDiffLayoutPlugin`, `TensorDiffBuilder`) are registered by
-    /// `modelweightvis::register_all` on top of this default. The plugin
-    /// types themselves still live in arbvis (pub-exposed via the lib) —
-    /// step 12e is what actually relocates their source and lifts the heavy
-    /// deps (`candle-core`, `regex`, `zip`, `half`).
+    /// Registry populated with arbvis's own (byte-only) built-ins:
+    /// `HilbertLayoutPlugin`, `JsonDiffBuilder`, `PlainBytesDiffBuilder`,
+    /// and the `"hilbert-bytes"` leaf loader+renderer. All Option hooks
+    /// start as `None` — `modelweightvis::register_all` populates them.
     pub fn with_defaults() -> Self {
         Self {
             formats: Vec::new(),
@@ -143,6 +185,11 @@ impl Registry {
                 Arc::new(crate::data::JsonDiffBuilder),
                 Arc::new(crate::data::PlainBytesDiffBuilder),
             ],
+            moe_diff: None,
+            repo_diff: None,
+            dir_tensor_diff: None,
+            finetune_detect: None,
+            single_image_arch: None,
         }
     }
 }

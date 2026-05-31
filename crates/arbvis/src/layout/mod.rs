@@ -1,78 +1,22 @@
-//! Mapping from canvas pixel coordinates to tensor element coordinates.
+//! Layout selection + the byte-only built-in layout.
 //!
-//! Two built-in layouts, both exposed through the [`LayoutShape`] trait:
-//!
-//! - [`hilbert::HilbertLayout`] preserves the legacy byte-Hilbert behaviour:
-//!   one continuous space-filling curve over the concatenated byte stream of
-//!   every source. 1 px = 1 byte. Used for non-safetensors inputs and when
-//!   the user passes `--layout hilbert`.
-//!
-//! - [`arch::ArchLayout`] is the structure-aware mode: each tensor occupies a
-//!   rectangle of its natural 2D element shape (1 px = 1 element);
-//!   transformer blocks are stacked vertically and pixel-aligned across the
-//!   stack. Used when every source is safetensors and tensor names look
-//!   transformer-style, unless overridden.
+//! arbvis ships exactly one layout: [`hilbert::HilbertLayout`], a global
+//! Hilbert curve over the concatenated byte stream of every source
+//! (1 px = 1 byte). Everything else — `ArchLayout`, MoE-diff layout,
+//! per-tensor regions, dtype-aware element decoding — lives in
+//! `modelweightvis::layout` and registers via the `LayoutPlugin` trait.
 
-pub mod arch;
-pub mod bin_pack;
 pub mod hilbert;
-pub mod model_config;
-pub mod name_tree;
-pub mod render;
 
 use std::any::Any;
 
-use crate::data::{Source, SourceMeta};
-use crate::format::Dtype;
+use crate::data::Source;
 use crate::tiled::html::FileEntity;
 use crate::tiled::leaf::TILE;
 
-/// One contiguous (row-major) element range of one tensor that overlaps a
-/// tile. The tile renderer fetches `byte_start..byte_end` from the source
-/// and decodes elements at the natural dtype stride.
-///
-/// The tensor is drawn at a per-tensor display footprint that may differ from
-/// its element grid (see [`crate::layout::arch::PlacedTensor`]): shrunk for
-/// huge tensors, enlarged for thin vectors. At a given zoom level the footprint
-/// is additionally multiplied by `2^(zoom - max_zoom)`. The renderer maps each
-/// painted output pixel back to an element via the footprint→element ratio:
-/// `element = floor((samp_off + delta_px) * tensor_dim / footprint_dim)`. The
-/// `row_first`/`col_first` element bounds are the floor at the first painted
-/// pixel, so they anchor both the byte fetch and the per-pixel offset.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct TileRegion {
-    /// Index into the source list this region's bytes come from.
-    pub source_idx: usize,
-    /// Index into the global tensor list (across all sources, in canvas order).
-    pub tensor_id: usize,
-    pub dtype: Dtype,
-    /// Tensor row × col element-grid dimensions, as `TensorMeta::element_shape`.
-    pub tensor_rows: u64,
-    pub tensor_cols: u64,
-    /// First/last row of the tensor element grid that overlap this tile.
-    pub row_first: u64,
-    pub row_last_exclusive: u64,
-    /// First/last column of the tensor element grid that overlap this tile.
-    pub col_first: u64,
-    pub col_last_exclusive: u64,
-    /// Byte offset within the source where this tensor's element data starts.
-    pub tensor_byte_start: u64,
-    /// Display footprint of the whole tensor at this tile's zoom level, in
-    /// pixels (`disp_w/h * 2^(zoom - max_zoom)`). Drives the pixel→element map.
-    pub footprint_w: u64,
-    pub footprint_h: u64,
-    /// Display-pixel offset, within the tensor's footprint, of the first
-    /// painted pixel (`tile_x0`/`tile_y0`).
-    pub samp_x0: u64,
-    pub samp_y0: u64,
-    /// Canvas pixel rectangle this region paints into, in *tile-local* (px, py)
-    /// coordinates `[x0, x1) × [y0, y1)`.
-    pub tile_x0: u32,
-    pub tile_y0: u32,
-    pub tile_x1: u32,
-    pub tile_y1: u32,
-}
+// `TileRegion` (the per-tensor tile-rectangle descriptor) lives in
+// `modelweightvis::layout::TileRegion` along with the arch layout that
+// produces it.
 
 /// User-facing layout selection.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -193,105 +137,8 @@ impl LayoutShape for hilbert::HilbertLayout {
     }
 }
 
-impl LayoutShape for arch::ArchLayout {
-    fn id(&self) -> &'static str {
-        "arch"
-    }
-    fn canvas_geom(&self) -> CanvasGeom {
-        // `world_w`/`world_h` are the geographic extents at zoom 0 in
-        // leaflet's coordinate system. At leaf zoom (`max_zoom`) the tile
-        // grid is `width_tiles × height_tiles`; halving each step down to
-        // zoom 0 leaves `width_tiles / 2^max_zoom × height_tiles / 2^max_zoom`
-        // tiles, each TILE px wide in geo space.
-        let two_pow_mz = 1u32 << self.max_zoom;
-        let world_w = (self.width_tiles / two_pow_mz.max(1)).max(1) * TILE;
-        let world_h = (self.height_tiles / two_pow_mz.max(1)).max(1) * TILE;
-        CanvasGeom {
-            // arch ignores `kh`/`square_pixels`; populate with safe values
-            // that won't divide by zero if accidentally read.
-            kh: 0,
-            width_tiles: self.width_tiles,
-            height_tiles: self.height_tiles,
-            world_w,
-            world_h,
-            width: self.width,
-            height: self.height,
-            max_zoom: self.max_zoom,
-            total_tiles: self.total_tiles,
-            square_pixels: 1,
-            total: self.width as u64 * self.height as u64,
-        }
-    }
-    fn detail_depth(&self) -> u32 {
-        self.detail_depth
-    }
-    fn layout_entities(&self) -> Option<Vec<FileEntity>> {
-        let mut ents: Vec<FileEntity> = Vec::with_capacity(self.tensors.len());
-        for t in &self.tensors {
-            // Overlay rectangles use the on-canvas *display* footprint, not
-            // the element grid, so labels/segments line up with what's drawn.
-            let w = t.disp_w;
-            let h = t.disp_h;
-            let x0 = t.canvas_x;
-            let y0 = t.canvas_y;
-            let x1 = x0.saturating_add(w);
-            let y1 = y0.saturating_add(h);
-            let segments = vec![
-                (x0, y0, x1, y0),
-                (x1, y0, x1, y1),
-                (x0, y1, x1, y1),
-                (x0, y0, x0, y1),
-            ];
-            let cx = x0 + (x1 - x0) / 2;
-            let cy = y0 + (y1 - y0) / 2;
-            ents.push(FileEntity {
-                name: t.name.clone(),
-                pixel_x: cx,
-                pixel_y: cy,
-                hue: t.hue,
-                byte_size: t
-                    .tensor_rows
-                    .saturating_mul(t.tensor_cols)
-                    .saturating_mul(t.dtype.element_size() as u64),
-                bbox: (x0, y0, x1, y1),
-                segments,
-            });
-        }
-        Some(ents)
-    }
-    fn detail_coords(&self, zoom: u32) -> Vec<(u32, u32)> {
-        // Tile coords that any shrunk tensor's footprint overlaps at this
-        // detail zoom. Deduped across tensors. Lifted from the prior
-        // free function in `tiled::mod.rs`.
-        use std::collections::BTreeSet;
-        let level = zoom.saturating_sub(self.max_zoom);
-        let f = 1u64 << level;
-        let t_sz = TILE as u64;
-        let mut set: BTreeSet<(u32, u32)> = BTreeSet::new();
-        for t in &self.tensors {
-            if arch::detail_depth_for_scale(t.scale) < level {
-                continue;
-            }
-            let x0 = t.canvas_x as u64 * f;
-            let y0 = t.canvas_y as u64 * f;
-            let x1 = x0 + t.disp_w as u64 * f;
-            let y1 = y0 + t.disp_h as u64 * f;
-            let tx0 = (x0 / t_sz) as u32;
-            let ty0 = (y0 / t_sz) as u32;
-            let tx1 = ((x1 - 1) / t_sz) as u32;
-            let ty1 = ((y1 - 1) / t_sz) as u32;
-            for ty in ty0..=ty1 {
-                for tx in tx0..=tx1 {
-                    set.insert((tx, ty));
-                }
-            }
-        }
-        set.into_iter().collect()
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
+// `impl LayoutShape for ArchLayout` lives in `modelweightvis::layout::arch`
+// with the `ArchLayout` struct itself.
 
 // ---------------------------------------------------------------------------
 // Layout plugins
@@ -347,7 +194,6 @@ pub fn select_layout(
     cumulative_offsets: &[u64],
     total_bytes: u64,
     mode: LayoutMode,
-    metas: &[SourceMeta],
     diff_mode: bool,
     registry: &crate::registry::Registry,
 ) -> Box<dyn LayoutShape> {
@@ -356,7 +202,6 @@ pub fn select_layout(
         cumulative_offsets,
         total_bytes,
         mode,
-        metas,
         diff_mode,
     };
 

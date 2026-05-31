@@ -13,7 +13,8 @@ use candle_core::quantized::GgmlDType;
 use candle_core::CpuStorage;
 use image::Rgb;
 
-use super::types::{DiffMetric, ABS_LOG_MAX, ABS_LOG_MIN, K_RMS_SAT, RMS_FLOOR};
+use super::types::{ABS_LOG_MAX, ABS_LOG_MIN, K_RMS_SAT, RMS_FLOOR};
+use super::DiffMetric;
 
 /// How an element is addressed within a contiguous tensor byte buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -6,8 +6,7 @@ description = "Tensor-format-aware visualization built on arbvis"
 
 [dependencies]
 # arbvis core. Path-pinned during workspace dev; when this crate splits out
-# into its own repo (step 14) the dep becomes a version pin against published
-# `arbvis`.
+# into its own repo the dep becomes a version pin against published `arbvis`.
 arbvis = { path = "../arbvis", version = "0.1.0" }
 anyhow = "1"
 async-trait = "0.1"
@@ -15,3 +14,29 @@ clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 log = "0.4"
 tokio = { version = "1", features = ["full"] }
+
+# Tensor-format parsing + dtype decode. Moved here from arbvis as part of
+# the workspace split: arbvis is byte-only, modelweightvis owns everything
+# tensor-aware (and the heavy deps that come with it).
+half = "2"
+# Used by `layout::name_tree` to classify tensor names into transformer
+# blocks (`model.layers.N.q_proj.weight` → layer N, q_proj sub-path).
+regex = "1"
+# GGUF + PyTorch pickle support. See arbvis's pre-split history for the
+# rationale comments — only `quantized::gguf_file`, `quantized::k_quants`,
+# and `pickle` modules are touched; no GPU features enabled.
+candle-core = { version = "0.10", default-features = false }
+# PyTorch `.bin` / `.pth` / `.pt` zip-entry byte-range resolution.
+zip = { version = "7.2", default-features = false }
+
+# Shared deps re-imported here so the moved files compile without
+# threading them through arbvis.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = "0.25"
+indicatif = "0.17"
+memmap2 = "0.9"
+reqwest = { version = "0.13", features = ["json"] }
+
+[dev-dependencies]
+tempfile = "3"

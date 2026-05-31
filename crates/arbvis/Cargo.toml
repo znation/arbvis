@@ -27,7 +27,6 @@ env_logger = "0.11"
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-half = "2"
 hf-hub = "1.0.0-rc.1"
 # xet-core-structures is the chunk/xorb wire format used by hf-hub internally.
 # We pull it in directly so we can decode xorb byte segments after fetching
@@ -42,21 +41,3 @@ tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 async-channel = "2"
 async-trait = "0.1"
-# Used by the architectural layout to parse tensor names (e.g.
-# `model.layers.N.q_proj.weight`) into structural slots.
-regex = "1"
-# GGUF format support: parses the metadata KV table + tensor info table
-# without touching tensor bytes, and exposes a device-free dequant path
-# (`QuantizedType::dequantize`) for the Q* block formats. PyTorch pickle
-# support also lives here (`candle_core::pickle`) — it walks the pickle
-# opcode stream without invoking `__reduce__` / `find_class`, so loading
-# untrusted `.bin` headers is safe. We use only the `quantized::gguf_file`,
-# `quantized::k_quants`, and `pickle` modules — none of the
-# `cuda`/`metal`/`mkl`/`accelerate` features are enabled.
-candle-core = { version = "0.10", default-features = false }
-# Used to resolve the byte offset of each per-tensor storage entry inside a
-# PyTorch `.bin` (`.pth` / `.pt`) zip archive. candle-core's pickle reader
-# gives us tensor names + dtypes + shapes + zip-entry names, but not the
-# absolute file byte ranges arbvis renders against — `ZipFile::data_start`
-# closes that gap. Version locked to candle-core's transitive dep.
-zip = { version = "7.2", default-features = false }

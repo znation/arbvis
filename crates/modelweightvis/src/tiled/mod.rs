@@ -1,15 +1,17 @@
-//! Architectural `LeafLoader` + `LeafRenderer` impls. Both delegate to
-//! arbvis-resident helpers (`load_arch_tile_regions`, the
-//! `render_arch_tile_*` family); step 12e's full source relocation is
-//! deferred, but the dispatch glue lives here so the arbvis binary's
-//! `LeafRegistry::with_defaults` no longer needs to register them.
+//! Architectural `LeafLoader` + `LeafRenderer` impls plus the moved
+//! `leaf_arch` submodule (per-tile tensor-region loader + dtype-aware
+//! renderers).
+
+pub mod leaf_arch;
 
 use futures::future::BoxFuture;
 
-use arbvis::{
+use arbvis::{EncodedTile, LeafLoader, LeafMode, LeafRenderer, LoadCtx, LoadedTile, RenderCtx};
+
+use crate::layout::arch::ArchLayout;
+use crate::tiled::leaf_arch::{
     load_arch_tile_regions, render_arch_tile_diff, render_arch_tile_dtype, render_arch_tile_plain,
-    render_arch_tile_xet, render_arch_tile_xet_dtype, ArchLayout, EncodedTile, LeafLoader,
-    LeafMode, LeafRenderer, LoadCtx, LoadedArchTile, LoadedTile, RenderCtx,
+    render_arch_tile_xet, render_arch_tile_xet_dtype, LoadedArchTile,
 };
 
 /// Architectural leaf loader: fetches one coalesced byte range per tensor
@@ -52,7 +54,7 @@ impl LeafLoader for ArchRegionsLoader {
                 tx: ctx.tx,
                 ty: ctx.ty,
                 tile_buf: None,
-                arch_tile: Some(at),
+                extra: Some(Box::new(at)),
             })
         })
     }
@@ -73,9 +75,15 @@ impl LeafRenderer for ArchRegionsRenderer {
             tx,
             ty,
             tile_buf: _,
-            arch_tile,
+            extra,
         } = tile;
-        let at = arch_tile.unwrap_or_else(LoadedArchTile::default);
+        // Recover the `LoadedArchTile` the loader produced; if the payload
+        // is missing or the wrong type, render an empty arch tile (rare —
+        // only happens when registry wiring is wrong).
+        let at = extra
+            .and_then(|e| e.downcast::<LoadedArchTile>().ok())
+            .map(|b| *b)
+            .unwrap_or_default();
         let fmt = ctx.fmt;
         let (image, bytes) = match ctx.mode {
             LeafMode::Plain { pixel_lut } => render_arch_tile_plain(&at, pixel_lut, fmt)?,

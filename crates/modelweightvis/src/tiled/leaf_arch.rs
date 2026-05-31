@@ -14,15 +14,15 @@
 
 use image::Rgb;
 
-use crate::data::Data;
-use crate::format::{DiffMetric, ElementStride};
+use arbvis::{encode_tile, Data, DiffMetric, TileFormat, TILE};
+
+use crate::format::ElementStride;
 use crate::layout::arch::ArchLayout;
 use crate::layout::render::{
     diff_element_color, plain_element_color, xet_dtype_element_color, xet_element_color,
     PADDING_RGB,
 };
 use crate::layout::TileRegion;
-use crate::tiled::leaf::{encode_tile, TileFormat, TILE};
 
 type TileResult = Result<(image::ImageBuffer<Rgb<u8>, Vec<u8>>, Vec<u8>), String>;
 

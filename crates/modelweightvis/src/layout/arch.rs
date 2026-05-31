@@ -15,13 +15,13 @@
 
 use std::collections::BTreeMap;
 
-use crate::data::{Source, SourceKind, SourceMeta};
+use arbvis::{name_hue, Source, SourceKind, TILE};
+
+use crate::data::SourceMeta;
 use crate::format::{Dtype, TensorMeta};
-use crate::geometry::name_hue;
 use crate::layout::bin_pack::{align_up, pack, Slot};
 use crate::layout::name_tree::{self, LayerSlot};
 use crate::layout::TileRegion;
-use crate::tiled::leaf::TILE;
 
 /// 8-px gutter between tensor slots inside a layer and between layer rows.
 /// Keeps boundaries visually distinct without dominating the canvas.
@@ -960,7 +960,7 @@ fn pick_column_count(n: u32, layer_w: u32, layer_h: u32, gutter: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::Extensions;
+    use arbvis::Extensions;
 
     #[test]
     fn next_pow2_basics() {

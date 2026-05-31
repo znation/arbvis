@@ -1,6 +1,5 @@
 pub mod html;
 pub mod leaf;
-pub mod leaf_arch;
 pub mod leaf_renderer;
 pub mod pyramid_accum;
 pub mod streaming;
@@ -16,8 +15,7 @@ use async_channel::{bounded, Receiver, Sender};
 use indicatif::ProgressBar;
 
 use crate::color::{build_diff_signed_lut, build_pixel_lut};
-use crate::data::{load_source_data, Data, Source, SourceKind};
-use crate::format::DiffFill;
+use crate::data::{load_source_data, Data, DiffFill, Source, SourceKind};
 use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, rects_centroid};
 use crate::layout::{select_layout, LayoutMode, LayoutShape};
 use crate::progress::{counter_style, multi, queue_style, status_style};
@@ -28,7 +26,6 @@ use crate::tiled::leaf::{
     render_leaf_tile_xet_dtype_from_buf, render_leaf_tile_xet_from_buf, TileFormat, TILE,
     TILE_LOG2, TILE_PIXELS,
 };
-use crate::tiled::leaf_arch::LoadedArchTile;
 use crate::tiled::leaf_renderer::{LeafRegistry, LeafTile, LoadCtx, RenderCtx};
 use crate::tiled::pyramid_accum::{LocalFileSink, PyramidAccumulator};
 use crate::xet::{XorbMap, TABLEAU_20};
@@ -165,13 +162,14 @@ impl TileCoords {
 pub struct LoadedTile {
     pub tx: u32,
     pub ty: u32,
-    /// `Some` when the mode needs raw byte data AND the layout is the legacy
-    /// Hilbert curve (one fixed 256 KiB buffer per tile); `None` for dtype
-    /// mode or architectural mode (which uses `arch_tile` instead).
+    /// `Some` for the byte-Hilbert loader; a fixed 256 KiB buffer painted
+    /// 1 byte → 1 pixel by the byte-LUT renderer.
     pub tile_buf: Option<Box<[u8; TILE_PIXELS]>>,
-    /// `Some` when the layout is architectural; carries per-region byte
-    /// slices for the (typically O(tens)) tensors that intersect this tile.
-    pub arch_tile: Option<LoadedArchTile>,
+    /// Opaque per-loader payload. Custom `LeafLoader` implementations
+    /// (e.g. modelweightvis's `ArchRegionsLoader`) stuff their per-tile
+    /// data here; the matching `LeafRenderer` downcasts to recover it.
+    /// `None` means the renderer expects byte-LUT mode only.
+    pub extra: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 pub struct EncodedTile {
@@ -522,119 +520,61 @@ pub(super) async fn build_tile_plan(
         arr
     };
 
-    let has_safetensors = !diff_mode
-        && sources
-            .iter()
-            .any(|s| s.extensions.get::<crate::format::ModelInfo>().is_some());
-    let dtype_mode = has_safetensors && !xet_mode;
-    let combined_dtype_ranges: Vec<(u64, u64, image::Rgb<u8>)> = if has_safetensors {
-        let mut ranges = Vec::new();
-        let mut cumulative: u64 = 0;
-        for source in &sources {
-            if let Some(st) = source.extensions.get::<crate::format::ModelInfo>() {
-                for &(start, end, color) in &st.color_ranges {
-                    ranges.push((cumulative + start, cumulative + end, color));
-                }
-            }
-            cumulative += source.byte_size;
-        }
-        ranges
-    } else {
-        vec![]
-    };
+    // Dtype-aware overlay (per-tensor color ranges + per-tensor entity
+    // labels for safetensors in byte-Hilbert mode) lives in
+    // `modelweightvis` now. arbvis byte-Hilbert renders pure byte-LUT;
+    // tensor-aware visualisation goes through the arch layout instead.
+    let dtype_mode = false;
+    let combined_dtype_ranges: Vec<(u64, u64, image::Rgb<u8>)> = vec![];
 
+    // File-level entity overlay (per-source rect + label, no tensor
+    // awareness). modelweightvis's arch layout supplies its own per-tensor
+    // entities via `LayoutShape::layout_entities`; arbvis byte-Hilbert
+    // sticks to one entity per source file.
     let mut entities: Vec<FileEntity> = Vec::new();
     {
         let mut cumulative: u64 = 0;
         for source in &sources {
-            if let Some(st) = source.extensions.get::<crate::format::ModelInfo>() {
-                for tensor in &st.tensors {
-                    let t_start = cumulative + tensor.file_start;
-                    let t_end = cumulative + tensor.file_end;
-                    if t_end <= t_start {
-                        continue;
-                    }
-                    let rects = file_rects(
-                        t_start,
-                        t_end,
-                        total_pixels,
-                        square_pixels,
-                        num_squares,
-                        height,
-                        kh as u8,
-                    );
-                    let (pixel_x, pixel_y) = rects_centroid(&rects).unwrap_or_else(|| {
-                        let mid = t_start + (t_end - t_start) / 2;
-                        let sq = mid / square_pixels;
-                        let (lx, ly) = hilbert_to_xy_u64(mid % square_pixels, kh as u8);
-                        (sq as u32 * height + lx, ly)
-                    });
-                    let name = tensor.label();
-                    let hue = name_hue(&tensor.name);
-                    let segments = outer_segments(&rects);
-                    let bbox = rects
-                        .first()
-                        .map(|&first| {
-                            rects.iter().skip(1).fold(
-                                first,
-                                |(x0, y0, x1, y1), &(rx0, ry0, rx1, ry1)| {
-                                    (x0.min(rx0), y0.min(ry0), x1.max(rx1), y1.max(ry1))
-                                },
-                            )
+            let name = source.name();
+            let data_start = cumulative;
+            let data_end = cumulative + source.byte_size;
+            let rects = file_rects(
+                data_start,
+                data_end,
+                total_pixels,
+                square_pixels,
+                num_squares,
+                height,
+                kh as u8,
+            );
+            let (pixel_x, pixel_y) = rects_centroid(&rects).unwrap_or_else(|| {
+                let mid = data_start + (data_end - data_start) / 2;
+                let sq = mid / square_pixels;
+                let (lx, ly) = hilbert_to_xy_u64(mid % square_pixels, kh as u8);
+                (sq as u32 * height + lx, ly)
+            });
+            let hue = name_hue(&name);
+            let segments = outer_segments(&rects);
+            let bbox = rects
+                .first()
+                .map(|&first| {
+                    rects
+                        .iter()
+                        .skip(1)
+                        .fold(first, |(x0, y0, x1, y1), &(rx0, ry0, rx1, ry1)| {
+                            (x0.min(rx0), y0.min(ry0), x1.max(rx1), y1.max(ry1))
                         })
-                        .unwrap_or((0, 0, 0, 0));
-                    entities.push(FileEntity {
-                        name,
-                        pixel_x,
-                        pixel_y,
-                        hue,
-                        byte_size: t_end - t_start,
-                        bbox,
-                        segments,
-                    });
-                }
-            } else {
-                let name = source.name();
-                let data_start = cumulative;
-                let data_end = cumulative + source.byte_size;
-                let rects = file_rects(
-                    data_start,
-                    data_end,
-                    total_pixels,
-                    square_pixels,
-                    num_squares,
-                    height,
-                    kh as u8,
-                );
-                let (pixel_x, pixel_y) = rects_centroid(&rects).unwrap_or_else(|| {
-                    let mid = data_start + (data_end - data_start) / 2;
-                    let sq = mid / square_pixels;
-                    let (lx, ly) = hilbert_to_xy_u64(mid % square_pixels, kh as u8);
-                    (sq as u32 * height + lx, ly)
-                });
-                let hue = name_hue(&name);
-                let segments = outer_segments(&rects);
-                let bbox = rects
-                    .first()
-                    .map(|&first| {
-                        rects.iter().skip(1).fold(
-                            first,
-                            |(x0, y0, x1, y1), &(rx0, ry0, rx1, ry1)| {
-                                (x0.min(rx0), y0.min(ry0), x1.max(rx1), y1.max(ry1))
-                            },
-                        )
-                    })
-                    .unwrap_or((0, 0, 0, 0));
-                entities.push(FileEntity {
-                    name,
-                    pixel_x,
-                    pixel_y,
-                    hue,
-                    byte_size: data_end - data_start,
-                    bbox,
-                    segments,
-                });
-            }
+                })
+                .unwrap_or((0, 0, 0, 0));
+            entities.push(FileEntity {
+                name,
+                pixel_x,
+                pixel_y,
+                hue,
+                byte_size: data_end - data_start,
+                bbox,
+                segments,
+            });
             cumulative += source.byte_size;
         }
     }
@@ -666,21 +606,16 @@ pub(super) async fn build_tile_plan(
             (Vec::new(), Vec::new())
         };
 
-    let mode = if xet_mode && has_safetensors {
-        LeafMode::XetDtype {
-            xorb_ranges: Arc::new(xorb_map.global_ranges),
-            tableau: Arc::new(tableau),
-            dtype_ranges: Arc::new(combined_dtype_ranges),
-        }
-    } else if xet_mode {
+    // `XetDtype` and `Dtype` modes mix tensor color ranges with the byte/xet
+    // overlay. arbvis byte-only has no tensor info, so we drop those modes
+    // here. modelweightvis re-enables them when its `FormatPlugin` populates
+    // `Source.extensions` and the arch layout takes over.
+    let _ = (dtype_mode, combined_dtype_ranges);
+    let mode = if xet_mode {
         LeafMode::Xet {
             pixel_lut: pixel_lut.clone(),
             xorb_ranges: Arc::new(xorb_map.global_ranges),
             tableau: Arc::new(tableau),
-        }
-    } else if dtype_mode {
-        LeafMode::Dtype {
-            ranges: Arc::new(combined_dtype_ranges),
         }
     } else if diff_mode {
         LeafMode::Diff {
@@ -695,32 +630,15 @@ pub(super) async fn build_tile_plan(
         }
     };
 
-    // Opportunistically fetch config.json / model.safetensors.index.json
-    // for each source. These are advisory — `select_layout` falls back to
-    // pure tensor-name inference when the sidecars are absent.
-    let metas = if matches!(layout_mode, LayoutMode::Hilbert) {
-        Vec::new()
-    } else {
-        crate::data::load_meta_for_sources(&sources).await
-    };
-    if let Some(arch_summary) = metas
-        .iter()
-        .find_map(|m| m.config.as_ref().map(|c| c.summary()))
-    {
-        log::info!("model config: {arch_summary}");
-    }
-
-    // Construct the layout. For Hilbert (the legacy path) we already have
-    // every field — we wrap them so downstream code can take `&Layout`.
-    // For Architectural we let the layout module rebuild the grid, then
-    // override `width_tiles`, `height_tiles`, `max_zoom`, `total_tiles`,
-    // and `world_w`/`height` with the layout-derived values.
+    // Sidecar metadata (config.json / model.safetensors.index.json) is
+    // model-side; if needed, a `FormatPlugin` populates `Source.extensions`
+    // and the arch layout plugin reads from there. arbvis itself only
+    // dispatches the layout.
     let layout = select_layout(
         &sources,
         &cumulative_offsets,
         total,
         layout_mode,
-        &metas,
         diff_mode,
         registry,
     );
@@ -1197,7 +1115,7 @@ pub(super) fn render_one(
         tx,
         ty,
         tile_buf,
-        arch_tile: _,
+        extra: _,
     } = tile;
     let (image, bytes) = match mode {
         LeafMode::Plain { pixel_lut } => {

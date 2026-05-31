@@ -4,9 +4,10 @@
 
 use std::path::Path;
 
-use arbvis::{
-    build_safetensors_diff_sources, DiffBuildCtx, DiffSourceBuilder, Source, SourceFormat,
-};
+use arbvis::{DiffBuildCtx, DiffSourceBuilder, Source};
+
+use crate::data::build_safetensors_diff_sources;
+use crate::format::SourceFormat;
 
 /// Tensor-aware diff (safetensors / GGUF). Applies when both paths look
 /// like a recognised model-format file.

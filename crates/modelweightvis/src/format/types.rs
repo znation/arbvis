@@ -10,64 +10,9 @@ use image::Rgb;
 use super::dtype::Dtype;
 use super::SourceFormat;
 
-/// Crosshatched-fill kind for unmatched-tensor / unmatched-file regions in diff mode.
-///
-/// `Grey` is for the "expected" finetune case (tensor present in base but
-/// absent from finetune — e.g. a base model's vision tower vs a text-only
-/// finetune). `Red` and `Green` flag genuine structural divergence between two
-/// otherwise-compatible files. Each region is filled with diagonal crosshatch
-/// lines so it's instantly distinguishable from a real signed-diff color.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum DiffFill {
-    /// Tensor/file present in original only, finetune mode (informational).
-    Grey,
-    /// Tensor/file present in original only, non-finetune mode (divergence).
-    Red,
-    /// Tensor/file present in modified only, non-finetune mode (divergence).
-    Green,
-}
-
-impl DiffFill {
-    /// `(stripe, base)` colors for the crosshatch pattern. `stripe` is the
-    /// foreground diagonal line color; `base` is the fill behind it.
-    pub fn colors(self) -> (Rgb<u8>, Rgb<u8>) {
-        match self {
-            DiffFill::Grey => (Rgb([80, 80, 80]), Rgb([160, 160, 160])),
-            DiffFill::Red => (Rgb([120, 0, 0]), Rgb([220, 40, 40])),
-            DiffFill::Green => (Rgb([0, 120, 0]), Rgb([40, 220, 40])),
-        }
-    }
-}
-
-/// Selects how per-element diffs are encoded for visualization.
-///
-/// All three preserve the sign convention (green = grew, red = shrank,
-/// black = no change, white = NaN/Inf in either side). They differ in how
-/// brightness is computed.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum DiffMetric {
-    /// Per-tensor RMS-normalized signed delta:
-    ///   `signed = clamp(delta / (K_RMS_SAT * rms(orig)), -1, 1)`
-    ///
-    /// Reads as "how many tensor-stddevs did this element move." Stable
-    /// across tensors regardless of weight scale, and doesn't blow up on
-    /// small base weights the way per-element `(m-o)/|o|` does. Requires a
-    /// per-tensor scale (computed at setup via sampling). Default.
-    #[default]
-    Rms,
-    /// Absolute delta on a log brightness scale, no normalization:
-    ///   `signed = sign(delta) * clamp((log10(|delta|) - log10(ABS_LOG_MIN))
-    ///             / (log10(ABS_LOG_MAX) - log10(ABS_LOG_MIN)), 0, 1)`
-    ///
-    /// Honest about raw magnitudes; no per-tensor pre-pass. Tensors with
-    /// naturally larger weights look hotter even if untouched relative to
-    /// their scale.
-    AbsLog,
-    /// Ternary: identical bytes → black, any change → full saturation in the
-    /// direction of the change. Best diagnostic for LoRA-merge patterns —
-    /// every untouched element is pitch black, touched elements glow.
-    Exact,
-}
+// DiffFill and DiffMetric moved to arbvis (byte-foundation). The
+// `format::DiffMetric` / `format::DiffFill` names that the per-format
+// parsers use are now re-exported from `format/mod.rs`.
 
 /// Saturation threshold for `DiffMetric::Rms`: an element whose delta equals
 /// `K_RMS_SAT * rms(orig)` paints at full brightness. 0.5 means "half a

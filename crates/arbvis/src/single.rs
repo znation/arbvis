@@ -10,14 +10,25 @@ use minifb::{Window, WindowOptions};
 use rayon::prelude::*;
 
 use crate::color::{build_diff_signed_lut, build_pixel_lut};
-use crate::data::{load_source_data, Data, Source, SourceKind};
-use crate::format::{color_for_pos, DiffFill};
+use crate::data::{load_source_data, Data, DiffFill, Source, SourceKind};
 use crate::geometry::{hilbert_to_xy_u64, sampled_in_range};
 use crate::label::draw_file_label;
-use crate::layout::arch::ArchLayout;
-use crate::layout::render::{plain_element_color, PADDING_RGB};
 use crate::layout::{select_layout, LayoutMode};
 use crate::xet::{XorbMap, TABLEAU_20};
+
+/// Binary-search color lookup over a sorted `[(start, end_exclusive, color)]`
+/// list. Local copy of what `modelweightvis::format::color_for_pos` does;
+/// arbvis byte-only never feeds a non-empty range list (its `dtype_ranges`
+/// is always `None`), but the type signature has to match the dead-code
+/// branch that still compiles.
+fn color_for_pos(pos: u64, ranges: &[(u64, u64, Rgb<u8>)]) -> Rgb<u8> {
+    let idx = ranges.partition_point(|&(_, end, _)| end <= pos);
+    if idx < ranges.len() && ranges[idx].0 <= pos {
+        ranges[idx].2
+    } else {
+        Rgb([0, 0, 0])
+    }
+}
 
 /// Two-pixel-wide diagonal crosshatch on (x, y) for unmatched-region sources.
 /// Kept identical in spirit to the tile renderer's pattern so the single-image
@@ -30,10 +41,6 @@ fn is_crosshatch_stripe_single(x: u32, y: u32) -> bool {
     let b = (x + (PERIOD - y % PERIOD)) % PERIOD;
     a < STRIPE || b < STRIPE
 }
-
-/// Maximum side length of the single-image output. Mirrors the GPU buffer
-/// size cap baked into the legacy Hilbert path (`(1 << 12)² × 3 ≈ 50 MB`).
-const SINGLE_MAX_DIM: u32 = 4096;
 
 /// Render a single image (non-tiled mode). Chooses between the legacy global-
 /// Hilbert layout and the architectural layout based on `layout_mode`.
@@ -57,31 +64,15 @@ pub fn run_single(
         }
         v
     };
-    // Opportunistic sidecar (config.json / index.json) load. Runs inside
-    // the ambient tokio runtime via `block_on` because `run_single` is sync
-    // and is already inside `spawn_blocking`. For Hilbert mode we skip —
-    // the legacy path doesn't consume the metadata.
-    let metas = if matches!(layout_mode, LayoutMode::Hilbert) {
-        Vec::new()
-    } else {
-        tokio::runtime::Handle::current().block_on(crate::data::load_meta_for_sources(&sources))
-    };
-    if let Some(arch_summary) = metas
-        .iter()
-        .find_map(|m| m.config.as_ref().map(|c| c.summary()))
-    {
-        log::info!("model config: {arch_summary}");
-    }
     let layout = select_layout(
         &sources,
         &cumulative_offsets,
         total,
         layout_mode,
-        &metas,
         diff_mode,
         registry,
     );
-    if let Some(arch) = layout.as_any().downcast_ref::<ArchLayout>() {
+    if layout.id() == "arch" {
         // Arch mode only handles local (mmap'd / owned) data for now. If any
         // source needs an HTTP/Xet/LazyDiff fetch we fall through to the
         // Hilbert path with a warning, since the architectural single-image
@@ -94,11 +85,18 @@ pub fn run_single(
             )
         });
         if all_local && !diff_mode && !show_xet_xorbs {
-            return run_single_arch(files, output, &sources, arch);
+            if let Some(hook) = registry.single_image_arch.as_ref() {
+                return hook.render(files, output, &sources, layout.as_ref());
+            }
+            log::warn!(
+                "architectural single-image layout selected but no `SingleImageArchHook` registered; \
+                 falling back to hilbert (modelweightvis registers the hook)"
+            );
+        } else {
+            log::warn!(
+                "architectural single-image layout requires local non-diff non-xet inputs; falling back to hilbert"
+            );
         }
-        log::warn!(
-            "architectural single-image layout requires local non-diff non-xet inputs; falling back to hilbert"
-        );
     }
     // Open each source as a `Data` handle (sync — mmap / lightweight clone)
     // before dispatching, so the rayon workers can be handed ready-to-use
@@ -123,130 +121,6 @@ pub fn run_single(
     )
 }
 
-/// Synchronous architectural-mode single-image render. Renders every tensor
-/// into a downsampled overview that fits inside `SINGLE_MAX_DIM²`; preserves
-/// the per-tensor 2D aspect via independent integer downsampling.
-fn run_single_arch(
-    _files: &[PathBuf],
-    output: Option<PathBuf>,
-    sources: &[Source],
-    layout: &ArchLayout,
-) -> anyhow::Result<()> {
-    let (canvas_w, canvas_h) = (layout.width, layout.height);
-    // Global integer downscale so the largest dimension fits in SINGLE_MAX_DIM.
-    let max_dim = canvas_w.max(canvas_h).max(1);
-    let scale: u32 = max_dim.div_ceil(SINGLE_MAX_DIM).max(1);
-    let out_w = (canvas_w / scale).max(1);
-    let out_h = (canvas_h / scale).max(1);
-
-    let mut img: image::ImageBuffer<Rgb<u8>, Vec<u8>> = image::ImageBuffer::new(out_w, out_h);
-    for p in img.pixels_mut() {
-        *p = PADDING_RGB;
-    }
-
-    // Open each source as `Data` so we can borrow its bytes synchronously
-    // via `Deref` (panics for HTTP/Xet/LazyDiff — but `run_single`'s
-    // dispatcher already gated those out above).
-    let data: Vec<Data> = sources
-        .iter()
-        .map(load_source_data)
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    let pixel_lut = build_pixel_lut();
-
-    // Per tensor, sample every `scale`-th element in row-major order and
-    // paint it into the output image. The sampling is intentionally simple
-    // pixel-skip (not box-averaged) — for a 4096²-bound overview the loss
-    // of detail vs box-averaging is invisible at this scale and the loop is
-    // a memory-bound walk.
-    for t in &layout.tensors {
-        let cols = t.tensor_cols;
-        let rows = t.tensor_rows;
-        // On-canvas footprint (element grid scaled by the per-tensor display
-        // scale); output pixels map back to elements through this footprint.
-        let disp_w = t.disp_w as u64;
-        let disp_h = t.disp_h as u64;
-        let src_idx = t.source_idx;
-        let src_bytes: &[u8] = match &data[src_idx] {
-            Data::Mapped(m) => m,
-            Data::Owned(v) => v,
-            _ => continue,
-        };
-        // Tensor byte start, local to its source. The tensor's element data runs
-        // contiguously from here; `plain_element_color` indexes it by *element*
-        // index, decoding the dtype's natural stride (fixed / block-quantised) —
-        // so we pass the whole tail slice and a flat element index rather than a
-        // hand-computed byte offset, which would be wrong for block/packed dtypes.
-        let local_off = t
-            .tensor_byte_start
-            .saturating_sub(sources[..src_idx].iter().map(|s| s.byte_size).sum::<u64>())
-            as usize;
-        if local_off >= src_bytes.len() {
-            continue;
-        }
-        let tensor_bytes = &src_bytes[local_off..];
-
-        // Output rect after scaling, in terms of the display footprint.
-        let out_x0 = t.canvas_x / scale;
-        let out_y0 = t.canvas_y / scale;
-        let out_x1 = ((t.canvas_x + disp_w.min(u32::MAX as u64) as u32) / scale).min(out_w);
-        let out_y1 = ((t.canvas_y + disp_h.min(u32::MAX as u64) as u32) / scale).min(out_h);
-        if out_x1 <= out_x0 || out_y1 <= out_y0 {
-            continue;
-        }
-
-        for oy in out_y0..out_y1 {
-            // Output y → display-pixel offset within the footprint → element row.
-            let disp_y = (oy - out_y0) as u64 * scale as u64;
-            if disp_y >= disp_h {
-                break;
-            }
-            let er = disp_y * rows / disp_h.max(1);
-            for ox in out_x0..out_x1 {
-                let disp_x = (ox - out_x0) as u64 * scale as u64;
-                if disp_x >= disp_w {
-                    break;
-                }
-                let ec = disp_x * cols / disp_w.max(1);
-                let flat = (er * cols + ec) as usize;
-                let color = plain_element_color(t.dtype, tensor_bytes, flat, &pixel_lut);
-                img.put_pixel(ox, oy, color);
-            }
-        }
-    }
-
-    if let Some(path) = output {
-        image::DynamicImage::ImageRgb8(img).save(&path)?;
-        return Ok(());
-    }
-
-    // Interactive window: just show the final image and wait for close.
-    let pixels: Vec<u32> = img
-        .pixels()
-        .map(|p| ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32))
-        .collect();
-    let mut window = Window::new(
-        "arbvis (arch layout) — press Esc or close to quit",
-        out_w as usize,
-        out_h as usize,
-        WindowOptions::default(),
-    )
-    .map_err(|e| anyhow::anyhow!("failed to open preview window: {e}"))?;
-    window.set_target_fps(10);
-    while window.is_open() && !window.is_key_down(minifb::Key::Escape) {
-        window
-            .update_with_buffer(&pixels, out_w as usize, out_h as usize)
-            .map_err(|e| anyhow::anyhow!("window update error: {e}"))?;
-    }
-    Ok(())
-}
-
-/// Legacy Hilbert-curve single-image renderer.
-///
-/// `source_data` is parallel to `sources`. Lazy/remote `Data` variants are
-/// read per chunk by blocking on `rt`, which lets this otherwise-synchronous
-/// rayon pipeline drive `--diff` and other `LazyDiff`-backed sources that
-/// can't be `Deref`d.
 fn run_single_hilbert(
     files: &[PathBuf],
     output: Option<PathBuf>,
@@ -627,19 +501,21 @@ fn render_chunks(
                 if source_chunks.is_empty() {
                     return Ok(vec![]);
                 }
-                let dtype_ranges = sources[src_idx]
-                    .extensions
-                    .get::<crate::format::ModelInfo>()
-                    .map(|st| st.color_ranges.as_slice());
+                // Dtype-aware color ranges live in modelweightvis's
+                // `FormatPlugin`-populated extensions; arbvis byte-only
+                // doesn't read those. Always `None` here — the pixel
+                // colorizer falls back to the byte LUT.
+                let dtype_ranges: Option<&[(u64, u64, image::Rgb<u8>)]> = None;
+                let _ = src_idx; // silence unused-var when dtype_ranges == None
                 let unmatched_fill: Option<DiffFill> = match &sources[src_idx].kind {
                     SourceKind::UnmatchedRegion { fill } => Some(*fill),
                     _ => None,
                 };
-                // Bytes are only needed for xet (entropy modulation) and for
-                // plain mode (byte LUT). Dtype and unmatched-region paths are
-                // position-only.
-                let needs_bytes = unmatched_fill.is_none()
-                    && (xet_mode || dtype_ranges.is_none());
+                // arbvis byte-only no longer has a dtype-only path; the
+                // only no-bytes case left is UnmatchedRegion. Kept as a
+                // local for parity with the original shape — fed into the
+                // chunk loop below.
+                let _needs_bytes = unmatched_fill.is_none() && xet_mode;
                 let data: &Data = &source_data[src_idx];
                 let results: anyhow::Result<Vec<(usize, Option<(u32, u32, u32, u32)>)>> = source_chunks
                     .par_iter()
@@ -667,34 +543,6 @@ fn render_chunks(
                                 } else {
                                     base_c
                                 };
-                                let pixel_idx = y as usize * side as usize + x as usize;
-                                unsafe {
-                                    let p = (img_base as *mut u8).add(pixel_idx * 3);
-                                    p.write(color[0]);
-                                    p.add(1).write(color[1]);
-                                    p.add(2).write(color[2]);
-                                    (pf_base as *mut Option<usize>)
-                                        .add(pixel_idx)
-                                        .write(Some(fi));
-                                }
-                                bbox = Some(match bbox {
-                                    None => (x, y, x, y),
-                                    Some((x0, y0, x1, y1)) => {
-                                        (x0.min(x), y0.min(y), x1.max(x), y1.max(y))
-                                    }
-                                });
-                                cur_pixel += 1;
-                            }
-                        } else if !needs_bytes {
-                            let ranges = dtype_ranges.unwrap();
-                            let first = chunk_b_start
-                                + (stride - chunk_b_start % stride) % stride;
-                            for strided_b in (first..chunk_b_end).step_by(stride as usize) {
-                                if cur_pixel >= canvas_size {
-                                    break;
-                                }
-                                let (x, y) = hilbert_to_xy_u64(cur_pixel as u64, k as u8);
-                                let color = color_for_pos(strided_b - src_global_start, ranges);
                                 let pixel_idx = y as usize * side as usize + x as usize;
                                 unsafe {
                                     let p = (img_base as *mut u8).add(pixel_idx * 3);

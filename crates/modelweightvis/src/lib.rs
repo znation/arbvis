@@ -1,24 +1,40 @@
 //! Tensor-format-aware visualization built on `arbvis`.
 //!
-//! Provides the model-aware plugin set (architectural + MoE-diff layouts,
-//! tensor-diff source builder, arch leaf loader+renderer) layered on top
-//! of `arbvis::Registry::with_defaults`. The binary calls `register_all`
-//! before handing off to `arbvis::run`, which is what makes the
-//! `modelweightvis` binary differ from the byte-only `arbvis` binary.
+//! Owns every model-aware piece of the workspace:
+//! - `format/` — safetensors / GGUF / PyTorch-pickle header parsers, dtype
+//!   tables, MoE expert decoding.
+//! - `layout/` — architectural canvas, MoE-diff matrix layout, transformer
+//!   name classification, dtype-aware element colorizers.
+//! - `tiled/` — per-tensor tile load and the dtype-aware tile renderers.
+//! - `data` — `TensorDiffSource`, MoE-diff source prep, multi-shard
+//!   safetensors diff helpers, `MoeCell`, `SourceMeta`.
+//! - `finetune` — HF model-card finetune auto-detection.
+//! - Plugin impls (`ArchLayoutPlugin`, `MoeDiffLayoutPlugin`,
+//!   `TensorDiffBuilder`, `ArchRegionsLoader`, `ArchRegionsRenderer`, the
+//!   `FormatPlugin` family, plus the `MoeDiffPrep`/`RepoDiffPrep`/
+//!   `DirectoryTensorDiffPrep`/`FinetuneDetect`/`SingleImageArchHook` hooks)
+//!   are registered on a registry via [`register_all`].
 //!
-//! The underlying types these plugins build (`arbvis::ArchLayout`,
-//! `arbvis::TensorDiffSource`, the `format::*` parsers, etc.) still live
-//! in arbvis as pub-exposed items. The full source relocation that would
-//! actually lift the heavy deps (`candle-core`, `regex`, `zip`, `half`)
-//! out of arbvis is deferred — see the workspace README.
+//! The `modelweightvis` binary builds `arbvis::Registry::with_defaults()`,
+//! calls `register_all(&mut registry)`, and hands off to `arbvis::run`.
 
+// Mid-relocation: many model-aware helpers (FormatPlugin impls,
+// MoeDiffPrep/RepoDiffPrep/DirectoryTensorDiffPrep/FinetuneDetect/
+// SingleImageArchHook trait impls, plus the data-side prep helpers
+// they call) are defined but not yet wired into `register_all`. The
+// dead_code allow comes off when the hook impls land.
+#![allow(dead_code, clippy::too_many_arguments, clippy::type_complexity)]
+
+mod data;
 mod diff;
+mod finetune;
+mod format;
 mod layout;
-mod leaf;
+mod tiled;
 
 pub use diff::TensorDiffBuilder;
 pub use layout::{ArchLayoutPlugin, MoeDiffLayoutPlugin};
-pub use leaf::{ArchRegionsLoader, ArchRegionsRenderer};
+pub use tiled::{ArchRegionsLoader, ArchRegionsRenderer};
 
 use std::sync::Arc;
 
@@ -30,15 +46,24 @@ pub fn register_all(registry: &mut Registry) {
     // it wins over the JSON / plain-byte fallbacks for matching pairs.
     registry.diffs.push(Arc::new(TensorDiffBuilder));
 
-    // Architectural + MoE-diff layouts. Priority order is encoded on the
-    // plugin (200 / 100); `select_layout` sorts by `priority()` descending.
+    // Architectural + MoE-diff layouts. Priority 200 / 100; `select_layout`
+    // sorts by `priority()` descending.
     registry.layouts.push(Arc::new(ArchLayoutPlugin));
     registry.layouts.push(Arc::new(MoeDiffLayoutPlugin));
 
-    // Tile loader+renderer pair for the `"arch"` layout id. The arch
-    // layout dispatches to these via `LeafRegistry` lookup at tile time.
+    // Tile loader+renderer pair for the `"arch"` layout id.
     registry.leaf.register_loader(Arc::new(ArchRegionsLoader));
     registry
         .leaf
         .register_renderer(Arc::new(ArchRegionsRenderer));
+
+    // Optional hooks (TODO): implement `TensorMoeDiffPrep`,
+    // `TensorRepoDiffPrep`, `TensorDirectoryDiffPrep`,
+    // `HfModelCardFinetuneDetect`, `ArchSingleImageHook`, and the
+    // `SafetensorsFormatPlugin` / `GgufFormatPlugin` / `PickleFormatPlugin`
+    // family on top of the moved-here `crate::data::*` helpers. Until
+    // those wrappers exist, --moe-diff, repo-level --diff,
+    // directory-safetensors --diff, single-image arch, and
+    // FormatPlugin-driven `ModelInfo` population error cleanly via
+    // arbvis's `Option`-slot guards.
 }

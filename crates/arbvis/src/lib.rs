@@ -3,11 +3,9 @@
 mod color;
 mod data;
 mod deploy;
-mod finetune;
-mod format;
 mod geometry;
 mod hf_upload;
-mod hf_url;
+pub mod hf_url;
 mod json_diff;
 mod label;
 mod layout;
@@ -17,25 +15,22 @@ mod registry;
 mod single;
 mod throttle;
 mod tiled;
-mod xet;
+pub mod xet;
 
-// Public plugin/library surface. The tile pipeline, layout-selection, and
-// diff-source-prep plugins all dispatch through these. Step 12e moves the
-// model-aware plugin IMPLS to modelweightvis; the underlying types and
-// helpers stay here (the heavy-dep relocation is deferred — see the README
-// for the workspace status).
+// Public library surface — the byte-only foundation modelweightvis builds
+// on. Tile pipeline, source/diff plumbing, layout traits, hooks for the
+// model-aware plugins to plug into.
 pub use data::{
-    build_safetensors_diff_sources, CustomSource, Extensions, MoeCell, Source, SourceKind,
-    TensorDiffSource,
+    CustomSource, Data, DiffFill, DiffMetric, Extensions, LazyFetcher, Source, SourceKind,
 };
-pub use format::{DiffFill, DiffMetric, ModelInfo, SourceFormat, TensorMeta};
-pub use layout::{arch::ArchLayout, CanvasGeom, LayoutMode, LayoutShape, TileRegion};
-pub use registry::{DiffBuildCtx, DiffSourceBuilder, LayoutBuildCtx, LayoutPlugin, Registry};
-pub use tiled::leaf::TileFormat;
-pub use tiled::leaf_arch::{
-    load_arch_tile_regions, render_arch_tile_diff, render_arch_tile_dtype, render_arch_tile_plain,
-    render_arch_tile_xet, render_arch_tile_xet_dtype, LoadedArchTile,
+pub use geometry::name_hue;
+pub use layout::{CanvasGeom, LayoutMode, LayoutShape};
+pub use registry::{
+    DiffBuildCtx, DiffSourceBuilder, DirectoryTensorDiffPrep, FinetuneDetect, FormatPlugin,
+    LayoutBuildCtx, LayoutPlugin, MoeDiffPrep, Registry, RepoDiffPrep, SingleImageArchHook,
 };
+pub use tiled::html::FileEntity;
+pub use tiled::leaf::{encode_tile, TileFormat, TILE};
 pub use tiled::leaf_renderer::{
     LeafLoader, LeafRegistry, LeafRenderer, LeafTile, LoadCtx, RenderCtx,
 };
@@ -447,11 +442,18 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
 
     // --- MoE diff ---------------------------------------------------------
     if let Some(moe_arg) = args.moe_diff {
+        let hook = registry.moe_diff.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--moe-diff requires a tensor-aware backend (no `MoeDiffPrep` registered); \
+                 use `modelweightvis` instead of `arbvis`"
+            )
+        })?;
         let metric = args.diff_metric.to_metric();
         let input = moe_arg.to_string_lossy().into_owned();
         let inputs = vec![input.clone()];
         let title = default_title(args.title, "arbvis moe-diff");
-        let (sources, total) = data::prepare_moe_diff_sources(&input, metric, stream)
+        let (sources, total) = hook
+            .prepare(&input, metric, stream)
             .await
             .with_context(|| format!("--moe-diff {input}"))?;
         let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
@@ -476,16 +478,31 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
         let diff_title = default_title(args.title, "arbvis diff");
         let orig_str = &diff_input_strs[0];
         let mod_str = &diff_input_strs[1];
-        let is_finetune =
-            resolve_finetune(args.finetune, args.no_finetune, orig_str, mod_str).await;
+        let is_finetune = resolve_finetune(
+            args.finetune,
+            args.no_finetune,
+            orig_str,
+            mod_str,
+            &registry,
+        )
+        .await;
         let metric = args.diff_metric.to_metric();
 
         let (sources, total) = if hf_url::is_repo_level(orig_str)?
             && hf_url::is_repo_level(mod_str)?
         {
             // Both are repo-level hf:// URLs: list files over API, diff lazily
-            // over HTTP. No model weights are downloaded to disk or held in RAM.
-            // The two listings are independent, so run them concurrently.
+            // over HTTP. Tensor-aware prep is required because the
+            // model-format files need byte-range header parses to match
+            // tensors across the two repos — arbvis core delegates to the
+            // registered `RepoDiffPrep` hook.
+            let hook = registry.repo_diff.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--diff between two `hf://` model repos requires a tensor-aware \
+                     backend (no `RepoDiffPrep` registered); use `modelweightvis` \
+                     instead of `arbvis`"
+                )
+            })?;
             let (orig_specs, mod_specs) = tokio::try_join!(
                 async {
                     hf_url::list_repo_as_http_specs(orig_str)
@@ -498,14 +515,8 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
                         .with_context(|| format!("listing files in {mod_str}"))
                 },
             )?;
-            data::prepare_diff_sources_from_http(
-                &orig_specs,
-                &mod_specs,
-                is_finetune,
-                metric,
-                stream,
-            )
-            .await?
+            hook.prepare(&orig_specs, &mod_specs, is_finetune, metric, stream)
+                .await?
         } else {
             // At least one side is a local path or single-file hf:// URL.
             // Resolve the two sides concurrently; order matters for the
@@ -562,7 +573,7 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
-    let (sources, total) = resolve_input_sources(&files, show_xet_xorbs, stream).await?;
+    let (sources, total) = resolve_input_sources(&files, show_xet_xorbs, stream, &registry).await?;
     let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
     let cfg = RenderConfig {
         title: default_title(args.title, "arbvis"),
@@ -587,6 +598,7 @@ async fn resolve_finetune(
     no_finetune: bool,
     orig_str: &str,
     mod_str: &str,
+    registry: &registry::Registry,
 ) -> bool {
     if finetune {
         log::info!("--diff finetune mode: forced on by --finetune");
@@ -596,7 +608,11 @@ async fn resolve_finetune(
         log::info!("--diff finetune mode: forced off by --no-finetune");
         return false;
     }
-    match finetune::detect_relation(orig_str, mod_str).await {
+    let detected = match registry.finetune_detect.as_ref() {
+        Some(hook) => hook.detect(orig_str, mod_str).await,
+        None => None,
+    };
+    match detected {
         Some(true) => {
             log::info!(
                 "--diff finetune mode: auto-detected ON ({} declares {} as its base in its HF model card)",
@@ -613,7 +629,7 @@ async fn resolve_finetune(
         }
         None => {
             log::info!(
-                "--diff finetune mode: auto-detect skipped (not both hf:// model URLs or API lookup failed); defaulting to OFF — pass --finetune to override"
+                "--diff finetune mode: auto-detect skipped (no `FinetuneDetect` registered, not both hf:// model URLs, or API lookup failed); defaulting to OFF — pass --finetune to override"
             );
             false
         }
@@ -659,6 +675,7 @@ async fn resolve_input_sources(
     files: &[PathBuf],
     show_xet_xorbs: bool,
     stream: bool,
+    registry: &registry::Registry,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     // Streaming mode keeps hf:// inputs remote; show-xet-xorbs is the other
     // case that has to start from specs (it needs the remote spec to look up
@@ -670,7 +687,7 @@ async fn resolve_input_sources(
                 .buffered(RESOLVE_CONCURRENCY)
                 .try_collect()
                 .await?;
-        return data::prepare_sources(&resolved);
+        return data::prepare_sources(&resolved, registry);
     }
 
     // Resolve `hf://` paths into specs concurrently. Repo-level URLs expand
@@ -703,7 +720,7 @@ async fn resolve_input_sources(
     .into_iter()
     .flatten()
     .collect();
-    let (mut sources, total) = data::prepare_sources_from_specs(&specs)?;
+    let (mut sources, total) = data::prepare_sources_from_specs(&specs, registry)?;
     if show_xet_xorbs {
         data::populate_xet_terms(&mut sources).await?;
     }

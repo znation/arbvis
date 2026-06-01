@@ -1,7 +1,7 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
-mod color;
-mod data;
+pub mod color;
+pub mod data;
 mod deploy;
 mod geometry;
 mod hf_upload;
@@ -21,7 +21,8 @@ pub mod xet;
 // on. Tile pipeline, source/diff plumbing, layout traits, hooks for the
 // model-aware plugins to plug into.
 pub use data::{
-    CustomSource, Data, DiffFill, DiffMetric, Extensions, LazyFetcher, Source, SourceKind,
+    load_source_data, CustomSource, Data, DiffFill, DiffMetric, Extensions, LazyFetcher, Source,
+    SourceKind,
 };
 pub use geometry::name_hue;
 pub use layout::{CanvasGeom, LayoutMode, LayoutShape};

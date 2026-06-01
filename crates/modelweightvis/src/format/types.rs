@@ -121,5 +121,15 @@ pub struct ModelInfo {
     #[allow(dead_code)]
     pub format: SourceFormat,
     pub tensors: Vec<TensorMeta>,
+    /// Per-file `(start, end, color)` LUT covering the metadata-header
+    /// region and per-tensor byte ranges. Populated by the per-format
+    /// `build_color_ranges` helpers and consumed by [`color_for_pos`]
+    /// in this crate's tests. The split-out byte-Hilbert pipeline lives
+    /// in arbvis (which doesn't carry [`ModelInfo`]), and the arch
+    /// renderer keys off `TensorMeta` directly — so this field is
+    /// currently only exercised by tests. Kept for a future arch-mode
+    /// Hilbert overlay (one-line wire-up) and for read-back by curious
+    /// downstream tooling.
+    #[allow(dead_code)]
     pub color_ranges: Vec<(u64, u64, Rgb<u8>)>,
 }

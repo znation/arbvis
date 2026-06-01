@@ -37,6 +37,11 @@ image = "0.25"
 indicatif = "0.17"
 memmap2 = "0.9"
 reqwest = { version = "0.13", features = ["json"] }
+# Interactive preview window for the arch single-image renderer
+# (modelweightvis::single_arch). The non-interactive PNG path doesn't
+# need this dep, but the same module owns both paths so we always
+# compile the window code in.
+minifb = "0.27"
 
 [dev-dependencies]
 tempfile = "3"

@@ -750,7 +750,7 @@ impl crate::throttle::ErrorClassify for DownloadAttemptError {
 /// [`materialize_http_sources`] (normal flow's `SourceKind::Http` swap) and
 /// [`materialize_remote_arcs`] (the `Arc<Data>`s buried inside
 /// `SourceKind::TensorDiff` for `--diff`/`--moe-diff`).
-async fn download_specs_to_paths(
+pub async fn download_specs_to_paths(
     specs: &[RemoteFileSpec],
     progress_label: &str,
 ) -> anyhow::Result<Vec<PathBuf>> {

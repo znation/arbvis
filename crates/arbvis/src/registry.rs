@@ -94,7 +94,14 @@ pub trait DiffSourceBuilder: Send + Sync {
 
 /// Hooks `--moe-diff` CLI flag's source preparation. arbvis errors out
 /// when this flag is passed but no `MoeDiffPrep` is registered.
-#[async_trait]
+///
+/// `?Send`: the canonical impl in `modelweightvis::hooks` calls into
+/// hf-hub's snapshot-download closures, whose internal lifetimes
+/// confuse the rustc HRTB check that `#[async_trait]`'s `+ Send`
+/// future bound triggers. The CLI dispatch never spawns this future
+/// across threads — only `.await`s it locally — so dropping the Send
+/// requirement is safe.
+#[async_trait(?Send)]
 pub trait MoeDiffPrep: Send + Sync {
     async fn prepare(
         &self,
@@ -107,7 +114,9 @@ pub trait MoeDiffPrep: Send + Sync {
 /// Hooks repo-level `--diff` (both args are `hf://owner/repo` URLs).
 /// arbvis errors out when this case is hit and no `RepoDiffPrep` is
 /// registered.
-#[async_trait]
+///
+/// `?Send`: see [`MoeDiffPrep`].
+#[async_trait(?Send)]
 pub trait RepoDiffPrep: Send + Sync {
     async fn prepare(
         &self,
@@ -122,7 +131,9 @@ pub trait RepoDiffPrep: Send + Sync {
 /// Hooks the tensor-files-in-directory branch of `--diff <dir> <dir>`.
 /// The non-tensor files are still handled by arbvis's generic byte-diff
 /// + crosshatch path.
-#[async_trait]
+///
+/// `?Send`: see [`MoeDiffPrep`].
+#[async_trait(?Send)]
 pub trait DirectoryTensorDiffPrep: Send + Sync {
     /// Which directory entries this preparer takes responsibility for.
     /// arbvis partitions directory contents on this predicate before
@@ -139,7 +150,9 @@ pub trait DirectoryTensorDiffPrep: Send + Sync {
 
 /// Hooks the HF "is X a finetune of Y" model-card lookup. arbvis defaults
 /// to "not a finetune" when this hook isn't registered or returns `None`.
-#[async_trait]
+///
+/// `?Send`: see [`MoeDiffPrep`].
+#[async_trait(?Send)]
 pub trait FinetuneDetect: Send + Sync {
     async fn detect(&self, orig_url: &str, mod_url: &str) -> Option<bool>;
 }

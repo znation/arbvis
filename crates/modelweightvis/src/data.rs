@@ -14,7 +14,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
-use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt};
 use indicatif::ProgressBar;
 use memmap2::Mmap;
@@ -83,19 +82,44 @@ fn collect_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
 /// by the multi-shard tensor diff to amortise xet setup cost. Lifted from
 /// arbvis::data unchanged; the xet/HTTP behaviour is identical.
 async fn materialize_remote_arcs(
-    _arcs: &mut [Arc<Data>],
-    _specs: &[RemoteFileSpec],
-    _label: &str,
+    arcs: &mut [Arc<Data>],
+    specs: &[RemoteFileSpec],
+    progress_label: &str,
 ) -> anyhow::Result<()> {
-    // TODO: re-implement against `arbvis::data`'s pub `materialize_http_sources`
-    // entry point (operates on `Source` not `Arc<Data>`). For now the
-    // tensor-diff prep paths that depend on this will need to fall through
-    // — `--moe-diff` and repo-level `--diff` are gated by `Option` hooks
-    // on `arbvis::Registry`, so a missing impl errors cleanly at the CLI.
-    anyhow::bail!(
-        "materialize_remote_arcs: stub during heavy-dep relocation. \
-         Need to wire to arbvis::data::materialize_http_sources."
-    )
+    assert_eq!(
+        arcs.len(),
+        specs.len(),
+        "materialize_remote_arcs: arcs and specs must be the same length"
+    );
+
+    let to_download: Vec<(usize, RemoteFileSpec)> = arcs
+        .iter()
+        .zip(specs.iter())
+        .enumerate()
+        .filter_map(|(i, (arc, spec))| {
+            if arc.is_local() {
+                None
+            } else {
+                Some((i, spec.clone()))
+            }
+        })
+        .collect();
+
+    if to_download.is_empty() {
+        return Ok(());
+    }
+
+    let indices: Vec<usize> = to_download.iter().map(|(i, _)| *i).collect();
+    let specs_subset: Vec<RemoteFileSpec> = to_download.into_iter().map(|(_, s)| s).collect();
+    let paths = arbvis::data::download_specs_to_paths(&specs_subset, progress_label).await?;
+
+    for (i, path) in indices.into_iter().zip(paths) {
+        let f = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        let mmap =
+            unsafe { Mmap::map(&f) }.with_context(|| format!("mmap'ing {}", path.display()))?;
+        arcs[i] = Arc::new(Data::Mapped(mmap));
+    }
+    Ok(())
 }
 
 // === extracted from arbvis::data (block_aligned_byte_range) ===
@@ -155,10 +179,7 @@ fn block_aligned_byte_range(dtype: format::Dtype, start: u64, len: u64) -> (u64,
     }
 }
 
-/// Async fetcher closure used by [`Data::LazyDiff`]. Captures its inputs by
-/// `Arc` so the returned future is `'static` and can be sent across tasks.
-pub type LazyFetcher =
-    Arc<dyn Fn(u64, usize) -> BoxFuture<'static, anyhow::Result<Vec<u8>>> + Send + Sync>;
+// `LazyFetcher` re-exported from arbvis::data (single source of truth).
 
 // === extracted from arbvis::data (TensorDiffSource_struct,TensorDiffSource_impl) ===
 /// Per-tensor diff buffer. The byte stream this exposes is computed lazily
@@ -309,6 +330,33 @@ pub fn load_model_info(
             })
         }
     }
+}
+
+/// Async sibling of [`load_model_info`] for `Data` sources (Http/Xet/etc.).
+/// Wraps [`fetch_model_header`] and builds the same [`ModelInfo`] shape.
+///
+/// Pickle files cannot be parsed from a remote prefix (the zip
+/// end-of-central-directory lives at the tail), so this returns an error
+/// for [`SourceFormat::Pickle`] — callers fall back to "treat as plain
+/// bytes" the same way they would for an unrecognised file.
+pub async fn load_model_info_async(
+    data: &Data,
+    byte_size: u64,
+    fmt: SourceFormat,
+) -> anyhow::Result<ModelInfo> {
+    let (tensors, header_end) = fetch_model_header(data, fmt).await?;
+    let color_ranges = match fmt {
+        SourceFormat::Safetensors => {
+            format::safetensors::build_color_ranges(&tensors, header_end, byte_size)
+        }
+        SourceFormat::Gguf => format::gguf::build_color_ranges(&tensors, header_end, byte_size),
+        SourceFormat::Pickle => format::pickle::build_color_ranges(&tensors, header_end, byte_size),
+    };
+    Ok(ModelInfo {
+        format: fmt,
+        tensors,
+        color_ranges,
+    })
 }
 
 /// Fetch and parse the header from any `Data` source. For local sources
@@ -1204,7 +1252,7 @@ async fn build_multi_safetensors_diff_sources_inner(
 /// side. Each path's extension determines its format (`.safetensors` or
 /// `.gguf`); mixed-format pairs are routed through the cross-format name
 /// canonicaliser.
-async fn build_multi_safetensors_diff_sources(
+pub async fn build_multi_safetensors_diff_sources(
     orig_files: &[PathBuf],
     mod_files: &[PathBuf],
     is_finetune: bool,
@@ -1528,28 +1576,34 @@ pub async fn prepare_moe_diff_sources(
     let pb = setup_progress("source files (model headers)", total_headers);
     let headers: Vec<(usize, Vec<format::TensorMeta>)> = {
         let pb = pb.clone();
-        let mut out: Vec<(usize, anyhow::Result<Vec<format::TensorMeta>>)> =
-            stream::iter(datas.iter().zip(fmts.iter()).enumerate())
-                .map(|(i, (d, fmt))| {
-                    let pb = pb.clone();
-                    let d = Arc::clone(d);
-                    let fmt = *fmt;
-                    async move {
-                        let r = fetch_model_header(&d, fmt)
-                            .await
-                            .map(|(t, _)| t)
-                            .with_context(|| {
-                                format!("reading {fmt:?} header for moe-diff file {i}")
-                            });
-                        if let Some(pb) = pb.as_ref() {
-                            pb.inc(1);
-                        }
-                        (i, r)
+        // Materialize the iter input as owned tuples so the
+        // `stream::iter(...).map(...)` closure doesn't borrow `datas` /
+        // `fmts` across the await — the for-all-lifetimes Send bound on
+        // the `MoeDiffPrep` trait future doesn't tolerate borrows
+        // leaking through async_trait's erased future.
+        let items: Vec<(usize, Arc<Data>, SourceFormat)> = datas
+            .iter()
+            .zip(fmts.iter())
+            .enumerate()
+            .map(|(i, (d, fmt))| (i, Arc::clone(d), *fmt))
+            .collect();
+        let mut out: Vec<(usize, anyhow::Result<Vec<format::TensorMeta>>)> = stream::iter(items)
+            .map(|(i, d, fmt)| {
+                let pb = pb.clone();
+                async move {
+                    let r = fetch_model_header(&d, fmt)
+                        .await
+                        .map(|(t, _)| t)
+                        .with_context(|| format!("reading {fmt:?} header for moe-diff file {i}"));
+                    if let Some(pb) = pb.as_ref() {
+                        pb.inc(1);
                     }
-                })
-                .buffer_unordered(SETUP_FETCH_CONCURRENCY)
-                .collect()
-                .await;
+                    (i, r)
+                }
+            })
+            .buffer_unordered(SETUP_FETCH_CONCURRENCY)
+            .collect()
+            .await;
         out.sort_by_key(|(i, _)| *i);
         out.into_iter()
             .map(|(i, r)| r.map(|t| (i, t)))
@@ -1834,6 +1888,17 @@ pub struct SourceMeta {
 ///
 /// Errors are swallowed and logged at debug level — sidecar info is advisory,
 /// and a missing sidecar must not break rendering.
+// `try_load_source_meta` / `load_meta_for_sources` / `fetch_hf_sidecar`
+// are the sidecar-fetching cluster: they load `config.json` and
+// `model.safetensors.index.json` next to a source so the arch layout
+// can read transformer hyperparams (num_hidden_layers, etc.) and shard
+// stitching info. They're plumbed but not yet routed through any hook:
+// `ArchLayoutPlugin::build` passes `&[]` for sidecars today. Wiring
+// them — via a new arbvis hook that lets modelweightvis post-process
+// `prepare_sources`'s output, or by extending `FormatPlugin` with a
+// sibling-file probe — is future work. The functions stay around so
+// the wiring is a one-line plug-in when that lands.
+#[allow(dead_code)]
 pub async fn try_load_source_meta(source: &Source) -> SourceMeta {
     match &source.kind {
         SourceKind::File(p) => {
@@ -1910,6 +1975,7 @@ pub async fn try_load_source_meta(source: &Source) -> SourceMeta {
 /// Load sidecar meta for every source, de-duplicated by HF Hub repo+revision
 /// (so a 4-shard model triggers one config.json fetch, not four). Returns a
 /// `Vec` parallel to `sources`.
+#[allow(dead_code)] // see comment above try_load_source_meta
 pub async fn load_meta_for_sources(sources: &[Source]) -> Vec<SourceMeta> {
     // Group sources by (repo_id, revision) for HF Hub; by parent dir for
     // local. Each group gets one fetch.
@@ -1944,6 +2010,7 @@ pub async fn load_meta_for_sources(sources: &[Source]) -> Vec<SourceMeta> {
 /// Fetch a small sidecar file (e.g. `config.json`) from an HF Hub repo via
 /// a raw GET to `{endpoint}/{repo_id}/resolve/{revision}/{filename}`.
 /// Returns the raw bytes on success.
+#[allow(dead_code)] // see comment above try_load_source_meta
 async fn fetch_hf_sidecar(
     repo: &RemoteRepo,
     revision: &str,

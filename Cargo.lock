@@ -2542,6 +2542,7 @@ dependencies = [
  "indicatif",
  "log",
  "memmap2",
+ "minifb",
  "regex",
  "reqwest",
  "serde",

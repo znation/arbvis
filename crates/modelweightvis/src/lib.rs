@@ -18,21 +18,24 @@
 //! The `modelweightvis` binary builds `arbvis::Registry::with_defaults()`,
 //! calls `register_all(&mut registry)`, and hands off to `arbvis::run`.
 
-// Mid-relocation: many model-aware helpers (FormatPlugin impls,
-// MoeDiffPrep/RepoDiffPrep/DirectoryTensorDiffPrep/FinetuneDetect/
-// SingleImageArchHook trait impls, plus the data-side prep helpers
-// they call) are defined but not yet wired into `register_all`. The
-// dead_code allow comes off when the hook impls land.
-#![allow(dead_code, clippy::too_many_arguments, clippy::type_complexity)]
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 mod data;
 mod diff;
 mod finetune;
 mod format;
+mod format_plugin;
+mod hooks;
 mod layout;
+mod single_arch;
 mod tiled;
 
 pub use diff::TensorDiffBuilder;
+pub use format_plugin::{GgufFormatPlugin, PickleFormatPlugin, SafetensorsFormatPlugin};
+pub use hooks::{
+    ArchSingleImageHook, HfModelCardFinetuneDetect, TensorDirectoryDiffPrep, TensorMoeDiffPrep,
+    TensorRepoDiffPrep,
+};
 pub use layout::{ArchLayoutPlugin, MoeDiffLayoutPlugin};
 pub use tiled::{ArchRegionsLoader, ArchRegionsRenderer};
 
@@ -41,7 +44,22 @@ use std::sync::Arc;
 use arbvis::Registry;
 
 /// Register every tensor-aware plugin on `registry`.
+///
+/// Populates the four Vec slots (`formats`, `layouts`, `diffs`, plus
+/// `leaf`'s loader+renderer maps) and every Option-slot hook
+/// (`moe_diff`, `repo_diff`, `dir_tensor_diff`, `finetune_detect`,
+/// `single_image_arch`). After this returns, arbvis::run handles every
+/// CLI shape the pre-split single-crate `arbvis` did, including
+/// `--moe-diff`, repo-level `--diff`, directory-safetensors `--diff`,
+/// single-image arch, and FormatPlugin-driven `ModelInfo` population.
 pub fn register_all(registry: &mut Registry) {
+    // Per-format header parsers — first plugin that detects a path
+    // wins. Stuff `ModelInfo` into `Source.extensions` so the arch
+    // layout / arch tile loader / renderer pick it up downstream.
+    registry.formats.push(Arc::new(SafetensorsFormatPlugin));
+    registry.formats.push(Arc::new(GgufFormatPlugin));
+    registry.formats.push(Arc::new(PickleFormatPlugin));
+
     // Tensor-aware diff (.safetensors / .gguf file pairs) — priority 300 so
     // it wins over the JSON / plain-byte fallbacks for matching pairs.
     registry.diffs.push(Arc::new(TensorDiffBuilder));
@@ -57,13 +75,10 @@ pub fn register_all(registry: &mut Registry) {
         .leaf
         .register_renderer(Arc::new(ArchRegionsRenderer));
 
-    // Optional hooks (TODO): implement `TensorMoeDiffPrep`,
-    // `TensorRepoDiffPrep`, `TensorDirectoryDiffPrep`,
-    // `HfModelCardFinetuneDetect`, `ArchSingleImageHook`, and the
-    // `SafetensorsFormatPlugin` / `GgufFormatPlugin` / `PickleFormatPlugin`
-    // family on top of the moved-here `crate::data::*` helpers. Until
-    // those wrappers exist, --moe-diff, repo-level --diff,
-    // directory-safetensors --diff, single-image arch, and
-    // FormatPlugin-driven `ModelInfo` population error cleanly via
-    // arbvis's `Option`-slot guards.
+    // Option-slot hooks — each one taps a single CLI dispatch.
+    registry.moe_diff = Some(Arc::new(TensorMoeDiffPrep));
+    registry.repo_diff = Some(Arc::new(TensorRepoDiffPrep));
+    registry.dir_tensor_diff = Some(Arc::new(TensorDirectoryDiffPrep));
+    registry.finetune_detect = Some(Arc::new(HfModelCardFinetuneDetect));
+    registry.single_image_arch = Some(Arc::new(ArchSingleImageHook));
 }

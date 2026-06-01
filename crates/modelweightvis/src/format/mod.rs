@@ -104,7 +104,15 @@ impl SourceFormat {
 ///
 /// `ranges` must be the output of [`SourceFormat::build_color_ranges`]
 /// (sorted by start, non-overlapping).
+///
+/// Currently consumed only by this crate's own tests — the byte-Hilbert
+/// pipeline that used to call this lives in arbvis (which doesn't have
+/// access to `ModelInfo`), and the arch / arch-tile renderers index
+/// tensors by their `TensorMeta` directly. Kept around so a future
+/// dtype-aware Hilbert overlay (file-position → color via this LUT) is
+/// a one-line wire-up.
 #[inline]
+#[allow(dead_code)]
 pub fn color_for_pos(pos: u64, ranges: &[(u64, u64, Rgb<u8>)]) -> Rgb<u8> {
     let idx = ranges.partition_point(|r| r.1 <= pos);
     if idx < ranges.len() && ranges[idx].0 <= pos {

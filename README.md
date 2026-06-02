@@ -1,26 +1,29 @@
 # arbvis
 
-Visualize ML model weights and arbitrary binary files as 2D images that make structure visible at a glance. For `.safetensors`, `.gguf`, and PyTorch `.bin`/`.pth`/`.pt` checkpoints, arbvis renders each tensor at its natural element shape and stacks transformer blocks so corresponding weights line up across layers. For anything else, it falls back to a global [Hilbert curve](https://en.wikipedia.org/wiki/Hilbert_curve) layout that maps one pixel per byte — null regions, ASCII text, compressed payloads, and section boundaries all produce recognizable visual signatures.
+Visualize arbitrary binary files as 2D images that make structure visible at a glance. arbvis lays bytes out along a [Hilbert curve](https://en.wikipedia.org/wiki/Hilbert_curve) — one pixel per byte — and colors them by value range. Null regions, ASCII text, compressed payloads, and section boundaries all produce recognizable visual signatures.
 
-## Quick start: visualize a model from the Hub
+**For ML model weights**, use [**modelweightvis**](https://github.com/znation/modelweightvis), built on top of arbvis. arbvis renders `.safetensors` / `.gguf` / `.bin` checkpoints as raw bytes; modelweightvis adds tensor-format parsing, an architectural layout that stacks transformer blocks at each tensor's natural element shape, MoE expert-vs-expert diffs, finetune auto-detection, and dtype-aware coloring. Architecturally, modelweightvis is a thin crate that registers tensor-aware plugins and hooks against arbvis's registry — see [Relationship to modelweightvis](#relationship-to-modelweightvis) below.
+
+## Quick start
 
 ```sh
-arbvis hf://meta-llama/Llama-3.2-1B --tiles ./out
+arbvis /bin/ls --output ls.png
+```
+
+Renders `/bin/ls` as a single Hilbert-curve PNG. With no `--output`, arbvis opens a display window. For zoomable tiles:
+
+```sh
+arbvis /tmp/foo.bin --tiles ./out
 # then open out/index.html in a browser
 ```
 
-`hf://` inputs are fetched directly — no manual download. The output is a [Leaflet.js](https://leafletjs.com/) tile pyramid you can zoom across; at maximum zoom, one pixel is one tensor element.
-
-In the architectural layout, each tensor is rendered at its 2D element shape. Transformer blocks stack vertically and corresponding sub-tensors (e.g. `q_proj` across every layer) are pixel-aligned, so block-to-block changes — quantization steps, finetune deltas, dead heads — line up as horizontal bands.
+The output is a [Leaflet.js](https://leafletjs.com/) tile pyramid you can zoom across; at maximum zoom, one pixel is one byte.
 
 ## What you see
 
-### Layouts
+### Byte-Hilbert layout
 
-- **Architectural** — selected automatically when every input is safetensors with transformer-style tensor names. 1 px = 1 element; blocks stack vertically; sub-tensors align across the stack.
-- **Byte-Hilbert** — 1 px = 1 byte along a Hilbert curve over the concatenated input bytes. Used for non-safetensors inputs, or anywhere structural metadata is absent.
-
-Override with `--layout auto|arch|hilbert`. `arch` forces structure-aware (falls back to Hilbert if no input is safetensors); `hilbert` forces the legacy global-Hilbert layout for regression checks or for non-tensor data.
+1 px = 1 byte along a Hilbert curve over the concatenated input bytes. The curve preserves locality: nearby bytes in the file end up nearby in the image, so contiguous regions (a string table, a compressed payload, an embedded image) appear as coherent blobs rather than scattered noise.
 
 ### Byte colors
 
@@ -36,49 +39,27 @@ Raw bytes are colored by range (based on [Stairwell's approach](https://stairwel
 
 ### Diff colors
 
-In `--diff` and `--moe-diff` modes, each pixel encodes a signed delta: **black** for identical, **green** for values that grew, **red** for values that shrank, **white** for non-finite results. Per-tensor RMS normalization (default) keeps the contrast stable across tensors of wildly different scale.
+In `--diff` mode, each pixel encodes the byte-wise difference between the two inputs. Identical bytes render as black; the larger the delta, the brighter the pixel.
 
 ## Supported input formats
 
-- **safetensors** (`.safetensors`) — single file or sharded index
-- **GGUF** (`.gguf`) — quantized weights are dequantized for diffing
-- **PyTorch pickle** (`.bin` / `.pth` / `.pt`) — parsed without invoking `__reduce__`/`find_class`, so loading untrusted headers is safe
-- **Plain binary** — any unrecognized file is rendered byte-for-byte
-- **JSON / JSONL** — structure-aware in diff mode (see below)
+- **Plain binary** — anything not specifically detected is rendered byte-for-byte.
+- **JSON / JSONL** — structure-aware in diff mode (see below).
 
-Diffs match tensors by canonical name across formats, so e.g. a GGUF checkpoint diffs cleanly against the corresponding safetensors release.
+Anything else — `.safetensors`, `.gguf`, PyTorch `.bin` — is rendered as plain bytes here. For tensor-format awareness use [modelweightvis](https://github.com/znation/modelweightvis).
 
-## Comparing two models: `--diff`
+## Comparing two files: `--diff`
 
 ```sh
-arbvis --diff hf://meta-llama/Llama-3.2-1B hf://meta-llama/Llama-3.2-1B-Instruct --tiles ./out
+arbvis --diff a.bin b.bin --tiles ./out
+arbvis --diff hf://owner/repo/a.json hf://owner/repo/b.json --output diff.png
 ```
 
-Per-tensor element-wise diff between two checkpoints (local files, directories, or `hf://` URLs).
-
-### Diff metric (`--diff-metric`)
-
-- `rms` (default) — per-tensor RMS-normalized signed delta. Stable across tensors of different scale.
-- `abs-log` — absolute delta on a log brightness scale. Honest about raw magnitudes.
-- `exact` — ternary: identical bytes → black; any change → full saturation.
-
-### Finetune mode (`--finetune` / `--no-finetune`)
-
-When both arguments are `hf://` model URLs, arbvis auto-detects whether the second is declared as a finetune of the first via the HF model card (`base_model` + `base_model_relation`). In finetune mode, tensors present only on the base side render as grey crosshatch (informational); anything new on the finetune side or with a mismatched shape aborts the run. Pass `--finetune` to force the relation on, `--no-finetune` to force it off.
+Plain-byte diff aligns the two inputs at offset 0 and computes per-byte deltas. Whole directories work too — each file pairs up by name across the two roots.
 
 ### JSON / JSONL structure-aware diff
 
 When both `--diff` inputs have a `.json` or `.jsonl` extension, arbvis aligns them by structure (object keys, array elements, value boundaries) before computing byte deltas, so a single-key insertion near the top of a file doesn't smear every following byte across the canvas.
-
-## MoE expert-vs-expert matrix: `--moe-diff`
-
-```sh
-arbvis --moe-diff hf://mistralai/Mixtral-8x7B-v0.1 --tiles ./out
-```
-
-Renders an N×N grid showing the element-wise diff of every expert pair within a single MoE model. Each cell stacks `gate_proj`, `up_proj`, and `down_proj` horizontally; only the upper triangle and diagonal are drawn (the raw diff is antisymmetric).
-
-Supports HF-style per-expert safetensors layouts: Mixtral, Qwen3-MoE, OLMoE, and DeepSeek routed experts. GGUF fused-expert tensors are not yet supported.
 
 ## Output destinations
 
@@ -90,8 +71,8 @@ arbvis file1.bin file2.bin --tiles ./out
 
 Generates a Leaflet pyramid (`out/tiles/{z}/{x}/{y}.{ext}` plus `out/index.html`). Advantages over single-image mode:
 
-- Full resolution at every zoom level (1 px = 1 byte / 1 element at max zoom).
-- Vector file/tensor boundaries — sharp at every scale, not baked into pixels.
+- Full resolution at every zoom level (1 px = 1 byte at max zoom).
+- Vector file boundaries — sharp at every scale, not baked into pixels.
 - No size limit — works on files of any size; lower zoom levels are averaged.
 - HTML labels positioned at each region's area-weighted centroid.
 
@@ -114,8 +95,8 @@ With no output flag, arbvis opens a display window (press ESC to close). With `-
 Both `--output` and `--tiles` accept `hf://` URLs and upload directly to the Hub:
 
 ```sh
-arbvis model.safetensors --output  hf://datasets/me/vis/model.png
-arbvis hf://meta-llama/Llama-3.2-1B --tiles hf://datasets/me/vis/llama
+arbvis file.bin --output hf://datasets/me/vis/file.png
+arbvis dir/ --tiles hf://datasets/me/vis/dir
 ```
 
 Note: `--tiles hf://…` uploads `tiles/`, `index.html`, and `labels.json` to the target repo, but the Hub won't render `index.html` on its own. Use `--space` for a working URL.
@@ -123,14 +104,14 @@ Note: `--tiles hf://…` uploads `tiles/`, `index.html`, and `labels.json` to th
 ### Deploy a viewable Space (`--space`)
 
 ```sh
-arbvis hf://meta-llama/Llama-3.2-1B --space me/llama-vis
+arbvis hf://datasets/owner/dataset --space me/dataset-vis
 ```
 
-Renders the tile pyramid and deploys a Docker Space that serves the Leaflet viewer. Tiles live in an auto-created sibling bucket repo (`me/llama-vis_bucket`); the Space itself is stateless and just proxies them.
+Renders the tile pyramid and deploys a Docker Space that serves the Leaflet viewer. Tiles live in an auto-created sibling bucket repo (`me/dataset-vis_bucket`); the Space itself is stateless and just proxies them.
 
 ### Tile format (`--tile-format`)
 
-`avif` (default) — ~30-50% smaller over the wire and supported in every modern browser. Leaf tiles are encoded near-lossless (each pixel is one source byte); pyramid tiles are lossy at quality 85.
+`avif` (default) — ~30–50% smaller over the wire and supported in every modern browser. Leaf tiles are encoded near-lossless (each pixel is one source byte); pyramid tiles are lossy at quality 85.
 
 `png` — universal fallback for byte-for-byte regression checks or audiences without AVIF support.
 
@@ -155,38 +136,52 @@ By default, `hf://` inputs are downloaded to the local hf-hub cache before rende
 ### Xet xorb visualization (`--show-xet-xorbs`)
 
 ```sh
-arbvis hf://meta-llama/Llama-3.2-1B --show-xet-xorbs --tiles ./out
+arbvis hf://datasets/owner/dataset --show-xet-xorbs --tiles ./out
 ```
 
-For xet-backed Hub files, colors each region by the xorb (content-addressed chunk) it was reconstructed from: hue encodes xorb ID, intensity encodes the underlying byte. Useful for seeing how a model's weights are partitioned across the CAS.
+For xet-backed Hub files, colors each region by the xorb (content-addressed chunk) it was reconstructed from: hue encodes xorb ID, intensity encodes the underlying byte. Useful for seeing how a file is partitioned across the CAS.
+
+modelweightvis layers a dtype-aware element coloring on top of the same xorb hue for `.safetensors` / `.gguf` inputs; arbvis covers the generic byte path.
 
 ## Other useful flags
 
-- `--title TEXT` — title shown in the viewer info panel (defaults to "arbvis" or "arbvis diff").
+- `--title TEXT` — title shown in the viewer info panel (defaults to `"arbvis"` or `"arbvis diff"`).
 - `-l, --file-list FILE` — read input paths from `FILE`, one per line; `-` reads from stdin.
 - `--regen-html DIR` — rebuild `index.html` for an existing tile directory without re-rendering tiles. Useful after editing the viewer template.
 - `--space OWNER/REPO --tiles LOCAL_DIR` (with no input files) — re-deploy an already-rendered tile directory to a Space without re-rendering.
 
 ```sh
 arbvis --regen-html ./out
-arbvis --space me/llama-vis --tiles ./out
+arbvis --space me/vis --tiles ./out
 ```
+
+## Relationship to modelweightvis
+
+arbvis is the byte-only foundation: Hilbert layout, byte coloring, JSON-aware diff, Hub I/O, tile pyramid, Space deploy, xet xorb path, streaming. It has no knowledge of tensors, model formats, or transformer architecture — `.safetensors` and `.gguf` get the same byte-Hilbert treatment as any other binary.
+
+[modelweightvis](https://github.com/znation/modelweightvis) is a separate crate that extends arbvis through its plugin / hook surface (no fork, no patch): `FormatPlugin` impls parse `.safetensors` / `.gguf` / pickle headers and stuff `ModelInfo` into each source's extension map; `LayoutPlugin` impls add the architectural transformer layout and the MoE-diff matrix; `DiffSourceBuilder` adds tensor-aware diffing; option-slot hooks (`MoeDiffPrep`, `RepoDiffPrep`, `FinetuneDetect`, `SingleImageArchHook`, `PrepareSourcesExtension`) tap CLI dispatch points. The `modelweightvis` binary builds an `arbvis::Registry::with_defaults()`, calls `modelweightvis::register_all(&mut registry)`, and hands off to `arbvis::run`. Same renderer, same Hub I/O, same tile pyramid — just with the tensor-aware plugins registered.
+
+**Which to use:**
+- **arbvis** — for non-model binaries (any file format), JSON/JSONL diffs, plain-byte diffs, the xet xorb path on arbitrary content. Smaller dependency footprint (no `candle-core` / `regex` / `zip` / `half`).
+- **modelweightvis** — for `.safetensors` / `.gguf` / `.bin` model checkpoints, architectural transformer layout, `--moe-diff`, `--diff-metric`, `--finetune` / `--no-finetune`, `--layout`. Inherits arbvis's full CLI surface (`--tiles`, `--space`, `--stream`, `--show-xet-xorbs`, `--regen-html`, etc.) — no need to use both binaries.
 
 ## Building
 
-Requires Rust (stable).
+Requires Rust (stable). This repo is a Cargo workspace with `crates/arbvis` and `crates/modelweightvis` as members:
 
 ```sh
-cargo build --release
+cargo build --release -p arbvis
 ./target/release/arbvis <file> --tiles ./output
 ```
 
 Or install into your `PATH`:
 
 ```sh
-cargo install --path .
+cargo install --path crates/arbvis
 ```
+
+To build modelweightvis from this workspace, swap `-p arbvis` for `-p modelweightvis` (or `--path crates/modelweightvis` on install). The standalone [modelweightvis repo](https://github.com/znation/modelweightvis) tracks the same `crates/modelweightvis/` source via a path-dep on arbvis.
 
 ## Credits
 
-Color scheme inspired by [Stairwell's binary visualization post](https://stairwell.com/blog/hilbert-curves-visualizing-binary-files-with-color-and-patterns/). Built on [clap](https://crates.io/crates/clap) (CLI), [image](https://crates.io/crates/image) + [png](https://crates.io/crates/png) + rav1e (tile encoding), [fast_hilbert](https://crates.io/crates/fast_hilbert) (curve mapping), [hf-hub](https://crates.io/crates/hf-hub) + [xet-core-structures](https://crates.io/crates/xet-core-structures) (Hub I/O), [candle-core](https://crates.io/crates/candle-core) (GGUF + PyTorch pickle), [minifb](https://crates.io/crates/minifb) (window display), and [Leaflet.js](https://leafletjs.com/) (the viewer).
+Color scheme inspired by [Stairwell's binary visualization post](https://stairwell.com/blog/hilbert-curves-visualizing-binary-files-with-color-and-patterns/). Built on [clap](https://crates.io/crates/clap) (CLI), [image](https://crates.io/crates/image) + [png](https://crates.io/crates/png) + rav1e (tile encoding), [fast_hilbert](https://crates.io/crates/fast_hilbert) (curve mapping), [hf-hub](https://crates.io/crates/hf-hub) + [xet-core-structures](https://crates.io/crates/xet-core-structures) (Hub I/O), [minifb](https://crates.io/crates/minifb) (window display), and [Leaflet.js](https://leafletjs.com/) (the viewer).

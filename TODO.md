@@ -71,28 +71,55 @@ Note: the standalone `~/hf/modelweightvis` repo (TODO item 6) is still
 on the pre-hook code and would need a parallel mirror commit once the
 path-dep flip happens.
 
-### 3. Move model-side CLI flags off `arbvis::Args`
+### 3. ~~Move model-side CLI flags off `arbvis::Args`~~ — DONE
 
-**Status.** The original plan ([§Step 12 in `tender-streamed-kitten.md`](.claude/plans/using-claude-plans-ok-i-think-the-tender-streamed-kitten.md))
-called for `modelweightvis::Args` to clap-flatten `arbvis::Args` and
-add `--moe-diff`, `--finetune`/`--no-finetune`, `--diff-metric`,
-`--layout`. Today these flags all live on `arbvis::Args` in
-[`crates/arbvis/src/lib.rs`](crates/arbvis/src/lib.rs:150).
+**Status.** Wired. The four tensor-aware flags (`--moe-diff`,
+`--finetune` / `--no-finetune`, `--diff-metric`, `--layout`) and their
+clap-mirror enums (`DiffMetricArg`, `LayoutArg`) have moved from
+`arbvis::Args` to a new
+[`modelweightvis::Args`](crates/modelweightvis/src/args.rs) that
+clap-flattens the byte-only `arbvis::Args` and adds those four. The
+new `arbvis::ModelOpts` (a plain data struct, no clap derive) carries
+the four runtime knobs through to `arbvis::run`; arbvis's binary
+passes `ModelOpts::default()` and modelweightvis's binary calls
+`Args::split()` to peel out the inner `(arbvis::Args, ModelOpts)`
+pair.
 
-**Gap.** Architectural rough edge — the byte-only `arbvis` CLI
-accepts model-side flags but errors at runtime when the corresponding
-hook isn't registered ("--moe-diff requires a tensor-aware backend").
-A user reading `arbvis --help` sees flags that don't work without
-modelweightvis.
+`arbvis::run` signature now takes `(args, opts, registry)` (was
+`(args, registry)`). The body reads `opts.moe_diff`, `opts.finetune`,
+`opts.no_finetune`, `opts.diff_metric`, and `opts.layout_mode` in
+place of the deleted `args.*` field accesses.
 
-**Fix.** Create `modelweightvis::Args` that clap-flattens
-`arbvis::Args` and owns the four model-side flags. Demote the same
-four flags from `arbvis::Args`. `arbvis::run` takes both args halves
-(or just the flattened struct, which works because clap can derive
-across crates).
+Help-text proof:
+```
+$ arbvis --help | grep '^\s*--'
+   --diff, --space, --regen-html, --title, --show-xet-xorbs,
+   --tile-format, --stream
+$ modelweightvis --help | grep '^\s*--'
+   --diff, --space, --regen-html, --title, --show-xet-xorbs,
+   --tile-format, --stream, --moe-diff, --finetune, --no-finetune,
+   --diff-metric, --layout
+```
 
-**Why deferred.** Cosmetic in the help text; flags are functional
-today. Real fix requires non-trivial clap reshaping.
+Cross-flatten clap constraints work: `--moe-diff` (defined on
+`modelweightvis::Args`) successfully `conflicts_with` `--diff` /
+`--files` / `--file_list` / `--show_xet_xorbs` (all flattened from
+`arbvis::Args`); `--finetune` / `--no-finetune` correctly `requires =
+"diff"` and conflict with each other. The pre-existing clap quirk
+where a positional `[FILES]` value bypasses `requires = "diff"` is
+preserved verbatim (same behaviour as before the move).
+
+Verification: `cargo fmt --all -- --check` clean, `cargo clippy
+--workspace --all-targets -- -D warnings` zero warnings, `cargo test
+--workspace` 169 tests passed. Smoke runs of `arbvis /bin/ls --output`
+(byte-only path) and `modelweightvis $SMOLLM2/model.safetensors
+--output` (tensor-aware path with `SourceMetaSidecarHook` firing)
+both produce valid PNGs.
+
+Note: same caveat as item 2 — the standalone `~/hf/modelweightvis`
+repo (item 6) is still on the pre-split CLI surface (it uses
+`arbvis::Args::parse()` directly) and would need a parallel mirror
+once the path-dep flip lands.
 
 ### 4. End-to-end smoke verification for remote scenarios
 

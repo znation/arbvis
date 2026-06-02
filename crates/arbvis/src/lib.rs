@@ -58,50 +58,47 @@ use crate::hf_url::HfOutputSpec;
 /// consistent across the input-resolution and materialisation stages.
 const RESOLVE_CONCURRENCY: usize = 16;
 
-/// CLI mirror of [`format::DiffMetric`]. Kept separate so the clap
-/// derive doesn't pollute the core type.
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum DiffMetricArg {
-    /// Per-tensor RMS-normalized signed delta. Stable across tensors of
-    /// different scale; default.
-    Rms,
-    /// Absolute delta on a log brightness scale. Honest about raw magnitudes.
-    AbsLog,
-    /// Ternary: identical bytes → black; any change → full saturation.
-    Exact,
+/// Runtime knobs that aren't part of `arbvis::Args` but still flow through
+/// `run()`. The byte-only arbvis CLI passes [`ModelOpts::default`] (no MoE
+/// diff, no finetune forcing, RMS metric, auto layout — which resolves to
+/// Hilbert in a byte-only registry); modelweightvis's CLI shell builds a
+/// populated `ModelOpts` from its tensor-aware [`modelweightvis::Args`].
+///
+/// These knobs all behave correctly with their defaults under arbvis-only
+/// registries — `moe_diff = None` is the inert "don't take the MoE branch"
+/// case, `layout_mode = Auto` picks the only registered layout (Hilbert),
+/// and `diff_metric` only matters when a tensor-aware diff builder is
+/// registered. So pure-arbvis callers don't have to reason about these.
+#[derive(Clone, Debug)]
+pub struct ModelOpts {
+    /// `--moe-diff <MODEL>`: render an N×N expert-vs-expert diff matrix for
+    /// each MoE layer of a single model. `None` for the byte-only path.
+    pub moe_diff: Option<PathBuf>,
+    /// `--finetune`: force-treat a `--diff` as a finetune (orig-only
+    /// tensors → grey crosshatch, mod-only → error). Exclusive with
+    /// `no_finetune`; both `false` means auto-detect via
+    /// `FinetuneDetect` hook.
+    pub finetune: bool,
+    /// `--no-finetune`: force-treat a `--diff` as NOT a finetune.
+    pub no_finetune: bool,
+    /// `--diff-metric`: how per-element tensor deltas are encoded
+    /// (`--diff` / `--moe-diff`). Default is `Rms`.
+    pub diff_metric: DiffMetric,
+    /// `--layout`: structure-aware vs byte-Hilbert layout strategy.
+    /// Defaults to `Auto` — `select_layout` iterates the registry's
+    /// layout plugins by descending priority and picks the first
+    /// applicable. In a byte-only registry that resolves to Hilbert.
+    pub layout_mode: LayoutMode,
 }
 
-impl DiffMetricArg {
-    fn to_metric(self) -> DiffMetric {
-        match self {
-            DiffMetricArg::Rms => DiffMetric::Rms,
-            DiffMetricArg::AbsLog => DiffMetric::AbsLog,
-            DiffMetricArg::Exact => DiffMetric::Exact,
-        }
-    }
-}
-
-/// CLI choice for layout strategy. Mirrors `layout::LayoutMode`.
-#[derive(Clone, Copy, Debug, ValueEnum, Default)]
-enum LayoutArg {
-    /// Architectural layout if every input is safetensors with detectable
-    /// structure; otherwise byte-Hilbert. Default.
-    #[default]
-    Auto,
-    /// Force architectural (structure-aware) layout. Falls back to hilbert if
-    /// no input is safetensors.
-    Arch,
-    /// Force the legacy global-Hilbert layout (1 px = 1 byte). Useful for
-    /// non-safetensors inputs and regression-checking the old output.
-    Hilbert,
-}
-
-impl LayoutArg {
-    fn to_mode(self) -> LayoutMode {
-        match self {
-            LayoutArg::Auto => LayoutMode::Auto,
-            LayoutArg::Arch => LayoutMode::Arch,
-            LayoutArg::Hilbert => LayoutMode::Hilbert,
+impl Default for ModelOpts {
+    fn default() -> Self {
+        Self {
+            moe_diff: None,
+            finetune: false,
+            no_finetune: false,
+            diff_metric: DiffMetric::Rms,
+            layout_mode: LayoutMode::Auto,
         }
     }
 }
@@ -177,42 +174,13 @@ pub struct Args {
     #[arg(long, num_args = 2, value_names = ["ORIGINAL", "MODIFIED"])]
     diff: Option<Vec<PathBuf>>,
 
-    /// Visualize an N×N expert-vs-expert diff matrix for each MoE layer of a single
-    /// model. MODEL is a local path or hf:// URL. Each cell (i, j) shows the
-    /// element-wise diff between expert i and expert j for `gate_proj`, `up_proj`,
-    /// and `down_proj`, stacked horizontally; only the upper triangle + diagonal is
-    /// rendered (the raw diff is antisymmetric). Currently supports HF-style
-    /// per-expert safetensors (Mixtral / Qwen3-MoE / OLMoE / DeepSeek routed
-    /// experts); GGUF fused-expert tensors are not yet supported.
-    #[arg(
-        long,
-        value_name = "MODEL",
-        conflicts_with_all = ["diff", "files", "file_list", "finetune", "no_finetune", "show_xet_xorbs"]
-    )]
-    moe_diff: Option<PathBuf>,
-
-    /// Force-treat the second --diff argument as a finetune of the first.
-    /// In finetune mode, tensors present only on the base side are rendered
-    /// as crosshatched grey (informational); anything present only on the
-    /// finetune side (or with a mismatched shape) is treated as a contract
-    /// violation and aborts the run. Without --finetune / --no-finetune the
-    /// relation is auto-detected from the HF model card (`base_model` +
-    /// `base_model_relation`) when both args are `hf://` model URLs, and
-    /// defaults to non-finetune otherwise.
-    #[arg(long, requires = "diff", conflicts_with = "no_finetune")]
-    finetune: bool,
-
-    /// Force-treat the diff as NOT a finetune (overrides auto-detection).
-    /// In this mode, tensors/files present only on one side render as red
-    /// (original-only) or green (modified-only) crosshatch.
-    #[arg(long = "no-finetune", requires = "diff", conflicts_with = "finetune")]
-    no_finetune: bool,
-
-    /// How per-element tensor deltas are encoded for visualization
-    /// (applies to `--diff` and `--moe-diff`).
-    #[arg(long, value_enum, default_value_t = DiffMetricArg::Rms)]
-    diff_metric: DiffMetricArg,
-
+    // `--moe-diff`, `--finetune` / `--no-finetune`, `--diff-metric`, and
+    // `--layout` previously lived on `Args` too, but they only do anything
+    // when a tensor-aware backend is registered. They've moved to
+    // `modelweightvis::Args` (which flattens this struct via clap and
+    // converts its own fields into [`ModelOpts`]); arbvis-only callers
+    // pass [`ModelOpts::default`] to `run()` and never see those flags in
+    // `arbvis --help`.
     /// Render tiles and deploy a viewable HF Space (e.g. username/my-vis).
     /// Creates the Space with a Docker app that serves the Leaflet viewer,
     /// and stores tiles in a sibling bucket auto-named `<namespace>/<repo>_bucket`.
@@ -239,23 +207,6 @@ pub struct Args {
     /// the wire; PNG is the universal fallback.
     #[arg(long, value_enum, default_value_t = TileFormatArg::Avif)]
     tile_format: TileFormatArg,
-
-    /// Layout strategy for arranging tensors on the canvas.
-    ///
-    /// `auto` (default): structure-aware layout when every input is
-    /// safetensors and tensor names look transformer-style; otherwise the
-    /// legacy global-Hilbert curve.
-    ///
-    /// `arch`: force structure-aware layout. Each tensor is rendered at its
-    /// natural 2D element shape (1 px = 1 element); transformer blocks stack
-    /// vertically with corresponding sub-tensors pixel-aligned across the
-    /// stack. Falls back to hilbert if no input is safetensors.
-    ///
-    /// `hilbert`: force the legacy layout. 1 px = 1 byte along a global
-    /// Hilbert curve over the concatenated source bytes. Reproduces the
-    /// pre-architectural output for regression checks.
-    #[arg(long, value_enum, default_value_t = LayoutArg::Auto)]
-    layout: LayoutArg,
 
     /// Opt in to streaming I/O. Keeps `hf://` inputs remote (per-tile range
     /// fetches instead of an up-front download) and — when combined with an
@@ -418,15 +369,16 @@ impl OutputDest {
 
 /// Drives the full arbvis pipeline (CLI → sources → layout → tiles/single).
 ///
-/// `registry` carries the pluggable surface (formats, layouts, diff builders,
-/// leaf renderers). Today `registry.layouts` drives `select_layout` (step 6)
-/// and `registry.leaf` drives the tile pipeline; the other slots are still
-/// placeholders that later steps will hand off to `prepare_diff_sources`
-/// (step 9) and format detection (step 12). The binary builds
-/// `Registry::with_defaults()` and passes it in; once `modelweightvis` splits
-/// out it will build its own registry by extending the default one with
-/// tensor-format plugins.
-pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()> {
+/// `args` carries the byte-only CLI surface (input/output paths, `--diff`,
+/// `--space`, etc.). `opts` carries the four model-side knobs that used to
+/// live on `Args` directly but are now owned by `modelweightvis::Args` —
+/// pure-arbvis callers pass [`ModelOpts::default`] and never see those
+/// flags in their `--help`. `registry` carries the pluggable surface
+/// (formats, layouts, diff builders, leaf renderers, plus the option-slot
+/// hooks). The arbvis binary builds `Registry::with_defaults()`;
+/// modelweightvis's binary extends it with tensor-aware plugins via
+/// `modelweightvis::register_all`.
+pub async fn run(args: Args, opts: ModelOpts, registry: registry::Registry) -> anyhow::Result<()> {
     if let Some(ref tile_dir) = args.regen_html {
         return tiled::regen_html(tile_dir);
     }
@@ -438,19 +390,19 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
     let dest = OutputDest::from_args(&args)?;
 
     let (leaf_format, pyramid_format) = args.tile_format.split();
-    let layout_mode = args.layout.to_mode();
+    let layout_mode = opts.layout_mode;
     let stream = args.stream;
     let show_xet_xorbs = args.show_xet_xorbs;
 
     // --- MoE diff ---------------------------------------------------------
-    if let Some(moe_arg) = args.moe_diff {
+    if let Some(moe_arg) = opts.moe_diff {
         let hook = registry.moe_diff.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "--moe-diff requires a tensor-aware backend (no `MoeDiffPrep` registered); \
                  use `modelweightvis` instead of `arbvis`"
             )
         })?;
-        let metric = args.diff_metric.to_metric();
+        let metric = opts.diff_metric;
         let input = moe_arg.to_string_lossy().into_owned();
         let inputs = vec![input.clone()];
         let title = default_title(args.title, "arbvis moe-diff");
@@ -481,14 +433,14 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
         let orig_str = &diff_input_strs[0];
         let mod_str = &diff_input_strs[1];
         let is_finetune = resolve_finetune(
-            args.finetune,
-            args.no_finetune,
+            opts.finetune,
+            opts.no_finetune,
             orig_str,
             mod_str,
             &registry,
         )
         .await;
-        let metric = args.diff_metric.to_metric();
+        let metric = opts.diff_metric;
 
         let (sources, total) = if hf_url::is_repo_level(orig_str)?
             && hf_url::is_repo_level(mod_str)?

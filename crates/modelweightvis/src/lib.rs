@@ -20,6 +20,7 @@
 
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+mod args;
 mod data;
 mod diff;
 mod finetune;
@@ -30,6 +31,7 @@ mod layout;
 mod single_arch;
 mod tiled;
 
+pub use args::{Args, DiffMetricArg, LayoutArg};
 pub use diff::TensorDiffBuilder;
 pub use format_plugin::{GgufFormatPlugin, PickleFormatPlugin, SafetensorsFormatPlugin};
 pub use hooks::{

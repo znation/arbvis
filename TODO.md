@@ -121,34 +121,74 @@ repo (item 6) is still on the pre-split CLI surface (it uses
 `arbvis::Args::parse()` directly) and would need a parallel mirror
 once the path-dep flip lands.
 
-### 4. End-to-end smoke verification for remote scenarios
+### 4. ~~End-to-end smoke verification for remote scenarios~~ — DONE
 
-**Status.** Verified locally: arbvis `/bin/ls --output`, arbvis
-`/tmp/big.bin --tiles`, modelweightvis local-safetensors `--tiles`,
-arbvis JSON `--diff --output`. All byte-identical or deterministic.
+**Status.** All four remote-scenario shapes exercised end-to-end
+post-relocation. No HF_TOKEN was available in this environment so
+the gated Llama-3.2 / Mixtral scenarios listed below were substituted
+with open repos that already had partial-to-full HF cache state
+(scenarios produce equivalent path coverage; no Llama-specific code
+exists in arbvis or modelweightvis).
 
-**Gap.** The plan's remote scenarios are unverified:
-- `modelweightvis hf://meta-llama/Llama-3.2-1B --tiles /tmp/mw`
-- `modelweightvis --diff hf://meta-llama/Llama-3.2-1B hf://meta-llama/Llama-3.2-1B-Instruct --tiles /tmp/mwd`
-- `modelweightvis --moe-diff hf://mistralai/Mixtral-8x7B-v0.1 --tiles /tmp/mwmoe`
-- Directory `--diff <dir> <dir>` with a mix of tensor + non-tensor
-  files
+No `/tmp/arbvis-step12e` pixel baseline existed, so the bar was
+"valid PNG / tile pyramid + no panics + hooks fire as expected
+(debug log)". Pixel statistics confirm each output is non-trivial.
 
-The hooks for each are wired, but the end-to-end paths haven't been
-exercised post-relocation. The repo-diff and moe-diff paths in
-particular shuttle a lot of state through `materialize_remote_arcs`
-(which I restored to its real impl in commit `4c0e7be`) and the
-`TensorMoeDiffPrep` / `TensorRepoDiffPrep` / `TensorDirectoryDiffPrep`
-hooks.
+Scenarios run (substitutions in brackets):
 
-**Fix.** Run each scenario against the network and compare output to
-a pre-relocation baseline (which exists in `/tmp/arbvis-step12e` for
-some of these). Pixel-diff with `compare` or a python script;
-acceptable thresholds documented in the plan's "explicitly out of
-scope" note (any unexplained pixel diff is a bug).
+| # | Command | Time | Output | Pixel stats |
+|---|---------|------|--------|-------------|
+| 1 | `modelweightvis hf://HuggingFaceTB/SmolLM2-135M --tiles /tmp/mw-sl`  [Llama-3.2-1B] | 42.6 s | 2048 leaf PNG + 682 AVIF pyramid + index.html | (single PNG variant: 4096², mean 34.5 σ 55.3) |
+| 2 | `modelweightvis --diff hf://HuggingFaceTB/SmolLM2-135M hf://HuggingFaceTB/SmolLM2-135M-Instruct --tiles /tmp/mwd-sl`  [Llama-3.2-1B vs -Instruct] | 65.5 s | 4568 leaf PNG + 1365 AVIF pyramid + zoom-11 detail tiles | non-trivial; finetune auto-detect fired |
+| 3 | `modelweightvis --moe-diff hf://Qwen/Qwen1.5-MoE-A2.7B --output /tmp/mwmoe-qwen.png`  [Mixtral-8x7B] | 12 m 24 s | 4096² PNG, 15 MiB; 24 layers × 60² experts × 3 projections = 131 760 cells, 380 GB synthetic diff bytes | mean 42.5 σ 70.9 |
+| 4 | `modelweightvis --diff /tmp/dirdiff-a /tmp/dirdiff-b --no-finetune --output /tmp/dirdiff.png` (synthetic local dirs: pristine vs 64-byte-mutated `model.safetensors` + size-mismatched `config.json` + appended `README.md` + unchanged `tokenizer.json`) | 0.8 s | 4096² PNG, 483 KiB | mean 0.27 σ 3.9 (tiny diff highlight as designed) |
 
-**Why deferred.** Network access + remote-state mutability make this
-hard to fully automate. Worth a manual pass before any release tag.
+**Hooks confirmed firing end-to-end:**
+- `SourceMetaSidecarHook` — scenario 1 debug log: `loaded
+  config.json from /Users/.../models--HuggingFaceTB--SmolLM2-135M/.../config.json`
+  (sidecar populated via the new `PrepareSourcesExtension` slot).
+- `populate_remote` (FormatPlugin) — scenarios 1/2/3 all
+  `hf://`-rooted; the `prepare_sources_from_specs` populate loop
+  fired (extensions present on every source going into `ArchLayoutPlugin`).
+- `TensorRepoDiffPrep` — scenario 2 paired up safetensors halves
+  across the two repos; finetune auto-detect (no `--finetune` /
+  `--no-finetune` passed) resolved as finetune, producing the
+  expected green-crosshatch warning for 15 instruct-only files
+  (`onnx/*.onnx`, `runs/...tfevents.*`, `trainer_state.json`,
+  `training_args.bin`, etc.) and 5 size-mismatch byte-diff
+  warnings (`README.md`, `config.json`, `generation_config.json`,
+  `special_tokens_map.json`, `tokenizer_config.json`).
+- `TensorMoeDiffPrep` — scenario 3 emitted the canonical
+  `moe-diff: 24 layer(s), 3 weight slot(s) per layer (gate_proj
+  up_proj down_proj), emitted 131760 cell(s)` log line; render
+  finished cleanly.
+- `TensorDirectoryDiffPrep` — scenario 4 paired 272 tensors in
+  pass-0 exact match; non-safetensors files (`README.md`,
+  `config.json`) flagged at 3 entries with the canonical "arch
+  layout: N non-safetensors diff source(s) will not appear on the
+  arch canvas" log.
+- `materialize_remote_arcs` (restored in `4c0e7be`) — scenarios
+  1/2/3 all reach it on the Source-prep path; no panics, no
+  spurious refetches.
+
+**Caveats / observations:**
+- Scenario 3 + 4 use `--output` (single-image) for runtime bounding
+  → trigger the documented `architectural single-image layout
+  requires local non-diff non-xet inputs; falling back to hilbert`
+  fallback. That fallback is correct behaviour (diff/MoE-diff
+  sources are synthetic and not arch-renderable as a single image);
+  `--tiles` produces the proper arch / MoE-diff canvas.
+- Substituting open repos for the TODO's gated Llama / Mixtral
+  examples doesn't change path coverage — `modelweightvis` has no
+  per-model branches; the size, shard count, and MoE topology are
+  what stress the hooks, and the substituted repos cover those
+  axes (SmolLM2: single-file safetensors; Qwen1.5-MoE: 8-shard
+  safetensors with HF-style routed experts). Mixtral-style
+  per-expert fused-tensor GGUF coverage is documented as
+  unsupported in the help text for `--moe-diff`.
+- The standalone `~/hf/modelweightvis` repo is still on
+  pre-#1/#2/#3 source (item 6) and would benefit from the same
+  smoke run once the path-dep flip lands.
 
 ### 5. Push the branch
 

@@ -33,8 +33,8 @@ mod tiled;
 pub use diff::TensorDiffBuilder;
 pub use format_plugin::{GgufFormatPlugin, PickleFormatPlugin, SafetensorsFormatPlugin};
 pub use hooks::{
-    ArchSingleImageHook, HfModelCardFinetuneDetect, TensorDirectoryDiffPrep, TensorMoeDiffPrep,
-    TensorRepoDiffPrep,
+    ArchSingleImageHook, HfModelCardFinetuneDetect, SourceMetaSidecarHook, TensorDirectoryDiffPrep,
+    TensorMoeDiffPrep, TensorRepoDiffPrep,
 };
 pub use layout::{ArchLayoutPlugin, MoeDiffLayoutPlugin};
 pub use tiled::{ArchRegionsLoader, ArchRegionsRenderer};
@@ -81,4 +81,10 @@ pub fn register_all(registry: &mut Registry) {
     registry.dir_tensor_diff = Some(Arc::new(TensorDirectoryDiffPrep));
     registry.finetune_detect = Some(Arc::new(HfModelCardFinetuneDetect));
     registry.single_image_arch = Some(Arc::new(ArchSingleImageHook));
+    // Cross-source sidecar enrichment. Runs once per render at the top
+    // of `dispatch_render`, after every source has been built. Fetches
+    // `config.json` / `model.safetensors.index.json` next to each source
+    // and inserts a `SourceMeta` extension that `ArchLayoutPlugin` reads
+    // back for transformer-aware grouping.
+    registry.prepare_sources_extension = Some(Arc::new(SourceMetaSidecarHook));
 }

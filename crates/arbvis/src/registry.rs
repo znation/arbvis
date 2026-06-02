@@ -157,6 +157,26 @@ pub trait FinetuneDetect: Send + Sync {
     async fn detect(&self, orig_url: &str, mod_url: &str) -> Option<bool>;
 }
 
+/// Opportunistic post-prepare-sources enrichment hook. Runs after sources
+/// have been built and `FormatPlugin::populate_{local,remote}` has stuffed
+/// each source's own format-specific metadata into its `extensions`. The
+/// impl sees the full source list at once so it can dedup cross-source work
+/// (e.g. one `config.json` fetch per HF repo regardless of shard count).
+/// arbvis no-ops when this hook isn't registered.
+///
+/// In practice the only caller is modelweightvis's
+/// `SourceMetaSidecarHook`, which fetches `config.json` and
+/// `model.safetensors.index.json` alongside each source and inserts a
+/// `SourceMeta` into the extensions map for the arch layout to read back.
+/// Other tensor-aware backends (e.g. an ONNX backend) could plug in here
+/// the same way without arbvis growing any extra slots.
+///
+/// `?Send`: see [`MoeDiffPrep`].
+#[async_trait(?Send)]
+pub trait PrepareSourcesExtension: Send + Sync {
+    async fn enrich(&self, sources: &mut [Source]) -> anyhow::Result<()>;
+}
+
 /// Hooks the single-image arch render path. Invoked from
 /// `single::run_single` when the chosen layout's id is `"arch"`. arbvis
 /// falls back to byte-Hilbert if this hook isn't registered.
@@ -182,6 +202,9 @@ pub struct Registry {
     pub dir_tensor_diff: Option<Arc<dyn DirectoryTensorDiffPrep>>,
     pub finetune_detect: Option<Arc<dyn FinetuneDetect>>,
     pub single_image_arch: Option<Arc<dyn SingleImageArchHook>>,
+    /// Cross-source enrichment pass that runs once per render after every
+    /// `Source` has been built. See [`PrepareSourcesExtension`].
+    pub prepare_sources_extension: Option<Arc<dyn PrepareSourcesExtension>>,
 }
 
 impl Registry {
@@ -203,6 +226,7 @@ impl Registry {
             dir_tensor_diff: None,
             finetune_detect: None,
             single_image_arch: None,
+            prepare_sources_extension: None,
         }
     }
 }

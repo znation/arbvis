@@ -1892,13 +1892,12 @@ pub struct SourceMeta {
 // are the sidecar-fetching cluster: they load `config.json` and
 // `model.safetensors.index.json` next to a source so the arch layout
 // can read transformer hyperparams (num_hidden_layers, etc.) and shard
-// stitching info. They're plumbed but not yet routed through any hook:
-// `ArchLayoutPlugin::build` passes `&[]` for sidecars today. Wiring
-// them — via a new arbvis hook that lets modelweightvis post-process
-// `prepare_sources`'s output, or by extending `FormatPlugin` with a
-// sibling-file probe — is future work. The functions stay around so
-// the wiring is a one-line plug-in when that lands.
-#[allow(dead_code)]
+// stitching info. They're invoked by [`crate::SourceMetaSidecarHook`],
+// the [`arbvis::PrepareSourcesExtension`] impl registered on the
+// registry by [`crate::register_all`]. The hook runs once at the top
+// of `dispatch_render`, after every `Source` has been built, and
+// inserts a `SourceMeta` into each source's extensions for
+// `ArchLayoutPlugin::build` to read back.
 pub async fn try_load_source_meta(source: &Source) -> SourceMeta {
     match &source.kind {
         SourceKind::File(p) => {
@@ -1975,7 +1974,6 @@ pub async fn try_load_source_meta(source: &Source) -> SourceMeta {
 /// Load sidecar meta for every source, de-duplicated by HF Hub repo+revision
 /// (so a 4-shard model triggers one config.json fetch, not four). Returns a
 /// `Vec` parallel to `sources`.
-#[allow(dead_code)] // see comment above try_load_source_meta
 pub async fn load_meta_for_sources(sources: &[Source]) -> Vec<SourceMeta> {
     // Group sources by (repo_id, revision) for HF Hub; by parent dir for
     // local. Each group gets one fetch.
@@ -2010,7 +2008,6 @@ pub async fn load_meta_for_sources(sources: &[Source]) -> Vec<SourceMeta> {
 /// Fetch a small sidecar file (e.g. `config.json`) from an HF Hub repo via
 /// a raw GET to `{endpoint}/{repo_id}/resolve/{revision}/{filename}`.
 /// Returns the raw bytes on success.
-#[allow(dead_code)] // see comment above try_load_source_meta
 async fn fetch_hf_sidecar(
     repo: &RemoteRepo,
     revision: &str,

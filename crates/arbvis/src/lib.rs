@@ -28,7 +28,8 @@ pub use geometry::name_hue;
 pub use layout::{CanvasGeom, LayoutMode, LayoutShape};
 pub use registry::{
     DiffBuildCtx, DiffSourceBuilder, DirectoryTensorDiffPrep, FinetuneDetect, FormatPlugin,
-    LayoutBuildCtx, LayoutPlugin, MoeDiffPrep, Registry, RepoDiffPrep, SingleImageArchHook,
+    LayoutBuildCtx, LayoutPlugin, MoeDiffPrep, PrepareSourcesExtension, Registry, RepoDiffPrep,
+    SingleImageArchHook,
 };
 pub use tiled::html::FileEntity;
 pub use tiled::leaf::{encode_tile, TileFormat, TILE};
@@ -738,8 +739,17 @@ async fn resolve_input_sources(
 /// Drive the renderer for one of the four output destinations, optionally
 /// through the streaming path. Centralises the cascade that used to be
 /// duplicated three times in `run()`.
+///
+/// All three preparation paths (normal `resolve_input_sources`, the file-
+/// pair / repo-level / moe `--diff`*, and `--moe-diff`) funnel through here,
+/// which makes this the natural single place to run the registry's
+/// [`PrepareSourcesExtension`] cross-source enrichment pass. Each path's
+/// own preparer (e.g. `FormatPlugin::populate_*`) stuffs format-specific
+/// per-source data into `Source.extensions`; the extension hook adds
+/// cross-source / sidecar data (deduped by repo or parent dir) before any
+/// layout selection sees the sources.
 async fn dispatch_render(
-    sources: Vec<Source>,
+    mut sources: Vec<Source>,
     total: u64,
     labels: &[PathBuf],
     cfg: &RenderConfig,
@@ -747,6 +757,11 @@ async fn dispatch_render(
     stream: bool,
     registry: &registry::Registry,
 ) -> anyhow::Result<()> {
+    if let Some(hook) = registry.prepare_sources_extension.as_ref() {
+        hook.enrich(&mut sources)
+            .await
+            .context("prepare_sources_extension hook failed")?;
+    }
     match dest {
         OutputDest::Window => {
             run_single_blocking(labels.to_vec(), None, sources, total, cfg, registry).await?;

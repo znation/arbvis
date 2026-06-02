@@ -33,33 +33,43 @@ Remote end-to-end pixel verification is still pending and tracked as
 item 4 below — that's the only thing left to confirm this change has
 the intended effect on `--stream` arch runs.
 
-### 2. Wire `SourceMeta` sidecar enrichment
+### 2. ~~Wire `SourceMeta` sidecar enrichment~~ — DONE
 
-**Status.** [`crates/modelweightvis/src/data.rs`](crates/modelweightvis/src/data.rs)
-has `try_load_source_meta`, `load_meta_for_sources`, and
-`fetch_hf_sidecar` defined, each with `#[allow(dead_code)]` and a
-comment explaining the gap. `ArchLayoutPlugin::build` passes `&[]` for
-sidecars to `ArchLayout::try_build`.
+**Status.** Wired via the first of the two options from the original
+plan: a new arbvis hook `PrepareSourcesExtension` in
+[`crates/arbvis/src/registry.rs`](crates/arbvis/src/registry.rs) that
+runs once per render at the top of `dispatch_render`, after every
+`Source` has been built. The new
+[`SourceMetaSidecarHook`](crates/modelweightvis/src/hooks.rs) (registered
+by [`register_all`](crates/modelweightvis/src/lib.rs)) implements the
+trait by calling `load_meta_for_sources(sources).await` and inserting
+each `SourceMeta` into the corresponding `Source.extensions` slot.
 
-**Gap.** Transformer-aware layout grouping (read `config.json`'s
-`num_hidden_layers` + `hidden_size`, read
-`model.safetensors.index.json` for shard stitching) doesn't run. The
-arch layout works without it — falls back to inferring structure from
-tensor names — but is less faithful for unusual model layouts.
+`ArchLayoutPlugin::build` in
+[`crates/modelweightvis/src/layout/mod.rs`](crates/modelweightvis/src/layout/mod.rs)
+now pulls a parallel `Vec<SourceMeta>` back out of every source's
+extensions and threads it into `ArchLayout::try_build` (replacing the
+`&[]` placeholder). The `#[allow(dead_code)]` markers on
+`try_load_source_meta` / `load_meta_for_sources` / `fetch_hf_sidecar`
+in [`data.rs`](crates/modelweightvis/src/data.rs) are gone.
 
-**Fix.** Two options:
-- Add a new arbvis hook (`PrepareSourcesExtension` or similar) that
-  runs after `prepare_sources`, takes `&mut [Source]`, and lets
-  modelweightvis call `load_meta_for_sources` and merge results into
-  each source's `extensions`. Then `ArchLayoutPlugin::build` reads
-  `source.extensions.get::<SourceMeta>()` and threads it into
-  `ArchLayout::try_build`.
-- Or extend `FormatPlugin` with a `sibling_probe(parent_dir: &Path) ->
-  Option<SourceMeta>` method that the local-populate path calls. Loses
-  the cross-source dedup that `load_meta_for_sources` does, so the
-  first option is cleaner.
+Behaviour change: `config.json`'s `num_hidden_layers` now extends the
+arch canvas's layer stack to the declared count (so partial-shard loads
+produce a stable layout), `architectures` populates
+`ArchLayout::architecture` for downstream display, and
+`model.safetensors.index.json` (when present) seeds canonical sub-path
+slots for tensors that live in shards we didn't load.
 
-**Why deferred.** Arch layout is correct without it; just less rich.
+Verification: `cargo build --workspace` clean, `cargo clippy --workspace
+--all-targets -- -D warnings` zero warnings, `cargo test --workspace`
+169 tests (82 arbvis + 87 modelweightvis) passed. Local smoke run of
+`modelweightvis $SMOLLM2/model.safetensors --output …` produces a valid
+4096×4096 PNG; debug log shows `config.json` loaded from the sidecar
+path, confirming the hook fires end-to-end.
+
+Note: the standalone `~/hf/modelweightvis` repo (TODO item 6) is still
+on the pre-hook code and would need a parallel mirror commit once the
+path-dep flip happens.
 
 ### 3. Move model-side CLI flags off `arbvis::Args`
 

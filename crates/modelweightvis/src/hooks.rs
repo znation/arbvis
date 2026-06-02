@@ -12,13 +12,14 @@ use std::path::{Path, PathBuf};
 
 use arbvis::hf_url::RemoteFileSpec;
 use arbvis::{
-    DiffMetric, DirectoryTensorDiffPrep, FinetuneDetect, LayoutShape, MoeDiffPrep, RepoDiffPrep,
-    SingleImageArchHook, Source,
+    DiffMetric, DirectoryTensorDiffPrep, FinetuneDetect, LayoutShape, MoeDiffPrep,
+    PrepareSourcesExtension, RepoDiffPrep, SingleImageArchHook, Source,
 };
 use async_trait::async_trait;
 
 use crate::data::{
-    build_multi_safetensors_diff_sources, prepare_diff_sources_from_http, prepare_moe_diff_sources,
+    build_multi_safetensors_diff_sources, load_meta_for_sources, prepare_diff_sources_from_http,
+    prepare_moe_diff_sources,
 };
 use crate::format::SourceFormat;
 
@@ -92,6 +93,32 @@ pub struct HfModelCardFinetuneDetect;
 impl FinetuneDetect for HfModelCardFinetuneDetect {
     async fn detect(&self, orig_url: &str, mod_url: &str) -> Option<bool> {
         crate::finetune::detect_relation(orig_url, mod_url).await
+    }
+}
+
+/// Cross-source sidecar enrichment hook. Runs after `prepare_sources` /
+/// `prepare_sources_from_specs` has built every `Source` and per-source
+/// `FormatPlugin::populate_*` has stuffed each source's own `ModelInfo`
+/// into its `extensions`. We then opportunistically fetch `config.json`
+/// and `model.safetensors.index.json` alongside every source (deduped by
+/// HF repo + revision or by parent directory) and insert a `SourceMeta`
+/// into each source's extensions. [`crate::ArchLayoutPlugin`] reads it
+/// back to validate transformer hyperparameters and reserve canonical
+/// slots for tensors that live in shards we didn't load.
+///
+/// Errors from the sidecar fetches are swallowed inside
+/// [`crate::data::try_load_source_meta`] — sidecar info is advisory and a
+/// missing sidecar must not break rendering — so this hook can't fail.
+pub struct SourceMetaSidecarHook;
+
+#[async_trait(?Send)]
+impl PrepareSourcesExtension for SourceMetaSidecarHook {
+    async fn enrich(&self, sources: &mut [Source]) -> anyhow::Result<()> {
+        let metas = load_meta_for_sources(sources).await;
+        for (s, m) in sources.iter_mut().zip(metas) {
+            s.extensions.insert(m);
+        }
+        Ok(())
     }
 }
 

@@ -12,7 +12,7 @@ use std::any::Any;
 
 use arbvis::{CanvasGeom, LayoutBuildCtx, LayoutMode, LayoutPlugin, LayoutShape};
 
-use crate::data::MoeCell;
+use crate::data::{MoeCell, SourceMeta};
 use crate::format::{Dtype, ModelInfo};
 pub use arch::ArchLayout;
 
@@ -176,11 +176,24 @@ impl LayoutPlugin for ArchLayoutPlugin {
         Self::eligible(ctx)
     }
     fn build(&self, ctx: &LayoutBuildCtx<'_>) -> Option<Box<dyn LayoutShape>> {
-        // Sidecar metas (config.json / safetensors index) are no longer
-        // threaded through `LayoutBuildCtx` — modelweightvis's
-        // `FormatPlugin` impls populate `Source.extensions` instead.
-        // `ArchLayout::try_build` reads from there.
-        let arch = ArchLayout::try_build(ctx.sources, ctx.cumulative_offsets, &[])?;
+        // Sidecar metas (config.json / safetensors index) are populated
+        // out-of-band by [`crate::SourceMetaSidecarHook`] (registered as a
+        // `PrepareSourcesExtension` on the registry) which fetches the
+        // siblings once per repo/parent-dir and inserts a `SourceMeta` into
+        // each `Source.extensions`. Pull them back out as a parallel slice
+        // (one per source, defaulting to empty when the hook didn't run or
+        // the source kind is exotic).
+        let metas: Vec<SourceMeta> = ctx
+            .sources
+            .iter()
+            .map(|s| {
+                s.extensions
+                    .get::<SourceMeta>()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect();
+        let arch = ArchLayout::try_build(ctx.sources, ctx.cumulative_offsets, &metas)?;
         // Diff-mode info note: surface tensor sources that don't carry
         // safetensors info (e.g. tokenizer.json file diffs) — they won't
         // appear on the arch canvas.

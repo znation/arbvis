@@ -721,7 +721,7 @@ async fn resolve_input_sources(
     .into_iter()
     .flatten()
     .collect();
-    let (mut sources, total) = data::prepare_sources_from_specs(&specs, registry)?;
+    let (mut sources, total) = data::prepare_sources_from_specs(&specs, registry).await?;
     if show_xet_xorbs {
         data::populate_xet_terms(&mut sources).await?;
     }

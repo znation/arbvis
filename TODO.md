@@ -12,33 +12,26 @@ work. Roughly ordered by impact-per-effort.
 
 ## Workspace (`~/hf/arbvis`, branch `zn/focused-mclaren-c3e069`)
 
-### 1. Wire `FormatPlugin::populate_remote`
+### 1. ~~Wire `FormatPlugin::populate_remote`~~ — DONE
 
-**Status.** Implemented on every plugin (`SafetensorsFormatPlugin`,
-`GgufFormatPlugin`, `PickleFormatPlugin` — pickle errors out by design;
-the zip end-of-central-directory record is at the tail). Never called.
+**Status.** Wired. `prepare_sources_from_specs` in
+[`crates/arbvis/src/data.rs`](crates/arbvis/src/data.rs) is now `async`;
+the `InputSpec::Remote` arm constructs a `Data::Http` handle and
+iterates `registry.formats` to call `populate_remote` on the first
+plugin whose `detects_path` matches. The single caller in `lib.rs`'s
+`resolve_input_sources` was updated to `.await` the function. Failures
+are logged and treated as "no plugin populated extensions" (same
+fallback the `populate_local` block uses); pickle remote bails out by
+design.
 
-**Gap.** [`crates/arbvis/src/data.rs`](crates/arbvis/src/data.rs)'s
-`prepare_sources_from_specs` (around line 605) handles the
-`InputSpec::Remote` arm by constructing the `Source` with
-`extensions: Extensions::default()` and does NOT iterate
-`registry.formats` to call `populate_remote`. So when a user passes a
-remote-streaming flag (`--stream`, `--show-xet-xorbs`, or an `hf://`
-URL whose materialization is deferred), `ModelInfo` never lands in
-`Source.extensions` → `ArchLayoutPlugin::applicable` returns false →
-silent fallback to Hilbert layout.
+Verification: `cargo clippy --workspace --all-targets -- -D warnings`
+zero warnings, `cargo test --workspace` 87 passed. The local-default
+path (`prepare_sources`, the non-`--stream` non-`--show-xet-xorbs` case)
+was not touched, so local smoke baselines remain byte-identical.
 
-**Fix.** Add a `populate_remote`-iteration block in the
-`InputSpec::Remote` branch mirroring the `InputSpec::Local` block 20
-lines above it. Open the source as a temporary `Data::Http` handle
-(the same handle the tile loader will use), call `populate_remote` on
-the first plugin that claims the filename, and stuff the resulting
-extensions into the new `Source`. Cost: one ~1 MiB range request per
-remote model file at setup. Small.
-
-**Why deferred.** The split lands without it — local hf:// resolution
-(the default, no `--stream`) downloads first and then `populate_local`
-runs fine. Only `--stream` / `--show-xet-xorbs` arch users feel this.
+Remote end-to-end pixel verification is still pending and tracked as
+item 4 below — that's the only thing left to confirm this change has
+the intended effect on `--stream` arch runs.
 
 ### 2. Wire `SourceMeta` sidecar enrichment
 

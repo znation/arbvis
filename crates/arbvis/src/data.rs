@@ -528,7 +528,14 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
 
 /// Build sources from a mixed list of local paths and remote HF file specs.
 /// Remote specs are turned into `SourceKind::Http` entries (no download).
-pub fn prepare_sources_from_specs(
+///
+/// Async so the remote arm can call each [`crate::registry::FormatPlugin`]'s
+/// `populate_remote` over a `Data::Http` handle — that's the only way
+/// `ModelInfo` gets stuffed into `Source.extensions` when `--stream` /
+/// `--show-xet-xorbs` keep the file remote. Without that population, the
+/// arch layout's `applicable()` check returns false on every remote source
+/// and arbvis silently falls back to byte-Hilbert.
+pub async fn prepare_sources_from_specs(
     specs: &[InputSpec],
     registry: &crate::registry::Registry,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
@@ -606,13 +613,41 @@ pub fn prepare_sources_from_specs(
             InputSpec::Remote(spec) => {
                 let size = spec.size;
                 total += size;
+                // Open a `Data::Http` handle pointing at the same remote file
+                // the downstream loader/renderer will use. This costs nothing
+                // up front — `Data::Http` is just (repo, filename, revision);
+                // `populate_remote` is what issues the actual head-prefix
+                // range fetch needed to parse the format header.
+                let data = Data::Http {
+                    repo: spec.repo.clone(),
+                    filename: Arc::clone(&spec.filename),
+                    revision: Arc::clone(&spec.revision),
+                };
+                let mut extensions = Extensions::default();
+                let filename_path = Path::new(spec.filename.as_str());
+                for plugin in &registry.formats {
+                    if plugin.detects_path(filename_path) {
+                        if let Err(e) = plugin.populate_remote(&data, size, &mut extensions).await {
+                            // Non-fatal: arch layout falls back to byte-Hilbert,
+                            // the same way it would for any source whose format
+                            // plugin couldn't parse its header.
+                            log::warn!(
+                                "{}: format plugin `{}` (remote) failed: {e} — \
+                                 treating as plain binary",
+                                spec.filename,
+                                plugin.id()
+                            );
+                        }
+                        break;
+                    }
+                }
                 sources.push(Source {
                     file_idx: sources.len(),
                     kind: SourceKind::Http(spec.clone()),
                     byte_size: size,
                     name_override: None,
                     xet_terms: None,
-                    extensions: Extensions::default(),
+                    extensions,
                 });
             }
         }

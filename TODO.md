@@ -200,21 +200,16 @@ up to whoever reviews the stack. GitHub printed the canonical
 
 ## Standalone repo (`~/hf/modelweightvis`)
 
-### 6. Update the `arbvis` path-dep
+### 6. ~~Update the `arbvis` path-dep~~ — DONE
 
-`Cargo.toml` pins `arbvis` to the in-progress worktree:
-```toml
-arbvis = { path = "../arbvis/.claude/worktrees/focused-mclaren-c3e069/crates/arbvis", version = "0.1.0" }
-```
-
-Once `zn/focused-mclaren-c3e069` lands on `~/hf/arbvis`'s `main`,
-update to:
-```toml
-arbvis = { path = "../arbvis/crates/arbvis", version = "0.1.0" }
-```
-
-The `version = "0.1.0"` pin already matches the workspace; only the
-path changes.
+Standalone `~/hf/modelweightvis` commit `dbe1e57` mirrors arbvis
+`5e71cd6a` (SourceMetaSidecarHook) + `37a3e5d9` (ModelOpts CLI
+split) and flips the `Cargo.toml` path-dep from the worktree
+location to `../arbvis/crates/arbvis`. Cargo.lock untouched (same
+arbvis 0.1.0 crate, different on-disk path). cargo fmt + clippy
+(zero warnings) + `cargo test --lib` (87 tests) clean; release
+build succeeds; local smoke of SmolLM2-135M `--output` produces a
+valid 4096² PNG.
 
 ### 7. Tag arbvis v0.1.0
 

@@ -190,11 +190,13 @@ Scenarios run (substitutions in brackets):
   pre-#1/#2/#3 source (item 6) and would benefit from the same
   smoke run once the path-dep flip lands.
 
-### 5. Push the branch
+### 5. ~~Push the branch~~ — DONE
 
-`zn/focused-mclaren-c3e069` is 20 commits ahead of `origin/main`. No
-push has been done. The branch is well-structured and reviewable as
-a stack.
+`zn/focused-mclaren-c3e069` is pushed to `origin` (now 25 commits
+ahead of `origin/main`; new-branch ref set to track
+`origin/zn/focused-mclaren-c3e069`). No PR has been opened — that's
+up to whoever reviews the stack. GitHub printed the canonical
+`pull/new/zn/focused-mclaren-c3e069` URL on push if it's wanted.
 
 ## Standalone repo (`~/hf/modelweightvis`)
 

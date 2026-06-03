@@ -38,7 +38,6 @@ pub async fn run_tiles_hf_streaming(
     registry: &crate::registry::Registry,
 ) -> anyhow::Result<Vec<u8>> {
     crate::hf_url::require_token()?;
-    let client = crate::hf_url::client()?;
 
     let plan = build_tile_plan(
         sources,
@@ -60,7 +59,7 @@ pub async fn run_tiles_hf_streaming(
     let leaf_ext = leaf_format.extension();
     let pyramid_ext = pyramid_format.extension();
 
-    let sink = Arc::new(HfTileSink::new(client, hf_out.clone())?);
+    let sink = Arc::new(HfTileSink::new(hf_out.clone())?);
     let pyramid_path_fn: Arc<dyn Fn(u32, u32, u32) -> String + Send + Sync> = {
         let hf_out = hf_out.clone();
         let ext = pyramid_ext.to_string();
@@ -102,7 +101,7 @@ pub async fn run_tiles_hf_streaming(
     .await?;
 
     // Await any in-flight pyramid encode/upload tasks before commit so every
-    // staged file is on disk by the time hf-hub takes the snapshot.
+    // staged file is on disk by the time `hf upload-large-folder` walks it.
     pyramid.drain().await;
 
     // Variable-depth detail tiles (sparse deeper levels, no accumulation).

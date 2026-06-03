@@ -348,27 +348,6 @@ pub trait ErrorClassify {
     fn classify(&self) -> Outcome;
 }
 
-impl ErrorClassify for hf_hub::HFError {
-    fn classify(&self) -> Outcome {
-        match self {
-            hf_hub::HFError::RateLimited { .. } => Outcome::RateLimit,
-            hf_hub::HFError::Request { source, .. } => {
-                if source.is_connect() || source.is_timeout() || source.is_request() {
-                    Outcome::Timeout
-                } else {
-                    Outcome::Permanent
-                }
-            }
-            hf_hub::HFError::Http { context } => match context.status.as_u16() {
-                429 => Outcome::RateLimit,
-                500 | 502 | 503 | 504 => Outcome::Timeout,
-                _ => Outcome::Permanent,
-            },
-            _ => Outcome::Permanent,
-        }
-    }
-}
-
 impl ErrorClassify for reqwest::Error {
     fn classify(&self) -> Outcome {
         if let Some(status) = self.status() {

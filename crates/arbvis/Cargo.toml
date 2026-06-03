@@ -27,11 +27,11 @@ env_logger = "0.11"
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-hf-hub = "1.0.0-rc.1"
-# xet-core-structures is the chunk/xorb wire format used by hf-hub internally.
-# We pull it in directly so we can decode xorb byte segments after fetching
-# them from CAS URLs ourselves — bypassing hf-hub's per-call xet stream group
-# rebuild, which dominates wall time for per-tile range requests.
+# xet-core-structures is the xet chunk/xorb wire format. arbvis fetches CAS
+# URLs directly (see `xet.rs`) for per-tile byte-range reads under `--stream`
+# and the `--show-xet-xorbs` overlay — the official `hf` CLI handles xet
+# dedup for whole-file downloads internally, but exposes no byte-range surface
+# we can hook into for the per-tile path.
 xet-core-structures = "1.5"
 # Byte-bounded LRU cache for decompressed xorb chunk segments, hit per tile.
 lru = "0.12"

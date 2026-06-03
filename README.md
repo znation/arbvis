@@ -131,7 +131,7 @@ Whole-repo URLs (no `/path`) expand to every file in the repo. Single-file URLs 
 
 ### Streaming (`--stream`)
 
-By default, `hf://` inputs are downloaded to the local hf-hub cache before rendering, and tile output is staged on local disk before upload. `--stream` flips both: input bytes are range-fetched per tile, and tiles are pushed to the Hub as they are produced. The disk-backed default is faster and more recoverable; use `--stream` only when input or output data won't fit on local disk.
+By default, `hf://` inputs are downloaded to the local HF cache (via the [`hf` CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli)) before rendering, and tile output is staged on local disk before upload. `--stream` flips both: input bytes are range-fetched per tile, and tiles are pushed to the Hub as they are produced. The disk-backed default is faster and more recoverable; use `--stream` only when input or output data won't fit on local disk.
 
 ### Xet xorb visualization (`--show-xet-xorbs`)
 
@@ -167,7 +167,7 @@ arbvis is the byte-only foundation: Hilbert layout, byte coloring, JSON-aware di
 
 ## Building
 
-Requires Rust (stable). This repo is a Cargo workspace with `crates/arbvis` and `crates/modelweightvis` as members:
+Requires Rust (stable) and the official Hugging Face [`hf` CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli) on `$PATH` (install via `pip install -U huggingface_hub`, `brew install huggingface-cli`, or `curl -LsSf https://hf.co/cli/install.sh | bash`). arbvis shells out to `hf` for every Hub download / upload / sync. This repo is a Cargo workspace with `crates/arbvis` and `crates/modelweightvis` as members:
 
 ```sh
 cargo build --release -p arbvis
@@ -184,4 +184,4 @@ To build modelweightvis from this workspace, swap `-p arbvis` for `-p modelweigh
 
 ## Credits
 
-Color scheme inspired by [Stairwell's binary visualization post](https://stairwell.com/blog/hilbert-curves-visualizing-binary-files-with-color-and-patterns/). Built on [clap](https://crates.io/crates/clap) (CLI), [image](https://crates.io/crates/image) + [png](https://crates.io/crates/png) + rav1e (tile encoding), [fast_hilbert](https://crates.io/crates/fast_hilbert) (curve mapping), [hf-hub](https://crates.io/crates/hf-hub) + [xet-core-structures](https://crates.io/crates/xet-core-structures) (Hub I/O), [minifb](https://crates.io/crates/minifb) (window display), and [Leaflet.js](https://leafletjs.com/) (the viewer).
+Color scheme inspired by [Stairwell's binary visualization post](https://stairwell.com/blog/hilbert-curves-visualizing-binary-files-with-color-and-patterns/). Built on [clap](https://crates.io/crates/clap) (CLI), [image](https://crates.io/crates/image) + [png](https://crates.io/crates/png) + rav1e (tile encoding), [fast_hilbert](https://crates.io/crates/fast_hilbert) (curve mapping), the official Hugging Face [`hf` CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli) (Hub I/O) + [xet-core-structures](https://crates.io/crates/xet-core-structures) (per-tile xet decode), [minifb](https://crates.io/crates/minifb) (window display), and [Leaflet.js](https://leafletjs.com/) (the viewer).

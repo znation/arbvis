@@ -60,20 +60,6 @@ pub type LazyFetcher =
 /// runtime have enough simultaneous awaiting tasks to keep the throttle full.
 const SETUP_FETCH_CONCURRENCY: usize = 16;
 
-/// Seconds of zero-byte silence before [`download_specs_to_paths`] aborts an
-/// in-flight `hf-hub` `download_file` and treats it as a transient timeout.
-/// hf-hub's `reqwest::Client` is built without `.timeout()` / `.read_timeout()`
-/// and its streaming write loop (`stream_response_to_file_with_progress`) has
-/// no per-chunk timeout, so a CDN edge that silently stops sending bytes hangs
-/// the future forever. A `ProgressHandler` stamps the latest event time and a
-/// sibling watchdog cancels the future after this many seconds of silence.
-///
-/// Override with `ARBVIS_DOWNLOAD_STALL_SECS` if 30 s is too aggressive (very
-/// slow links may legitimately go 30 s between TCP windows under heavy
-/// congestion). The throttle's `Outcome::Timeout` retry budget
-/// (`MAX_TIMEOUT_RETRIES = 5`) gates total wall-time before we give up.
-const DEFAULT_DOWNLOAD_STALL_SECS: u64 = 30;
-
 /// Build a one-shot progress bar attached to the global `MultiProgress` so
 /// it interleaves cleanly with log output. Always returns `Some(...)`; the
 /// non-TTY case is handled by the hidden draw target on the global multi.
@@ -99,10 +85,11 @@ pub enum Data {
     },
     /// Remote xet-backed file accessed via direct CAS range requests. Each
     /// `fetch_range` issues one or more HTTP GETs against signed xorb URLs
-    /// and decompresses the resulting chunk segments locally, bypassing
-    /// hf-hub's per-call xet stream-group rebuild. Decoded chunk segments
-    /// are cached inside the reader for spatial-locality wins (adjacent
-    /// tiles on the Hilbert curve share terms).
+    /// and decompresses the resulting chunk segments locally. The `hf` CLI
+    /// has no byte-range surface, so per-tile xet dedup wire-speedup goes
+    /// through this direct decoder. Decoded chunk segments are cached
+    /// inside the reader for spatial-locality wins (adjacent tiles on the
+    /// Hilbert curve share terms).
     Xet(Arc<XetReader>),
     /// Diff computed on demand per range — never stored in full.
     /// Async-only: the inner closure returns a future so it can issue HTTP
@@ -211,7 +198,7 @@ pub enum SourceKind {
         original: PathBuf,
         modified: PathBuf,
     },
-    /// Remote HF file, accessed via hf-hub range requests per tile.
+    /// Remote HF file, accessed via direct HTTPS range requests per tile.
     Http(RemoteFileSpec),
     /// A canvas region for a tensor / file that exists on only one side of a
     /// diff. The byte_size on the parent `Source` controls how much canvas
@@ -659,14 +646,11 @@ pub async fn prepare_sources_from_specs(
 /// Materialize every `SourceKind::Http` source as a local file via one
 /// whole-file download per source, then swap each source to `SourceKind::File`.
 ///
-/// Why: `Data::Http::fetch_range` ultimately hits hf-hub's xet streaming API
-/// when the file is xet-backed. That code path has substantial *per-call*
-/// setup cost — it fetches a fresh CAS token, builds a `XetDownloadStreamGroup`,
-/// and opens a new stream — far more expensive than the ~65 KiB of payload
-/// transferred for a single tile. With tens of thousands of tiles per file,
-/// the per-call overhead dominates and the pipeline appears stalled.
+/// Why: `Data::Http::fetch_range` issues a fresh HTTPS GET (with Range) per
+/// tile. With tens of thousands of tiles per file, the per-call TLS + HTTP
+/// setup dominates and the pipeline appears stalled.
 ///
-/// One whole-file `download_file` per source amortises that overhead across
+/// One whole-file `hf download` per source amortises that overhead across
 /// the entire file (which the renderer will read every byte of anyway). After
 /// materialization, all tile reads are mmap'd `memcpy`s — no HTTP, no throttle.
 ///
@@ -702,84 +686,16 @@ pub async fn materialize_http_sources(sources: &mut [Source]) -> anyhow::Result<
     Ok(())
 }
 
-/// `ProgressHandler` that records the wall-clock time of the most recent
-/// hf-hub progress event into a shared atomic. Paired with the watchdog future
-/// inside [`download_specs_to_paths`] to detect silent body-stream stalls.
-#[derive(Clone)]
-struct StallSentinel {
-    last_event_unix_ms: Arc<std::sync::atomic::AtomicI64>,
-}
-
-impl hf_hub::progress::ProgressHandler for StallSentinel {
-    fn on_progress(&self, _event: &hf_hub::progress::ProgressEvent) {
-        self.last_event_unix_ms
-            .store(unix_now_ms(), std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-fn unix_now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-/// Per-attempt error from the closure passed to `with_throttle` inside
-/// [`download_specs_to_paths`]. Wraps `hf-hub`'s `HFError` and adds a `Stalled`
-/// variant that classifies as `Outcome::Timeout`, so the AIMD throttle's
-/// existing retry path (`MAX_TIMEOUT_RETRIES`, backoff, scale-down) handles
-/// connection stalls without any special-case logic above.
-#[derive(Debug)]
-enum DownloadAttemptError {
-    Hf(hf_hub::HFError),
-    Stalled { filename: String, idle_secs: u64 },
-}
-
-impl std::fmt::Display for DownloadAttemptError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DownloadAttemptError::Hf(e) => write!(f, "{e}"),
-            DownloadAttemptError::Stalled {
-                filename,
-                idle_secs,
-            } => write!(
-                f,
-                "{filename}: no progress for {idle_secs}s — treating as transient timeout",
-            ),
-        }
-    }
-}
-
-impl std::error::Error for DownloadAttemptError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            DownloadAttemptError::Hf(e) => Some(e),
-            DownloadAttemptError::Stalled { .. } => None,
-        }
-    }
-}
-
-impl crate::throttle::ErrorClassify for DownloadAttemptError {
-    fn classify(&self) -> crate::throttle::Outcome {
-        match self {
-            DownloadAttemptError::Hf(e) => e.classify(),
-            DownloadAttemptError::Stalled { .. } => crate::throttle::Outcome::Timeout,
-        }
-    }
-}
-
-/// Download a batch of [`RemoteFileSpec`]s to the local hf-hub cache and return
+/// Download a batch of [`RemoteFileSpec`]s to the local HF cache and return
 /// the local paths in the same order. Drives the AIMD throttle through
 /// [`crate::throttle::with_throttle`] and reports progress via a one-shot
 /// `setup_progress` bar.
 ///
-/// Each attempt is wrapped in a stall watchdog: a [`StallSentinel`] passed as
-/// the hf-hub progress handler stamps every event, and a sibling future
-/// cancels the download if no event arrives for `DEFAULT_DOWNLOAD_STALL_SECS`
-/// (`ARBVIS_DOWNLOAD_STALL_SECS` env override). Stalls surface as
-/// [`DownloadAttemptError::Stalled`], which classifies as `Outcome::Timeout`
-/// and goes through the throttle's normal retry/backoff path.
+/// Each download is a fresh `hf download <repo> <file>` subprocess. The CLI
+/// applies its own `HF_HUB_DOWNLOAD_TIMEOUT` (default 10 s) to detect CDN
+/// stalls, so we no longer need a custom watchdog around the call. Errors
+/// classify via `HfCliError::ErrorClassify`, which feeds the throttle's
+/// existing retry/backoff path.
 ///
 /// Shared by every disk-backed materialisation path:
 /// [`materialize_http_sources`] (normal flow's `SourceKind::Http` swap) and
@@ -789,17 +705,11 @@ pub async fn download_specs_to_paths(
     specs: &[RemoteFileSpec],
     progress_label: &str,
 ) -> anyhow::Result<Vec<PathBuf>> {
+    use crate::hf_cli;
     use crate::throttle::with_throttle;
-    use std::sync::atomic::{AtomicI64, Ordering};
 
     let pb = setup_progress(progress_label, specs.len() as u64);
     let pb_for_workers = pb.clone();
-
-    let stall_secs: u64 = std::env::var("ARBVIS_DOWNLOAD_STALL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_DOWNLOAD_STALL_SECS);
-    let stall_ms: i64 = (stall_secs as i64).saturating_mul(1000);
 
     let mut downloads: Vec<(usize, anyhow::Result<PathBuf>)> =
         stream::iter(specs.iter().cloned().enumerate())
@@ -808,68 +718,35 @@ pub async fn download_specs_to_paths(
                 async move {
                     let filename = (*spec.filename).clone();
                     let revision = (*spec.revision).clone();
-                    let label = format!("download_file {filename}");
-                    let result = with_throttle(&label, || {
-                        let spec = spec.clone();
-                        let filename = filename.clone();
-                        let revision = revision.clone();
-                        async move {
-                            let last_event = Arc::new(AtomicI64::new(unix_now_ms()));
-                            let sentinel = StallSentinel {
-                                last_event_unix_ms: Arc::clone(&last_event),
-                            };
-                            let download_fut = async {
-                                match &spec.repo {
-                                    RemoteRepo::Model(r) => {
-                                        r.download_file()
-                                            .filename(filename.clone())
-                                            .revision(revision.clone())
-                                            .progress(sentinel)
-                                            .send()
-                                            .await
-                                    }
-                                    RemoteRepo::Dataset(r) => {
-                                        r.download_file()
-                                            .filename(filename.clone())
-                                            .revision(revision.clone())
-                                            .progress(sentinel)
-                                            .send()
-                                            .await
-                                    }
-                                    RemoteRepo::Space(r) => {
-                                        r.download_file()
-                                            .filename(filename.clone())
-                                            .revision(revision.clone())
-                                            .progress(sentinel)
-                                            .send()
-                                            .await
-                                    }
-                                }
-                            };
-                            let watchdog = async {
-                                loop {
-                                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                    let idle_ms = unix_now_ms()
-                                        .saturating_sub(last_event.load(Ordering::Relaxed));
-                                    if idle_ms >= stall_ms {
-                                        return idle_ms;
-                                    }
-                                }
-                            };
-                            tokio::select! {
-                                r = download_fut => r.map_err(DownloadAttemptError::Hf),
-                                idle_ms = watchdog => {
-                                    let idle_secs = (idle_ms / 1000).max(0) as u64;
-                                    log::warn!(
-                                        "{filename}: download stalled (no bytes for {idle_secs}s); aborting attempt and retrying via throttle"
-                                    );
-                                    Err(DownloadAttemptError::Stalled {
-                                        filename: filename.clone(),
-                                        idle_secs,
-                                    })
-                                }
-                            }
+                    let label = format!("hf download {filename}");
+                    let repo_id = spec.repo.repo_id().to_string();
+                    // Map the api_segment ("models"/"datasets"/"spaces") to the
+                    // `--type` flag value the CLI expects.
+                    let repo_type = match spec.repo.api_segment() {
+                        "models" => "model",
+                        "datasets" => "dataset",
+                        "spaces" => "space",
+                        other => {
+                            return (
+                                i,
+                                Err(anyhow::anyhow!(
+                                    "unexpected api_segment {other:?} on remote repo"
+                                )),
+                            );
                         }
+                    };
+                    let result: Result<PathBuf, anyhow::Error> = with_throttle(&label, || async {
+                        let out = hf_cli::run_hf_json::<hf_cli::HfDownloadResult, _, _>([
+                            "download",
+                            "--type",
+                            repo_type,
+                            "--revision",
+                            revision.as_str(),
+                            repo_id.as_str(),
+                            filename.as_str(),
+                        ])
+                        .await?;
+                        Ok::<PathBuf, hf_cli::HfCliError>(PathBuf::from(out.path))
                     })
                     .await
                     .map_err(anyhow::Error::from);

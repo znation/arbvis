@@ -1,16 +1,17 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Context;
-use futures::StreamExt;
-use hf_hub::{HFBucket, HFClient, HFRepository, RepoTypeDataset, RepoTypeModel, RepoTypeSpace};
+use tokio::sync::Mutex as AsyncMutex;
 
+use crate::hf_cli::{self, HfDownloadResult, HfTreeEntry};
 use crate::throttle::with_throttle;
 
 /// Repo kind parsed from an `hf://` URL. Carried as a typed value rather than a
 /// string so the four upload/download dispatch sites in this crate can match
 /// exhaustively and the compiler enforces consistency.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RepoKind {
     Model,
     Dataset,
@@ -18,24 +19,64 @@ pub enum RepoKind {
     Bucket,
 }
 
-/// Typed repo handle bundling the kind, revision, and the in-process client.
+impl RepoKind {
+    /// `models`, `datasets`, `spaces`, or `buckets` — the URL segment used in
+    /// `/api/{api_segment}/{repo_id}/...` routes and the `hf {api_segment}`
+    /// subcommand group.
+    pub fn api_segment(self) -> &'static str {
+        match self {
+            RepoKind::Model => "models",
+            RepoKind::Dataset => "datasets",
+            RepoKind::Space => "spaces",
+            RepoKind::Bucket => "buckets",
+        }
+    }
+
+    /// Value to pass to `hf {download,upload} --type ...`. Only valid for
+    /// model/dataset/space — buckets are addressed via the `hf buckets` /
+    /// `hf sync` subcommand groups instead.
+    pub fn cli_repo_type(self) -> anyhow::Result<&'static str> {
+        match self {
+            RepoKind::Model => Ok("model"),
+            RepoKind::Dataset => Ok("dataset"),
+            RepoKind::Space => Ok("space"),
+            RepoKind::Bucket => anyhow::bail!(
+                "buckets are addressed via `hf buckets` / `hf sync`, not the --type flag"
+            ),
+        }
+    }
+}
+
+/// Repo handle for direct-HTTP read paths (`fetch_range`, xet CAS bypass).
 ///
-/// Carries the type marker as an enum so `Data::Http` can dispatch range
-/// downloads against the right `HFRepository<T>` without leaking generics
-/// through the rest of the codebase.
-///
-/// Buckets are intentionally absent from this enum: the bucket HTTP API has no
-/// range-read primitive in hf-hub 1.0, so any caller building a `RemoteRepo`
-/// for read access is doing range I/O and bucket URLs are rejected upstream
-/// (see [`make_remote_repo`]).
-#[derive(Clone)]
-pub enum RemoteRepo {
-    Model(HFRepository<RepoTypeModel>),
-    Dataset(HFRepository<RepoTypeDataset>),
-    Space(HFRepository<RepoTypeSpace>),
+/// Buckets are intentionally not constructable here: the bucket HTTP surface
+/// has no public range-read primitive, so any caller building a `RemoteRepo`
+/// for range I/O is rejected upstream (see [`make_remote_repo`]). The Hub I/O
+/// that flows through the `hf` CLI uses the [`RepoKind`] + repo-id pair
+/// directly and doesn't need this struct.
+#[derive(Clone, Debug)]
+pub struct RemoteRepo {
+    kind: RepoKind,
+    repo_id: String,
 }
 
 impl RemoteRepo {
+    /// `owner/name` for the underlying repository.
+    pub fn repo_id(&self) -> &str {
+        &self.repo_id
+    }
+
+    /// `models`, `datasets`, or `spaces` — the URL segment used in
+    /// `/api/{api_segment}/{repo_id}/...` routes.
+    pub fn api_segment(&self) -> &'static str {
+        self.kind.api_segment()
+    }
+
+    /// Range-fetch `[range.start, range.end)` bytes from `filename` at
+    /// `revision`. Direct HTTPS GET to the Hub's `/resolve/` URL with a
+    /// `Range` header — `hf` CLI has no byte-range surface and tile
+    /// rendering's `--stream` path needs the per-tile range read, so this
+    /// stays direct-reqwest.
     pub async fn fetch_range(
         &self,
         filename: &str,
@@ -43,55 +84,45 @@ impl RemoteRepo {
         range: std::ops::Range<u64>,
     ) -> anyhow::Result<Vec<u8>> {
         let label = format!("fetch_range {filename}");
+        // The Hub `/resolve/` URL doesn't include the `models/` segment for
+        // model repos — only `datasets/` and `spaces/` get a prefix. The
+        // `/api/` URLs DO include `models/`, which is why `api_segment` here
+        // would be wrong.
+        let kind_prefix = match self.kind {
+            RepoKind::Model => String::new(),
+            RepoKind::Dataset => "datasets/".to_string(),
+            RepoKind::Space => "spaces/".to_string(),
+            // RemoteRepo can't be constructed with Bucket (rejected in
+            // `make_remote_repo`), but match exhaustively to keep this honest.
+            RepoKind::Bucket => unreachable!("RemoteRepo can't hold a bucket"),
+        };
+        let url = format!(
+            "{}/{}{}/resolve/{}/{}",
+            endpoint(),
+            kind_prefix,
+            self.repo_id,
+            revision,
+            filename,
+        );
+        // `Range: bytes=START-END` is inclusive on both sides; our `range.end`
+        // is the exclusive Rust convention, so subtract 1 for the header.
+        let header = format!("bytes={}-{}", range.start, range.end.saturating_sub(1));
         let bytes = with_throttle(&label, || async {
-            match self {
-                RemoteRepo::Model(r) => {
-                    r.download_file_to_bytes()
-                        .filename(filename)
-                        .revision(revision)
-                        .range(range.clone())
-                        .send()
-                        .await
-                }
-                RemoteRepo::Dataset(r) => {
-                    r.download_file_to_bytes()
-                        .filename(filename)
-                        .revision(revision)
-                        .range(range.clone())
-                        .send()
-                        .await
-                }
-                RemoteRepo::Space(r) => {
-                    r.download_file_to_bytes()
-                        .filename(filename)
-                        .revision(revision)
-                        .range(range.clone())
-                        .send()
-                        .await
-                }
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()?;
+            let mut req = client.get(&url).header(reqwest::header::RANGE, &header);
+            if let Some(tok) = read_token() {
+                req = req.bearer_auth(tok);
             }
+            let resp = req.send().await?;
+            let resp = resp.error_for_status()?;
+            let body = resp.bytes().await?;
+            Ok::<_, reqwest::Error>(body)
         })
-        .await?;
+        .await
+        .with_context(|| format!("range GET {url} {header}"))?;
         Ok(bytes.to_vec())
-    }
-
-    /// `models`, `datasets`, or `spaces` — the URL segment used in
-    /// `/api/{api_segment}/{repo_id}/...` routes.
-    pub fn api_segment(&self) -> &'static str {
-        match self {
-            RemoteRepo::Model(_) => "models",
-            RemoteRepo::Dataset(_) => "datasets",
-            RemoteRepo::Space(_) => "spaces",
-        }
-    }
-
-    /// `owner/name` for the underlying repository.
-    pub fn repo_id(&self) -> String {
-        match self {
-            RemoteRepo::Model(r) => format!("{}/{}", r.owner(), r.name()),
-            RemoteRepo::Dataset(r) => format!("{}/{}", r.owner(), r.name()),
-            RemoteRepo::Space(r) => format!("{}/{}", r.owner(), r.name()),
-        }
     }
 }
 
@@ -221,16 +252,9 @@ pub fn parse(raw: &str) -> anyhow::Result<HfUrl> {
     })
 }
 
-/// Shared `HFClient` reused across all HF operations.
-///
-/// Reads token, endpoint, and cache config from the standard env vars (`HF_TOKEN`,
-/// `HF_TOKEN_PATH`, `HF_ENDPOINT`, `HF_HOME`, `HF_HUB_CACHE`).
-pub fn client() -> anyhow::Result<HFClient> {
-    HFClient::new().context("failed to initialise HF client")
-}
-
-/// The HF endpoint (mirrors hf-hub's resolution: `HF_ENDPOINT` env override,
-/// else `https://huggingface.co`). Trailing slashes stripped.
+/// The HF endpoint (`HF_ENDPOINT` env override, else `https://huggingface.co`).
+/// Trailing slashes stripped. Used by the direct-HTTP paths that bypass the
+/// `hf` CLI (`fetch_range`, `fetch_model_card`, and `xet.rs`).
 pub fn endpoint() -> String {
     let raw = std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
     raw.trim_end_matches('/').to_string()
@@ -238,9 +262,9 @@ pub fn endpoint() -> String {
 
 /// Resolve the HF auth token, returning `None` if no token is available.
 ///
-/// hf-hub resolves the token internally and does not expose a public getter;
-/// this mirrors its precedence so we can sign our own requests against the
-/// xet endpoints (which hf-hub does not expose publicly).
+/// Mirrors the resolution order the `hf` CLI uses internally so the direct
+/// HTTP paths (`fetch_range`, `fetch_model_card`, `xet.rs`) sign their
+/// requests with the same token the CLI would.
 ///
 /// Precedence: `HF_TOKEN` env → `HF_TOKEN_PATH` file → `$HF_HOME/token` file (with
 /// `HF_HOME` defaulting to `~/.cache/huggingface`). Returns `None` if
@@ -328,16 +352,15 @@ pub fn split_owner_name(repo_id: &str) -> anyhow::Result<(&str, &str)> {
     Ok((&repo_id[..slash], &repo_id[slash + 1..]))
 }
 
-fn make_remote_repo(client: &HFClient, hf: &HfUrl) -> anyhow::Result<RemoteRepo> {
-    let (owner, name) = split_owner_name(&hf.repo_id)?;
+fn make_remote_repo(hf: &HfUrl) -> anyhow::Result<RemoteRepo> {
     match hf.kind {
-        RepoKind::Model => Ok(RemoteRepo::Model(client.model(owner, name))),
-        RepoKind::Dataset => Ok(RemoteRepo::Dataset(client.dataset(owner, name))),
-        RepoKind::Space => Ok(RemoteRepo::Space(client.space(owner, name))),
-        // hf-hub 1.0 exposes neither a range-read nor a bytes-stream API for
-        // buckets — only whole-file `download_files` and HEAD-style metadata.
-        // The Data::Http path requires range reads, so reject up front rather
-        // than silently routing bucket URLs through dataset APIs.
+        RepoKind::Model | RepoKind::Dataset | RepoKind::Space => Ok(RemoteRepo {
+            kind: hf.kind,
+            repo_id: hf.repo_id.clone(),
+        }),
+        // The bucket HTTP surface has no public range-read primitive; tile
+        // rendering's `fetch_range` would have nothing to call. Reject up
+        // front rather than silently routing through a different API.
         RepoKind::Bucket => anyhow::bail!(
             "bucket URLs do not support range/streaming reads (hf://buckets/{}/...). \
              Download the file first or use a model/dataset/space URL.",
@@ -346,9 +369,63 @@ fn make_remote_repo(client: &HFClient, hf: &HfUrl) -> anyhow::Result<RemoteRepo>
     }
 }
 
-fn make_bucket(client: &HFClient, hf: &HfUrl) -> anyhow::Result<HFBucket> {
-    let (owner, name) = split_owner_name(&hf.repo_id)?;
-    Ok(client.bucket(owner, name))
+/// Per-process cache of `hf {kind} list -R --json` (and `hf buckets ls -R
+/// --json` for buckets) output, keyed by `(kind, repo_id, revision)`. The
+/// CLI doesn't expose a HEAD-style "size of one file" query, so a single
+/// metadata lookup requires a full tree listing; without this cache,
+/// every `resolve_to_http` call paid for a fresh listing.
+///
+/// Bucket entries use the empty string for `revision` since buckets don't
+/// have a revision concept.
+fn listing_cache() -> &'static AsyncMutex<HashMap<(RepoKind, String, String), Arc<Vec<HfTreeEntry>>>>
+{
+    static CACHE: OnceLock<AsyncMutex<HashMap<(RepoKind, String, String), Arc<Vec<HfTreeEntry>>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| AsyncMutex::new(HashMap::new()))
+}
+
+/// Return the recursive listing for `(kind, repo_id, revision)`, populating
+/// the per-process cache on first call.
+async fn list_repo_entries(
+    kind: RepoKind,
+    repo_id: &str,
+    revision: &str,
+) -> anyhow::Result<Arc<Vec<HfTreeEntry>>> {
+    let key = (kind, repo_id.to_string(), revision.to_string());
+    {
+        let cache = listing_cache().lock().await;
+        if let Some(entries) = cache.get(&key) {
+            return Ok(Arc::clone(entries));
+        }
+    }
+
+    let label = format!("list_tree {} {repo_id}@{revision}", kind.api_segment());
+    let entries: Vec<HfTreeEntry> = with_throttle(&label, || async {
+        match kind {
+            RepoKind::Bucket => {
+                hf_cli::run_hf_json::<Vec<HfTreeEntry>, _, _>(["buckets", "ls", "-R", repo_id])
+                    .await
+            }
+            _ => {
+                hf_cli::run_hf_json::<Vec<HfTreeEntry>, _, _>([
+                    kind.api_segment(),
+                    "list",
+                    "-R",
+                    "--revision",
+                    revision,
+                    repo_id,
+                ])
+                .await
+            }
+        }
+    })
+    .await
+    .with_context(|| format!("listing {} {repo_id}@{revision}", kind.api_segment()))?;
+
+    let arc = Arc::new(entries);
+    let mut cache = listing_cache().lock().await;
+    cache.entry(key).or_insert_with(|| Arc::clone(&arc));
+    Ok(arc)
 }
 
 /// If `path` starts with `hf://`, download and return its local cache path.
@@ -361,203 +438,121 @@ pub async fn resolve(path: &Path) -> anyhow::Result<PathBuf> {
     }
 
     let hf = parse(&s).with_context(|| format!("invalid hf:// URL: {s:?}"))?;
-    let cli = client()?;
 
     if hf.kind == RepoKind::Bucket {
-        return resolve_bucket(&cli, &hf).await;
+        return resolve_bucket(&hf).await;
     }
 
-    let repo = make_remote_repo(&cli, &hf)?;
-
-    if hf.path_in_repo.is_empty() {
+    let repo_type = hf.kind.cli_repo_type()?;
+    let label = if hf.path_in_repo.is_empty() {
         log::info!("Resolving repo {} ...", hf.repo_id);
-        let dir = with_throttle(&format!("snapshot_download {}", hf.repo_id), || async {
-            match &repo {
-                RemoteRepo::Model(r) => {
-                    r.snapshot_download()
-                        .revision(hf.revision.clone())
-                        .send()
-                        .await
-                }
-                RemoteRepo::Dataset(r) => {
-                    r.snapshot_download()
-                        .revision(hf.revision.clone())
-                        .send()
-                        .await
-                }
-                RemoteRepo::Space(r) => {
-                    r.snapshot_download()
-                        .revision(hf.revision.clone())
-                        .send()
-                        .await
-                }
-            }
-        })
-        .await
-        .with_context(|| format!("downloading {}", hf.repo_id))?;
-        return Ok(dir);
-    }
+        format!("hf download {}", hf.repo_id)
+    } else {
+        log::info!("Fetching {} from {} ...", hf.path_in_repo, hf.repo_id);
+        format!("hf download {} {}", hf.repo_id, hf.path_in_repo)
+    };
 
-    log::info!("Fetching {} from {} ...", hf.path_in_repo, hf.repo_id);
-
-    let local = with_throttle(&format!("download_file {}", hf.path_in_repo), || async {
-        match &repo {
-            RemoteRepo::Model(r) => {
-                r.download_file()
-                    .filename(hf.path_in_repo.clone())
-                    .revision(hf.revision.clone())
-                    .send()
-                    .await
-            }
-            RemoteRepo::Dataset(r) => {
-                r.download_file()
-                    .filename(hf.path_in_repo.clone())
-                    .revision(hf.revision.clone())
-                    .send()
-                    .await
-            }
-            RemoteRepo::Space(r) => {
-                r.download_file()
-                    .filename(hf.path_in_repo.clone())
-                    .revision(hf.revision.clone())
-                    .send()
-                    .await
-            }
+    let result = with_throttle(&label, || async {
+        // `hf download <repo> [file]`: with `[file]` returns the file path,
+        // without returns the snapshot directory. Either way `path` lands
+        // under `~/.cache/huggingface/hub/...` (shared with any direct
+        // `hf` invocations the user makes outside arbvis).
+        let mut args = vec![
+            "download".to_string(),
+            "--type".to_string(),
+            repo_type.to_string(),
+            "--revision".to_string(),
+            hf.revision.clone(),
+            hf.repo_id.clone(),
+        ];
+        if !hf.path_in_repo.is_empty() {
+            args.push(hf.path_in_repo.clone());
         }
+        hf_cli::run_hf_json::<HfDownloadResult, _, _>(args.iter().map(String::as_str)).await
     })
     .await
-    .with_context(|| format!("fetching hf://{}/{}", hf.repo_id, hf.path_in_repo))?;
+    .with_context(|| format!("downloading hf://{}/{}", hf.repo_id, hf.path_in_repo))?;
 
+    let local = PathBuf::from(result.path);
     log::info!("Cached at {}", local.display());
     Ok(local)
 }
 
-/// Download a bucket file or full bucket tree to a fresh temp directory and return
-/// the local path. Buckets have no in-cache `snapshot_download` equivalent, so the
-/// caller is handed a tempdir whose lifetime is the same as the process; this
-/// matches the existing semantics for repo-level downloads where the cache dir
-/// outlives the call.
-async fn resolve_bucket(cli: &HFClient, hf: &HfUrl) -> anyhow::Result<PathBuf> {
-    use hf_hub::buckets::{BucketDownload, BucketTreeEntry};
-
-    let bucket = make_bucket(cli, hf)?;
+/// Download a bucket file or full bucket tree to a fresh temp directory and
+/// return the local path. Buckets have no shared cache equivalent, so the
+/// caller is handed a tempdir whose lifetime is the process — matching the
+/// existing semantics where the cache dir outlives the call.
+async fn resolve_bucket(hf: &HfUrl) -> anyhow::Result<PathBuf> {
     let dest_root = tempfile::Builder::new()
         .prefix("arbvis-bucket-")
         .tempdir()
         .context("creating bucket download tempdir")?
         .keep();
 
+    let bucket_id = &hf.repo_id;
     if hf.path_in_repo.is_empty() {
-        log::info!("Resolving bucket {} ...", hf.repo_id);
-        // list_tree returns a Stream of entries — collect under a single throttle permit.
-        let entries: Vec<BucketTreeEntry> =
-            with_throttle(&format!("bucket list_tree {}", hf.repo_id), || async {
-                let stream = bucket.list_tree().recursive(true).send()?;
-                futures::pin_mut!(stream);
-                let mut out = Vec::new();
-                while let Some(e) = stream.next().await {
-                    out.push(e?);
-                }
-                Ok::<_, hf_hub::HFError>(out)
-            })
-            .await
-            .with_context(|| format!("listing bucket {}", hf.repo_id))?;
-        let downloads: Vec<BucketDownload> = entries
-            .into_iter()
-            .filter_map(|e| match e {
-                BucketTreeEntry::File { path, .. } => {
-                    let local = dest_root.join(&path);
-                    Some(BucketDownload::new(path, local))
-                }
-                BucketTreeEntry::Directory { .. } => None,
-            })
-            .collect();
-        if downloads.is_empty() {
-            anyhow::bail!("bucket {} has no files", hf.repo_id);
-        }
-        with_throttle(&format!("bucket download_files {}", hf.repo_id), || async {
-            bucket
-                .download_files()
-                .files(downloads.clone())
-                .send()
-                .await
+        log::info!("Resolving bucket {} ...", bucket_id);
+        let dest = dest_root.to_string_lossy().into_owned();
+        let bucket_url = format!("hf://buckets/{bucket_id}");
+        with_throttle(&format!("hf sync {bucket_id} -> {dest}"), || async {
+            // `hf sync <source> <dest>` infers direction from argument order:
+            // bucket source + local dest = download. The destination directory
+            // already exists from `tempdir().keep()`, which is what `hf sync`
+            // expects.
+            hf_cli::run_hf(["sync", bucket_url.as_str(), dest.as_str()]).await
         })
         .await
-        .with_context(|| format!("downloading bucket {}", hf.repo_id))?;
+        .with_context(|| format!("downloading bucket {bucket_id}"))?;
         return Ok(dest_root);
     }
 
-    log::info!(
-        "Fetching {} from bucket {} ...",
-        hf.path_in_repo,
-        hf.repo_id
-    );
+    log::info!("Fetching {} from bucket {} ...", hf.path_in_repo, bucket_id);
     let local = dest_root.join(&hf.path_in_repo);
-    with_throttle(
-        &format!("bucket download_files {}", hf.path_in_repo),
-        || async {
-            bucket
-                .download_files()
-                .files(vec![BucketDownload::new(
-                    hf.path_in_repo.clone(),
-                    local.clone(),
-                )])
-                .send()
-                .await
-        },
-    )
+    if let Some(parent) = local.parent() {
+        std::fs::create_dir_all(parent).context("creating bucket-file parent dir")?;
+    }
+    let src = format!("hf://buckets/{bucket_id}/{}", hf.path_in_repo);
+    let dest = local.to_string_lossy().into_owned();
+    with_throttle(&format!("hf buckets cp {src} {dest}"), || async {
+        hf_cli::run_hf(["buckets", "cp", src.as_str(), dest.as_str()]).await
+    })
     .await
-    .with_context(|| format!("fetching hf://buckets/{}/{}", hf.repo_id, hf.path_in_repo))?;
+    .with_context(|| format!("fetching hf://buckets/{bucket_id}/{}", hf.path_in_repo))?;
     log::info!("Cached at {}", local.display());
     Ok(local)
 }
 
 /// Resolve an `hf://` path to a typed `RemoteFileSpec` without downloading.
 ///
-/// Uses hf-hub's HEAD-based `get_file_metadata` to pick up the file size.
+/// Backed by the per-process listing cache so this doesn't pay for a fresh
+/// tree listing on every call.
 pub async fn resolve_to_http(path: &Path) -> anyhow::Result<RemoteFileSpec> {
     let s = path.to_string_lossy();
     let hf = parse(&s).with_context(|| format!("invalid hf:// URL: {s:?}"))?;
-    let cli = client()?;
-    let repo = make_remote_repo(&cli, &hf)?;
-    let meta = with_throttle(
-        &format!("get_file_metadata {}", hf.path_in_repo),
-        || async {
-            match &repo {
-                RemoteRepo::Model(r) => {
-                    r.get_file_metadata()
-                        .filepath(hf.path_in_repo.clone())
-                        .revision(hf.revision.clone())
-                        .send()
-                        .await
-                }
-                RemoteRepo::Dataset(r) => {
-                    r.get_file_metadata()
-                        .filepath(hf.path_in_repo.clone())
-                        .revision(hf.revision.clone())
-                        .send()
-                        .await
-                }
-                RemoteRepo::Space(r) => {
-                    r.get_file_metadata()
-                        .filepath(hf.path_in_repo.clone())
-                        .revision(hf.revision.clone())
-                        .send()
-                        .await
-                }
-            }
-        },
-    )
-    .await
-    .with_context(|| format!("metadata for hf://{}/{}", hf.repo_id, hf.path_in_repo))?;
+    let repo = make_remote_repo(&hf)?;
 
-    log::info!("Remote file {}: {} bytes", hf.path_in_repo, meta.file_size);
+    let entries = list_repo_entries(hf.kind, &hf.repo_id, &hf.revision).await?;
+    let entry = entries
+        .iter()
+        .find(|e| e.path == hf.path_in_repo && e.is_file())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no file `{}` in {} {}@{} (or it's a directory)",
+                hf.path_in_repo,
+                hf.kind.api_segment(),
+                hf.repo_id,
+                hf.revision,
+            )
+        })?;
+
+    let size = entry.size.unwrap_or(0);
+    log::info!("Remote file {}: {} bytes", hf.path_in_repo, size);
     Ok(RemoteFileSpec {
         repo,
         filename: Arc::new(hf.path_in_repo),
         revision: Arc::new(hf.revision),
-        size: meta.file_size,
-        xet_hash: meta.xet_hash,
+        size,
+        xet_hash: entry.xet_hash.clone(),
     })
 }
 
@@ -593,85 +588,29 @@ pub async fn list_repo_as_http_specs(
     url_str: &str,
 ) -> anyhow::Result<Vec<(String, RemoteFileSpec)>> {
     let hf = parse(url_str).with_context(|| format!("invalid hf:// URL: {url_str:?}"))?;
-    let cli = client()?;
-    let repo = make_remote_repo(&cli, &hf)?;
+    let repo = make_remote_repo(&hf)?;
 
-    // Collect from the streaming list_tree under one throttle permit.
-    // Each variant has its own Stream type because the inferred impl Stream
-    // depends on the typed RepoType, so the drain code is duplicated rather
-    // than going through a generic closure.
-    let entries: Vec<hf_hub::repository::RepoTreeEntry> =
-        with_throttle(&format!("list_tree {}", hf.repo_id), || async {
-            match &repo {
-                RemoteRepo::Model(r) => {
-                    let stream = r
-                        .list_tree()
-                        .revision(hf.revision.clone())
-                        .recursive(true)
-                        .expand(true)
-                        .send()?;
-                    futures::pin_mut!(stream);
-                    let mut out = Vec::new();
-                    while let Some(e) = stream.next().await {
-                        out.push(e?);
-                    }
-                    Ok::<_, hf_hub::HFError>(out)
-                }
-                RemoteRepo::Dataset(r) => {
-                    let stream = r
-                        .list_tree()
-                        .revision(hf.revision.clone())
-                        .recursive(true)
-                        .expand(true)
-                        .send()?;
-                    futures::pin_mut!(stream);
-                    let mut out = Vec::new();
-                    while let Some(e) = stream.next().await {
-                        out.push(e?);
-                    }
-                    Ok::<_, hf_hub::HFError>(out)
-                }
-                RemoteRepo::Space(r) => {
-                    let stream = r
-                        .list_tree()
-                        .revision(hf.revision.clone())
-                        .recursive(true)
-                        .expand(true)
-                        .send()?;
-                    futures::pin_mut!(stream);
-                    let mut out = Vec::new();
-                    while let Some(e) = stream.next().await {
-                        out.push(e?);
-                    }
-                    Ok::<_, hf_hub::HFError>(out)
-                }
-            }
-        })
-        .await
-        .with_context(|| format!("listing files for {}", hf.repo_id))?;
+    let entries = list_repo_entries(hf.kind, &hf.repo_id, &hf.revision).await?;
 
-    let mut specs = Vec::new();
     let revision = Arc::new(hf.revision);
-    for entry in entries {
-        if let hf_hub::repository::RepoTreeEntry::File {
-            path,
-            size,
-            xet_hash,
-            ..
-        } = entry
-        {
-            log::info!("  {} — {} bytes", path, size);
-            specs.push((
-                path.clone(),
-                RemoteFileSpec {
-                    repo: repo.clone(),
-                    filename: Arc::new(path),
-                    revision: Arc::clone(&revision),
-                    size,
-                    xet_hash,
-                },
-            ));
+    let mut specs = Vec::new();
+    for entry in entries.iter() {
+        if !entry.is_file() {
+            continue;
         }
+        let size = entry.size.unwrap_or(0);
+        let path = entry.path.clone();
+        log::info!("  {} — {} bytes", path, size);
+        specs.push((
+            path.clone(),
+            RemoteFileSpec {
+                repo: repo.clone(),
+                filename: Arc::new(path),
+                revision: Arc::clone(&revision),
+                size,
+                xet_hash: entry.xet_hash.clone(),
+            },
+        ));
     }
 
     if specs.is_empty() {

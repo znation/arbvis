@@ -4,6 +4,7 @@ pub mod color;
 pub mod data;
 mod deploy;
 mod geometry;
+pub mod hf_cli;
 mod hf_upload;
 pub mod hf_url;
 mod json_diff;
@@ -619,7 +620,7 @@ fn collect_input_files(
 /// Build `Source`s for the normal (non-diff) flow.
 ///
 /// In disk-backed mode (the default), every `hf://` input is downloaded to
-/// the local hf-hub cache via [`data::materialize_http_sources`]. In
+/// the local HF cache (via the `hf` CLI) by [`data::materialize_http_sources`]. In
 /// `--stream` mode the sources stay remote and per-tile reads hit HTTP
 /// directly; that's only useful when inputs don't fit on local disk and is
 /// substantially slower otherwise. `--show-xet-xorbs` captures xet term
@@ -679,10 +680,10 @@ async fn resolve_input_sources(
         data::populate_xet_terms(&mut sources).await?;
     }
     if !stream {
-        // Per-range hf-hub xet calls are too expensive for the tile workload
-        // — one whole-file download amortises the xet setup over the entire
-        // file (which we read every byte of anyway during render). See
-        // `materialize_http_sources` for the full story.
+        // Per-range HTTPS GETs are too expensive for the tile workload
+        // — one whole-file download amortises the connection setup over the
+        // entire file (which we read every byte of anyway during render).
+        // See `materialize_http_sources` for the full story.
         data::materialize_http_sources(&mut sources).await?;
     }
     Ok((sources, total))

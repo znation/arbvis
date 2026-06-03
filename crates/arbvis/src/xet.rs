@@ -10,10 +10,10 @@
 //!   2. `GET {cas_url}/v2/reconstructions/{xet_hash_hex}` with the CAS token
 //!      → returns `{offset_into_first_range, terms: [...], xorbs: {...}}`.
 //!
-//! hf-hub 1.0.0-rc.1 has these as `pub(crate)` internals only; the
-//! reconstruction call is not exposed through `xet-client` either in a
-//! blocking form. We avoid pulling the full async stack in by talking to the
-//! two endpoints directly with `reqwest::blocking`.
+//! The `hf` CLI handles whole-file xet dedup transparently via its bundled
+//! `hf_xet`, but exposes no byte-range or CAS-URL surface. To get xet wire
+//! dedup for per-tile range reads (`--stream` and `--show-xet-xorbs`) we
+//! talk to these two endpoints directly with `reqwest`.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -303,12 +303,7 @@ pub async fn reconstruction_for(spec: &RemoteFileSpec) -> anyhow::Result<Vec<Xet
         );
         return Ok(Vec::new());
     };
-    let cas = fetch_cas_token(
-        spec.repo.api_segment(),
-        &spec.repo.repo_id(),
-        &spec.revision,
-    )
-    .await?;
+    let cas = fetch_cas_token(spec.repo.api_segment(), spec.repo.repo_id(), &spec.revision).await?;
     fetch_reconstruction_terms(&cas, hash).await
 }
 
@@ -408,14 +403,12 @@ impl XorbMap {
 
 // ─── XetReader: direct-CAS byte fetcher ──────────────────────────────────────
 //
-// hf-hub's `xet_download_stream` rebuilds a `XetDownloadStreamGroup` per call,
-// which dominates wall time for short range requests (see the comment on
-// `data::materialize_http_sources`). When we know the file is xet-backed we
-// can do the streaming ourselves: fetch the V2 reconstruction once, then for
-// each byte range translate into (xorb, chunk-range) lookups and HTTP GET the
-// pre-signed xorb URLs directly. Decoded chunk segments are cached so adjacent
-// tiles (which the Hilbert curve makes spatially coherent) reuse the same
-// decompression work.
+// The `hf` CLI exposes no byte-range surface, so per-tile range reads on
+// xet-backed files implement their own xet streaming: fetch the V2
+// reconstruction once, then for each byte range translate into (xorb,
+// chunk-range) lookups and HTTP GET the pre-signed xorb URLs directly.
+// Decoded chunk segments are cached so adjacent tiles (which the Hilbert
+// curve makes spatially coherent) reuse the same decompression work.
 
 /// One term from the V2 reconstruction response, in the form we keep at
 /// runtime: cumulative file offset and exact chunk range within the xorb.
@@ -614,7 +607,7 @@ impl XetReader {
             .as_deref()
             .ok_or_else(|| anyhow!("{}: not xet-backed, cannot build XetReader", spec.filename))?;
         let api_segment = spec.repo.api_segment().to_string();
-        let repo_id = spec.repo.repo_id();
+        let repo_id = spec.repo.repo_id().to_string();
         let revision: String = (*spec.revision).clone();
         let cas = fetch_cas_token(&api_segment, &repo_id, &revision).await?;
         let raw = fetch_reconstruction_response(&cas, hash).await?;

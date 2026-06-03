@@ -95,12 +95,11 @@ pub trait DiffSourceBuilder: Send + Sync {
 /// Hooks `--moe-diff` CLI flag's source preparation. arbvis errors out
 /// when this flag is passed but no `MoeDiffPrep` is registered.
 ///
-/// `?Send`: the canonical impl in `modelweightvis::hooks` calls into
-/// hf-hub's snapshot-download closures, whose internal lifetimes
-/// confuse the rustc HRTB check that `#[async_trait]`'s `+ Send`
-/// future bound triggers. The CLI dispatch never spawns this future
-/// across threads — only `.await`s it locally — so dropping the Send
-/// requirement is safe.
+/// `?Send`: the canonical impl in `modelweightvis::hooks` carries
+/// futures whose internal lifetimes confuse the rustc HRTB check that
+/// `#[async_trait]`'s `+ Send` bound triggers. The CLI dispatch never
+/// spawns this future across threads — only `.await`s it locally — so
+/// dropping the Send requirement is safe.
 #[async_trait(?Send)]
 pub trait MoeDiffPrep: Send + Sync {
     async fn prepare(

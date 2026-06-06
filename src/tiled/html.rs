@@ -329,6 +329,17 @@ fn build_html(
     }}).addTo(map);
 {detail_layer_js}
     map.fitBounds([[-{world_h}, 0], [0, {world_w}]]);
+    // `viewer_min_zoom` lets the user zoom out past the pyramid root for
+    // non-square canvases (so the whole canvas fits when the viewer aspect
+    // doesn't match the viewport's), but using that as the *initial* zoom
+    // makes tall/wide layouts (e.g. MoE-diff: 1:7 matrix in a square-ish
+    // viewport) load as a tiny thin strip in a sea of empty space — the user
+    // has to manually zoom in one or more levels before they see content.
+    // Clamp the initial zoom at 0 (the pyramid root) so they land on a
+    // usable view. Zooming out past 0 is still available manually.
+    if (map.getZoom() < 0) {{
+      map.setZoom(0);
+    }}
 
     var HEIGHT = {height};
     var WIDTH = {width};

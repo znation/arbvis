@@ -29,8 +29,8 @@ pub use geometry::name_hue;
 pub use layout::{CanvasGeom, LayoutMode, LayoutShape};
 pub use registry::{
     DiffBuildCtx, DiffSourceBuilder, DirectoryTensorDiffPrep, FinetuneDetect, FormatPlugin,
-    LayoutBuildCtx, LayoutPlugin, MoeDiffPrep, MoeSummaryPrep, PrepareSourcesExtension, Registry,
-    RepoDiffPrep, SingleImageArchHook,
+    LayoutBuildCtx, LayoutPlugin, MoeCkaPrep, MoeDiffPrep, MoeSummaryPrep, PrepareSourcesExtension,
+    Registry, RepoDiffPrep, SingleImageArchHook,
 };
 pub use tiled::html::FileEntity;
 pub use tiled::leaf::{encode_tile, TileFormat, TILE};
@@ -79,6 +79,10 @@ pub struct ModelOpts {
     /// MoE layer (one panel per FFN weight + router). `None` for the
     /// byte-only path. Mutually exclusive with `moe_diff` at the CLI layer.
     pub moe_summary: Option<PathBuf>,
+    /// `--moe-cka <MODEL>`: render N×N linear-CKA similarity heatmaps,
+    /// one panel per `(layer, weight)`. `None` for the byte-only path.
+    /// Mutually exclusive with `moe_diff` and `moe_summary`.
+    pub moe_cka: Option<PathBuf>,
     /// `--finetune`: force-treat a `--diff` as a finetune (orig-only
     /// tensors → grey crosshatch, mod-only → error). Exclusive with
     /// `no_finetune`; both `false` means auto-detect via
@@ -92,6 +96,10 @@ pub struct ModelOpts {
     /// `--summary-stat`: which scalar to compute per expert for
     /// `--moe-summary`. Default is `Rms`.
     pub summary_stat: SummaryStat,
+    /// `--cka-sample`: random-projection dimension for `--moe-cka`.
+    /// Trades CKA accuracy for compute (smaller = faster, larger =
+    /// closer to exact). CLI default is 128.
+    pub cka_sample: u32,
     /// `--layout`: structure-aware vs byte-Hilbert layout strategy.
     /// Defaults to `Auto` — `select_layout` iterates the registry's
     /// layout plugins by descending priority and picks the first
@@ -104,10 +112,12 @@ impl Default for ModelOpts {
         Self {
             moe_diff: None,
             moe_summary: None,
+            moe_cka: None,
             finetune: false,
             no_finetune: false,
             diff_metric: DiffMetric::Rms,
             summary_stat: SummaryStat::Rms,
+            cka_sample: 128,
             layout_mode: LayoutMode::Auto,
         }
     }
@@ -454,6 +464,36 @@ pub async fn run(args: Args, opts: ModelOpts, registry: registry::Registry) -> a
         // plugins apply their strict applicability gates. The summary layout
         // plugin signals applicability through its own per-source extension
         // tag, not through diff_mode.
+        let cfg = RenderConfig {
+            title,
+            inputs,
+            diff_mode: false,
+            show_xet_xorbs: false,
+            layout_mode,
+            leaf_format,
+            pyramid_format,
+        };
+        return dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await;
+    }
+
+    // --- MoE CKA ----------------------------------------------------------
+    if let Some(cka_arg) = opts.moe_cka {
+        let hook = registry.moe_cka.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--moe-cka requires a tensor-aware backend (no `MoeCkaPrep` registered); \
+                 use `modelweightvis` instead of `arbvis`"
+            )
+        })?;
+        let sample = opts.cka_sample;
+        let input = cka_arg.to_string_lossy().into_owned();
+        let inputs = vec![input.clone()];
+        let title = default_title(args.title, "arbvis moe-cka");
+        let (sources, total) = hook
+            .prepare(&input, sample, stream)
+            .await
+            .with_context(|| format!("--moe-cka {input}"))?;
+        let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
+        // Same diff_mode reasoning as --moe-summary above.
         let cfg = RenderConfig {
             title,
             inputs,

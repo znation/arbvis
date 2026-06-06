@@ -130,6 +130,30 @@ pub trait MoeSummaryPrep: Send + Sync {
     ) -> anyhow::Result<(Vec<Source>, u64)>;
 }
 
+/// Hooks `--moe-cka` CLI flag's source preparation. arbvis errors out
+/// when this flag is passed but no `MoeCkaPrep` is registered.
+///
+/// The impl returns one synthetic `Source` per `(layer, weight)`
+/// panel, each carrying a per-panel extension tag and an in-memory U8
+/// `[n_experts, n_experts]` similarity heatmap (linear CKA between
+/// every expert pair). The registered layout plugin reads the tags
+/// back and arranges the panels in a grid.
+///
+/// `sample` is the random-projection dimension on the shared input
+/// axis — smaller is faster, larger preserves CKA more accurately.
+/// 128 is the CLI default.
+///
+/// `?Send`: see [`MoeDiffPrep`].
+#[async_trait(?Send)]
+pub trait MoeCkaPrep: Send + Sync {
+    async fn prepare(
+        &self,
+        input: &str,
+        sample: u32,
+        stream: bool,
+    ) -> anyhow::Result<(Vec<Source>, u64)>;
+}
+
 /// Hooks repo-level `--diff` (both args are `hf://owner/repo` URLs).
 /// arbvis errors out when this case is hit and no `RepoDiffPrep` is
 /// registered.
@@ -218,6 +242,7 @@ pub struct Registry {
     pub diffs: Vec<Arc<dyn DiffSourceBuilder>>,
     pub moe_diff: Option<Arc<dyn MoeDiffPrep>>,
     pub moe_summary: Option<Arc<dyn MoeSummaryPrep>>,
+    pub moe_cka: Option<Arc<dyn MoeCkaPrep>>,
     pub repo_diff: Option<Arc<dyn RepoDiffPrep>>,
     pub dir_tensor_diff: Option<Arc<dyn DirectoryTensorDiffPrep>>,
     pub finetune_detect: Option<Arc<dyn FinetuneDetect>>,
@@ -243,6 +268,7 @@ impl Registry {
             ],
             moe_diff: None,
             moe_summary: None,
+            moe_cka: None,
             repo_diff: None,
             dir_tensor_diff: None,
             finetune_detect: None,

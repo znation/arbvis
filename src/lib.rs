@@ -23,14 +23,14 @@ pub mod xet;
 // model-aware plugins to plug into.
 pub use data::{
     load_source_data, CustomSource, Data, DiffFill, DiffMetric, Extensions, LazyFetcher, Source,
-    SourceKind,
+    SourceKind, SummaryStat,
 };
 pub use geometry::name_hue;
 pub use layout::{CanvasGeom, LayoutMode, LayoutShape};
 pub use registry::{
     DiffBuildCtx, DiffSourceBuilder, DirectoryTensorDiffPrep, FinetuneDetect, FormatPlugin,
-    LayoutBuildCtx, LayoutPlugin, MoeDiffPrep, PrepareSourcesExtension, Registry, RepoDiffPrep,
-    SingleImageArchHook,
+    LayoutBuildCtx, LayoutPlugin, MoeDiffPrep, MoeSummaryPrep, PrepareSourcesExtension, Registry,
+    RepoDiffPrep, SingleImageArchHook,
 };
 pub use tiled::html::FileEntity;
 pub use tiled::leaf::{encode_tile, TileFormat, TILE};
@@ -75,6 +75,10 @@ pub struct ModelOpts {
     /// `--moe-diff <MODEL>`: render an N×N expert-vs-expert diff matrix for
     /// each MoE layer of a single model. `None` for the byte-only path.
     pub moe_diff: Option<PathBuf>,
+    /// `--moe-summary <MODEL>`: render per-expert scalar heatmaps for each
+    /// MoE layer (one panel per FFN weight + router). `None` for the
+    /// byte-only path. Mutually exclusive with `moe_diff` at the CLI layer.
+    pub moe_summary: Option<PathBuf>,
     /// `--finetune`: force-treat a `--diff` as a finetune (orig-only
     /// tensors → grey crosshatch, mod-only → error). Exclusive with
     /// `no_finetune`; both `false` means auto-detect via
@@ -85,6 +89,9 @@ pub struct ModelOpts {
     /// `--diff-metric`: how per-element tensor deltas are encoded
     /// (`--diff` / `--moe-diff`). Default is `Rms`.
     pub diff_metric: DiffMetric,
+    /// `--summary-stat`: which scalar to compute per expert for
+    /// `--moe-summary`. Default is `Rms`.
+    pub summary_stat: SummaryStat,
     /// `--layout`: structure-aware vs byte-Hilbert layout strategy.
     /// Defaults to `Auto` — `select_layout` iterates the registry's
     /// layout plugins by descending priority and picks the first
@@ -96,9 +103,11 @@ impl Default for ModelOpts {
     fn default() -> Self {
         Self {
             moe_diff: None,
+            moe_summary: None,
             finetune: false,
             no_finetune: false,
             diff_metric: DiffMetric::Rms,
+            summary_stat: SummaryStat::Rms,
             layout_mode: LayoutMode::Auto,
         }
     }
@@ -416,6 +425,39 @@ pub async fn run(args: Args, opts: ModelOpts, registry: registry::Registry) -> a
             title,
             inputs,
             diff_mode: true,
+            show_xet_xorbs: false,
+            layout_mode,
+            leaf_format,
+            pyramid_format,
+        };
+        return dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await;
+    }
+
+    // --- MoE summary ------------------------------------------------------
+    if let Some(summary_arg) = opts.moe_summary {
+        let hook = registry.moe_summary.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--moe-summary requires a tensor-aware backend (no `MoeSummaryPrep` registered); \
+                 use `modelweightvis` instead of `arbvis`"
+            )
+        })?;
+        let stat = opts.summary_stat;
+        let input = summary_arg.to_string_lossy().into_owned();
+        let inputs = vec![input.clone()];
+        let title = default_title(args.title, "arbvis moe-summary");
+        let (sources, total) = hook
+            .prepare(&input, stat, stream)
+            .await
+            .with_context(|| format!("--moe-summary {input}"))?;
+        let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
+        // Not a true diff (no orig/mod sides) — `diff_mode = false` so layout
+        // plugins apply their strict applicability gates. The summary layout
+        // plugin signals applicability through its own per-source extension
+        // tag, not through diff_mode.
+        let cfg = RenderConfig {
+            title,
+            inputs,
+            diff_mode: false,
             show_xet_xorbs: false,
             layout_mode,
             leaf_format,

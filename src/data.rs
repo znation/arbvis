@@ -26,6 +26,22 @@ pub enum DiffMetric {
     Exact,
 }
 
+/// Per-tensor scalar for `--moe-summary`. The CLI exposes this via the
+/// `--summary-stat` flag. Tensor-aware backends interpret the value;
+/// arbvis core just plumbs it through `MoeSummaryPrep::prepare`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryStat {
+    /// √(mean(x²)). Default — comparable across tensors of different scale.
+    #[default]
+    Rms,
+    /// √(sum(x²)). Honest about total magnitude; varies with tensor size.
+    Frobenius,
+    /// mean(|x|). Stable, dominated by typical-magnitude entries.
+    MeanAbs,
+    /// Fraction of entries with |x| < ε. Surfaces dead / near-dead experts.
+    Sparsity,
+}
+
 /// Crosshatch fill color for `UnmatchedRegion` / `OneSidedRange` sources —
 /// the diff path uses these to mark one-side-only spans visually.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

@@ -22,7 +22,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 
-use crate::data::{Data, DiffMetric, Extensions, Source};
+use crate::data::{Data, DiffMetric, Extensions, Source, SummaryStat};
 use crate::hf_url::RemoteFileSpec;
 use crate::layout::{LayoutMode, LayoutShape};
 use crate::tiled::leaf_renderer::LeafRegistry;
@@ -106,6 +106,26 @@ pub trait MoeDiffPrep: Send + Sync {
         &self,
         input: &str,
         metric: DiffMetric,
+        stream: bool,
+    ) -> anyhow::Result<(Vec<Source>, u64)>;
+}
+
+/// Hooks `--moe-summary` CLI flag's source preparation. arbvis errors
+/// out when this flag is passed but no `MoeSummaryPrep` is registered.
+///
+/// The impl returns one synthetic `Source` per per-weight panel (gate /
+/// up / down, plus router when present), each carrying a per-panel
+/// extension tag and an in-memory U8 heatmap of shape `[n_layers,
+/// n_experts]`. The registered layout plugin reads the tags back and
+/// arranges the panels on the canvas.
+///
+/// `?Send`: see [`MoeDiffPrep`].
+#[async_trait(?Send)]
+pub trait MoeSummaryPrep: Send + Sync {
+    async fn prepare(
+        &self,
+        input: &str,
+        stat: SummaryStat,
         stream: bool,
     ) -> anyhow::Result<(Vec<Source>, u64)>;
 }
@@ -197,6 +217,7 @@ pub struct Registry {
     pub leaf: LeafRegistry,
     pub diffs: Vec<Arc<dyn DiffSourceBuilder>>,
     pub moe_diff: Option<Arc<dyn MoeDiffPrep>>,
+    pub moe_summary: Option<Arc<dyn MoeSummaryPrep>>,
     pub repo_diff: Option<Arc<dyn RepoDiffPrep>>,
     pub dir_tensor_diff: Option<Arc<dyn DirectoryTensorDiffPrep>>,
     pub finetune_detect: Option<Arc<dyn FinetuneDetect>>,
@@ -221,6 +242,7 @@ impl Registry {
                 Arc::new(crate::data::PlainBytesDiffBuilder),
             ],
             moe_diff: None,
+            moe_summary: None,
             repo_diff: None,
             dir_tensor_diff: None,
             finetune_detect: None,

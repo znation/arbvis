@@ -167,20 +167,20 @@ arbvis is the byte-only foundation: Hilbert layout, byte coloring, JSON-aware di
 
 ## Building
 
-Requires Rust (stable) and the official Hugging Face [`hf` CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli) on `$PATH` (install via `pip install -U huggingface_hub`, `brew install huggingface-cli`, or `curl -LsSf https://hf.co/cli/install.sh | bash`). arbvis shells out to `hf` for every Hub download / upload / sync. This repo is a Cargo workspace with `crates/arbvis` and `crates/modelweightvis` as members:
+Requires Rust (stable) and the official Hugging Face [`hf` CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli) on `$PATH` (install via `pip install -U huggingface_hub`, `brew install huggingface-cli`, or `curl -LsSf https://hf.co/cli/install.sh | bash`). arbvis shells out to `hf` for every Hub download / upload / sync.
 
 ```sh
-cargo build --release -p arbvis
+cargo build --release
 ./target/release/arbvis <file> --tiles ./output
 ```
 
 Or install into your `PATH`:
 
 ```sh
-cargo install --path crates/arbvis
+cargo install --path .
 ```
 
-To build modelweightvis from this workspace, swap `-p arbvis` for `-p modelweightvis` (or `--path crates/modelweightvis` on install). The standalone [modelweightvis repo](https://github.com/znation/modelweightvis) tracks the same `crates/modelweightvis/` source via a path-dep on arbvis.
+For modelweightvis, see the [standalone modelweightvis repo](https://github.com/znation/modelweightvis) — it depends on arbvis via a pinned git revision and inherits arbvis's full CLI surface.
 
 ## Credits
 

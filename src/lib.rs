@@ -486,7 +486,7 @@ pub async fn run(args: Args, opts: ModelOpts, registry: registry::Registry) -> a
         let inputs = vec![input.clone()];
         let title = default_title(args.title, "arbvis moe-summary");
         let (sources, total) = hook
-            .prepare(&input, stat, stream)
+            .prepare(&input, stat, stream, &opts.probe)
             .await
             .with_context(|| format!("--moe-summary {input}"))?;
         let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();

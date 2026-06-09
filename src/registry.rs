@@ -127,6 +127,7 @@ pub trait MoeSummaryPrep: Send + Sync {
         input: &str,
         stat: SummaryStat,
         stream: bool,
+        probe: &crate::ProbeOpts,
     ) -> anyhow::Result<(Vec<Source>, u64)>;
 }
 

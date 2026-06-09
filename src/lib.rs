@@ -100,11 +100,40 @@ pub struct ModelOpts {
     /// Trades CKA accuracy for compute (smaller = faster, larger =
     /// closer to exact). CLI default is 128.
     pub cka_sample: u32,
+    /// `--probe` family: when `probe.enabled` is true, the downstream
+    /// MoE prep impl runs a routing-faithful forward pass on the
+    /// resolved probe text and adds a per-(layer, expert) routing-
+    /// frequency panel to the output. Inert by default — `probe.enabled
+    /// = false` means the standard byte-only path runs.
+    pub probe: ProbeOpts,
     /// `--layout`: structure-aware vs byte-Hilbert layout strategy.
     /// Defaults to `Auto` — `select_layout` iterates the registry's
     /// layout plugins by descending priority and picks the first
     /// applicable. In a byte-only registry that resolves to Hilbert.
     pub layout_mode: LayoutMode,
+}
+
+/// `--probe` family — probe-input resolution + on/off bit. Plumbed
+/// through `ModelOpts` so any MoE prep impl can opt into the routing-
+/// faithful forward pass with a single struct.
+#[derive(Clone, Debug, Default)]
+pub struct ProbeOpts {
+    pub enabled: bool,
+    pub source: ProbeSource,
+}
+
+/// Where the probe text comes from. `Default` uses a small bundled
+/// snippet (~300 tokens of varied prose / code / dialogue) embedded
+/// in the modelweightvis binary. The other three are mutually
+/// exclusive overrides driven by `--probe-text` / `--probe-file` /
+/// `--probe-url`.
+#[derive(Clone, Debug, Default)]
+pub enum ProbeSource {
+    #[default]
+    Default,
+    Text(String),
+    File(PathBuf),
+    Url(String),
 }
 
 impl Default for ModelOpts {
@@ -118,6 +147,7 @@ impl Default for ModelOpts {
             diff_metric: DiffMetric::Rms,
             summary_stat: SummaryStat::Rms,
             cka_sample: 128,
+            probe: ProbeOpts::default(),
             layout_mode: LayoutMode::Auto,
         }
     }

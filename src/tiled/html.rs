@@ -273,6 +273,11 @@ fn build_html(
     html, body, #map {{ height: 100%; margin: 0; padding: 0; }}
     .leaflet-right .leaflet-control {{ margin-right: 10px; }}
     .leaflet-control-attribution {{ box-sizing: border-box; }}
+    /* One pixel is one byte/element. Past the deepest native zoom Leaflet
+       CSS-upscales the leaf tiles; the default bilinear smoothing turns crisp
+       per-element cells into a blurry wash. Force nearest-neighbour so zoomed-in
+       tiles stay sharp (and honest about the underlying resolution). */
+    .leaflet-tile {{ image-rendering: crisp-edges; image-rendering: pixelated; }}
     .file-label {{
       background: rgba(0,0,0,0.65);
       color: #ccc;
@@ -321,6 +326,15 @@ fn build_html(
     }});
     new ArbvisTileLayer('', {{
       tileSize: {tile_size},
+      // GridLayer defaults `minZoom` to 0 and blanks the layer (no tiles
+      // rendered) whenever the *map* zoom rounds below it. For non-square
+      // canvases the viewer's min zoom is negative (`viewer_min_zoom`), so the
+      // user can zoom out past the pyramid root to fit the whole canvas — but
+      // with the default the base layer would go empty there, leaving only the
+      // label overlay on a blank background. Pin the layer's `minZoom` to the
+      // viewer min so it keeps rendering; `minNativeZoom: 0` still clamps the
+      // actual tile fetches to zoom 0 and CSS-scales them down.
+      minZoom: {viewer_min_zoom},
       minNativeZoom: 0,
       maxNativeZoom: {max_zoom},
       bounds: [[-{world_h}, 0], [0, {world_w}]],
@@ -483,7 +497,30 @@ fn build_html(
 
 #[cfg(test)]
 mod tests {
-    use super::hf_url_to_web;
+    use super::{build_html, hf_url_to_web};
+
+    /// Non-square canvas (8:1 tall) → the viewer allows zooming out past the
+    /// pyramid root (`viewer_min_zoom < 0`). The base tile layer must carry the
+    /// same `minZoom` as the map, otherwise GridLayer's default `minZoom: 0`
+    /// blanks the layer at negative zooms and the fully-zoomed-out view shows
+    /// the label overlay over an empty background (no tiles). Also assert the
+    /// crisp-upscaling rule that keeps zoomed-in leaf tiles sharp.
+    #[test]
+    fn tall_canvas_tile_layer_renders_below_pyramid_root() {
+        // world_h/world_w = 2949/366 ≈ 8.06 → viewer_min_zoom = -ceil(log2) = -4.
+        let html = build_html(366, 2949, 2, 0, 11796, 1464, 512, "t", &[], "png", "avif");
+        // One `minZoom: -4,` for the map options, one for the tile layer. The
+        // detail layer (absent here, detail_depth = 0) would use its own value.
+        let n = html.matches("minZoom: -4,").count();
+        assert!(
+            n >= 2,
+            "expected both the map and the base tile layer to set minZoom: -4, found {n} occurrence(s)",
+        );
+        assert!(
+            html.contains("image-rendering: pixelated"),
+            "leaf tiles must upscale crisply past max_zoom",
+        );
+    }
 
     #[test]
     fn bare_model_repo() {

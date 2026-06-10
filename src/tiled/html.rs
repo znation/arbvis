@@ -632,6 +632,11 @@ const TEMPLATE_MULTI: &str = r#"<!DOCTYPE html>
     .leaflet-right .leaflet-control { margin-right: 10px; }
     .leaflet-control-attribution { box-sizing: border-box; }
     .leaflet-control-layers { font: 12px/1.4 monospace; }
+    /* One pixel is one byte/element. Past the deepest native zoom Leaflet
+       CSS-upscales the leaf tiles; the default bilinear smoothing turns crisp
+       per-element cells into a blurry wash. Force nearest-neighbour so zoomed-in
+       tiles stay sharp (and honest about the underlying resolution). */
+    .leaflet-tile { image-rendering: crisp-edges; image-rendering: pixelated; }
     .file-label {
       background: rgba(0,0,0,0.65);
       color: #ccc;
@@ -689,6 +694,11 @@ const TEMPLATE_MULTI: &str = r#"<!DOCTYPE html>
       var grp = L.layerGroup();
       grp.addLayer(new Base('', {
         tileSize: TILE,
+        // Pin to the map's min zoom (the most-zoomed-out across all scenes) so a
+        // non-square scene keeps rendering when the user zooms past its pyramid
+        // root, instead of GridLayer's default `minZoom: 0` blanking the layer.
+        // `minNativeZoom: 0` still clamps fetches to zoom 0 and CSS-scales them.
+        minZoom: /*__VMIN__*/,
         minNativeZoom: 0,
         maxNativeZoom: s.max_zoom,
         bounds: sceneBounds(s),
@@ -883,7 +893,44 @@ pub fn generate_leaflet_content_multi(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_html, hf_url_to_web};
+    use super::{build_html, build_html_multi, hf_url_to_web, SceneView};
+
+    fn scene(key: &str, world_w: u32, world_h: u32) -> SceneView {
+        SceneView {
+            key: Some(key.to_string()),
+            label: key.to_string(),
+            order: 0,
+            world_w,
+            world_h,
+            max_zoom: 2,
+            detail_depth: 0,
+            height: world_h,
+            width: world_w,
+            leaf_ext: "png".to_string(),
+            pyramid_ext: "avif".to_string(),
+            entities: Vec::new(),
+        }
+    }
+
+    /// Multi-scene parity with [`tall_canvas_tile_layer_renders_below_pyramid_root`]:
+    /// the tab switcher's base layers must carry the (global) map min zoom so a
+    /// tall scene still renders when zoomed past its pyramid root, and the
+    /// crisp-upscale rule must be present. With a tall 8:1 scene the global
+    /// `viewer_min_zoom` is -4, used by the map + each scene's base layer.
+    #[test]
+    fn multi_scene_viewer_pins_minzoom_and_upscales_crisply() {
+        let scenes = [scene("summary", 560, 64), scene("cka", 366, 2949)];
+        let html = build_html_multi(&scenes, "t", &[]);
+        let n = html.matches("minZoom: -4,").count();
+        assert!(
+            n >= 2,
+            "expected the map and the per-scene base layer to set minZoom: -4, found {n}",
+        );
+        assert!(
+            html.contains("image-rendering: pixelated"),
+            "leaf tiles must upscale crisply past max_zoom",
+        );
+    }
 
     /// Non-square canvas (8:1 tall) → the viewer allows zooming out past the
     /// pyramid root (`viewer_min_zoom < 0`). The base tile layer must carry the

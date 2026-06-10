@@ -495,6 +495,392 @@ fn build_html(
     )
 }
 
+// ===========================================================================
+// Multi-scene viewer
+//
+// A *scene* is one independent tile pyramid under `tiles/<key>/`. When a render
+// produces more than one (e.g. `modelweightvis --moe` → "summary" + "cka"), the
+// viewer registers one Leaflet base layer per scene and a `L.control.layers`
+// switcher ("tabs"). The single-scene path above is left untouched, so ordinary
+// renders stay byte-for-byte identical.
+// ===========================================================================
+
+/// Per-scene geometry + entities handed to the multi-scene HTML/labels builder.
+/// One is produced per tile pyramid by the tiler ([`crate::tiled::run_tiles`]).
+pub struct SceneView {
+    /// `Some(key)` → tiles live under `tiles/<key>/`; `None` → legacy `tiles/`
+    /// (only used for the lone implicit default scene).
+    pub key: Option<String>,
+    pub label: String,
+    pub order: u32,
+    pub world_w: u32,
+    pub world_h: u32,
+    pub max_zoom: u32,
+    pub detail_depth: u32,
+    pub height: u32,
+    pub width: u32,
+    pub leaf_ext: String,
+    pub pyramid_ext: String,
+    pub entities: Vec<FileEntity>,
+}
+
+/// Quote + escape a string for embedding in JSON / JS source.
+fn json_str(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Scene-keyed labels JSON:
+/// `{ "scenes": [ { key, label, order, world_w, world_h, width, height,
+/// max_zoom, detail_depth, files: [...] }, ... ] }`. Per-scene geometry is
+/// persisted so [`crate::tiled::regen_html`] can rebuild the viewer without
+/// scanning the (now per-scene) tile directories.
+fn build_labels_json_scenes(scenes: &[SceneView]) -> String {
+    let arr: Vec<String> = scenes
+        .iter()
+        .map(|s| {
+            format!(
+                "{{\"key\":{key},\"label\":{label},\"order\":{order},\"world_w\":{ww},\"world_h\":{wh},\"width\":{w},\"height\":{h},\"max_zoom\":{mz},\"detail_depth\":{dd},\"leaf_ext\":{le},\"pyramid_ext\":{pe},\"files\":{files}}}",
+                key = json_str(s.key.as_deref().unwrap_or("")),
+                label = json_str(&s.label),
+                order = s.order,
+                ww = s.world_w,
+                wh = s.world_h,
+                w = s.width,
+                h = s.height,
+                mz = s.max_zoom,
+                dd = s.detail_depth,
+                le = json_str(&s.leaf_ext),
+                pe = json_str(&s.pyramid_ext),
+                files = entities_to_json(&s.entities),
+            )
+        })
+        .collect();
+    format!("{{\"scenes\":[{}]}}", arr.join(","))
+}
+
+/// JS array literal of per-scene descriptors for the viewer.
+fn scenes_js_literal(scenes: &[SceneView]) -> String {
+    let items: Vec<String> = scenes
+        .iter()
+        .map(|s| {
+            format!(
+                "{{key:{key},label:{label},world_w:{ww},world_h:{wh},width:{w},height:{h},max_zoom:{mz},detail_depth:{dd},leaf_ext:{le},pyramid_ext:{pe}}}",
+                key = json_str(s.key.as_deref().unwrap_or("")),
+                label = json_str(&s.label),
+                ww = s.world_w,
+                wh = s.world_h,
+                w = s.width,
+                h = s.height,
+                mz = s.max_zoom,
+                dd = s.detail_depth,
+                le = json_str(&s.leaf_ext),
+                pe = json_str(&s.pyramid_ext),
+            )
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+/// Build the multi-scene viewer HTML. Scenes must be pre-sorted by `order`
+/// (the first is the default-active layer).
+fn build_html_multi(scenes: &[SceneView], title: &str, inputs: &[String]) -> String {
+    let info_html = build_info_html(title, inputs);
+    // Map zoom envelope spanning every scene's pyramid + detail + upsample
+    // headroom (the historical "+3"), and the most-negative aspect-fit zoom.
+    let viewer_max_zoom = scenes
+        .iter()
+        .map(|s| s.max_zoom + s.detail_depth + 3)
+        .max()
+        .unwrap_or(3);
+    let viewer_min_zoom = scenes
+        .iter()
+        .map(|s| {
+            let aspect_max = s.world_w.max(s.world_h);
+            let aspect_min = s.world_w.min(s.world_h).max(1);
+            -((aspect_max as f64 / aspect_min as f64).log2().ceil() as i32)
+        })
+        .min()
+        .unwrap_or(0);
+
+    // Build via token replacement rather than `format!` — the Leaflet JS is
+    // dense with literal `{`/`}` that `format!` would force us to double.
+    TEMPLATE_MULTI
+        .replace("/*__INFO__*/", &info_html)
+        .replace("/*__SCENES__*/", &scenes_js_literal(scenes))
+        .replace("/*__TILE__*/", &TILE_SIZE.to_string())
+        .replace("/*__VMIN__*/", &viewer_min_zoom.to_string())
+        .replace("/*__VMAX__*/", &viewer_max_zoom.to_string())
+        .replace("__TITLE_ESCAPED__", &escape_html(title))
+}
+
+/// Tile edge length used by the viewer; matches [`crate::tiled::leaf::TILE`].
+const TILE_SIZE: u32 = crate::tiled::leaf::TILE;
+
+const TEMPLATE_MULTI: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>__TITLE_ESCAPED__</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+        crossorigin=""/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+          crossorigin=""></script>
+  <style>
+    html, body, #map { height: 100%; margin: 0; padding: 0; }
+    .leaflet-right .leaflet-control { margin-right: 10px; }
+    .leaflet-control-attribution { box-sizing: border-box; }
+    .leaflet-control-layers { font: 12px/1.4 monospace; }
+    .file-label {
+      background: rgba(0,0,0,0.65);
+      color: #ccc;
+      padding: 2px 5px;
+      font: 11px/1.4 monospace;
+      white-space: nowrap;
+      border-radius: 2px;
+      pointer-events: none;
+    }
+    #arbvis-info {
+      position: absolute;
+      top: 10px;
+      left: 50px;
+      z-index: 1000;
+      background: rgba(0,0,0,0.65);
+      color: #ccc;
+      padding: 6px 10px;
+      font: 12px/1.5 monospace;
+      border-radius: 3px;
+      max-width: 60vw;
+      pointer-events: none;
+    }
+    #arbvis-info a { pointer-events: auto; color: #7af; text-decoration: none; }
+    #arbvis-info a:hover { text-decoration: underline; }
+    #arbvis-title { font-weight: bold; font-size: 13px; margin-bottom: 2px; }
+    #arbvis-title a { color: inherit; opacity: 0.7; }
+    #arbvis-title a:hover { opacity: 1; text-decoration: none; }
+    #arbvis-sources { font-size: 11px; color: #aaa; }
+  </style>
+</head>
+<body>
+  /*__INFO__*/
+  <div id="map"></div>
+  <script>
+    var SCENES = /*__SCENES__*/;
+    var TILE = /*__TILE__*/;
+    var TRANSPARENT = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+
+    var map = L.map('map', {
+      crs: L.CRS.Simple,
+      minZoom: /*__VMIN__*/,
+      maxZoom: /*__VMAX__*/,
+      preferCanvas: true,
+    });
+
+    function sceneBounds(s) { return [[-s.world_h, 0], [0, s.world_w]]; }
+
+    function makeBaseLayer(s) {
+      var Base = L.TileLayer.extend({
+        getTileUrl: function(c) {
+          var ext = c.z >= s.max_zoom ? s.leaf_ext : s.pyramid_ext;
+          return 'tiles/' + s.key + '/' + c.z + '/' + c.x + '/' + c.y + '.' + ext;
+        }
+      });
+      var grp = L.layerGroup();
+      grp.addLayer(new Base('', {
+        tileSize: TILE,
+        minNativeZoom: 0,
+        maxNativeZoom: s.max_zoom,
+        bounds: sceneBounds(s),
+        noWrap: true,
+        attribution: '<a href="https://github.com/znation/arbvis">arbvis</a>'
+      }));
+      if (s.detail_depth > 0) {
+        var Detail = L.TileLayer.extend({
+          getTileUrl: function(c) {
+            return 'tiles/' + s.key + '/' + c.z + '/' + c.x + '/' + c.y + '.' + s.leaf_ext;
+          }
+        });
+        grp.addLayer(new Detail('', {
+          tileSize: TILE,
+          minNativeZoom: s.max_zoom + 1,
+          maxNativeZoom: s.max_zoom + s.detail_depth,
+          minZoom: s.max_zoom + 1,
+          bounds: sceneBounds(s),
+          noWrap: true,
+          errorTileUrl: TRANSPARENT,
+        }));
+      }
+      return grp;
+    }
+
+    var baseLayers = {};
+    var layerToScene = [];
+    for (var i = 0; i < SCENES.length; i++) {
+      var grp = makeBaseLayer(SCENES[i]);
+      baseLayers[SCENES[i].label] = grp;
+      layerToScene.push({ layer: grp, scene: SCENES[i] });
+    }
+
+    var activeScene = SCENES[0];
+    baseLayers[activeScene.label].addTo(map);
+    L.control.layers(baseLayers, null, { collapsed: false }).addTo(map);
+
+    function fitScene(s) {
+      map.fitBounds(sceneBounds(s));
+      if (map.getZoom() < 0) { map.setZoom(0); }
+    }
+    fitScene(activeScene);
+
+    var activeOverlays = L.layerGroup().addTo(map);
+    var filesByKey = {};
+
+    function updateLabels() {
+      var s = activeScene;
+      var WIDTH = s.width, HEIGHT = s.height, WORLD_W = s.world_w, WORLD_H = s.world_h, MAX_ZOOM = s.max_zoom;
+      var labels = filesByKey[s.key] || [];
+
+      var bounds = map.getBounds();
+      var sw = bounds.getSouthWest();
+      var ne = bounds.getNorthEast();
+      var minX = sw.lng * WIDTH / WORLD_W;
+      var minY = -ne.lat * HEIGHT / WORLD_H;
+      var maxX = ne.lng * WIDTH / WORLD_W;
+      var maxY = -sw.lat * HEIGHT / WORLD_H;
+
+      var visible = [];
+      for (var i = 0; i < labels.length; i++) {
+        var l = labels[i];
+        var b = l.bbox;
+        if (b[0] < maxX && b[2] > minX && b[1] < maxY && b[3] > minY) {
+          visible.push(l);
+        }
+      }
+      visible.sort(function(a, b) { return b.size - a.size; });
+      if (visible.length > 1000) { visible.length = 1000; }
+
+      activeOverlays.clearLayers();
+      var placed = [];
+
+      for (var i = 0; i < visible.length; i++) {
+        var l = visible[i];
+        if (l.segs && l.segs.length > 0) {
+          var scale = Math.pow(2, map.getZoom() - MAX_ZOOM);
+          var minWorld = 2 / scale;
+          var ll = l.segs
+            .filter(function(seg) {
+              var len = Math.max(Math.abs(seg[2] - seg[0]), Math.abs(seg[3] - seg[1]));
+              return len >= minWorld;
+            })
+            .map(function(seg) {
+              return [
+                [-(seg[1] / HEIGHT) * WORLD_H, (seg[0] / WIDTH) * WORLD_W],
+                [-(seg[3] / HEIGHT) * WORLD_H, (seg[2] / WIDTH) * WORLD_W],
+              ];
+            });
+          activeOverlays.addLayer(L.polyline(ll, {
+            color: 'hsl(' + l.hue + ',70%,60%)',
+            weight: i < 3 ? 2 : 1,
+            opacity: 0.9,
+            fill: false,
+            interactive: false,
+          }));
+        }
+        var lat = -(l.y / HEIGHT) * WORLD_H;
+        var lng = (l.x / WIDTH) * WORLD_W;
+        var pt = map.latLngToContainerPoint([lat, lng]);
+        var tw = l.name.length * 7 + 12;
+        var th = 22;
+        var vw = map.getSize().x;
+        var vh = map.getSize().y;
+        var lx = Math.max(0, Math.min(pt.x - tw / 2, vw - tw));
+        var ly = Math.max(0, Math.min(pt.y - th / 2, vh - th));
+        var lb = { x: lx, y: ly, w: tw, h: th };
+        var overlaps = false;
+        for (var j = 0; j < placed.length; j++) {
+          var p = placed[j];
+          if (lb.x < p.x + p.w && lb.x + lb.w > p.x &&
+              lb.y < p.y + p.h && lb.y + lb.h > p.y) {
+            overlaps = true;
+            break;
+          }
+        }
+        if (!overlaps) {
+          placed.push(lb);
+          activeOverlays.addLayer(L.circleMarker([lat, lng], {
+            radius: 3,
+            color: 'hsl(' + l.hue + ',70%,60%)',
+            fillColor: 'hsl(' + l.hue + ',70%,60%)',
+            fillOpacity: 1,
+            weight: 0,
+            interactive: false,
+          }));
+          activeOverlays.addLayer(L.marker([lat, lng], {
+            icon: L.divIcon({
+              className: 'file-label',
+              html: l.name,
+              iconSize: [tw, th],
+              iconAnchor: [pt.x - lx, pt.y - ly]
+            }),
+            interactive: false
+          }));
+        }
+      }
+    }
+
+    map.on('baselayerchange', function(e) {
+      for (var i = 0; i < layerToScene.length; i++) {
+        if (layerToScene[i].layer === e.layer) {
+          activeScene = layerToScene[i].scene;
+          break;
+        }
+      }
+      fitScene(activeScene);
+      updateLabels();
+    });
+
+    fetch('labels.json')
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        var scenes = data.scenes || [];
+        for (var i = 0; i < scenes.length; i++) {
+          filesByKey[scenes[i].key] = scenes[i].files || [];
+        }
+        updateLabels();
+        map.on('zoomend moveend', updateLabels);
+      });
+  </script>
+</body>
+</html>"#;
+
+/// Write the multi-scene Leaflet viewer + scene-keyed labels JSON to `dir`.
+pub fn write_leaflet_html_multi(
+    dir: &Path,
+    scenes: &[SceneView],
+    title: &str,
+    inputs: &[String],
+) -> anyhow::Result<()> {
+    std::fs::write(dir.join("labels.json"), build_labels_json_scenes(scenes))?;
+    std::fs::write(
+        dir.join("index.html"),
+        build_html_multi(scenes, title, inputs),
+    )?;
+    Ok(())
+}
+
+/// Multi-scene equivalent of [`generate_leaflet_content`] for the streaming
+/// path: returns `(index.html bytes, labels.json bytes)` without touching disk.
+pub fn generate_leaflet_content_multi(
+    scenes: &[SceneView],
+    title: &str,
+    inputs: &[String],
+) -> (Vec<u8>, Vec<u8>) {
+    (
+        build_html_multi(scenes, title, inputs).into_bytes(),
+        build_labels_json_scenes(scenes).into_bytes(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{build_html, hf_url_to_web};

@@ -10,7 +10,7 @@ fn main() -> anyhow::Result<()> {
     let args = arbvis::Args::parse();
     let registry = arbvis::Registry::with_defaults();
     // The byte-only arbvis CLI doesn't expose the tensor-aware knobs
-    // (`--moe-summary` / `--moe-cka`, `--finetune`/`--no-finetune`,
+    // (`--moe`, `--finetune`/`--no-finetune`,
     // `--diff-metric`, `--layout`); pass the default `ModelOpts` so `run()` takes the
     // byte-only branches (no MoE, RMS metric, auto-layout — which resolves
     // to byte-Hilbert in a registry without arch-aware plugins).

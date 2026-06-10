@@ -26,9 +26,9 @@ pub enum DiffMetric {
     Exact,
 }
 
-/// Per-tensor scalar for `--moe-summary`. The CLI exposes this via the
-/// `--summary-stat` flag. Tensor-aware backends interpret the value;
-/// arbvis core just plumbs it through `MoeSummaryPrep::prepare`.
+/// Per-tensor scalar for the `--moe` summary scene. The CLI exposes this via
+/// the `--summary-stat` flag. Tensor-aware backends interpret the value;
+/// arbvis core just plumbs it through `MoeScenesPrep::prepare`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum SummaryStat {
     /// √(mean(x²)). Default — comparable across tensors of different scale.
@@ -289,6 +289,28 @@ impl std::fmt::Debug for Extensions {
             .field("type_count", &self.map.len())
             .finish()
     }
+}
+
+/// Assigns a [`Source`] to a named *scene*. Sources sharing a `key` are
+/// rendered into their own independent tile pyramid under `tiles/<key>/…`,
+/// and the Leaflet viewer gets a base-layer switcher ("tabs") to toggle
+/// between scenes. Sources with no `SceneTag` form a single implicit default
+/// scene rendered to the legacy `tiles/…` path with single-layer HTML — so
+/// every non-scene render (hilbert / arch / diff) is byte-for-byte unchanged.
+///
+/// Attached via [`Extensions::insert`] by a producer that wants more than one
+/// lens in a single run (e.g. `modelweightvis --moe` emits a `"summary"` and a
+/// `"cka"` scene). The tiler partitions on this tag *before* layout selection,
+/// so each scene independently picks its own [`crate::layout::LayoutShape`].
+#[derive(Clone, Debug)]
+pub struct SceneTag {
+    /// Path-safe slug used as the on-disk / repo subdirectory (`tiles/<key>/`)
+    /// and the scene's stable identity in `labels.json`.
+    pub key: String,
+    /// Human-readable label shown on the viewer's tab / layer switcher.
+    pub label: String,
+    /// Tab ordering; the lowest-`order` scene is the default-active layer.
+    pub order: u32,
 }
 
 /// Metadata and storage descriptor for one input.

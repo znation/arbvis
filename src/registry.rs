@@ -11,7 +11,7 @@
 //! The hooks are split into two families:
 //!   - **Vec slots** (`formats`, `layouts`, `diffs`): multiple plugins,
 //!     iterated/priority-ordered. Always present (empty by default).
-//!   - **Option slots** (`moe_summary`, `repo_diff`, `dir_tensor_diff`,
+//!   - **Option slots** (`moe`, `repo_diff`, `dir_tensor_diff`,
 //!     `finetune_detect`, `single_image_arch`): single tap point per CLI
 //!     dispatch. When `None`, the corresponding feature errors out (or
 //!     defaults) and the rest of arbvis still works.
@@ -92,55 +92,35 @@ pub trait DiffSourceBuilder: Send + Sync {
         -> anyhow::Result<Option<(Vec<Source>, u64)>>;
 }
 
-/// Hooks `--moe-summary` CLI flag's source preparation. arbvis errors
-/// out when this flag is passed but no `MoeSummaryPrep` is registered.
-///
-/// The impl returns one synthetic `Source` per per-weight panel (gate /
-/// up / down, plus router when present), each carrying a per-panel
-/// extension tag and an in-memory U8 heatmap of shape `[n_layers,
-/// n_experts]`. The registered layout plugin reads the tags back and
-/// arranges the panels on the canvas.
-///
-/// `?Send`: the canonical impl in `modelweightvis::hooks` carries
-/// futures whose internal lifetimes confuse the rustc HRTB check that
-/// `#[async_trait]`'s `+ Send` bound triggers. The CLI dispatch never
-/// spawns this future across threads — only `.await`s it locally — so
-/// dropping the Send requirement is safe.
+/// Hooks the `--moe` CLI flag's source preparation. arbvis errors out when
+/// the flag is passed but no `MoeScenesPrep` is registered (the byte-only
+/// `arbvis` binary has none; `modelweightvis` registers the tensor-aware impl).
 #[async_trait(?Send)]
-pub trait MoeSummaryPrep: Send + Sync {
+pub trait MoeScenesPrep: Send + Sync {
+    /// Build every MoE scene for `input` in a single pass — loading the
+    /// model once — and return their `Source`s concatenated into one list.
+    ///
+    /// Each returned `Source` carries a [`crate::SceneTag`] assigning it to
+    /// a scene (the canonical impl emits a `"summary"` scene of per-expert
+    /// scalar heatmaps and a `"cka"` scene of N×N linear-CKA matrices); the
+    /// tiler partitions on that tag into independent pyramids and the viewer
+    /// renders a tab switcher.
+    ///
+    /// `stat` configures the summary scene's per-expert scalar; `sample` is
+    /// the CKA scene's random-projection dimension (smaller = faster). When
+    /// `probe.enabled`, the impl runs a routing-faithful forward and attaches
+    /// a behavioral panel to each scene (routing frequency to summary,
+    /// co-activation to CKA).
+    ///
+    /// `?Send`: the canonical impl in `modelweightvis::hooks` carries futures
+    /// whose internal lifetimes confuse the rustc HRTB check that
+    /// `#[async_trait]`'s `+ Send` bound triggers. The CLI dispatch never
+    /// spawns this future across threads — only `.await`s it locally — so
+    /// dropping the Send requirement is safe.
     async fn prepare(
         &self,
         input: &str,
         stat: SummaryStat,
-        stream: bool,
-        probe: &crate::ProbeOpts,
-    ) -> anyhow::Result<(Vec<Source>, u64)>;
-}
-
-/// Hooks `--moe-cka` CLI flag's source preparation. arbvis errors out
-/// when this flag is passed but no `MoeCkaPrep` is registered.
-///
-/// The impl returns one synthetic `Source` per `(layer, weight)`
-/// panel, each carrying a per-panel extension tag and an in-memory U8
-/// `[n_experts, n_experts]` similarity heatmap (linear CKA between
-/// every expert pair). The registered layout plugin reads the tags
-/// back and arranges the panels in a grid.
-///
-/// `sample` is the random-projection dimension on the shared input
-/// axis — smaller is faster, larger preserves CKA more accurately.
-/// 128 is the CLI default.
-///
-/// `probe` carries the `--probe` options; when enabled the impl may
-/// run a routing-faithful forward and attach extra behavioral panels
-/// (e.g. a per-layer routing co-activation matrix) alongside the static
-/// CKA panels. Mirrors [`MoeSummaryPrep`].
-///
-/// `?Send`: see [`MoeSummaryPrep`].
-#[async_trait(?Send)]
-pub trait MoeCkaPrep: Send + Sync {
-    async fn prepare(
-        &self,
-        input: &str,
         sample: u32,
         stream: bool,
         probe: &crate::ProbeOpts,
@@ -151,7 +131,7 @@ pub trait MoeCkaPrep: Send + Sync {
 /// arbvis errors out when this case is hit and no `RepoDiffPrep` is
 /// registered.
 ///
-/// `?Send`: see [`MoeSummaryPrep`].
+/// `?Send`: see [`MoeScenesPrep`].
 #[async_trait(?Send)]
 pub trait RepoDiffPrep: Send + Sync {
     async fn prepare(
@@ -168,7 +148,7 @@ pub trait RepoDiffPrep: Send + Sync {
 /// The non-tensor files are still handled by arbvis's generic byte-diff
 /// + crosshatch path.
 ///
-/// `?Send`: see [`MoeSummaryPrep`].
+/// `?Send`: see [`MoeScenesPrep`].
 #[async_trait(?Send)]
 pub trait DirectoryTensorDiffPrep: Send + Sync {
     /// Which directory entries this preparer takes responsibility for.
@@ -187,7 +167,7 @@ pub trait DirectoryTensorDiffPrep: Send + Sync {
 /// Hooks the HF "is X a finetune of Y" model-card lookup. arbvis defaults
 /// to "not a finetune" when this hook isn't registered or returns `None`.
 ///
-/// `?Send`: see [`MoeSummaryPrep`].
+/// `?Send`: see [`MoeScenesPrep`].
 #[async_trait(?Send)]
 pub trait FinetuneDetect: Send + Sync {
     async fn detect(&self, orig_url: &str, mod_url: &str) -> Option<bool>;
@@ -207,7 +187,7 @@ pub trait FinetuneDetect: Send + Sync {
 /// Other tensor-aware backends (e.g. an ONNX backend) could plug in here
 /// the same way without arbvis growing any extra slots.
 ///
-/// `?Send`: see [`MoeSummaryPrep`].
+/// `?Send`: see [`MoeScenesPrep`].
 #[async_trait(?Send)]
 pub trait PrepareSourcesExtension: Send + Sync {
     async fn enrich(&self, sources: &mut [Source]) -> anyhow::Result<()>;
@@ -233,8 +213,7 @@ pub struct Registry {
     pub layouts: Vec<Arc<dyn LayoutPlugin>>,
     pub leaf: LeafRegistry,
     pub diffs: Vec<Arc<dyn DiffSourceBuilder>>,
-    pub moe_summary: Option<Arc<dyn MoeSummaryPrep>>,
-    pub moe_cka: Option<Arc<dyn MoeCkaPrep>>,
+    pub moe: Option<Arc<dyn MoeScenesPrep>>,
     pub repo_diff: Option<Arc<dyn RepoDiffPrep>>,
     pub dir_tensor_diff: Option<Arc<dyn DirectoryTensorDiffPrep>>,
     pub finetune_detect: Option<Arc<dyn FinetuneDetect>>,
@@ -258,8 +237,7 @@ impl Registry {
                 Arc::new(crate::data::JsonDiffBuilder),
                 Arc::new(crate::data::PlainBytesDiffBuilder),
             ],
-            moe_summary: None,
-            moe_cka: None,
+            moe: None,
             repo_diff: None,
             dir_tensor_diff: None,
             finetune_detect: None,

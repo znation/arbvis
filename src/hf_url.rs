@@ -148,11 +148,27 @@ pub struct HfOutputSpec {
 
 impl HfOutputSpec {
     pub fn tile_repo_path(&self, z: u32, x: u32, y: u32, ext: &str) -> String {
+        self.tile_repo_path_in(None, z, x, y, ext)
+    }
+    /// Scene-aware tile path: `[<prefix>/]tiles/[<scene>/]<z>/<x>/<y>.<ext>`.
+    /// `scene = None` reproduces the legacy single-pyramid layout.
+    pub fn tile_repo_path_in(
+        &self,
+        scene: Option<&str>,
+        z: u32,
+        x: u32,
+        y: u32,
+        ext: &str,
+    ) -> String {
         let p = &self.path_prefix;
+        let sub = match scene {
+            Some(k) => format!("tiles/{k}"),
+            None => "tiles".to_string(),
+        };
         if p.is_empty() {
-            format!("tiles/{z}/{x}/{y}.{ext}")
+            format!("{sub}/{z}/{x}/{y}.{ext}")
         } else {
-            format!("{p}/tiles/{z}/{x}/{y}.{ext}")
+            format!("{p}/{sub}/{z}/{x}/{y}.{ext}")
         }
     }
     pub fn index_html_path(&self) -> String {

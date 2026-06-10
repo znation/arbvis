@@ -35,13 +35,16 @@ _TILE_MEDIA_TYPES = {
 }
 
 
-@app.get("/tiles/{z}/{x}/{y_ext}")
-def tile(z: int, x: int, y_ext: str):
-    path = f"hf://buckets/{BUCKET_ID}/tiles/{z}/{x}/{y_ext}"
+# Catch-all under tiles/ so this serves both the single-pyramid layout
+# (tiles/<z>/<x>/<y>.<ext>) and the multi-scene layout
+# (tiles/<scene>/<z>/<x>/<y>.<ext>).
+@app.get("/tiles/{rest:path}")
+def tile(rest: str):
+    path = f"hf://buckets/{BUCKET_ID}/tiles/{rest}"
     try:
         data = fs().read_bytes(path)
     except (FileNotFoundError, EntryNotFoundError):
         return Response(status_code=404)
-    ext = y_ext.rsplit(".", 1)[-1].lower() if "." in y_ext else ""
+    ext = rest.rsplit(".", 1)[-1].lower() if "." in rest else ""
     media_type = _TILE_MEDIA_TYPES.get(ext, "application/octet-stream")
     return Response(content=data, media_type=media_type)

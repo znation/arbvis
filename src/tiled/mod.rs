@@ -4,6 +4,7 @@ pub mod leaf_renderer;
 pub mod pyramid_accum;
 pub mod streaming;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -15,7 +16,7 @@ use async_channel::{bounded, Receiver, Sender};
 use indicatif::ProgressBar;
 
 use crate::color::{build_diff_signed_lut, build_pixel_lut};
-use crate::data::{load_source_data, Data, DiffFill, Source, SourceKind};
+use crate::data::{load_source_data, Data, DiffFill, SceneTag, Source, SourceKind};
 use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, rects_centroid};
 use crate::layout::{select_layout, LayoutMode, LayoutShape};
 use crate::progress::{counter_style, multi, queue_style, status_style};
@@ -274,6 +275,94 @@ fn sniff_ext_for_zoom(tiles_dir: &std::path::Path, zoom: u32) -> Option<String> 
     sniff_ext_in(&x_dir.path())
 }
 
+/// Parse one `labels.json` file entry back into a [`html::FileEntity`].
+fn file_entity_from_json(v: &serde_json::Value) -> html::FileEntity {
+    let name = v["name"].as_str().unwrap_or("").to_string();
+    let pixel_x = v["x"].as_u64().unwrap_or(0) as u32;
+    let pixel_y = v["y"].as_u64().unwrap_or(0) as u32;
+    let hue = v["hue"].as_u64().unwrap_or(0) as u16;
+    let byte_size = v["size"].as_u64().unwrap_or(0);
+    let bbox = {
+        if let Some(b) = v["bbox"].as_array() {
+            let g = |i: usize| b.get(i).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            (g(0), g(1), g(2), g(3))
+        } else {
+            (0, 0, 0, 0)
+        }
+    };
+    let segments = if let Some(segs) = v["segs"].as_array() {
+        segs.iter()
+            .filter_map(|s| {
+                let arr = s.as_array()?;
+                let g = |i: usize| arr.get(i)?.as_u64().map(|x| x as u32);
+                Some((g(0)?, g(1)?, g(2)?, g(3)?))
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+    html::FileEntity {
+        name,
+        pixel_x,
+        pixel_y,
+        hue,
+        byte_size,
+        bbox,
+        segments,
+    }
+}
+
+/// Rebuild a multi-scene viewer from the scene-keyed `labels.json` shape
+/// (`{ "scenes": [...] }`). All geometry is persisted per scene, so unlike the
+/// single-scene path this needs no tile-directory scan. Returns `Ok(false)`
+/// when `labels.json` isn't the scenes shape, so the caller falls through to
+/// the legacy single-pyramid regen.
+fn regen_html_multi(tile_dir: &Path, parsed: &serde_json::Value) -> anyhow::Result<bool> {
+    let Some(scenes_json) = parsed.get("scenes").and_then(|v| v.as_array()) else {
+        return Ok(false);
+    };
+    let u32_field =
+        |s: &serde_json::Value, k: &str| s.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let str_field = |s: &serde_json::Value, k: &str, dflt: &str| {
+        s.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or(dflt)
+            .to_string()
+    };
+    let scenes: Vec<html::SceneView> = scenes_json
+        .iter()
+        .map(|s| {
+            let entities = s
+                .get("files")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().map(file_entity_from_json).collect())
+                .unwrap_or_default();
+            let key = s.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            html::SceneView {
+                key: (!key.is_empty()).then(|| key.to_string()),
+                label: str_field(s, "label", ""),
+                order: u32_field(s, "order"),
+                world_w: u32_field(s, "world_w"),
+                world_h: u32_field(s, "world_h"),
+                max_zoom: u32_field(s, "max_zoom"),
+                detail_depth: u32_field(s, "detail_depth"),
+                height: u32_field(s, "height"),
+                width: u32_field(s, "width"),
+                leaf_ext: str_field(s, "leaf_ext", "png"),
+                pyramid_ext: str_field(s, "pyramid_ext", "png"),
+                entities,
+            }
+        })
+        .collect();
+    html::write_leaflet_html_multi(tile_dir, &scenes, "arbvis", &[])?;
+    log::info!(
+        "Regenerated index.html ({} scenes) in {}",
+        scenes.len(),
+        tile_dir.display()
+    );
+    Ok(true)
+}
+
 /// Regenerate `index.html` for an existing tiles directory without re-rendering tiles.
 pub fn regen_html(tile_dir: &Path) -> anyhow::Result<()> {
     let tiles_dir = tile_dir.join("tiles");
@@ -286,6 +375,11 @@ pub fn regen_html(tile_dir: &Path) -> anyhow::Result<()> {
     let json_str = std::fs::read_to_string(&labels_path)
         .with_context(|| format!("cannot read {}", labels_path.display()))?;
     let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+    // Multi-scene outputs carry per-scene geometry in labels.json and live
+    // under `tiles/<key>/…`, so they regenerate without any dir scan.
+    if regen_html_multi(tile_dir, &parsed)? {
+        return Ok(());
+    }
     let detail_depth = parsed
         .get("detail_depth")
         .and_then(|v| v.as_u64())
@@ -347,47 +441,7 @@ pub fn regen_html(tile_dir: &Path) -> anyhow::Result<()> {
     let world_w = (width_tiles / two_pow_mz.max(1)).max(1) * TILE;
     let world_h = (height_tiles / two_pow_mz.max(1)).max(1) * TILE;
 
-    let entities: Vec<html::FileEntity> = values
-        .into_iter()
-        .map(|v| {
-            let name = v["name"].as_str().unwrap_or("").to_string();
-            let pixel_x = v["x"].as_u64().unwrap_or(0) as u32;
-            let pixel_y = v["y"].as_u64().unwrap_or(0) as u32;
-            let hue = v["hue"].as_u64().unwrap_or(0) as u16;
-            let byte_size = v["size"].as_u64().unwrap_or(0);
-            let bbox = {
-                let b = v["bbox"].as_array();
-                if let Some(b) = b {
-                    let g = |i: usize| b.get(i).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-                    (g(0), g(1), g(2), g(3))
-                } else {
-                    (0, 0, 0, 0)
-                }
-            };
-            let segments = {
-                if let Some(segs) = v["segs"].as_array() {
-                    segs.iter()
-                        .filter_map(|s| {
-                            let arr = s.as_array()?;
-                            let g = |i: usize| arr.get(i)?.as_u64().map(|x| x as u32);
-                            Some((g(0)?, g(1)?, g(2)?, g(3)?))
-                        })
-                        .collect()
-                } else {
-                    vec![]
-                }
-            };
-            html::FileEntity {
-                name,
-                pixel_x,
-                pixel_y,
-                hue,
-                byte_size,
-                bbox,
-                segments,
-            }
-        })
-        .collect();
+    let entities: Vec<html::FileEntity> = values.iter().map(file_entity_from_json).collect();
 
     let width = width_tiles * TILE;
     html::write_leaflet_html(
@@ -1232,6 +1286,69 @@ pub(super) fn derive_leaf_format(user_choice: TileFormat, mode: &LeafMode) -> Ti
 /// accumulator as leaves complete, so we never re-decode tiles back from
 /// disk — which is also why this code path doesn't need a decoder for AVIF
 /// tiles.
+/// One scene's worth of sources, peeled off `Vec<Source>` by [`partition_scenes`].
+pub(super) struct SceneGroup {
+    /// `Some(key)` → tiles go under `tiles/<key>/`; `None` → legacy lone scene.
+    pub(super) key: Option<String>,
+    pub(super) label: String,
+    pub(super) order: u32,
+    pub(super) sources: Vec<Source>,
+    pub(super) total: u64,
+}
+
+/// Group sources into scenes by their [`SceneTag`]. With no tags present, the
+/// whole input is one implicit default scene (`key: None`) carrying the
+/// caller's original `total` — preserving the exact legacy single-pyramid path.
+/// With tags present, sources are bucketed by `key` (first-seen order, then
+/// sorted by `order`); each scene's `total` is the sum of its source sizes.
+pub(super) fn partition_scenes(sources: Vec<Source>, total: u64) -> Vec<SceneGroup> {
+    let any_tagged = sources
+        .iter()
+        .any(|s| s.extensions.get::<SceneTag>().is_some());
+    if !any_tagged {
+        return vec![SceneGroup {
+            key: None,
+            label: String::new(),
+            order: 0,
+            sources,
+            total,
+        }];
+    }
+
+    let mut key_order: Vec<String> = Vec::new();
+    let mut buckets: HashMap<String, (String, u32, Vec<Source>)> = HashMap::new();
+    for s in sources {
+        let (key, label, order) = match s.extensions.get::<SceneTag>() {
+            Some(t) => (t.key.clone(), t.label.clone(), t.order),
+            // Untagged source in an otherwise-tagged run: bucket it into a
+            // sensible default scene rather than dropping it.
+            None => ("main".to_string(), "Main".to_string(), u32::MAX),
+        };
+        let entry = buckets.entry(key.clone()).or_insert_with(|| {
+            key_order.push(key.clone());
+            (label, order, Vec::new())
+        });
+        entry.2.push(s);
+    }
+
+    let mut groups: Vec<SceneGroup> = key_order
+        .into_iter()
+        .map(|k| {
+            let (label, order, srcs) = buckets.remove(&k).unwrap();
+            let total = srcs.iter().map(|s| s.byte_size).sum();
+            SceneGroup {
+                key: Some(k),
+                label,
+                order,
+                sources: srcs,
+                total,
+            }
+        })
+        .collect();
+    groups.sort_by_key(|g| g.order);
+    groups
+}
+
 pub async fn run_tiles(
     sources: Vec<Source>,
     total: u64,
@@ -1245,6 +1362,80 @@ pub async fn run_tiles(
     layout_mode: LayoutMode,
     registry: &crate::registry::Registry,
 ) -> anyhow::Result<()> {
+    let scenes = partition_scenes(sources, total);
+    let mut views: Vec<html::SceneView> = Vec::with_capacity(scenes.len());
+    for group in scenes {
+        let subdir = match &group.key {
+            Some(k) => format!("tiles/{k}"),
+            None => "tiles".to_string(),
+        };
+        let view = render_scene_to_disk(
+            &tile_dir,
+            &subdir,
+            group,
+            diff_mode,
+            show_xet_xorbs,
+            leaf_format,
+            pyramid_format,
+            layout_mode,
+            registry,
+        )
+        .await?;
+        views.push(view);
+    }
+
+    log::info!("Writing HTML viewer...");
+    // The lone implicit scene takes the legacy single-layer viewer verbatim
+    // (byte-identical output); anything tagged gets the multi-scene switcher.
+    if views.len() == 1 && views[0].key.is_none() {
+        let v = &views[0];
+        html::write_leaflet_html(
+            &tile_dir,
+            v.world_w,
+            v.world_h,
+            v.max_zoom,
+            v.detail_depth,
+            v.height,
+            v.width,
+            TILE,
+            &v.entities,
+            title,
+            inputs,
+            &v.leaf_ext,
+            &v.pyramid_ext,
+        )?;
+    } else {
+        html::write_leaflet_html_multi(&tile_dir, &views, title, inputs)?;
+    }
+
+    log::info!("Tiled output written to {}", tile_dir.display());
+    Ok(())
+}
+
+/// Render one scene's full pyramid (overview + detail levels) to disk under
+/// `<tile_dir>/<subdir>/…` and return its [`html::SceneView`]. `subdir` is
+/// `"tiles"` for the legacy lone scene or `"tiles/<key>"` for a named scene —
+/// it's the only thing that distinguishes the two paths on disk.
+#[allow(clippy::too_many_arguments)]
+async fn render_scene_to_disk(
+    tile_dir: &Path,
+    subdir: &str,
+    group: SceneGroup,
+    diff_mode: bool,
+    show_xet_xorbs: bool,
+    leaf_format: TileFormat,
+    pyramid_format: TileFormat,
+    layout_mode: LayoutMode,
+    registry: &crate::registry::Registry,
+) -> anyhow::Result<html::SceneView> {
+    let SceneGroup {
+        key,
+        label,
+        order,
+        sources,
+        total,
+    } = group;
+
     let plan = build_tile_plan(
         sources,
         total,
@@ -1257,29 +1448,27 @@ pub async fn run_tiles(
 
     let leaf_format = derive_leaf_format(leaf_format, &plan.mode);
     let max_zoom = plan.max_zoom;
-    let world_w = plan.world_w;
-    let world_h = plan.world_h;
-    let height = plan.height;
-    let width = plan.width;
     let total_tiles = plan.total_tiles;
     let leaf_ext = leaf_format.extension();
     let pyramid_ext = pyramid_format.extension();
 
-    std::fs::create_dir_all(tile_dir.join(format!("tiles/{max_zoom}")))?;
+    std::fs::create_dir_all(tile_dir.join(format!("{subdir}/{max_zoom}")))?;
 
     log::info!(
-        "Rendering {} leaf tiles ({} leaf / {} pyramid)...",
+        "Rendering {} leaf tiles for {} ({} leaf / {} pyramid)...",
         total_tiles,
+        subdir,
         leaf_ext,
         pyramid_ext
     );
 
     let sink = Arc::new(LocalFileSink {
-        root: tile_dir.clone(),
+        root: tile_dir.to_path_buf(),
     });
     let pyramid_path_fn: Arc<dyn Fn(u32, u32, u32) -> String + Send + Sync> = {
         let ext = pyramid_ext.to_string();
-        Arc::new(move |z, x, y| format!("tiles/{z}/{x}/{y}.{ext}"))
+        let subdir = subdir.to_string();
+        Arc::new(move |z, x, y| format!("{subdir}/{z}/{x}/{y}.{ext}"))
     };
     let pyramid = Arc::new(PyramidAccumulator::new(
         TILE,
@@ -1289,7 +1478,8 @@ pub async fn run_tiles(
         pyramid_format,
     ));
 
-    let tile_dir_for_write = tile_dir.clone();
+    let tile_dir_for_write = tile_dir.to_path_buf();
+    let subdir_for_write = subdir.to_string();
     let pyramid_for_write = pyramid.clone();
     drive_pipeline(
         &plan,
@@ -1300,8 +1490,10 @@ pub async fn run_tiles(
             height_tiles: plan.height_tiles,
         },
         move |t: EncodedTile| {
-            let path =
-                tile_dir_for_write.join(format!("tiles/{max_zoom}/{}/{}.{leaf_ext}", t.tx, t.ty));
+            let path = tile_dir_for_write.join(format!(
+                "{subdir_for_write}/{max_zoom}/{}/{}.{leaf_ext}",
+                t.tx, t.ty
+            ));
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("creating tile dir {}", parent.display()))?;
@@ -1320,9 +1512,13 @@ pub async fn run_tiles(
 
     // Variable-depth detail tiles: sparse deeper levels rendered directly from
     // source over the shrunk tensors' footprints (no pyramid accumulation).
-    let detail_dir = tile_dir.clone();
+    let detail_dir = tile_dir.to_path_buf();
+    let subdir_for_detail = subdir.to_string();
     render_detail_levels(&plan, leaf_format, &move |t: &EncodedTile, z| {
-        let path = detail_dir.join(format!("tiles/{z}/{}/{}.{leaf_ext}", t.tx, t.ty));
+        let path = detail_dir.join(format!(
+            "{subdir_for_detail}/{z}/{}/{}.{leaf_ext}",
+            t.tx, t.ty
+        ));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1331,28 +1527,81 @@ pub async fn run_tiles(
     })
     .await?;
 
-    log::info!("Writing HTML viewer...");
-    html::write_leaflet_html(
-        &tile_dir,
-        world_w,
-        world_h,
+    Ok(html::SceneView {
+        key,
+        label,
+        order,
+        world_w: plan.world_w,
+        world_h: plan.world_h,
         max_zoom,
-        plan.detail_depth,
-        height,
-        width,
-        TILE,
-        &plan.entities,
-        title,
-        inputs,
-        leaf_ext,
-        pyramid_ext,
-    )?;
-
-    log::info!("Tiled output written to {}", tile_dir.display());
-    Ok(())
+        detail_depth: plan.detail_depth,
+        height: plan.height,
+        width: plan.width,
+        leaf_ext: leaf_ext.to_string(),
+        pyramid_ext: pyramid_ext.to_string(),
+        entities: plan.entities,
+    })
 }
 
 // Streaming tile output (`run_tiles_hf_streaming`) lives in the
 // [`streaming`](crate::tiled::streaming) submodule. It uses the same plan and
 // pipeline helpers above; keeping it in its own file makes the "off-by-default"
 // path easy to find and easy to delete if it's ever superseded.
+
+#[cfg(test)]
+mod scene_tests {
+    use super::partition_scenes;
+    use crate::data::{Extensions, SceneTag, Source, SourceKind};
+
+    fn src(byte_size: u64, scene: Option<(&str, u32)>) -> Source {
+        let mut extensions = Extensions::default();
+        if let Some((key, order)) = scene {
+            extensions.insert(SceneTag {
+                key: key.to_string(),
+                label: key.to_string(),
+                order,
+            });
+        }
+        Source {
+            file_idx: 0,
+            kind: SourceKind::Buffered(Vec::new()),
+            byte_size,
+            name_override: Some("t".to_string()),
+            xet_terms: None,
+            extensions,
+        }
+    }
+
+    #[test]
+    fn untagged_sources_form_one_default_scene_with_original_total() {
+        let groups = partition_scenes(vec![src(10, None), src(20, None)], 999);
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].key.is_none());
+        // The lone default scene keeps the caller's `total` verbatim so the
+        // legacy single-pyramid path is byte-for-byte unchanged.
+        assert_eq!(groups[0].total, 999);
+        assert_eq!(groups[0].sources.len(), 2);
+    }
+
+    #[test]
+    fn tagged_sources_split_into_ordered_scenes_with_summed_totals() {
+        // Deliberately interleaved and out-of-order to exercise grouping + sort.
+        let groups = partition_scenes(
+            vec![
+                src(3, Some(("cka", 1))),
+                src(10, Some(("summary", 0))),
+                src(5, Some(("cka", 1))),
+                src(20, Some(("summary", 0))),
+            ],
+            0,
+        );
+        assert_eq!(groups.len(), 2);
+        // Sorted by `order`: summary (0) before cka (1).
+        assert_eq!(groups[0].key.as_deref(), Some("summary"));
+        assert_eq!(groups[0].total, 30);
+        assert_eq!(groups[0].sources.len(), 2);
+        assert_eq!(groups[1].key.as_deref(), Some("cka"));
+        assert_eq!(groups[1].total, 8);
+        assert_eq!(groups[1].sources.len(), 2);
+    }
+}

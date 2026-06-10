@@ -130,6 +130,11 @@ pub trait MoeSummaryPrep: Send + Sync {
 /// axis — smaller is faster, larger preserves CKA more accurately.
 /// 128 is the CLI default.
 ///
+/// `probe` carries the `--probe` options; when enabled the impl may
+/// run a routing-faithful forward and attach extra behavioral panels
+/// (e.g. a per-layer routing co-activation matrix) alongside the static
+/// CKA panels. Mirrors [`MoeSummaryPrep`].
+///
 /// `?Send`: see [`MoeSummaryPrep`].
 #[async_trait(?Send)]
 pub trait MoeCkaPrep: Send + Sync {
@@ -138,6 +143,7 @@ pub trait MoeCkaPrep: Send + Sync {
         input: &str,
         sample: u32,
         stream: bool,
+        probe: &crate::ProbeOpts,
     ) -> anyhow::Result<(Vec<Source>, u64)>;
 }
 

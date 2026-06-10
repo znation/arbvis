@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned so local `cargo fmt`/`cargo clippy` (incl. the .githooks/pre-commit
+# hook) and CI all run the exact same compiler, rustfmt, and clippy — clippy
+# lints and fmt rules shift between releases, so an unpinned channel drifts.
+# Bump this deliberately when you want the newer toolchain's lints.
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

@@ -317,7 +317,11 @@ fn file_entity_from_json(v: &serde_json::Value) -> html::FileEntity {
 /// single-scene path this needs no tile-directory scan. Returns `Ok(false)`
 /// when `labels.json` isn't the scenes shape, so the caller falls through to
 /// the legacy single-pyramid regen.
-fn regen_html_multi(tile_dir: &Path, parsed: &serde_json::Value) -> anyhow::Result<bool> {
+fn regen_html_multi(
+    tile_dir: &Path,
+    parsed: &serde_json::Value,
+    branding: &crate::registry::Branding,
+) -> anyhow::Result<bool> {
     let Some(scenes_json) = parsed.get("scenes").and_then(|v| v.as_array()) else {
         return Ok(false);
     };
@@ -354,7 +358,7 @@ fn regen_html_multi(tile_dir: &Path, parsed: &serde_json::Value) -> anyhow::Resu
             }
         })
         .collect();
-    html::write_leaflet_html_multi(tile_dir, &scenes, "arbvis", &[])?;
+    html::write_leaflet_html_multi(tile_dir, &scenes, &branding.name, &[], branding)?;
     log::info!(
         "Regenerated index.html ({} scenes) in {}",
         scenes.len(),
@@ -364,7 +368,7 @@ fn regen_html_multi(tile_dir: &Path, parsed: &serde_json::Value) -> anyhow::Resu
 }
 
 /// Regenerate `index.html` for an existing tiles directory without re-rendering tiles.
-pub fn regen_html(tile_dir: &Path) -> anyhow::Result<()> {
+pub fn regen_html(tile_dir: &Path, branding: &crate::registry::Branding) -> anyhow::Result<()> {
     let tiles_dir = tile_dir.join("tiles");
 
     // Read labels.json first. Newer outputs persist `max_zoom`/`detail_depth` so
@@ -377,7 +381,7 @@ pub fn regen_html(tile_dir: &Path) -> anyhow::Result<()> {
     let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
     // Multi-scene outputs carry per-scene geometry in labels.json and live
     // under `tiles/<key>/…`, so they regenerate without any dir scan.
-    if regen_html_multi(tile_dir, &parsed)? {
+    if regen_html_multi(tile_dir, &parsed, branding)? {
         return Ok(());
     }
     let detail_depth = parsed
@@ -454,10 +458,11 @@ pub fn regen_html(tile_dir: &Path) -> anyhow::Result<()> {
         width,
         TILE,
         &entities,
-        "arbvis",
+        &branding.name,
         &[],
         &leaf_ext,
         &pyramid_ext,
+        branding,
     )?;
     log::info!(
         "Regenerated index.html in {} (zoom 0–{max_zoom}, +{detail_depth} detail, {width_tiles}×{height_tiles} tiles, height={height})",
@@ -1403,9 +1408,10 @@ pub async fn run_tiles(
             inputs,
             &v.leaf_ext,
             &v.pyramid_ext,
+            &registry.branding,
         )?;
     } else {
-        html::write_leaflet_html_multi(&tile_dir, &views, title, inputs)?;
+        html::write_leaflet_html_multi(&tile_dir, &views, title, inputs, &registry.branding)?;
     }
 
     log::info!("Tiled output written to {}", tile_dir.display());

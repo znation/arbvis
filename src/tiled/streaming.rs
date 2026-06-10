@@ -81,9 +81,10 @@ pub async fn run_tiles_hf_streaming(
             inputs,
             &v.leaf_ext,
             &v.pyramid_ext,
+            &registry.branding,
         )
     } else {
-        generate_leaflet_content_multi(&views, title, inputs)
+        generate_leaflet_content_multi(&views, title, inputs, &registry.branding)
     };
     sink.upload_tile(hf_out.index_html_path(), html_bytes.clone())?;
     sink.upload_tile(hf_out.labels_json_path(), labels_bytes)?;

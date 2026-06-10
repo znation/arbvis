@@ -16,6 +16,7 @@
 //!     dispatch. When `None`, the corresponding feature errors out (or
 //!     defaults) and the rest of arbvis still works.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -206,6 +207,34 @@ pub trait SingleImageArchHook: Send + Sync {
     ) -> anyhow::Result<()>;
 }
 
+/// Viewer branding: the tool name shown in the HTML title fallbacks
+/// (`"{name}"` / `"{name} diff"` / `"{name} moe"`) and the repo URL used for
+/// the title link + leaflet attribution.
+///
+/// Defaults to arbvis's own identity so the standalone `arbvis` binary keeps
+/// its branding. A downstream crate (e.g. `modelweightvis`) overrides
+/// [`Registry::branding`] to rebrand the viewer it generates.
+#[derive(Clone, Debug)]
+pub struct Branding {
+    pub name: Cow<'static, str>,
+    pub repo_url: Cow<'static, str>,
+}
+
+impl Branding {
+    pub fn new(name: impl Into<Cow<'static, str>>, repo_url: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            name: name.into(),
+            repo_url: repo_url.into(),
+        }
+    }
+}
+
+impl Default for Branding {
+    fn default() -> Self {
+        Self::new("arbvis", "https://github.com/znation/arbvis")
+    }
+}
+
 /// Plugin slots threaded through [`crate::run`].
 #[derive(Clone, Default)]
 pub struct Registry {
@@ -221,6 +250,8 @@ pub struct Registry {
     /// Cross-source enrichment pass that runs once per render after every
     /// `Source` has been built. See [`PrepareSourcesExtension`].
     pub prepare_sources_extension: Option<Arc<dyn PrepareSourcesExtension>>,
+    /// Viewer branding (tool name + repo URL). See [`Branding`].
+    pub branding: Branding,
 }
 
 impl Registry {
@@ -243,6 +274,7 @@ impl Registry {
             finetune_detect: None,
             single_image_arch: None,
             prepare_sources_extension: None,
+            branding: Branding::default(),
         }
     }
 }

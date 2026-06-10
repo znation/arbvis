@@ -28,9 +28,9 @@ pub use data::{
 pub use geometry::name_hue;
 pub use layout::{CanvasGeom, LayoutMode, LayoutShape};
 pub use registry::{
-    DiffBuildCtx, DiffSourceBuilder, DirectoryTensorDiffPrep, FinetuneDetect, FormatPlugin,
-    LayoutBuildCtx, LayoutPlugin, MoeScenesPrep, PrepareSourcesExtension, Registry, RepoDiffPrep,
-    SingleImageArchHook,
+    Branding, DiffBuildCtx, DiffSourceBuilder, DirectoryTensorDiffPrep, FinetuneDetect,
+    FormatPlugin, LayoutBuildCtx, LayoutPlugin, MoeScenesPrep, PrepareSourcesExtension, Registry,
+    RepoDiffPrep, SingleImageArchHook,
 };
 pub use tiled::html::FileEntity;
 pub use tiled::leaf::{encode_tile, TileFormat, TILE};
@@ -243,7 +243,8 @@ pub struct Args {
     #[arg(long, value_name = "TILES_DIR", conflicts_with_all = ["files", "diff", "output", "tiles", "space"])]
     regen_html: Option<PathBuf>,
 
-    /// Title shown in the HTML info panel (default: "arbvis" or "arbvis diff")
+    /// Title shown in the HTML info panel (default: the brand name, optionally
+    /// suffixed " diff" / " moe" — e.g. "arbvis" / "arbvis moe")
     #[arg(long, value_name = "TITLE")]
     title: Option<String>,
 
@@ -275,9 +276,10 @@ pub struct Args {
 /// Bag of parameters shared by every render entrypoint. Avoids the
 /// repeated-argument-list-of-doom that the call sites had before.
 struct RenderConfig {
-    /// Display title for the viewer / single-image label. `Cow` so the
-    /// common default ("arbvis" / "arbvis diff" / "arbvis moe") stays
-    /// as a `&'static str` borrow instead of allocating on every run.
+    /// Display title for the viewer / single-image label. Either the user's
+    /// `--title` or the brand-derived default (`"{name}"` / `"{name} diff"` /
+    /// `"{name} moe"`); see [`default_title`]. `Cow` avoids a clone when the
+    /// caller already owns the string.
     title: Cow<'static, str>,
     inputs: Vec<String>,
     diff_mode: bool,
@@ -429,7 +431,7 @@ impl OutputDest {
 /// `modelweightvis::register_all`.
 pub async fn run(args: Args, opts: ModelOpts, registry: registry::Registry) -> anyhow::Result<()> {
     if let Some(ref tile_dir) = args.regen_html {
-        return tiled::regen_html(tile_dir);
+        return tiled::regen_html(tile_dir, &registry.branding);
     }
 
     if args.show_xet_xorbs && args.diff.is_some() {
@@ -464,7 +466,7 @@ pub async fn run(args: Args, opts: ModelOpts, registry: registry::Registry) -> a
         let sample = opts.cka_sample;
         let input = moe_arg.to_string_lossy().into_owned();
         let inputs = vec![input.clone()];
-        let title = default_title(args.title, "arbvis moe");
+        let title = default_title(args.title, &registry.branding.name, "moe");
         // One load, both lenses: the hook returns each scene's sources tagged
         // with a `SceneTag`, concatenated. The tiler partitions on that tag.
         let (sources, total) = hook
@@ -494,7 +496,7 @@ pub async fn run(args: Args, opts: ModelOpts, registry: registry::Registry) -> a
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
-        let diff_title = default_title(args.title, "arbvis diff");
+        let diff_title = default_title(args.title, &registry.branding.name, "diff");
         let orig_str = &diff_input_strs[0];
         let mod_str = &diff_input_strs[1];
         let is_finetune = resolve_finetune(
@@ -595,7 +597,7 @@ pub async fn run(args: Args, opts: ModelOpts, registry: registry::Registry) -> a
     let (sources, total) = resolve_input_sources(&files, show_xet_xorbs, stream, &registry).await?;
     let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
     let cfg = RenderConfig {
-        title: default_title(args.title, "arbvis"),
+        title: default_title(args.title, &registry.branding.name, ""),
         inputs: original_inputs,
         diff_mode: false,
         show_xet_xorbs,
@@ -606,10 +608,16 @@ pub async fn run(args: Args, opts: ModelOpts, registry: registry::Registry) -> a
     dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await
 }
 
-/// Pick the viewer title: the user's `--title` if set, else a `&'static`
-/// default. `Cow` keeps the default zero-alloc.
-fn default_title(user: Option<String>, fallback: &'static str) -> Cow<'static, str> {
-    user.map_or(Cow::Borrowed(fallback), Cow::Owned)
+/// Pick the viewer title: the user's `--title` if set, else the brand name
+/// with a mode suffix (`"{name} moe"` / `"{name} diff"`, or just `"{name}"`
+/// when `suffix` is empty). Built once per run, so the fallback allocation is
+/// negligible.
+fn default_title(user: Option<String>, name: &str, suffix: &str) -> Cow<'static, str> {
+    match user {
+        Some(t) => Cow::Owned(t),
+        None if suffix.is_empty() => Cow::Owned(name.to_string()),
+        None => Cow::Owned(format!("{name} {suffix}")),
+    }
 }
 
 async fn resolve_finetune(
@@ -1066,4 +1074,27 @@ pub fn init() -> anyhow::Result<tokio::runtime::Runtime> {
 /// the process lifetime.
 pub fn perf_monitor_spawn_if_enabled() -> Option<Arc<AtomicBool>> {
     perf_monitor::spawn_if_enabled()
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::default_title;
+
+    #[test]
+    fn brand_and_suffix_fallbacks() {
+        assert_eq!(
+            default_title(None, "modelweightvis", "moe"),
+            "modelweightvis moe"
+        );
+        assert_eq!(default_title(None, "arbvis", "diff"), "arbvis diff");
+        assert_eq!(default_title(None, "arbvis", ""), "arbvis");
+    }
+
+    #[test]
+    fn user_title_wins() {
+        assert_eq!(
+            default_title(Some("custom".to_string()), "arbvis", "moe"),
+            "custom"
+        );
+    }
 }

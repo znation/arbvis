@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use crate::registry::Branding;
+
 /// Metadata for one file entity in the Leaflet viewer.
 pub struct FileEntity {
     pub name: String,
@@ -31,6 +33,7 @@ pub fn generate_leaflet_content(
     inputs: &[String],
     leaf_ext: &str,
     pyramid_ext: &str,
+    branding: &Branding,
 ) -> (Vec<u8>, Vec<u8>) {
     let entities_json = build_labels_json(entities, max_zoom, detail_depth);
     let html = build_html(
@@ -45,6 +48,7 @@ pub fn generate_leaflet_content(
         inputs,
         leaf_ext,
         pyramid_ext,
+        branding,
     );
     (html.into_bytes(), entities_json.into_bytes())
 }
@@ -64,6 +68,7 @@ pub fn write_leaflet_html(
     inputs: &[String],
     leaf_ext: &str,
     pyramid_ext: &str,
+    branding: &Branding,
 ) -> anyhow::Result<()> {
     let entities_json = build_labels_json(entities, max_zoom, detail_depth);
     std::fs::write(dir.join("labels.json"), &entities_json)?;
@@ -80,6 +85,7 @@ pub fn write_leaflet_html(
         inputs,
         leaf_ext,
         pyramid_ext,
+        branding,
     );
     std::fs::write(dir.join("index.html"), html)?;
     Ok(())
@@ -176,8 +182,19 @@ fn escape_html(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn build_info_html(title: &str, inputs: &[String]) -> String {
+/// The leaflet attribution control's HTML: a link to the branded repo. Shared
+/// by the single- and multi-scene viewers.
+fn attribution_html(branding: &Branding) -> String {
+    format!(
+        "<a href=\"{}\">{}</a>",
+        escape_html(&branding.repo_url),
+        escape_html(&branding.name)
+    )
+}
+
+fn build_info_html(title: &str, inputs: &[String], branding: &Branding) -> String {
     let title_html = escape_html(title);
+    let repo_url = escape_html(&branding.repo_url);
     let sources_html = if inputs.is_empty() {
         String::new()
     } else {
@@ -195,7 +212,7 @@ fn build_info_html(title: &str, inputs: &[String]) -> String {
         format!("<div id=\"arbvis-sources\">{}</div>", items.join(", "))
     };
     format!(
-        "<div id=\"arbvis-info\"><div id=\"arbvis-title\"><a href=\"https://github.com/znation/arbvis\" target=\"_blank\" rel=\"noopener\">{title_html}</a></div>{sources_html}</div>"
+        "<div id=\"arbvis-info\"><div id=\"arbvis-title\"><a href=\"{repo_url}\" target=\"_blank\" rel=\"noopener\">{title_html}</a></div>{sources_html}</div>"
     )
 }
 
@@ -211,8 +228,10 @@ fn build_html(
     inputs: &[String],
     leaf_ext: &str,
     pyramid_ext: &str,
+    branding: &Branding,
 ) -> String {
-    let info_html = build_info_html(title, inputs);
+    let info_html = build_info_html(title, inputs, branding);
+    let attribution = attribution_html(branding);
     // Real tiles exist up to `max_zoom + detail_depth`; allow 3 more zoom
     // levels of CSS upsampling past that (the historical "+3" headroom).
     let viewer_max_zoom = max_zoom + detail_depth + 3;
@@ -339,7 +358,7 @@ fn build_html(
       maxNativeZoom: {max_zoom},
       bounds: [[-{world_h}, 0], [0, {world_w}]],
       noWrap: true,
-      attribution: '<a href="https://github.com/znation/arbvis">arbvis</a>'
+      attribution: '{attribution}'
     }}).addTo(map);
 {detail_layer_js}
     map.fitBounds([[-{world_h}, 0], [0, {world_w}]]);
@@ -482,6 +501,7 @@ fn build_html(
 </html>"#,
         title_escaped = escape_html(title),
         info_html = info_html,
+        attribution = attribution,
         max_zoom = max_zoom,
         detail_layer_js = detail_layer_js,
         viewer_max_zoom = viewer_max_zoom,
@@ -583,8 +603,13 @@ fn scenes_js_literal(scenes: &[SceneView]) -> String {
 
 /// Build the multi-scene viewer HTML. Scenes must be pre-sorted by `order`
 /// (the first is the default-active layer).
-fn build_html_multi(scenes: &[SceneView], title: &str, inputs: &[String]) -> String {
-    let info_html = build_info_html(title, inputs);
+fn build_html_multi(
+    scenes: &[SceneView],
+    title: &str,
+    inputs: &[String],
+    branding: &Branding,
+) -> String {
+    let info_html = build_info_html(title, inputs, branding);
     // Map zoom envelope spanning every scene's pyramid + detail + upsample
     // headroom (the historical "+3"), and the most-negative aspect-fit zoom.
     let viewer_max_zoom = scenes
@@ -610,6 +635,7 @@ fn build_html_multi(scenes: &[SceneView], title: &str, inputs: &[String]) -> Str
         .replace("/*__TILE__*/", &TILE_SIZE.to_string())
         .replace("/*__VMIN__*/", &viewer_min_zoom.to_string())
         .replace("/*__VMAX__*/", &viewer_max_zoom.to_string())
+        .replace("__ATTRIBUTION__", &attribution_html(branding))
         .replace("__TITLE_ESCAPED__", &escape_html(title))
 }
 
@@ -703,7 +729,7 @@ const TEMPLATE_MULTI: &str = r#"<!DOCTYPE html>
         maxNativeZoom: s.max_zoom,
         bounds: sceneBounds(s),
         noWrap: true,
-        attribution: '<a href="https://github.com/znation/arbvis">arbvis</a>'
+        attribution: '__ATTRIBUTION__'
       }));
       if (s.detail_depth > 0) {
         var Detail = L.TileLayer.extend({
@@ -869,11 +895,12 @@ pub fn write_leaflet_html_multi(
     scenes: &[SceneView],
     title: &str,
     inputs: &[String],
+    branding: &Branding,
 ) -> anyhow::Result<()> {
     std::fs::write(dir.join("labels.json"), build_labels_json_scenes(scenes))?;
     std::fs::write(
         dir.join("index.html"),
-        build_html_multi(scenes, title, inputs),
+        build_html_multi(scenes, title, inputs, branding),
     )?;
     Ok(())
 }
@@ -884,16 +911,17 @@ pub fn generate_leaflet_content_multi(
     scenes: &[SceneView],
     title: &str,
     inputs: &[String],
+    branding: &Branding,
 ) -> (Vec<u8>, Vec<u8>) {
     (
-        build_html_multi(scenes, title, inputs).into_bytes(),
+        build_html_multi(scenes, title, inputs, branding).into_bytes(),
         build_labels_json_scenes(scenes).into_bytes(),
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_html, build_html_multi, hf_url_to_web, SceneView};
+    use super::{build_html, build_html_multi, hf_url_to_web, Branding, SceneView};
 
     fn scene(key: &str, world_w: u32, world_h: u32) -> SceneView {
         SceneView {
@@ -920,7 +948,7 @@ mod tests {
     #[test]
     fn multi_scene_viewer_pins_minzoom_and_upscales_crisply() {
         let scenes = [scene("summary", 560, 64), scene("cka", 366, 2949)];
-        let html = build_html_multi(&scenes, "t", &[]);
+        let html = build_html_multi(&scenes, "t", &[], &Branding::default());
         let n = html.matches("minZoom: -4,").count();
         assert!(
             n >= 2,
@@ -941,7 +969,20 @@ mod tests {
     #[test]
     fn tall_canvas_tile_layer_renders_below_pyramid_root() {
         // world_h/world_w = 2949/366 ≈ 8.06 → viewer_min_zoom = -ceil(log2) = -4.
-        let html = build_html(366, 2949, 2, 0, 11796, 1464, 512, "t", &[], "png", "avif");
+        let html = build_html(
+            366,
+            2949,
+            2,
+            0,
+            11796,
+            1464,
+            512,
+            "t",
+            &[],
+            "png",
+            "avif",
+            &Branding::default(),
+        );
         // One `minZoom: -4,` for the map options, one for the tile layer. The
         // detail layer (absent here, detail_depth = 0) would use its own value.
         let n = html.matches("minZoom: -4,").count();
@@ -953,6 +994,48 @@ mod tests {
             html.contains("image-rendering: pixelated"),
             "leaf tiles must upscale crisply past max_zoom",
         );
+    }
+
+    /// Custom branding must rebrand both the info-panel title link and the
+    /// leaflet attribution, in both the single- and multi-scene viewers, with
+    /// no leftover default arbvis URL.
+    #[test]
+    fn branding_overrides_repo_link_and_attribution() {
+        let branding = Branding::new(
+            "modelweightvis",
+            "https://github.com/znation/modelweightvis",
+        );
+
+        let single = build_html(
+            560,
+            64,
+            2,
+            0,
+            64,
+            560,
+            512,
+            "t",
+            &[],
+            "png",
+            "avif",
+            &branding,
+        );
+        let multi = build_html_multi(&[scene("summary", 560, 64)], "t", &[], &branding);
+
+        for html in [&single, &multi] {
+            assert!(
+                html.contains("https://github.com/znation/modelweightvis"),
+                "branded repo URL must appear",
+            );
+            assert!(
+                !html.contains("github.com/znation/arbvis"),
+                "no default arbvis URL should remain",
+            );
+            assert!(
+                html.contains(">modelweightvis</a>"),
+                "attribution must use the branded name",
+            );
+        }
     }
 
     #[test]

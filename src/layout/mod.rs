@@ -2,8 +2,8 @@
 //!
 //! arbvis ships exactly one layout: [`hilbert::HilbertLayout`], a global
 //! Hilbert curve over the concatenated byte stream of every source
-//! (1 px = 1 byte). Everything else — `ArchLayout`, MoE-diff layout,
-//! per-tensor regions, dtype-aware element decoding — lives in
+//! (1 px = 1 byte). Everything else — `ArchLayout`, the MoE summary / CKA
+//! layouts, per-tensor regions, dtype-aware element decoding — lives in
 //! `modelweightvis::layout` and registers via the `LayoutPlugin` trait.
 
 pub mod hilbert;
@@ -145,9 +145,9 @@ impl LayoutShape for hilbert::HilbertLayout {
 //
 // `select_layout` (below) iterates `registry.layouts` in descending priority
 // and returns the first plugin that's `applicable` and whose `build` returns
-// `Some`. The three built-in plugins cover the existing layout selection
-// tree: MoE-diff at priority 200, regular arch at 100, byte-Hilbert at the
-// `i32::MIN` floor.
+// `Some`. arbvis ships only the byte-Hilbert floor at `i32::MIN`; the
+// tensor-aware plugins modelweightvis registers (arch at 100, the MoE summary
+// / CKA layouts higher still) slot in above it.
 // ---------------------------------------------------------------------------
 
 /// Byte-Hilbert plugin — always applies, always builds. The floor of the
@@ -171,8 +171,9 @@ impl crate::registry::LayoutPlugin for HilbertLayoutPlugin {
     }
 }
 
-// `ArchLayoutPlugin` and `MoeDiffLayoutPlugin` live in `modelweightvis::layout`
-// (step 12e). The arbvis default registry no longer wires them up.
+// The tensor-aware layout plugins (`ArchLayoutPlugin`, the MoE summary / CKA
+// plugins) live in `modelweightvis::layout` (step 12e). The arbvis default
+// registry no longer wires them up.
 
 /// Build the layout for the given sources. Returns a byte-Hilbert layout for
 /// non-architectural runs.
@@ -213,7 +214,6 @@ pub fn select_layout(
     sorted.sort_by_key(|p| std::cmp::Reverse(p.priority()));
 
     let mut chosen: Option<Box<dyn LayoutShape>> = None;
-    let mut moe_applicable_but_failed = false;
     let mut arch_was_applicable = false;
     for plugin in &sorted {
         if !plugin.applicable(&ctx) {
@@ -226,9 +226,6 @@ pub fn select_layout(
                 break;
             }
             None => {
-                if pid == "moe-diff" {
-                    moe_applicable_but_failed = true;
-                }
                 if pid == "arch" {
                     arch_was_applicable = true;
                 }
@@ -239,9 +236,6 @@ pub fn select_layout(
         .expect("registry.layouts must include a floor plugin (HilbertLayoutPlugin at i32::MIN)");
 
     // Diagnostic logs preserve the original `select_layout` messages.
-    if moe_applicable_but_failed {
-        log::warn!("moe-diff sources present but layout build failed; falling back to hilbert");
-    }
     if matches!(mode, LayoutMode::Arch) && chosen.id() != "arch" {
         if arch_was_applicable {
             log::warn!(

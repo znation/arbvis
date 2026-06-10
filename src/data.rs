@@ -14,7 +14,7 @@ use crate::hf_url::{RemoteFileSpec, RemoteRepo};
 use crate::progress::{counter_style, multi};
 use crate::xet::{self, XetReader, XetTerm};
 
-/// Per-element delta encoding for `--diff` / `--moe-diff`. The CLI exposes
+/// Per-element delta encoding for `--diff`. The CLI exposes
 /// this via the `--diff-metric` flag. Tensor-aware backends interpret the
 /// value; arbvis core just plumbs it through `prepare_diff_sources` and
 /// the registered hooks.
@@ -245,8 +245,8 @@ pub enum SourceKind {
     },
     /// Source supplied by a [`CustomSource`] impl. The arbvis pipeline only
     /// touches its `open` / `byte_size` / `id`; everything else is up to the
-    /// impl. Today this carries `TensorDiffSource` for per-tensor `--diff` /
-    /// `--moe-diff` runs.
+    /// impl. Today this carries `TensorDiffSource` for per-tensor `--diff`
+    /// runs.
     Custom(Box<dyn CustomSource>),
 }
 
@@ -257,8 +257,8 @@ pub enum InputSpec {
 
 /// Typed extension map for [`Source`]. Holds at most one value per
 /// concrete type. Format/layout plugins use this to attach typed metadata
-/// (e.g. `ModelInfo` from a `FormatPlugin`, `MoeCell` from MoE-diff prep)
-/// without bolting extra fields onto `Source`.
+/// (e.g. `ModelInfo` from a `FormatPlugin`, or the per-panel tags the MoE
+/// summary / CKA preps attach) without bolting extra fields onto `Source`.
 #[derive(Default)]
 pub struct Extensions {
     map: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
@@ -304,10 +304,9 @@ pub struct Source {
     /// this source isn't xet-backed.
     pub xet_terms: Option<Vec<XetTerm>>,
     /// Typed per-source metadata that format and layout plugins consume.
-    /// Today this carries `ModelInfo` (safetensors header parse) and
-    /// `MoeCell` (the MoE-diff layout's per-cell tag); future format
-    /// plugins in `modelweightvis` will stuff their own per-source data
-    /// here.
+    /// Today this carries `ModelInfo` (safetensors header parse) and the
+    /// per-panel MoE summary / CKA tags; future format plugins in
+    /// `modelweightvis` will stuff their own per-source data here.
     pub extensions: Extensions,
 }
 
@@ -716,7 +715,7 @@ pub async fn materialize_http_sources(sources: &mut [Source]) -> anyhow::Result<
 /// Shared by every disk-backed materialisation path:
 /// [`materialize_http_sources`] (normal flow's `SourceKind::Http` swap) and
 /// [`materialize_remote_arcs`] (the `Arc<Data>`s buried inside
-/// `SourceKind::TensorDiff` for `--diff`/`--moe-diff`).
+/// `SourceKind::TensorDiff` for `--diff`).
 pub async fn download_specs_to_paths(
     specs: &[RemoteFileSpec],
     progress_label: &str,

@@ -29,8 +29,8 @@ pub use geometry::name_hue;
 pub use layout::{CanvasGeom, LayoutMode, LayoutShape};
 pub use registry::{
     DiffBuildCtx, DiffSourceBuilder, DirectoryTensorDiffPrep, FinetuneDetect, FormatPlugin,
-    LayoutBuildCtx, LayoutPlugin, MoeCkaPrep, MoeDiffPrep, MoeSummaryPrep, PrepareSourcesExtension,
-    Registry, RepoDiffPrep, SingleImageArchHook,
+    LayoutBuildCtx, LayoutPlugin, MoeCkaPrep, MoeSummaryPrep, PrepareSourcesExtension, Registry,
+    RepoDiffPrep, SingleImageArchHook,
 };
 pub use tiled::html::FileEntity;
 pub use tiled::leaf::{encode_tile, TileFormat, TILE};
@@ -61,27 +61,25 @@ const RESOLVE_CONCURRENCY: usize = 16;
 
 /// Runtime knobs that aren't part of `arbvis::Args` but still flow through
 /// `run()`. The byte-only arbvis CLI passes [`ModelOpts::default`] (no MoE
-/// diff, no finetune forcing, RMS metric, auto layout — which resolves to
+/// mode, no finetune forcing, RMS metric, auto layout — which resolves to
 /// Hilbert in a byte-only registry); modelweightvis's CLI shell builds a
 /// populated `ModelOpts` from its tensor-aware [`modelweightvis::Args`].
 ///
 /// These knobs all behave correctly with their defaults under arbvis-only
-/// registries — `moe_diff = None` is the inert "don't take the MoE branch"
-/// case, `layout_mode = Auto` picks the only registered layout (Hilbert),
-/// and `diff_metric` only matters when a tensor-aware diff builder is
-/// registered. So pure-arbvis callers don't have to reason about these.
+/// registries — `moe_summary = None` (and `moe_cka = None`) is the inert
+/// "don't take the MoE branch" case, `layout_mode = Auto` picks the only
+/// registered layout (Hilbert), and `diff_metric` only matters when a
+/// tensor-aware diff builder is registered. So pure-arbvis callers don't
+/// have to reason about these.
 #[derive(Clone, Debug)]
 pub struct ModelOpts {
-    /// `--moe-diff <MODEL>`: render an N×N expert-vs-expert diff matrix for
-    /// each MoE layer of a single model. `None` for the byte-only path.
-    pub moe_diff: Option<PathBuf>,
     /// `--moe-summary <MODEL>`: render per-expert scalar heatmaps for each
     /// MoE layer (one panel per FFN weight + router). `None` for the
-    /// byte-only path. Mutually exclusive with `moe_diff` at the CLI layer.
+    /// byte-only path.
     pub moe_summary: Option<PathBuf>,
     /// `--moe-cka <MODEL>`: render N×N linear-CKA similarity heatmaps,
     /// one panel per `(layer, weight)`. `None` for the byte-only path.
-    /// Mutually exclusive with `moe_diff` and `moe_summary`.
+    /// Mutually exclusive with `moe_summary` at the CLI layer.
     pub moe_cka: Option<PathBuf>,
     /// `--finetune`: force-treat a `--diff` as a finetune (orig-only
     /// tensors → grey crosshatch, mod-only → error). Exclusive with
@@ -91,7 +89,7 @@ pub struct ModelOpts {
     /// `--no-finetune`: force-treat a `--diff` as NOT a finetune.
     pub no_finetune: bool,
     /// `--diff-metric`: how per-element tensor deltas are encoded
-    /// (`--diff` / `--moe-diff`). Default is `Rms`.
+    /// (`--diff`). Default is `Rms`.
     pub diff_metric: DiffMetric,
     /// `--summary-stat`: which scalar to compute per expert for
     /// `--moe-summary`. Default is `Rms`.
@@ -139,7 +137,6 @@ pub enum ProbeSource {
 impl Default for ModelOpts {
     fn default() -> Self {
         Self {
-            moe_diff: None,
             moe_summary: None,
             moe_cka: None,
             finetune: false,
@@ -224,8 +221,9 @@ pub struct Args {
     #[arg(long, num_args = 2, value_names = ["ORIGINAL", "MODIFIED"])]
     diff: Option<Vec<PathBuf>>,
 
-    // `--moe-diff`, `--finetune` / `--no-finetune`, `--diff-metric`, and
-    // `--layout` previously lived on `Args` too, but they only do anything
+    // `--moe-summary` / `--moe-cka`, `--finetune` / `--no-finetune`,
+    // `--diff-metric`, and `--layout` previously lived on `Args` too (along
+    // with the retired `--moe-diff`), but they only do anything
     // when a tensor-aware backend is registered. They've moved to
     // `modelweightvis::Args` (which flattens this struct via clap and
     // converts its own fields into [`ModelOpts`]); arbvis-only callers
@@ -266,7 +264,8 @@ pub struct Args {
     /// `--stream` when input or output data won't fit on local disk.
     ///
     /// Applies to every flow that takes `hf://` inputs: the normal renderer,
-    /// `--diff` (when both sides are repo-level URLs), and `--moe-diff`.
+    /// `--diff` (when both sides are repo-level URLs), and the MoE modes
+    /// (`--moe-summary` / `--moe-cka`).
     /// Single-file / local-path inputs always resolve through
     /// `hf_url::resolve` + mmap and are unaffected by `--stream`.
     #[arg(long)]
@@ -277,7 +276,7 @@ pub struct Args {
 /// repeated-argument-list-of-doom that the call sites had before.
 struct RenderConfig {
     /// Display title for the viewer / single-image label. `Cow` so the
-    /// common default ("arbvis" / "arbvis diff" / "arbvis moe-diff") stays
+    /// common default ("arbvis" / "arbvis diff" / "arbvis moe-summary") stays
     /// as a `&'static str` borrow instead of allocating on every run.
     title: Cow<'static, str>,
     inputs: Vec<String>,
@@ -443,35 +442,6 @@ pub async fn run(args: Args, opts: ModelOpts, registry: registry::Registry) -> a
     let layout_mode = opts.layout_mode;
     let stream = args.stream;
     let show_xet_xorbs = args.show_xet_xorbs;
-
-    // --- MoE diff ---------------------------------------------------------
-    if let Some(moe_arg) = opts.moe_diff {
-        let hook = registry.moe_diff.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "--moe-diff requires a tensor-aware backend (no `MoeDiffPrep` registered); \
-                 use `modelweightvis` instead of `arbvis`"
-            )
-        })?;
-        let metric = opts.diff_metric;
-        let input = moe_arg.to_string_lossy().into_owned();
-        let inputs = vec![input.clone()];
-        let title = default_title(args.title, "arbvis moe-diff");
-        let (sources, total) = hook
-            .prepare(&input, metric, stream)
-            .await
-            .with_context(|| format!("--moe-diff {input}"))?;
-        let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
-        let cfg = RenderConfig {
-            title,
-            inputs,
-            diff_mode: true,
-            show_xet_xorbs: false,
-            layout_mode,
-            leaf_format,
-            pyramid_format,
-        };
-        return dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await;
-    }
 
     // --- MoE summary ------------------------------------------------------
     if let Some(summary_arg) = opts.moe_summary {
@@ -805,8 +775,8 @@ async fn resolve_input_sources(
 /// through the streaming path. Centralises the cascade that used to be
 /// duplicated three times in `run()`.
 ///
-/// All three preparation paths (normal `resolve_input_sources`, the file-
-/// pair / repo-level / moe `--diff`*, and `--moe-diff`) funnel through here,
+/// All preparation paths (normal `resolve_input_sources`, the file-pair /
+/// repo-level `--diff`, and the MoE-mode preps) funnel through here,
 /// which makes this the natural single place to run the registry's
 /// [`PrepareSourcesExtension`] cross-source enrichment pass. Each path's
 /// own preparer (e.g. `FormatPlugin::populate_*`) stuffs format-specific

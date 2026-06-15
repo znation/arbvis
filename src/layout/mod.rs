@@ -19,16 +19,23 @@ use crate::tiled::leaf::TILE;
 // produces it.
 
 /// User-facing layout selection.
+///
+/// arbvis itself only knows two layouts — `Auto` (let the registered layout
+/// plugins decide by priority) and `Hilbert` (the built-in byte curve).
+/// `Forced(id)` pins a specific layout by its [`LayoutShape::id`]; the id is
+/// opaque to arbvis (a downstream specialization supplies a `&'static str`
+/// naming one of its own registered layouts), and `select_layout` falls back
+/// to the priority floor when no registered layout with that id applies.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutMode {
-    /// Auto-select: architectural if every source is safetensors AND
-    /// transformer-style names are detected; otherwise hilbert.
+    /// Auto-select: the highest-priority applicable [`LayoutPlugin`] wins,
+    /// falling back to the byte-Hilbert floor.
     #[default]
     Auto,
-    /// Force architectural (structure-aware) layout. Falls back to hilbert if
-    /// no source is safetensors.
-    Arch,
-    /// Force the legacy global-Hilbert layout.
+    /// Force a specific registered layout by id (opaque to arbvis). Falls back
+    /// to hilbert if no layout with that id applies to the inputs.
+    Forced(&'static str),
+    /// Force the byte-only global-Hilbert layout.
     Hilbert,
 }
 
@@ -213,8 +220,15 @@ pub fn select_layout(
         registry.layouts.iter().collect();
     sorted.sort_by_key(|p| std::cmp::Reverse(p.priority()));
 
+    // A `Forced(id)` request that doesn't end up winning gets a diagnostic
+    // below; track whether the forced plugin was applicable-but-couldn't-build
+    // vs. never applicable, so the message can distinguish the two.
+    let forced_id = match mode {
+        LayoutMode::Forced(id) => Some(id),
+        _ => None,
+    };
     let mut chosen: Option<Box<dyn LayoutShape>> = None;
-    let mut arch_was_applicable = false;
+    let mut forced_was_applicable = false;
     for plugin in &sorted {
         if !plugin.applicable(&ctx) {
             continue;
@@ -226,8 +240,8 @@ pub fn select_layout(
                 break;
             }
             None => {
-                if pid == "arch" {
-                    arch_was_applicable = true;
+                if Some(pid) == forced_id {
+                    forced_was_applicable = true;
                 }
             }
         }
@@ -235,16 +249,21 @@ pub fn select_layout(
     let chosen = chosen
         .expect("registry.layouts must include a floor plugin (HilbertLayoutPlugin at i32::MIN)");
 
-    // Diagnostic logs preserve the original `select_layout` messages.
-    if matches!(mode, LayoutMode::Arch) && chosen.id() != "arch" {
-        if arch_was_applicable {
-            log::warn!(
-                "--layout arch requested but no recognisable structure; falling back to hilbert"
-            );
-        } else {
-            log::warn!(
-                "--layout arch requested but no input carries safetensors data; falling back to hilbert"
-            );
+    if let Some(id) = forced_id {
+        if chosen.id() != id {
+            if forced_was_applicable {
+                log::warn!(
+                    "--layout {id} requested but it could not build for these inputs; \
+                     falling back to {}",
+                    chosen.id()
+                );
+            } else {
+                log::warn!(
+                    "--layout {id} requested but no registered layout matched; \
+                     falling back to {}",
+                    chosen.id()
+                );
+            }
         }
     }
 

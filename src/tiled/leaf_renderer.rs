@@ -91,9 +91,9 @@ pub trait LeafLoader: Send + Sync {
 
     /// Whether this loader will perform I/O for the given context. The
     /// pipeline uses this to decide whether to acquire an HTTP throttle
-    /// permit and record success on `Ok`. Byte-Hilbert returns `false` for
-    /// `LeafMode::Dtype` (positional-only, no bytes needed); arch always
-    /// fetches.
+    /// permit and record success on `Ok`. A positional-only loader (one that
+    /// colors purely from tile coordinates, no source bytes) returns `false`
+    /// to skip the fetch and the permit it would consume.
     fn needs_io(&self, ctx: &LoadCtx<'_>) -> bool;
 
     fn load<'a>(&'a self, ctx: &'a LoadCtx<'a>) -> BoxFuture<'a, anyhow::Result<LoadedTile>>;
@@ -158,9 +158,10 @@ impl LeafLoader for HilbertBytesLoader {
     }
 
     fn needs_io(&self, ctx: &LoadCtx<'_>) -> bool {
-        // `LeafMode::Dtype` colors purely from positional dtype ranges, so the
-        // Hilbert tile buffer is unused — skip the byte fetch entirely (and
-        // the throttle permit it would consume).
+        // Every byte-Hilbert mode reads source bytes into the tile buffer, so
+        // this is effectively always true today; routed through `needs_bytes`
+        // so a future positional-only mode can opt out of the fetch (and the
+        // throttle permit it would consume) without touching this loader.
         ctx.mode.needs_bytes()
     }
 

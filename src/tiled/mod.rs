@@ -23,9 +23,8 @@ use crate::progress::{counter_style, multi, queue_style, status_style};
 use crate::throttle::{Throttle, MAX_FETCH_WORKERS};
 use crate::tiled::html::FileEntity;
 use crate::tiled::leaf::{
-    render_leaf_tile_diff, render_leaf_tile_dtype, render_leaf_tile_from_buf,
-    render_leaf_tile_xet_dtype_from_buf, render_leaf_tile_xet_from_buf, TileFormat, TILE,
-    TILE_LOG2, TILE_PIXELS,
+    render_leaf_tile_diff, render_leaf_tile_from_buf, render_leaf_tile_xet_from_buf, TileFormat,
+    TILE, TILE_LOG2, TILE_PIXELS,
 };
 use crate::tiled::leaf_renderer::{LeafRegistry, LeafTile, LoadCtx, RenderCtx};
 use crate::tiled::pyramid_accum::{LocalFileSink, PyramidAccumulator};
@@ -194,9 +193,6 @@ pub enum LeafMode {
         xorb_ranges: Arc<Vec<(u64, u64, u8)>>,
         tableau: Arc<[image::Rgb<u8>; 20]>,
     },
-    Dtype {
-        ranges: Arc<Vec<(u64, u64, image::Rgb<u8>)>>,
-    },
     /// Diff mode: byte → color via the signed-diff LUT, *plus* a crosshatch
     /// overlay for byte ranges that map to `UnmatchedRegion` sources (tensors
     /// or files that exist on only one side). `fills` is sorted by start
@@ -210,14 +206,6 @@ pub enum LeafMode {
         fills: Arc<Vec<(u64, u64, DiffFill)>>,
         tints: Arc<Vec<(u64, u64, DiffFill)>>,
     },
-    /// Combined xet + safetensors: blend dtype hue with xorb tableau hue,
-    /// modulated by byte intensity. Produces a single image where both tensor
-    /// boundaries and xorb boundaries are visible.
-    XetDtype {
-        xorb_ranges: Arc<Vec<(u64, u64, u8)>>,
-        tableau: Arc<[image::Rgb<u8>; 20]>,
-        dtype_ranges: Arc<Vec<(u64, u64, image::Rgb<u8>)>>,
-    },
 }
 
 impl LeafMode {
@@ -225,16 +213,13 @@ impl LeafMode {
     fn needs_bytes(&self) -> bool {
         matches!(
             self,
-            LeafMode::Plain { .. }
-                | LeafMode::Xet { .. }
-                | LeafMode::Diff { .. }
-                | LeafMode::XetDtype { .. }
+            LeafMode::Plain { .. } | LeafMode::Xet { .. } | LeafMode::Diff { .. }
         )
     }
 
     /// Whether this mode produces leaves with ≤256 distinct colors, making
     /// indexed-PNG the smallest lossless option. Plain mode draws from a
-    /// fixed 256-entry LUT; Dtype mode uses a short list of dtype colors.
+    /// fixed 256-entry LUT.
     /// Xet mode multiplies the byte LUT by 20 Tableau colors per xorb, which
     /// can exceed 256 distinct colors in a single tile — indexed-PNG would
     /// fall back to truecolor in that case, so we route Xet through AVIF
@@ -242,13 +227,9 @@ impl LeafMode {
     /// Diff mode adds at most 6 crosshatch colors (3 fills × 2 shades) on top
     /// of the 256-entry diff LUT — usually still ≤256 distinct colors per
     /// tile in practice, and the encoder falls back to truecolor when it
-    /// isn't. XetDtype crosses dtype hues with tableau hues per xorb, so it's
-    /// high-color.
+    /// isn't.
     fn is_palette_safe(&self) -> bool {
-        matches!(
-            self,
-            LeafMode::Plain { .. } | LeafMode::Dtype { .. } | LeafMode::Diff { .. }
-        )
+        matches!(self, LeafMode::Plain { .. } | LeafMode::Diff { .. })
     }
 }
 
@@ -579,12 +560,10 @@ pub(super) async fn build_tile_plan(
         arr
     };
 
-    // Dtype-aware overlay (per-tensor color ranges + per-tensor entity
-    // labels for safetensors in byte-Hilbert mode) lives in
-    // `modelweightvis` now. arbvis byte-Hilbert renders pure byte-LUT;
-    // tensor-aware visualisation goes through the arch layout instead.
-    let dtype_mode = false;
-    let combined_dtype_ranges: Vec<(u64, u64, image::Rgb<u8>)> = vec![];
+    // Per-element overlays (per-region color ranges + per-region entity
+    // labels) for structure-aware specializations live downstream now —
+    // they go through a layout plugin's own loader/renderer. arbvis
+    // byte-Hilbert renders the pure byte-LUT.
 
     // File-level entity overlay (per-source rect + label, no tensor
     // awareness). modelweightvis's arch layout supplies its own per-tensor
@@ -665,11 +644,10 @@ pub(super) async fn build_tile_plan(
             (Vec::new(), Vec::new())
         };
 
-    // `XetDtype` and `Dtype` modes mix tensor color ranges with the byte/xet
-    // overlay. arbvis byte-only has no tensor info, so we drop those modes
-    // here. modelweightvis re-enables them when its `FormatPlugin` populates
-    // `Source.extensions` and the arch layout takes over.
-    let _ = (dtype_mode, combined_dtype_ranges);
+    // arbvis byte-Hilbert renders one of three modes: xet (xorb-colored),
+    // diff (signed-delta LUT + crosshatch), or plain byte-LUT. Structure-aware
+    // specializations don't reach this path — they ship their own layout plugin
+    // with a matching leaf loader/renderer.
     let mode = if xet_mode {
         LeafMode::Xet {
             pixel_lut: pixel_lut.clone(),
@@ -929,8 +907,8 @@ where
                     source_data: &source_data,
                     cumulative_offsets: &cumulative_offsets,
                 };
-                // Throttle only when the loader will actually do I/O: the
-                // Hilbert loader skips byte fetches in `LeafMode::Dtype`, and
+                // Throttle only when the loader will actually do I/O: a
+                // positional-only loader can skip byte fetches entirely, and
                 // we don't want to hold a permit (or call `record_success`)
                 // for a no-op load.
                 let do_io = loader.needs_io(&ctx);
@@ -1211,9 +1189,6 @@ pub(super) fn render_one(
                 fmt,
             )?
         }
-        LeafMode::Dtype { ranges } => {
-            render_leaf_tile_dtype(tx, ty, kh, height_tiles, square_pixels, total, ranges, fmt)?
-        }
         LeafMode::Diff {
             pixel_lut,
             plain_lut,
@@ -1236,26 +1211,6 @@ pub(super) fn render_one(
                 fmt,
             )?
         }
-        LeafMode::XetDtype {
-            xorb_ranges,
-            tableau,
-            dtype_ranges,
-        } => {
-            let buf = tile_buf.as_deref().expect("xet+dtype mode needs tile_buf");
-            render_leaf_tile_xet_dtype_from_buf(
-                tx,
-                ty,
-                kh,
-                height_tiles,
-                square_pixels,
-                total,
-                buf,
-                xorb_ranges,
-                tableau,
-                dtype_ranges,
-                fmt,
-            )?
-        }
     };
     Ok(EncodedTile {
         tx,
@@ -1270,7 +1225,7 @@ pub(super) fn render_one(
 
 /// Pick the actual leaf tile format given the user's request and the render
 /// mode. When the user asked for AVIF and the mode produces ≤256 distinct
-/// colors per tile (Plain / Dtype), indexed-PNG beats lossless AVIF
+/// colors per tile (Plain), indexed-PNG beats lossless AVIF
 /// substantially (AV1 isn't tuned for palette content). Xet-mode tiles can
 /// exceed 256 colors so they stay on AVIF; truecolor PNG passes through
 /// unchanged.

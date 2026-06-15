@@ -14,34 +14,6 @@ use crate::hf_url::{RemoteFileSpec, RemoteRepo};
 use crate::progress::{counter_style, multi};
 use crate::xet::{self, XetReader, XetTerm};
 
-/// Per-element delta encoding for `--diff`. The CLI exposes
-/// this via the `--diff-metric` flag. Tensor-aware backends interpret the
-/// value; arbvis core just plumbs it through `prepare_diff_sources` and
-/// the registered hooks.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum DiffMetric {
-    #[default]
-    Rms,
-    AbsLog,
-    Exact,
-}
-
-/// Per-tensor scalar for the `--moe` summary scene. The CLI exposes this via
-/// the `--summary-stat` flag. Tensor-aware backends interpret the value;
-/// arbvis core just plumbs it through `MoeScenesPrep::prepare`.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum SummaryStat {
-    /// √(mean(x²)). Default — comparable across tensors of different scale.
-    #[default]
-    Rms,
-    /// √(sum(x²)). Honest about total magnitude; varies with tensor size.
-    Frobenius,
-    /// mean(|x|). Stable, dominated by typical-magnitude entries.
-    MeanAbs,
-    /// Fraction of entries with |x| < ε. Surfaces dead / near-dead experts.
-    Sparsity,
-}
-
 /// Crosshatch fill color for `UnmatchedRegion` / `OneSidedRange` sources —
 /// the diff path uses these to mark one-side-only spans visually.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -985,20 +957,21 @@ impl crate::registry::DiffSourceBuilder for PlainBytesDiffBuilder {
 
 /// Build diff sources from two files or two directories.
 ///
-/// For files: dispatched through `registry.diffs` by descending priority —
-/// `TensorDiffBuilder` (300) → `JsonDiffBuilder` (200) → `PlainBytesDiffBuilder`
-/// (0). The plain-byte floor always builds for a same-sized pair, so
-/// iteration terminates with a valid diff for any well-formed input.
+/// For files: dispatched through `registry.diffs` by descending priority. The
+/// `PlainBytesDiffBuilder` floor always builds for a same-sized pair, so
+/// iteration terminates with a valid diff for any well-formed input. A
+/// specialization can register a higher-priority builder (e.g. a format-aware
+/// element diff).
 ///
-/// For directories: files are matched by relative path; pairs with mismatched
-/// sizes or no counterpart on the other side are skipped with a warning. The
-/// safetensors sub-tree is matched by tensor name across both sides. This
-/// branch is still inline pending step 12.
+/// For directories: every file is byte-diffed by relative path via
+/// [`byte_directory_diff`]. A specialization that diffs some files itself (e.g.
+/// tensor matching across shards) runs its own [`crate::SourceProvider`] and
+/// calls `byte_directory_diff` directly with a `skip` predicate for the
+/// remainder.
 pub async fn prepare_diff_sources(
     original: &Path,
     modified: &Path,
     is_finetune: bool,
-    metric: DiffMetric,
     registry: &crate::registry::Registry,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     let orig_is_file = original.is_file();
@@ -1006,24 +979,11 @@ pub async fn prepare_diff_sources(
     let orig_is_dir = original.is_dir();
     let mod_is_dir = modified.is_dir();
 
-    // Whether a file should be diffed via the tensor-aware (modelweightvis-
-    // registered) path. arbvis itself doesn't know which extensions are
-    // tensor formats — the `DirectoryTensorDiffPrep` hook says. When no
-    // hook is registered, the directory branch falls through to pure
-    // byte-diff for every file (no tensor matching).
-    let is_tensor = |p: &Path| -> bool {
-        registry
-            .dir_tensor_diff
-            .as_ref()
-            .is_some_and(|h| h.is_tensor_file(p))
-    };
-
     if orig_is_file && mod_is_file {
         let ctx = crate::registry::DiffBuildCtx {
             original,
             modified,
             is_finetune,
-            metric,
         };
         let mut sorted: Vec<&Arc<dyn crate::registry::DiffSourceBuilder>> =
             registry.diffs.iter().collect();
@@ -1041,188 +1001,10 @@ pub async fn prepare_diff_sources(
     }
 
     if orig_is_dir && mod_is_dir {
-        let orig_files = collect_files_recursive(original);
-        let mod_files = collect_files_recursive(modified);
-
-        let mut sources = Vec::new();
-        let mut total = 0u64;
-
-        // Tensor files: hand off to the registered `DirectoryTensorDiffPrep`
-        // hook (modelweightvis-side). This handles sharded model layouts,
-        // tensor-name matching across files, etc. arbvis core only knows
-        // how to byte-diff files matched by relative path.
-        let orig_tensor: Vec<PathBuf> = orig_files
-            .iter()
-            .filter(|p| is_tensor(p))
-            .cloned()
-            .collect();
-        let mod_tensor: Vec<PathBuf> = mod_files.iter().filter(|p| is_tensor(p)).cloned().collect();
-        if !orig_tensor.is_empty() || !mod_tensor.is_empty() {
-            if let Some(hook) = registry.dir_tensor_diff.as_ref() {
-                match hook
-                    .prepare(&orig_tensor, &mod_tensor, is_finetune, metric)
-                    .await
-                {
-                    Ok((mut tensor_sources, bytes)) => {
-                        let base_idx = sources.len();
-                        for s in &mut tensor_sources {
-                            s.file_idx += base_idx;
-                        }
-                        sources.extend(tensor_sources);
-                        total += bytes;
-                    }
-                    Err(e) => log::warn!("tensor-aware directory diff failed: {e} — skipping"),
-                }
-            }
-            // If no hook, the tensor files fall through to the byte-diff
-            // path below (matched by relative path like any other file).
-        }
-
-        // Non-tensor files (or all files when no `DirectoryTensorDiffPrep`
-        // is registered): match by relative path. Same-size pairs become a
-        // byte diff; different-size or single-side files become crosshatched
-        // unmatched regions so they remain visible.
-        let orig_fill_kind = if is_finetune {
-            DiffFill::Grey
-        } else {
-            DiffFill::Red
-        };
-        let orig_map: HashMap<PathBuf, PathBuf> = orig_files
-            .iter()
-            .filter(|p| !is_tensor(p))
-            .filter_map(|p| {
-                p.strip_prefix(original)
-                    .ok()
-                    .map(|rel| (rel.to_path_buf(), p.clone()))
-            })
-            .collect();
-        let mod_map: HashMap<PathBuf, PathBuf> = mod_files
-            .iter()
-            .filter(|p| !is_tensor(p))
-            .filter_map(|p| {
-                p.strip_prefix(modified)
-                    .ok()
-                    .map(|rel| (rel.to_path_buf(), p.clone()))
-            })
-            .collect();
-
-        let mut mod_only_keys: Vec<&PathBuf> = mod_map
-            .keys()
-            .filter(|k| !orig_map.contains_key(*k))
-            .collect();
-        mod_only_keys.sort();
-        if is_finetune && !mod_only_keys.is_empty() {
-            let names: Vec<String> = mod_only_keys
-                .iter()
-                .map(|rel| modified.join(rel).display().to_string())
-                .collect();
-            log::warn!(
-                "--diff --finetune: modified side has {} file(s) with no counterpart on the \
-                 original/base side — rendering as green crosshatch: {}",
-                names.len(),
-                names.join(", ")
-            );
-        }
-
-        let mut sorted_keys: Vec<&PathBuf> = orig_map.keys().collect();
-        sorted_keys.sort();
-
-        for rel in sorted_keys {
-            let orig_abs = &orig_map[rel];
-            let size_o = match std::fs::metadata(orig_abs) {
-                Ok(m) => m.len(),
-                Err(e) => {
-                    log::warn!("{}: {} — skipping", orig_abs.display(), e);
-                    continue;
-                }
-            };
-            match mod_map.get(rel) {
-                None => {
-                    if size_o == 0 {
-                        continue;
-                    }
-                    sources.push(Source {
-                        file_idx: sources.len(),
-                        kind: SourceKind::UnmatchedRegion {
-                            fill: orig_fill_kind,
-                        },
-                        byte_size: size_o,
-                        name_override: Some(format!("[only in original] {}", rel.display())),
-                        xet_terms: None,
-                        extensions: Extensions::default(),
-                    });
-                    total += size_o;
-                }
-                Some(mod_abs) => {
-                    let size_m = match std::fs::metadata(mod_abs) {
-                        Ok(m) => m.len(),
-                        Err(e) => {
-                            log::warn!("{}: {} — skipping", mod_abs.display(), e);
-                            continue;
-                        }
-                    };
-                    if size_o != size_m {
-                        if is_finetune {
-                            log::warn!(
-                                "--diff --finetune: size mismatch ({} vs {} bytes) for {} — \
-                                 byte-diffing with zero-padding on the shorter side",
-                                size_o,
-                                size_m,
-                                rel.display()
-                            );
-                        } else {
-                            log::warn!(
-                                "size mismatch ({} vs {} bytes) for {} — byte-diffing with zero-padding",
-                                size_o, size_m, rel.display()
-                            );
-                        }
-                    }
-                    let max_size = size_o.max(size_m);
-                    if max_size == 0 {
-                        continue;
-                    }
-                    sources.push(Source {
-                        file_idx: sources.len(),
-                        kind: SourceKind::Diff {
-                            original: orig_abs.clone(),
-                            modified: mod_abs.clone(),
-                        },
-                        byte_size: max_size,
-                        name_override: None,
-                        xet_terms: None,
-                        extensions: Extensions::default(),
-                    });
-                    total += max_size;
-                }
-            }
-        }
-
-        // mod-only files (non-finetune case — finetune bailed earlier).
-        for rel in &mod_only_keys {
-            let mod_abs = &mod_map[*rel];
-            let size_m = match std::fs::metadata(mod_abs) {
-                Ok(m) => m.len(),
-                Err(e) => {
-                    log::warn!("{}: {} — skipping", mod_abs.display(), e);
-                    continue;
-                }
-            };
-            if size_m == 0 {
-                continue;
-            }
-            sources.push(Source {
-                file_idx: sources.len(),
-                kind: SourceKind::UnmatchedRegion {
-                    fill: DiffFill::Green,
-                },
-                byte_size: size_m,
-                name_override: Some(format!("[only in modified] {}", rel.display())),
-                xet_terms: None,
-                extensions: Extensions::default(),
-            });
-            total += size_m;
-        }
-
+        // arbvis byte-only diffs every file by relative path. A specialization
+        // that handles some files itself runs its own provider and calls
+        // `byte_directory_diff` with a `skip` predicate for the remainder.
+        let (sources, total) = byte_directory_diff(original, modified, is_finetune, &|_| false)?;
         if sources.is_empty() {
             anyhow::bail!("--diff: no matching file pairs found between the two directories");
         }
@@ -1246,4 +1028,177 @@ pub async fn prepare_diff_sources(
             "missing path"
         }
     );
+}
+
+/// Byte-diff two directory trees, matching files by relative path. Same-size
+/// pairs become a `SourceKind::Diff`; size-mismatched pairs are byte-diffed
+/// with zero-padding; files present on only one side become crosshatched
+/// `UnmatchedRegion`s so they stay visible.
+///
+/// `skip` excludes entries the caller handles itself (e.g. a specialization's
+/// own format-aware diff over the same directory) — pass `&|_| false` to diff
+/// every file. `is_finetune` tunes crosshatch semantics: original-only files
+/// render grey (expected drops) rather than red, and mod-only files are warned
+/// about and rendered green.
+///
+/// Returns a possibly-empty `(sources, total)`; the caller decides whether an
+/// empty result is an error, so a specialization can append the non-skipped
+/// remainder to a larger source list (offsetting `file_idx` as needed).
+pub fn byte_directory_diff(
+    original: &Path,
+    modified: &Path,
+    is_finetune: bool,
+    skip: &dyn Fn(&Path) -> bool,
+) -> anyhow::Result<(Vec<Source>, u64)> {
+    let orig_files = collect_files_recursive(original);
+    let mod_files = collect_files_recursive(modified);
+
+    let mut sources = Vec::new();
+    let mut total = 0u64;
+
+    // Match by relative path. Same-size pairs become a byte diff; different-size
+    // or single-side files become crosshatched unmatched regions so they remain
+    // visible.
+    let orig_fill_kind = if is_finetune {
+        DiffFill::Grey
+    } else {
+        DiffFill::Red
+    };
+    let orig_map: HashMap<PathBuf, PathBuf> = orig_files
+        .iter()
+        .filter(|p| !skip(p))
+        .filter_map(|p| {
+            p.strip_prefix(original)
+                .ok()
+                .map(|rel| (rel.to_path_buf(), p.clone()))
+        })
+        .collect();
+    let mod_map: HashMap<PathBuf, PathBuf> = mod_files
+        .iter()
+        .filter(|p| !skip(p))
+        .filter_map(|p| {
+            p.strip_prefix(modified)
+                .ok()
+                .map(|rel| (rel.to_path_buf(), p.clone()))
+        })
+        .collect();
+
+    let mut mod_only_keys: Vec<&PathBuf> = mod_map
+        .keys()
+        .filter(|k| !orig_map.contains_key(*k))
+        .collect();
+    mod_only_keys.sort();
+    if is_finetune && !mod_only_keys.is_empty() {
+        let names: Vec<String> = mod_only_keys
+            .iter()
+            .map(|rel| modified.join(rel).display().to_string())
+            .collect();
+        log::warn!(
+            "--diff --finetune: modified side has {} file(s) with no counterpart on the \
+                 original/base side — rendering as green crosshatch: {}",
+            names.len(),
+            names.join(", ")
+        );
+    }
+
+    let mut sorted_keys: Vec<&PathBuf> = orig_map.keys().collect();
+    sorted_keys.sort();
+
+    for rel in sorted_keys {
+        let orig_abs = &orig_map[rel];
+        let size_o = match std::fs::metadata(orig_abs) {
+            Ok(m) => m.len(),
+            Err(e) => {
+                log::warn!("{}: {} — skipping", orig_abs.display(), e);
+                continue;
+            }
+        };
+        match mod_map.get(rel) {
+            None => {
+                if size_o == 0 {
+                    continue;
+                }
+                sources.push(Source {
+                    file_idx: sources.len(),
+                    kind: SourceKind::UnmatchedRegion {
+                        fill: orig_fill_kind,
+                    },
+                    byte_size: size_o,
+                    name_override: Some(format!("[only in original] {}", rel.display())),
+                    xet_terms: None,
+                    extensions: Extensions::default(),
+                });
+                total += size_o;
+            }
+            Some(mod_abs) => {
+                let size_m = match std::fs::metadata(mod_abs) {
+                    Ok(m) => m.len(),
+                    Err(e) => {
+                        log::warn!("{}: {} — skipping", mod_abs.display(), e);
+                        continue;
+                    }
+                };
+                if size_o != size_m {
+                    if is_finetune {
+                        log::warn!(
+                            "--diff --finetune: size mismatch ({} vs {} bytes) for {} — \
+                                 byte-diffing with zero-padding on the shorter side",
+                            size_o,
+                            size_m,
+                            rel.display()
+                        );
+                    } else {
+                        log::warn!(
+                                "size mismatch ({} vs {} bytes) for {} — byte-diffing with zero-padding",
+                                size_o, size_m, rel.display()
+                            );
+                    }
+                }
+                let max_size = size_o.max(size_m);
+                if max_size == 0 {
+                    continue;
+                }
+                sources.push(Source {
+                    file_idx: sources.len(),
+                    kind: SourceKind::Diff {
+                        original: orig_abs.clone(),
+                        modified: mod_abs.clone(),
+                    },
+                    byte_size: max_size,
+                    name_override: None,
+                    xet_terms: None,
+                    extensions: Extensions::default(),
+                });
+                total += max_size;
+            }
+        }
+    }
+
+    // mod-only files (non-finetune case — finetune bailed earlier).
+    for rel in &mod_only_keys {
+        let mod_abs = &mod_map[*rel];
+        let size_m = match std::fs::metadata(mod_abs) {
+            Ok(m) => m.len(),
+            Err(e) => {
+                log::warn!("{}: {} — skipping", mod_abs.display(), e);
+                continue;
+            }
+        };
+        if size_m == 0 {
+            continue;
+        }
+        sources.push(Source {
+            file_idx: sources.len(),
+            kind: SourceKind::UnmatchedRegion {
+                fill: DiffFill::Green,
+            },
+            byte_size: size_m,
+            name_override: Some(format!("[only in modified] {}", rel.display())),
+            xet_terms: None,
+            extensions: Extensions::default(),
+        });
+        total += size_m;
+    }
+
+    Ok((sources, total))
 }

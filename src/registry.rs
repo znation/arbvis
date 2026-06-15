@@ -1,30 +1,30 @@
 //! Pluggable surface threaded through [`crate::run`].
 //!
-//! After step 12 + the heavy-dep relocation, arbvis is the byte-only
-//! foundation: it owns the tile pipeline, byte-Hilbert layout, JSON-diff,
-//! plain-byte diff, HF I/O, and Space deploy. Everything model-aware
-//! (tensor-format parsing, architectural / MoE layouts, tensor-diff
-//! source prep, finetune auto-detection, the arch single-image renderer,
-//! the arch tile loader/renderer) lives in `modelweightvis` and registers
-//! against this surface.
+//! arbvis is the generic byte-only foundation: it owns the tile pipeline,
+//! byte-Hilbert layout, JSON-diff, plain-byte diff, HF I/O, and Space deploy.
+//! Everything specialization-specific (a domain's format parsing, structured
+//! layouts, custom source preparation, single-image rendering, custom tile
+//! loaders/renderers) is registered against this surface by a downstream crate
+//! — `modelweightvis` (tensor/model-weight viz) is one such specialization.
 //!
-//! The hooks are split into two families:
-//!   - **Vec slots** (`formats`, `layouts`, `diffs`): multiple plugins,
-//!     iterated/priority-ordered. Always present (empty by default).
-//!   - **Option slots** (`moe`, `repo_diff`, `dir_tensor_diff`,
-//!     `finetune_detect`, `single_image_arch`): single tap point per CLI
-//!     dispatch. When `None`, the corresponding feature errors out (or
-//!     defaults) and the rest of arbvis still works.
+//! The extension points come in three families:
+//!   - **Vec slots** (`formats`, `layouts`, `diffs`, `providers`): multiple
+//!     plugins, iterated by descending priority. The byte built-ins are always
+//!     present; a downstream pushes higher-priority entries.
+//!   - **Id-keyed maps** (`leaf`, `single_renderers`): a per-layout-id
+//!     loader/renderer registered by a downstream layout plugin.
+//!   - **Option slots** (`prepare_sources_extension`): a single optional tap
+//!     point. When `None` the feature no-ops and the rest of arbvis still works.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 
-use crate::data::{Data, DiffMetric, Extensions, Source, SummaryStat};
-use crate::hf_url::RemoteFileSpec;
+use crate::data::{Data, Extensions, Source};
 use crate::layout::{LayoutMode, LayoutShape};
 use crate::tiled::leaf_renderer::LeafRegistry;
 
@@ -79,7 +79,6 @@ pub struct DiffBuildCtx<'a> {
     pub original: &'a Path,
     pub modified: &'a Path,
     pub is_finetune: bool,
-    pub metric: DiffMetric,
 }
 
 /// Builds diff sources for a file-pair `--diff` run when the input pair
@@ -93,85 +92,96 @@ pub trait DiffSourceBuilder: Send + Sync {
         -> anyhow::Result<Option<(Vec<Source>, u64)>>;
 }
 
-/// Hooks the `--moe` CLI flag's source preparation. arbvis errors out when
-/// the flag is passed but no `MoeScenesPrep` is registered (the byte-only
-/// `arbvis` binary has none; `modelweightvis` registers the tensor-aware impl).
-#[async_trait(?Send)]
-pub trait MoeScenesPrep: Send + Sync {
-    /// Build every MoE scene for `input` in a single pass — loading the
-    /// model once — and return their `Source`s concatenated into one list.
-    ///
-    /// Each returned `Source` carries a [`crate::SceneTag`] assigning it to
-    /// a scene (the canonical impl emits a `"summary"` scene of per-expert
-    /// scalar heatmaps and a `"cka"` scene of N×N linear-CKA matrices); the
-    /// tiler partitions on that tag into independent pyramids and the viewer
-    /// renders a tab switcher.
-    ///
-    /// `stat` configures the summary scene's per-expert scalar; `sample` is
-    /// the CKA scene's random-projection dimension (smaller = faster). When
-    /// `probe.enabled`, the impl runs a routing-faithful forward and attaches
-    /// a behavioral panel to each scene (routing frequency to summary,
-    /// co-activation to CKA).
-    ///
-    /// `?Send`: the canonical impl in `modelweightvis::hooks` carries futures
-    /// whose internal lifetimes confuse the rustc HRTB check that
-    /// `#[async_trait]`'s `+ Send` bound triggers. The CLI dispatch never
-    /// spawns this future across threads — only `.await`s it locally — so
-    /// dropping the Send requirement is safe.
-    async fn prepare(
-        &self,
-        input: &str,
-        stat: SummaryStat,
-        sample: u32,
-        stream: bool,
-        probe: &crate::ProbeOpts,
-    ) -> anyhow::Result<(Vec<Source>, u64)>;
+/// Coarse output-destination shape — enough for a [`SourceProvider`] to gate
+/// on without seeing the tempdir / upload internals of arbvis's `OutputDest`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DestKind {
+    Window,
+    SingleImage,
+    Tiles,
 }
 
-/// Hooks repo-level `--diff` (both args are `hf://owner/repo` URLs).
-/// arbvis errors out when this case is hit and no `RepoDiffPrep` is
-/// registered.
-///
-/// `?Send`: see [`MoeScenesPrep`].
-#[async_trait(?Send)]
-pub trait RepoDiffPrep: Send + Sync {
-    async fn prepare(
-        &self,
-        orig_specs: &[(String, RemoteFileSpec)],
-        mod_specs: &[(String, RemoteFileSpec)],
-        is_finetune: bool,
-        metric: DiffMetric,
-        stream: bool,
-    ) -> anyhow::Result<(Vec<Source>, u64)>;
+/// The two sides of a `--diff`, exactly as the user wrote them (a local path
+/// or an `hf://` URL). Kept as an ordered pair — the diff LUT and crosshatch
+/// direction depend on (original, modified) order — and deliberately neutral:
+/// arbvis core no longer knows or cares whether the two sides are tensors.
+pub struct DiffPair<'a> {
+    pub original: &'a str,
+    pub modified: &'a str,
 }
 
-/// Hooks the tensor-files-in-directory branch of `--diff <dir> <dir>`.
-/// The non-tensor files are still handled by arbvis's generic byte-diff
-/// + crosshatch path.
-///
-/// `?Send`: see [`MoeScenesPrep`].
-#[async_trait(?Send)]
-pub trait DirectoryTensorDiffPrep: Send + Sync {
-    /// Which directory entries this preparer takes responsibility for.
-    /// arbvis partitions directory contents on this predicate before
-    /// invoking `prepare`.
-    fn is_tensor_file(&self, p: &Path) -> bool;
-    async fn prepare(
-        &self,
-        orig_files: &[PathBuf],
-        mod_files: &[PathBuf],
-        is_finetune: bool,
-        metric: DiffMetric,
-    ) -> anyhow::Result<(Vec<Source>, u64)>;
+/// The parsed, neutral description of what the user asked arbvis to render.
+/// Built once in [`crate::run`] and passed to every [`SourceProvider`].
+pub struct SourceCtx<'a> {
+    /// Positional inputs (`FILES` + expanded `--file-list`), already collected.
+    /// Empty means "read stdin" for the byte provider.
+    pub inputs: &'a [PathBuf],
+    /// Present iff `--diff ORIGINAL MODIFIED` was passed.
+    pub diff: Option<DiffPair<'a>>,
+    /// The resolved destination shape. Lets a provider reject a destination it
+    /// can't represent (e.g. a multi-scene provider requires [`DestKind::Tiles`]).
+    pub dest_kind: DestKind,
+    /// `--stream`.
+    pub stream: bool,
+    /// `--show-xet-xorbs`.
+    pub show_xet_xorbs: bool,
+    /// The registry, so a provider can reuse arbvis's byte machinery
+    /// (`data::prepare_sources`, `data::byte_directory_diff`, the diff-builder
+    /// cascade, `hf_url` helpers).
+    pub registry: &'a Registry,
 }
 
-/// Hooks the HF "is X a finetune of Y" model-card lookup. arbvis defaults
-/// to "not a finetune" when this hook isn't registered or returns `None`.
+/// Per-provider render hints that [`crate::run`] folds into the final render
+/// configuration. Everything else (layout mode, tile formats, the user's
+/// `--title` override) comes from `Args`/`Registry`, not the provider.
+#[derive(Clone, Debug, Default)]
+pub struct RenderHints {
+    /// Drives the diff LUT + crosshatch overlay and the layout `diff_mode` gate.
+    pub diff_mode: bool,
+    /// Title suffix used when the user didn't pass `--title` (e.g. `"diff"`,
+    /// `"moe"`, or `""` for the plain byte path). Fed to arbvis's `default_title`.
+    pub title_suffix: Cow<'static, str>,
+    /// Whether to color regions by xet xorb id. The byte provider passes the
+    /// user's `--show-xet-xorbs`; diff / multi-scene providers force `false`.
+    pub show_xet_xorbs: bool,
+    /// Display inputs for the viewer info panel — the provider is the authority
+    /// on what it actually rendered (e.g. the two `--diff` paths, the input
+    /// file list, or a single specialization target).
+    pub inputs: Vec<String>,
+}
+
+/// Turns a parsed invocation into render sources — the single generic seam that
+/// replaced the old per-feature option-slot hooks. arbvis's own byte renderer
+/// and byte/JSON diff are built-in providers; a downstream specialization
+/// registers higher-priority providers for its own input shapes (e.g. a
+/// multi-scene view, a repo-level diff, a directory diff).
 ///
-/// `?Send`: see [`MoeScenesPrep`].
+/// Priority-ordered exactly like [`LayoutPlugin`]: [`crate::run`] iterates
+/// registered providers by descending priority and uses the first whose
+/// [`applicable`](SourceProvider::applicable) returns true, which then commits
+/// (no deferral — so `applicable` must be precise, not optimistic).
+///
+/// arbvis ships two built-ins: a byte-diff provider (priority 100, applies when
+/// `--diff` is set) and a normal-bytes provider (priority `i32::MIN`, the floor
+/// that always applies). The floor guarantees the iteration always terminates
+/// with a chosen provider.
+///
+/// `?Send`: a downstream provider's `prepare` future may be non-`Send` (e.g. a
+/// model forward pass holding `!Send` state across awaits). `run` only `.await`s
+/// the chosen future locally, never spawning it across threads, so dropping the
+/// `Send` bound is safe.
 #[async_trait(?Send)]
-pub trait FinetuneDetect: Send + Sync {
-    async fn detect(&self, orig_url: &str, mod_url: &str) -> Option<bool>;
+pub trait SourceProvider: Send + Sync {
+    /// Stable identifier for diagnostics. Format: kebab-case.
+    fn id(&self) -> &'static str;
+    /// Selection priority; higher wins. The built-in normal-bytes floor sits at
+    /// `i32::MIN`.
+    fn priority(&self) -> i32;
+    /// Cheap, synchronous gate — inspect `ctx`'s shape only, no I/O.
+    fn applicable(&self, ctx: &SourceCtx<'_>) -> bool;
+    /// Build the render sources. Only the chosen provider's `prepare` runs.
+    async fn prepare(&self, ctx: &SourceCtx<'_>)
+        -> anyhow::Result<(Vec<Source>, u64, RenderHints)>;
 }
 
 /// Opportunistic post-prepare-sources enrichment hook. Runs after sources
@@ -188,16 +198,28 @@ pub trait FinetuneDetect: Send + Sync {
 /// Other tensor-aware backends (e.g. an ONNX backend) could plug in here
 /// the same way without arbvis growing any extra slots.
 ///
-/// `?Send`: see [`MoeScenesPrep`].
+/// `?Send`: see [`SourceProvider`].
 #[async_trait(?Send)]
 pub trait PrepareSourcesExtension: Send + Sync {
     async fn enrich(&self, sources: &mut [Source]) -> anyhow::Result<()>;
 }
 
-/// Hooks the single-image arch render path. Invoked from
-/// `single::run_single` when the chosen layout's id is `"arch"`. arbvis
-/// falls back to byte-Hilbert if this hook isn't registered.
-pub trait SingleImageArchHook: Send + Sync {
+/// Renders a single (non-tiled) image for a structure-aware layout. The
+/// single-image analog of the [`LeafLoader`]/[`LeafRenderer`] pair, which is
+/// likewise keyed by layout id in [`crate::LeafRegistry`]. `single::run_single`
+/// looks up the renderer registered under the chosen layout's
+/// [`LayoutShape::id`] and uses it when [`SingleImageRenderer::applicable`]
+/// returns true; otherwise arbvis falls back to its byte-Hilbert single-image
+/// path. Register one via [`Registry::register_single_renderer`].
+pub trait SingleImageRenderer: Send + Sync {
+    /// The [`LayoutShape::id`] this renderer draws (its key in
+    /// [`Registry::single_renderers`]).
+    fn id(&self) -> &'static str;
+    /// Whether this renderer can draw the given invocation. When it returns
+    /// false, `run_single` logs and falls back to byte-Hilbert. (e.g. a
+    /// synchronous renderer might only handle local, non-diff, non-xet
+    /// sources.)
+    fn applicable(&self, sources: &[Source], diff_mode: bool, show_xet_xorbs: bool) -> bool;
     fn render(
         &self,
         files: &[PathBuf],
@@ -242,23 +264,31 @@ pub struct Registry {
     pub layouts: Vec<Arc<dyn LayoutPlugin>>,
     pub leaf: LeafRegistry,
     pub diffs: Vec<Arc<dyn DiffSourceBuilder>>,
-    pub moe: Option<Arc<dyn MoeScenesPrep>>,
-    pub repo_diff: Option<Arc<dyn RepoDiffPrep>>,
-    pub dir_tensor_diff: Option<Arc<dyn DirectoryTensorDiffPrep>>,
-    pub finetune_detect: Option<Arc<dyn FinetuneDetect>>,
-    pub single_image_arch: Option<Arc<dyn SingleImageArchHook>>,
+    /// Priority-ordered source providers. `run` picks the highest-priority
+    /// applicable one. See [`SourceProvider`]; populated with arbvis's two
+    /// byte built-ins by [`Registry::with_defaults`].
+    pub providers: Vec<Arc<dyn SourceProvider>>,
+    /// Per-layout-id single-image renderers. Keyed by [`LayoutShape::id`];
+    /// `single::run_single` looks up the renderer for the chosen layout. See
+    /// [`SingleImageRenderer`] and [`Registry::register_single_renderer`].
+    pub single_renderers: HashMap<&'static str, Arc<dyn SingleImageRenderer>>,
     /// Cross-source enrichment pass that runs once per render after every
     /// `Source` has been built. See [`PrepareSourcesExtension`].
     pub prepare_sources_extension: Option<Arc<dyn PrepareSourcesExtension>>,
+    /// User-chosen layout strategy for this run. arbvis-only leaves the default
+    /// ([`LayoutMode::Auto`]); a downstream maps its own `--layout` flag onto
+    /// this (e.g. [`LayoutMode::Forced`] with one of its layout ids).
+    pub layout_mode: LayoutMode,
     /// Viewer branding (tool name + repo URL). See [`Branding`].
     pub branding: Branding,
 }
 
 impl Registry {
     /// Registry populated with arbvis's own (byte-only) built-ins:
-    /// `HilbertLayoutPlugin`, `JsonDiffBuilder`, `PlainBytesDiffBuilder`,
-    /// and the `"hilbert-bytes"` leaf loader+renderer. All Option hooks
-    /// start as `None` — `modelweightvis::register_all` populates them.
+    /// `HilbertLayoutPlugin`, the `JsonDiffBuilder`/`PlainBytesDiffBuilder`
+    /// file-pair builders, the `ByteDiffProvider`/`NormalBytesProvider` source
+    /// providers, and the `"hilbert-bytes"` leaf loader+renderer. A downstream
+    /// extends these (e.g. `modelweightvis::register_all`).
     pub fn with_defaults() -> Self {
         Self {
             formats: Vec::new(),
@@ -268,13 +298,21 @@ impl Registry {
                 Arc::new(crate::data::JsonDiffBuilder),
                 Arc::new(crate::data::PlainBytesDiffBuilder),
             ],
-            moe: None,
-            repo_diff: None,
-            dir_tensor_diff: None,
-            finetune_detect: None,
-            single_image_arch: None,
+            providers: vec![
+                Arc::new(crate::ByteDiffProvider),
+                Arc::new(crate::NormalBytesProvider),
+            ],
+            single_renderers: HashMap::new(),
             prepare_sources_extension: None,
+            layout_mode: LayoutMode::Auto,
             branding: Branding::default(),
         }
+    }
+
+    /// Register a single-image renderer under its [`SingleImageRenderer::id`]
+    /// (which must equal the [`LayoutShape::id`] it draws). Mirrors
+    /// [`crate::LeafRegistry`]'s loader/renderer registration.
+    pub fn register_single_renderer(&mut self, renderer: Arc<dyn SingleImageRenderer>) {
+        self.single_renderers.insert(renderer.id(), renderer);
     }
 }

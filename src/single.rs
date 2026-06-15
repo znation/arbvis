@@ -16,20 +16,6 @@ use crate::label::draw_file_label;
 use crate::layout::{select_layout, LayoutMode};
 use crate::xet::{XorbMap, TABLEAU_20};
 
-/// Binary-search color lookup over a sorted `[(start, end_exclusive, color)]`
-/// list. Local copy of what `modelweightvis::format::color_for_pos` does;
-/// arbvis byte-only never feeds a non-empty range list (its `dtype_ranges`
-/// is always `None`), but the type signature has to match the dead-code
-/// branch that still compiles.
-fn color_for_pos(pos: u64, ranges: &[(u64, u64, Rgb<u8>)]) -> Rgb<u8> {
-    let idx = ranges.partition_point(|&(_, end, _)| end <= pos);
-    if idx < ranges.len() && ranges[idx].0 <= pos {
-        ranges[idx].2
-    } else {
-        Rgb([0, 0, 0])
-    }
-}
-
 /// Two-pixel-wide diagonal crosshatch on (x, y) for unmatched-region sources.
 /// Kept identical in spirit to the tile renderer's pattern so the single-image
 /// output is visually consistent with the tiled viewer.
@@ -72,31 +58,21 @@ pub fn run_single(
         diff_mode,
         registry,
     );
-    if layout.id() == "arch" {
-        // Arch mode only handles local (mmap'd / owned) data for now. If any
-        // source needs an HTTP/Xet/LazyDiff fetch we fall through to the
-        // Hilbert path with a warning, since the architectural single-image
-        // renderer is synchronous and we don't want to block a tokio worker
-        // inside spawn_blocking on per-pixel HTTP calls.
-        let all_local = sources.iter().all(|s| {
-            matches!(
-                s.kind,
-                SourceKind::File(_) | SourceKind::Buffered(_) | SourceKind::Diff { .. }
-            )
-        });
-        if all_local && !diff_mode && !show_xet_xorbs {
-            if let Some(hook) = registry.single_image_arch.as_ref() {
-                return hook.render(files, output, &sources, layout.as_ref());
-            }
-            log::warn!(
-                "architectural single-image layout selected but no `SingleImageArchHook` registered; \
-                 falling back to hilbert (modelweightvis registers the hook)"
-            );
-        } else {
-            log::warn!(
-                "architectural single-image layout requires local non-diff non-xet inputs; falling back to hilbert"
-            );
+    // A structure-aware layout may ship a single-image renderer, keyed by its
+    // layout id (the single-image analog of the tiled loader/renderer pair).
+    // Use it when it can draw this invocation; otherwise fall back to the
+    // byte-Hilbert path below. (The arch renderer, for one, is synchronous and
+    // only handles local non-diff non-xet sources — that gate lives in its
+    // `applicable`, not here.)
+    if let Some(renderer) = registry.single_renderers.get(layout.id()) {
+        if renderer.applicable(&sources, diff_mode, show_xet_xorbs) {
+            return renderer.render(files, output, &sources, layout.as_ref());
         }
+        log::warn!(
+            "single-image renderer for layout `{}` can't draw these inputs; \
+             falling back to hilbert",
+            layout.id()
+        );
     }
     // Open each source as a `Data` handle (sync — mmap / lightweight clone)
     // before dispatching, so the rayon workers can be handed ready-to-use
@@ -458,22 +434,12 @@ fn render_chunks(
     rt: &tokio::runtime::Handle,
 ) -> anyhow::Result<Vec<(usize, Option<(u32, u32, u32, u32)>)>> {
     let xet_mode = !xorb_map.is_empty();
-    // Per-pixel color combining (optional) xorb hue, (optional) dtype hue, and
-    // byte intensity. When both xorb and dtype are present, the two hues are
-    // averaged then modulated by the byte value; either alone falls back to
-    // pure xet or pure dtype-byte; with neither, the plain byte LUT.
-    let pixel_color = |byte: u8, abs_byte: u64, dtype: Option<Rgb<u8>>| -> Rgb<u8> {
-        match (xorb_map.color_idx_at(abs_byte), dtype) {
-            (Some(idx), Some(d)) => {
-                let t = tableau[idx as usize];
-                let s = byte as u32;
-                Rgb([
-                    (((d[0] as u32 + t[0] as u32) * s + 255) / 510) as u8,
-                    (((d[1] as u32 + t[1] as u32) * s + 255) / 510) as u8,
-                    (((d[2] as u32 + t[2] as u32) * s + 255) / 510) as u8,
-                ])
-            }
-            (Some(idx), None) => {
+    // Per-pixel color combining the (optional) xorb hue and byte intensity.
+    // With a xorb present, the tableau hue is modulated by the byte value;
+    // otherwise the plain byte LUT.
+    let pixel_color = |byte: u8, abs_byte: u64| -> Rgb<u8> {
+        match xorb_map.color_idx_at(abs_byte) {
+            Some(idx) => {
                 let t = tableau[idx as usize];
                 let s = byte as u16;
                 Rgb([
@@ -482,15 +448,7 @@ fn render_chunks(
                     ((t[2] as u16 * s + 127) / 255) as u8,
                 ])
             }
-            (None, Some(d)) => {
-                let s = byte as u16;
-                Rgb([
-                    ((d[0] as u16 * s + 127) / 255) as u8,
-                    ((d[1] as u16 * s + 127) / 255) as u8,
-                    ((d[2] as u16 * s + 127) / 255) as u8,
-                ])
-            }
-            (None, None) => pixel_lut[byte as usize],
+            None => pixel_lut[byte as usize],
         }
     };
     let chunk_results: Vec<(usize, Option<(u32, u32, u32, u32)>)> = chunks_by_source
@@ -501,12 +459,6 @@ fn render_chunks(
                 if source_chunks.is_empty() {
                     return Ok(vec![]);
                 }
-                // Dtype-aware color ranges live in modelweightvis's
-                // `FormatPlugin`-populated extensions; arbvis byte-only
-                // doesn't read those. Always `None` here — the pixel
-                // colorizer falls back to the byte LUT.
-                let dtype_ranges: Option<&[(u64, u64, image::Rgb<u8>)]> = None;
-                let _ = src_idx; // silence unused-var when dtype_ranges == None
                 let unmatched_fill: Option<DiffFill> = match &sources[src_idx].kind {
                     SourceKind::UnmatchedRegion { fill } => Some(*fill),
                     _ => None,
@@ -586,9 +538,7 @@ fn render_chunks(
                                 let cur_byte = chunk_b_start + i as u64;
                                 if cur_byte.is_multiple_of(stride) {
                                     let (x, y) = hilbert_to_xy_u64(cur_pixel as u64, k as u8);
-                                    let dtype = dtype_ranges
-                                        .map(|r| color_for_pos(cur_byte - src_global_start, r));
-                                    let color = pixel_color(b, cur_byte, dtype);
+                                    let color = pixel_color(b, cur_byte);
                                     let pixel_idx = y as usize * side as usize + x as usize;
                                     unsafe {
                                         let p = (img_base as *mut u8).add(pixel_idx * 3);

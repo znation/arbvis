@@ -22,15 +22,16 @@ pub mod xet;
 // on. Tile pipeline, source/diff plumbing, layout traits, hooks for the
 // model-aware plugins to plug into.
 pub use data::{
-    load_source_data, CustomSource, Data, DiffFill, DiffMetric, Extensions, LazyFetcher, SceneTag,
-    Source, SourceKind, SummaryStat,
+    byte_directory_diff, load_source_data, prepare_diff_sources, prepare_sources,
+    prepare_sources_from_specs, CustomSource, Data, DiffFill, Extensions, LazyFetcher, SceneTag,
+    Source, SourceKind,
 };
 pub use geometry::name_hue;
 pub use layout::{CanvasGeom, LayoutMode, LayoutShape};
 pub use registry::{
-    Branding, DiffBuildCtx, DiffSourceBuilder, DirectoryTensorDiffPrep, FinetuneDetect,
-    FormatPlugin, LayoutBuildCtx, LayoutPlugin, MoeScenesPrep, PrepareSourcesExtension, Registry,
-    RepoDiffPrep, SingleImageArchHook,
+    Branding, DestKind, DiffBuildCtx, DiffPair, DiffSourceBuilder, FormatPlugin, LayoutBuildCtx,
+    LayoutPlugin, PrepareSourcesExtension, Registry, RenderHints, SingleImageRenderer, SourceCtx,
+    SourceProvider,
 };
 pub use tiled::html::FileEntity;
 pub use tiled::leaf::{encode_tile, TileFormat, TILE};
@@ -47,6 +48,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use anyhow::Context;
+use async_trait::async_trait;
 use clap::{Parser, ValueEnum};
 use futures::stream::{StreamExt, TryStreamExt};
 use tempfile::TempDir;
@@ -59,93 +61,85 @@ use crate::hf_url::HfOutputSpec;
 /// consistent across the input-resolution and materialisation stages.
 const RESOLVE_CONCURRENCY: usize = 16;
 
-/// Runtime knobs that aren't part of `arbvis::Args` but still flow through
-/// `run()`. The byte-only arbvis CLI passes [`ModelOpts::default`] (no MoE
-/// mode, no finetune forcing, RMS metric, auto layout — which resolves to
-/// Hilbert in a byte-only registry); modelweightvis's CLI shell builds a
-/// populated `ModelOpts` from its tensor-aware [`modelweightvis::Args`].
-///
-/// These knobs all behave correctly with their defaults under arbvis-only
-/// registries — `moe = None` is the inert
-/// "don't take the MoE branch" case, `layout_mode = Auto` picks the only
-/// registered layout (Hilbert), and `diff_metric` only matters when a
-/// tensor-aware diff builder is registered. So pure-arbvis callers don't
-/// have to reason about these.
-#[derive(Clone, Debug)]
-pub struct ModelOpts {
-    /// `--moe <MODEL>`: render the MoE viewer for a single model as a
-    /// tabbed, multi-scene visualization — a per-expert scalar "summary"
-    /// scene (one panel per FFN weight + router) and an N×N linear-CKA
-    /// "similarity" scene (one panel per `(layer, weight)`) — that the
-    /// viewer switches between. `None` for the byte-only path. The
-    /// individual lenses are configured by `summary_stat` / `cka_sample`,
-    /// and `--probe` adds a behavioral panel to each scene.
-    pub moe: Option<PathBuf>,
-    /// `--finetune`: force-treat a `--diff` as a finetune (orig-only
-    /// tensors → grey crosshatch, mod-only → error). Exclusive with
-    /// `no_finetune`; both `false` means auto-detect via
-    /// `FinetuneDetect` hook.
-    pub finetune: bool,
-    /// `--no-finetune`: force-treat a `--diff` as NOT a finetune.
-    pub no_finetune: bool,
-    /// `--diff-metric`: how per-element tensor deltas are encoded
-    /// (`--diff`). Default is `Rms`.
-    pub diff_metric: DiffMetric,
-    /// `--summary-stat`: which scalar to compute per expert for the `--moe`
-    /// summary scene. Default is `Rms`.
-    pub summary_stat: SummaryStat,
-    /// `--cka-sample`: random-projection dimension for the `--moe` CKA scene.
-    /// Trades CKA accuracy for compute (smaller = faster, larger =
-    /// closer to exact). CLI default is 128.
-    pub cka_sample: u32,
-    /// `--probe` family: when `probe.enabled` is true, the downstream
-    /// MoE prep impl runs a routing-faithful forward pass on the
-    /// resolved probe text and adds a per-(layer, expert) routing-
-    /// frequency panel to the output. Inert by default — `probe.enabled
-    /// = false` means the standard byte-only path runs.
-    pub probe: ProbeOpts,
-    /// `--layout`: structure-aware vs byte-Hilbert layout strategy.
-    /// Defaults to `Auto` — `select_layout` iterates the registry's
-    /// layout plugins by descending priority and picks the first
-    /// applicable. In a byte-only registry that resolves to Hilbert.
-    pub layout_mode: LayoutMode,
+// arbvis's two built-in [`SourceProvider`]s, installed by
+// [`Registry::with_defaults`]. A specialization registers its own
+// higher-priority providers; these are the always-present byte fallbacks.
+
+/// Byte/JSON diff over a `--diff` pair (priority 100). Resolves both sides
+/// (local path or single-file `hf://`) and dispatches through the file-pair
+/// builder cascade or [`data::byte_directory_diff`].
+struct ByteDiffProvider;
+
+#[async_trait(?Send)]
+impl SourceProvider for ByteDiffProvider {
+    fn id(&self) -> &'static str {
+        "byte-diff"
+    }
+    fn priority(&self) -> i32 {
+        100
+    }
+    fn applicable(&self, ctx: &SourceCtx<'_>) -> bool {
+        ctx.diff.is_some()
+    }
+    async fn prepare(
+        &self,
+        ctx: &SourceCtx<'_>,
+    ) -> anyhow::Result<(Vec<Source>, u64, RenderHints)> {
+        let diff = ctx
+            .diff
+            .as_ref()
+            .expect("ByteDiffProvider applies only when --diff is set");
+        // Resolve both sides concurrently; the (original, modified) order is
+        // part of the diff contract, so `try_join!` (not unordered) is used.
+        let (orig, mod_) = tokio::try_join!(
+            resolve_input(PathBuf::from(diff.original)),
+            resolve_input(PathBuf::from(diff.modified)),
+        )?;
+        let (sources, total) =
+            data::prepare_diff_sources(&orig, &mod_, false, ctx.registry).await?;
+        let hints = RenderHints {
+            diff_mode: true,
+            title_suffix: Cow::Borrowed("diff"),
+            show_xet_xorbs: false,
+            inputs: vec![diff.original.to_string(), diff.modified.to_string()],
+        };
+        Ok((sources, total, hints))
+    }
 }
 
-/// `--probe` family — probe-input resolution + on/off bit. Plumbed
-/// through `ModelOpts` so any MoE prep impl can opt into the routing-
-/// faithful forward pass with a single struct.
-#[derive(Clone, Debug, Default)]
-pub struct ProbeOpts {
-    pub enabled: bool,
-    pub source: ProbeSource,
-}
+/// Normal byte render of the positional inputs (or stdin). The priority floor
+/// (`i32::MIN`) — always applicable, so provider selection always terminates.
+struct NormalBytesProvider;
 
-/// Where the probe text comes from. `Default` uses a small bundled
-/// snippet (~300 tokens of varied prose / code / dialogue) embedded
-/// in the modelweightvis binary. The other three are mutually
-/// exclusive overrides driven by `--probe-text` / `--probe-file` /
-/// `--probe-url`.
-#[derive(Clone, Debug, Default)]
-pub enum ProbeSource {
-    #[default]
-    Default,
-    Text(String),
-    File(PathBuf),
-    Url(String),
-}
-
-impl Default for ModelOpts {
-    fn default() -> Self {
-        Self {
-            moe: None,
-            finetune: false,
-            no_finetune: false,
-            diff_metric: DiffMetric::Rms,
-            summary_stat: SummaryStat::Rms,
-            cka_sample: 128,
-            probe: ProbeOpts::default(),
-            layout_mode: LayoutMode::Auto,
-        }
+#[async_trait(?Send)]
+impl SourceProvider for NormalBytesProvider {
+    fn id(&self) -> &'static str {
+        "normal-bytes"
+    }
+    fn priority(&self) -> i32 {
+        i32::MIN
+    }
+    fn applicable(&self, _ctx: &SourceCtx<'_>) -> bool {
+        true
+    }
+    async fn prepare(
+        &self,
+        ctx: &SourceCtx<'_>,
+    ) -> anyhow::Result<(Vec<Source>, u64, RenderHints)> {
+        let (sources, total) =
+            resolve_input_sources(ctx.inputs, ctx.show_xet_xorbs, ctx.stream, ctx.registry).await?;
+        let inputs: Vec<String> = ctx
+            .inputs
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let hints = RenderHints {
+            diff_mode: false,
+            title_suffix: Cow::Borrowed(""),
+            show_xet_xorbs: ctx.show_xet_xorbs,
+            inputs,
+        };
+        Ok((sources, total, hints))
     }
 }
 
@@ -220,15 +214,11 @@ pub struct Args {
     #[arg(long, num_args = 2, value_names = ["ORIGINAL", "MODIFIED"])]
     diff: Option<Vec<PathBuf>>,
 
-    // `--moe`, `--finetune` / `--no-finetune`,
-    // `--diff-metric`, and `--layout` previously lived on `Args` too (along
-    // with the retired `--moe-diff` / `--moe-summary` / `--moe-cka`), but they
-    // only do anything
-    // when a tensor-aware backend is registered. They've moved to
-    // `modelweightvis::Args` (which flattens this struct via clap and
-    // converts its own fields into [`ModelOpts`]); arbvis-only callers
-    // pass [`ModelOpts::default`] to `run()` and never see those flags in
-    // `arbvis --help`.
+    // Specialization-specific flags (a multi-scene view, a structured layout
+    // choice, format-specific diff knobs, etc.) live on the *downstream*
+    // crate's clap struct, which flattens this one. The downstream reads those
+    // flags to construct its own `SourceProvider`s / set `Registry::layout_mode`
+    // before calling `run`; arbvis-only callers never see them in `arbvis --help`.
     /// Render tiles and deploy a viewable HF Space (e.g. username/my-vis).
     /// Creates the Space with a Docker app that serves the Leaflet viewer,
     /// and stores tiles in a sibling bucket auto-named `<namespace>/<repo>_bucket`.
@@ -416,20 +406,32 @@ impl OutputDest {
             _tempdir: tempdir,
         })
     }
+
+    /// Coarse destination shape for [`SourceCtx`], hiding the tempdir / upload
+    /// internals so a provider can gate on it without depending on them.
+    fn kind(&self) -> DestKind {
+        match self {
+            OutputDest::Window => DestKind::Window,
+            OutputDest::SingleImage { .. } => DestKind::SingleImage,
+            OutputDest::Tiles { .. } => DestKind::Tiles,
+        }
+    }
 }
 
 /// Drives the full arbvis pipeline (CLI → sources → layout → tiles/single).
 ///
 /// `args` carries the byte-only CLI surface (input/output paths, `--diff`,
-/// `--space`, etc.). `opts` carries the four model-side knobs that used to
-/// live on `Args` directly but are now owned by `modelweightvis::Args` —
-/// pure-arbvis callers pass [`ModelOpts::default`] and never see those
-/// flags in their `--help`. `registry` carries the pluggable surface
-/// (formats, layouts, diff builders, leaf renderers, plus the option-slot
-/// hooks). The arbvis binary builds `Registry::with_defaults()`;
-/// modelweightvis's binary extends it with tensor-aware plugins via
-/// `modelweightvis::register_all`.
-pub async fn run(args: Args, opts: ModelOpts, registry: registry::Registry) -> anyhow::Result<()> {
+/// `--space`, etc.). `registry` carries the pluggable surface (formats,
+/// layouts, diff builders, leaf renderers, source providers, single-image
+/// renderers, branding, layout mode). The arbvis binary builds
+/// `Registry::with_defaults()`; a downstream specialization extends it (e.g.
+/// `modelweightvis::register_all` plus its own provider registration) and maps
+/// its own flags onto the registry before calling `run`.
+///
+/// Source preparation is fully delegated to the registry's [`SourceProvider`]s:
+/// `run` builds a neutral [`SourceCtx`] from the parsed args and picks the
+/// highest-priority applicable provider (the `i32::MIN` floor always applies).
+pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()> {
     if let Some(ref tile_dir) = args.regen_html {
         return tiled::regen_html(tile_dir, &registry.branding);
     }
@@ -441,132 +443,12 @@ pub async fn run(args: Args, opts: ModelOpts, registry: registry::Registry) -> a
     let dest = OutputDest::from_args(&args)?;
 
     let (leaf_format, pyramid_format) = args.tile_format.split();
-    let layout_mode = opts.layout_mode;
     let stream = args.stream;
     let show_xet_xorbs = args.show_xet_xorbs;
 
-    // --- MoE (tabbed summary + CKA scenes) --------------------------------
-    if let Some(moe_arg) = opts.moe {
-        let hook = registry.moe.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "--moe requires a tensor-aware backend (no `MoeScenesPrep` registered); \
-                 use `modelweightvis` instead of `arbvis`"
-            )
-        })?;
-        // The MoE viewer is a tabbed, multi-scene render; the tab switcher only
-        // exists in the interactive Leaflet viewer, so a single-PNG / window
-        // destination can't represent it.
-        if !matches!(dest, OutputDest::Tiles { .. }) {
-            anyhow::bail!(
-                "--moe renders a tabbed multi-scene viewer and needs a tile destination; \
-                 pass --tiles <DIR> (or --space <OWNER/REPO>)"
-            );
-        }
-        let stat = opts.summary_stat;
-        let sample = opts.cka_sample;
-        let input = moe_arg.to_string_lossy().into_owned();
-        let inputs = vec![input.clone()];
-        let title = default_title(args.title, &registry.branding.name, "moe");
-        // One load, both lenses: the hook returns each scene's sources tagged
-        // with a `SceneTag`, concatenated. The tiler partitions on that tag.
-        let (sources, total) = hook
-            .prepare(&input, stat, sample, stream, &opts.probe)
-            .await
-            .with_context(|| format!("--moe {input}"))?;
-        let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
-        // Not a true diff (no orig/mod sides) — `diff_mode = false` so layout
-        // plugins apply their strict applicability gates. The MoE layout
-        // plugins signal applicability through their own per-source extension
-        // tags, not through diff_mode.
-        let cfg = RenderConfig {
-            title,
-            inputs,
-            diff_mode: false,
-            show_xet_xorbs: false,
-            layout_mode,
-            leaf_format,
-            pyramid_format,
-        };
-        return dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await;
-    }
-
-    // --- Two-input diff ---------------------------------------------------
-    if let Some(raw_diff_args) = args.diff {
-        let diff_input_strs: Vec<String> = raw_diff_args
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let diff_title = default_title(args.title, &registry.branding.name, "diff");
-        let orig_str = &diff_input_strs[0];
-        let mod_str = &diff_input_strs[1];
-        let is_finetune = resolve_finetune(
-            opts.finetune,
-            opts.no_finetune,
-            orig_str,
-            mod_str,
-            &registry,
-        )
-        .await;
-        let metric = opts.diff_metric;
-
-        let (sources, total) = if hf_url::is_repo_level(orig_str)?
-            && hf_url::is_repo_level(mod_str)?
-        {
-            // Both are repo-level hf:// URLs: list files over API, diff lazily
-            // over HTTP. Tensor-aware prep is required because the
-            // model-format files need byte-range header parses to match
-            // tensors across the two repos — arbvis core delegates to the
-            // registered `RepoDiffPrep` hook.
-            let hook = registry.repo_diff.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--diff between two `hf://` model repos requires a tensor-aware \
-                     backend (no `RepoDiffPrep` registered); use `modelweightvis` \
-                     instead of `arbvis`"
-                )
-            })?;
-            let (orig_specs, mod_specs) = tokio::try_join!(
-                async {
-                    hf_url::list_repo_as_http_specs(orig_str)
-                        .await
-                        .with_context(|| format!("listing files in {orig_str}"))
-                },
-                async {
-                    hf_url::list_repo_as_http_specs(mod_str)
-                        .await
-                        .with_context(|| format!("listing files in {mod_str}"))
-                },
-            )?;
-            hook.prepare(&orig_specs, &mod_specs, is_finetune, metric, stream)
-                .await?
-        } else {
-            // At least one side is a local path or single-file hf:// URL.
-            // Resolve the two sides concurrently; order matters for the
-            // (orig, modified) contract, so use `buffered` not
-            // `buffer_unordered`.
-            let diff_args: Vec<PathBuf> =
-                futures::stream::iter(raw_diff_args.into_iter().map(resolve_input))
-                    .buffered(2)
-                    .try_collect()
-                    .await?;
-            data::prepare_diff_sources(&diff_args[0], &diff_args[1], is_finetune, metric, &registry)
-                .await?
-        };
-        let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
-        let cfg = RenderConfig {
-            title: diff_title,
-            inputs: diff_input_strs,
-            diff_mode: true,
-            show_xet_xorbs: false,
-            layout_mode,
-            leaf_format,
-            pyramid_format,
-        };
-        return dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await;
-    }
-
-    // --- Normal flow ------------------------------------------------------
-    // Deploy-only shortcut: `--space` + `--tiles <local>` with no input files
-    // means the tiles directory is already fully rendered; just deploy it.
+    // Deploy-only shortcut (a destination concern, so it runs before any source
+    // prep): `--space` + `--tiles <local>` with no input files means the tiles
+    // directory is already fully rendered; just deploy it.
     //
     // The match is the SAME shape as the rest of the dispatch — only the
     // `local: Some(p)` (user-provided dir) + `_tempdir: None` (we didn't
@@ -589,23 +471,64 @@ pub async fn run(args: Args, opts: ModelOpts, registry: registry::Registry) -> a
         }
     }
 
+    // Collect positional inputs (no stdin fallback here — the byte provider
+    // reads stdin when its input list is empty). `--diff` sides are kept as an
+    // ordered pair in the neutral `SourceCtx`.
     let files = collect_input_files(args.files, args.file_list)?;
-    let original_inputs: Vec<String> = files
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    let (sources, total) = resolve_input_sources(&files, show_xet_xorbs, stream, &registry).await?;
+    let diff_strs: Option<[String; 2]> = args.diff.as_ref().map(|v| {
+        [
+            v[0].to_string_lossy().into_owned(),
+            v[1].to_string_lossy().into_owned(),
+        ]
+    });
+    let diff = diff_strs.as_ref().map(|p| DiffPair {
+        original: p[0].as_str(),
+        modified: p[1].as_str(),
+    });
+
+    let ctx = SourceCtx {
+        inputs: &files,
+        diff,
+        dest_kind: dest.kind(),
+        stream,
+        show_xet_xorbs,
+        registry: &registry,
+    };
+
+    // Pick the highest-priority applicable provider. The `i32::MIN`
+    // NormalBytesProvider floor always applies, so this always resolves —
+    // mirrors `select_layout`.
+    let chosen = select_provider(&registry.providers, &ctx)
+        .expect("registry.providers must include the i32::MIN NormalBytesProvider floor");
+
+    let (sources, total, hints) = chosen
+        .prepare(&ctx)
+        .await
+        .with_context(|| format!("source provider `{}`", chosen.id()))?;
+
     let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
     let cfg = RenderConfig {
-        title: default_title(args.title, &registry.branding.name, ""),
-        inputs: original_inputs,
-        diff_mode: false,
-        show_xet_xorbs,
-        layout_mode,
+        title: default_title(args.title, &registry.branding.name, &hints.title_suffix),
+        inputs: hints.inputs,
+        diff_mode: hints.diff_mode,
+        show_xet_xorbs: hints.show_xet_xorbs,
+        layout_mode: registry.layout_mode,
         leaf_format,
         pyramid_format,
     };
     dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await
+}
+
+/// Pick the highest-priority [`SourceProvider`] whose `applicable` returns true.
+/// Sorted descending by priority; the `i32::MIN` floor (`NormalBytesProvider`)
+/// guarantees a result for any registry built via [`Registry::with_defaults`].
+fn select_provider<'a>(
+    providers: &'a [Arc<dyn SourceProvider>],
+    ctx: &SourceCtx<'_>,
+) -> Option<&'a Arc<dyn SourceProvider>> {
+    let mut sorted: Vec<&Arc<dyn SourceProvider>> = providers.iter().collect();
+    sorted.sort_by_key(|p| std::cmp::Reverse(p.priority()));
+    sorted.into_iter().find(|p| p.applicable(ctx))
 }
 
 /// Pick the viewer title: the user's `--title` if set, else the brand name
@@ -617,49 +540,6 @@ fn default_title(user: Option<String>, name: &str, suffix: &str) -> Cow<'static,
         Some(t) => Cow::Owned(t),
         None if suffix.is_empty() => Cow::Owned(name.to_string()),
         None => Cow::Owned(format!("{name} {suffix}")),
-    }
-}
-
-async fn resolve_finetune(
-    finetune: bool,
-    no_finetune: bool,
-    orig_str: &str,
-    mod_str: &str,
-    registry: &registry::Registry,
-) -> bool {
-    if finetune {
-        log::info!("--diff finetune mode: forced on by --finetune");
-        return true;
-    }
-    if no_finetune {
-        log::info!("--diff finetune mode: forced off by --no-finetune");
-        return false;
-    }
-    let detected = match registry.finetune_detect.as_ref() {
-        Some(hook) => hook.detect(orig_str, mod_str).await,
-        None => None,
-    };
-    match detected {
-        Some(true) => {
-            log::info!(
-                "--diff finetune mode: auto-detected ON ({} declares {} as its base in its HF model card)",
-                mod_str, orig_str
-            );
-            true
-        }
-        Some(false) => {
-            log::info!(
-                "--diff finetune mode: auto-detected OFF ({} does not declare {} as a finetune base)",
-                mod_str, orig_str
-            );
-            false
-        }
-        None => {
-            log::info!(
-                "--diff finetune mode: auto-detect skipped (no `FinetuneDetect` registered, not both hf:// model URLs, or API lookup failed); defaulting to OFF — pass --finetune to override"
-            );
-            false
-        }
     }
 }
 
@@ -1095,6 +975,99 @@ mod title_tests {
         assert_eq!(
             default_title(Some("custom".to_string()), "arbvis", "moe"),
             "custom"
+        );
+    }
+}
+
+#[cfg(test)]
+mod provider_selection_tests {
+    use super::*;
+
+    /// A high-priority diff-only provider, standing in for a downstream
+    /// specialization's provider (e.g. modelweightvis's `RepoDiffProvider`).
+    struct MockDiffProvider;
+
+    #[async_trait(?Send)]
+    impl SourceProvider for MockDiffProvider {
+        fn id(&self) -> &'static str {
+            "mock-high"
+        }
+        fn priority(&self) -> i32 {
+            500
+        }
+        fn applicable(&self, ctx: &SourceCtx<'_>) -> bool {
+            ctx.diff.is_some()
+        }
+        async fn prepare(
+            &self,
+            _ctx: &SourceCtx<'_>,
+        ) -> anyhow::Result<(Vec<Source>, u64, RenderHints)> {
+            Ok((Vec::new(), 0, RenderHints::default()))
+        }
+    }
+
+    fn ctx<'a>(
+        reg: &'a Registry,
+        inputs: &'a [PathBuf],
+        diff: Option<DiffPair<'a>>,
+    ) -> SourceCtx<'a> {
+        SourceCtx {
+            inputs,
+            diff,
+            dest_kind: DestKind::Tiles,
+            stream: false,
+            show_xet_xorbs: false,
+            registry: reg,
+        }
+    }
+
+    // The byte built-ins: a normal-input invocation falls to the `i32::MIN`
+    // floor; a `--diff` invocation is caught by the byte-diff provider.
+    #[test]
+    fn byte_builtins_ladder() {
+        let reg = Registry::with_defaults();
+        let inputs = vec![PathBuf::from("a.bin")];
+        assert_eq!(
+            select_provider(&reg.providers, &ctx(&reg, &inputs, None))
+                .unwrap()
+                .id(),
+            "normal-bytes"
+        );
+        let none: Vec<PathBuf> = Vec::new();
+        let pair = DiffPair {
+            original: "a",
+            modified: "b",
+        };
+        assert_eq!(
+            select_provider(&reg.providers, &ctx(&reg, &none, Some(pair)))
+                .unwrap()
+                .id(),
+            "byte-diff"
+        );
+    }
+
+    // A higher-priority provider shadows the byte-diff built-in when it
+    // applies, but the floor still wins when it doesn't.
+    #[test]
+    fn higher_priority_shadows_then_falls_through() {
+        let mut reg = Registry::with_defaults();
+        reg.providers.push(Arc::new(MockDiffProvider));
+        let none: Vec<PathBuf> = Vec::new();
+        let pair = DiffPair {
+            original: "a",
+            modified: "b",
+        };
+        assert_eq!(
+            select_provider(&reg.providers, &ctx(&reg, &none, Some(pair)))
+                .unwrap()
+                .id(),
+            "mock-high"
+        );
+        assert_eq!(
+            select_provider(&reg.providers, &ctx(&reg, &none, None))
+                .unwrap()
+                .id(),
+            "normal-bytes"
         );
     }
 }

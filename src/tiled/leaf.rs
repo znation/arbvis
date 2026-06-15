@@ -19,7 +19,7 @@ type TileResult = Result<(image::ImageBuffer<Rgb<u8>, Vec<u8>>, Vec<u8>), String
 ///
 /// - `IndexedPng`: 8-bit indexed-color PNG with the tile's unique RGB values
 ///   as a ≤256-entry palette. Lossless and ~2-4× smaller than truecolor PNG
-///   for Plain/Dtype mode leaves (where every pixel comes from a fixed
+///   for Plain mode leaves (where every pixel comes from a fixed
 ///   256-color LUT). Falls back to truecolor PNG if a tile happens to need
 ///   more than 256 colors.
 /// - `Avif`: AV1 still-image. `quality=100` is near-lossless; lower values
@@ -58,7 +58,7 @@ pub fn encode_tile(
         TileFormat::IndexedPng => match encode_indexed_png(&img)? {
             Some(b) => b,
             // Tile exceeded the 256-color palette budget — fall back to
-            // truecolor PNG so we never crash. For Plain/Dtype mode this
+            // truecolor PNG so we never crash. For Plain mode this
             // shouldn't happen; for Xet mode the caller should pick AVIF.
             None => encode_truecolor_png(&img)?,
         },
@@ -356,62 +356,6 @@ fn blend_with_tint(c: Rgb<u8>, fill: DiffFill) -> Rgb<u8> {
     ])
 }
 
-/// Render one `TILE×TILE` leaf tile using position-based dtype coloring (safetensors mode).
-///
-/// Does not read file bytes — color is determined entirely by byte position via
-/// `color_ranges`, a sorted list of `(start, end, color)` entries from
-/// `safetensors::build_color_ranges`.
-pub fn render_leaf_tile_dtype(
-    tx: u32,
-    ty: u32,
-    kh: u8,
-    height_tiles: u32,
-    square_pixels: u64,
-    total: u64,
-    color_ranges: &[(u64, u64, image::Rgb<u8>)],
-    fmt: TileFormat,
-) -> TileResult {
-    let sq = (tx / height_tiles) as u64;
-    let sq_off = sq * square_pixels;
-    let local_tx = tx % height_tiles;
-
-    let tile_order = kh - TILE_LOG2;
-    let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
-    let tile_pixel_start = sq_off + base;
-    let tile_pixel_end = (tile_pixel_start + TILE_AREA).min(total);
-
-    let first_range = color_ranges.partition_point(|r| r.1 <= tile_pixel_start);
-    let local_ranges: Vec<(u64, u64, image::Rgb<u8>)> = color_ranges[first_range..]
-        .iter()
-        .take_while(|r| r.0 < tile_pixel_end)
-        .copied()
-        .collect();
-
-    let mut img = image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::new(TILE, TILE);
-    for py in 0..TILE {
-        let ly = ty * TILE + py;
-        for px in 0..TILE {
-            let lx = local_tx * TILE + px;
-            let local_idx = xy2h_u64(lx as u64, ly as u64, kh);
-            let pixel_idx = sq_off + local_idx;
-            let color = if pixel_idx < total {
-                let mut found = image::Rgb([0u8, 0, 0]);
-                for &(start, end, c) in &local_ranges {
-                    if pixel_idx >= start && pixel_idx < end {
-                        found = c;
-                        break;
-                    }
-                }
-                found
-            } else {
-                image::Rgb([0u8, 0, 0])
-            };
-            img.put_pixel(px, py, color);
-        }
-    }
-    encode_tile(img, fmt)
-}
-
 /// CPU-only render in xet/xorb mode from a pre-filled tile buffer.
 ///
 /// Each pixel's byte is read from `tile_buf`. Its absolute file offset is
@@ -456,89 +400,6 @@ pub fn render_leaf_tile_xet_from_buf(
                         ])
                     }
                     None => pixel_lut[byte as usize],
-                }
-            } else {
-                Rgb([0u8, 0, 0])
-            };
-            img.put_pixel(px, py, color);
-        }
-    }
-    encode_tile(img, fmt)
-}
-
-/// CPU-only render for combined xet + safetensors mode.
-///
-/// For each pixel: look up its dtype color from `dtype_ranges` and (optionally)
-/// its xorb tableau color from `xorb_ranges`. The byte value modulates
-/// intensity in both cases. Where a xorb is present, the dtype hue and tableau
-/// hue are 50/50 averaged before modulation; otherwise the dtype color alone
-/// is modulated. Gives a single image where tensor boundaries (from dtype) and
-/// xorb boundaries (from tableau) are both visible.
-pub fn render_leaf_tile_xet_dtype_from_buf(
-    tx: u32,
-    ty: u32,
-    kh: u8,
-    height_tiles: u32,
-    square_pixels: u64,
-    total: u64,
-    tile_buf: &[u8; TILE_PIXELS],
-    xorb_ranges: &[(u64, u64, u8)],
-    tableau: &[Rgb<u8>; 20],
-    dtype_ranges: &[(u64, u64, Rgb<u8>)],
-    fmt: TileFormat,
-) -> TileResult {
-    let sq = (tx / height_tiles) as u64;
-    let sq_off = sq * square_pixels;
-    let local_tx = tx % height_tiles;
-    let tile_order = kh - TILE_LOG2;
-    let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
-    let tile_pixel_start = sq_off + base;
-    let tile_pixel_end = (tile_pixel_start + TILE_AREA).min(total);
-
-    let first_dt = dtype_ranges.partition_point(|r| r.1 <= tile_pixel_start);
-    let local_dtype_ranges: Vec<(u64, u64, Rgb<u8>)> = dtype_ranges[first_dt..]
-        .iter()
-        .take_while(|r| r.0 < tile_pixel_end)
-        .copied()
-        .collect();
-
-    let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
-    for py in 0..TILE {
-        let ly = ty * TILE + py;
-        for px in 0..TILE {
-            let lx = local_tx * TILE + px;
-            let local_idx = xy2h_u64(lx as u64, ly as u64, kh);
-            let pixel_idx = sq_off + local_idx;
-            let color = if pixel_idx < total {
-                let byte = tile_buf[(local_idx - base) as usize];
-                let d = {
-                    let mut found = Rgb([0u8, 0, 0]);
-                    for &(start, end, c) in &local_dtype_ranges {
-                        if pixel_idx >= start && pixel_idx < end {
-                            found = c;
-                            break;
-                        }
-                    }
-                    found
-                };
-                match xorb_color_idx(xorb_ranges, pixel_idx) {
-                    Some(idx) => {
-                        let t = tableau[idx as usize];
-                        let s = byte as u32;
-                        Rgb([
-                            (((d[0] as u32 + t[0] as u32) * s + 255) / 510) as u8,
-                            (((d[1] as u32 + t[1] as u32) * s + 255) / 510) as u8,
-                            (((d[2] as u32 + t[2] as u32) * s + 255) / 510) as u8,
-                        ])
-                    }
-                    None => {
-                        let s = byte as u16;
-                        Rgb([
-                            ((d[0] as u16 * s + 127) / 255) as u8,
-                            ((d[1] as u16 * s + 127) / 255) as u8,
-                            ((d[2] as u16 * s + 127) / 255) as u8,
-                        ])
-                    }
                 }
             } else {
                 Rgb([0u8, 0, 0])

@@ -8,11 +8,9 @@ fn main() -> anyhow::Result<()> {
     // lifetime (drop stops the monitor). See `perf_monitor::spawn_if_enabled`.
     let _perf_monitor_stop = arbvis::perf_monitor_spawn_if_enabled();
     let args = arbvis::Args::parse();
+    // The byte-only arbvis CLI registers just the built-in byte providers /
+    // Hilbert layout. A downstream specialization extends the registry and maps
+    // its own flags onto it before calling `run`.
     let registry = arbvis::Registry::with_defaults();
-    // The byte-only arbvis CLI doesn't expose the tensor-aware knobs
-    // (`--moe`, `--finetune`/`--no-finetune`,
-    // `--diff-metric`, `--layout`); pass the default `ModelOpts` so `run()` takes the
-    // byte-only branches (no MoE, RMS metric, auto-layout — which resolves
-    // to byte-Hilbert in a registry without arch-aware plugins).
-    rt.block_on(arbvis::run(args, arbvis::ModelOpts::default(), registry))
+    rt.block_on(arbvis::run(args, registry))
 }

@@ -22,29 +22,30 @@ def index():
     return FileResponse("index.html")
 
 
-@app.get("/labels.json")
-def labels():
-    data = fs().read_bytes(f"hf://buckets/{BUCKET_ID}/labels.json")
-    return Response(content=data, media_type="application/json")
-
-
-_TILE_MEDIA_TYPES = {
+_MEDIA_TYPES = {
     "avif": "image/avif",
     "png": "image/png",
     "webp": "image/webp",
+    "json": "application/json",
+    "bin": "application/octet-stream",
+    "html": "text/html",
+    "js": "text/javascript",
+    "css": "text/css",
 }
 
 
-# Catch-all under tiles/ so this serves both the single-pyramid layout
-# (tiles/<z>/<x>/<y>.<ext>) and the multi-scene layout
-# (tiles/<scene>/<z>/<x>/<y>.<ext>).
-@app.get("/tiles/{rest:path}")
-def tile(rest: str):
-    path = f"hf://buckets/{BUCKET_ID}/tiles/{rest}"
+# Serve any bundle asset from the backing bucket. This single catch-all covers
+# the 2D layout (tiles/<z>/<x>/<y>.<ext>, the multi-scene tiles/<scene>/...,
+# and labels.json) and the 3D bundle (volume.bin, points.bin, meta.json).
+@app.get("/{rest:path}")
+def asset(rest: str):
+    if not rest or rest == "index.html":
+        return FileResponse("index.html")
+    path = f"hf://buckets/{BUCKET_ID}/{rest}"
     try:
         data = fs().read_bytes(path)
     except (FileNotFoundError, EntryNotFoundError):
         return Response(status_code=404)
     ext = rest.rsplit(".", 1)[-1].lower() if "." in rest else ""
-    media_type = _TILE_MEDIA_TYPES.get(ext, "application/octet-stream")
+    media_type = _MEDIA_TYPES.get(ext, "application/octet-stream")
     return Response(content=data, media_type=media_type)

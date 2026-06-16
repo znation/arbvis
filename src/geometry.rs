@@ -12,21 +12,6 @@ pub const CHILD_TABLE: [[(u32, u32, u8); 4]; 4] = [
     [(1, 1, 2), (1, 0, 3), (0, 0, 3), (0, 1, 1)], // state 3
 ];
 
-/// Count multiples of `stride` in the byte range `[byte_start, byte_end)`.
-pub fn sampled_in_range(byte_start: u64, byte_end: u64, stride: u64) -> u64 {
-    if byte_end <= byte_start {
-        return 0;
-    }
-    if stride == 1 {
-        return byte_end - byte_start;
-    }
-    if byte_start == 0 {
-        (byte_end - 1) / stride + 1
-    } else {
-        (byte_end - 1) / stride - (byte_start - 1) / stride
-    }
-}
-
 /// Recursively decompose Hilbert local range [a, b) at `level` (order-`level`
 /// curve on a 2^level × 2^level square) into axis-aligned pixel rectangles.
 pub fn decompose_hilbert(
@@ -183,18 +168,120 @@ pub fn hilbert_to_xy_u64(idx: u64, order: u8) -> (u32, u32) {
     h2xy::<u32>(idx, order)
 }
 
+/// Number of axes for the 3D Hilbert curve.
+const N3: usize = 3;
+
+/// Smallest curve order `bits` such that a `2^bits` cube holds at least
+/// `cells` points (i.e. `2^(3*bits) >= cells`). Used to pick the 3D Hilbert
+/// order for a voxel grid of a given side. Clamped to `[1, 21]` — order 21
+/// fills a `2^21` cube and uses 63 of a `u64`'s 64 bits.
+pub fn hilbert3d_order_for_cells(cells: u64) -> u32 {
+    let mut bits = 1u32;
+    while (bits < 21) && ((1u128 << (3 * bits)) < cells as u128) {
+        bits += 1;
+    }
+    bits
+}
+
+/// 3D Hilbert curve: map a 1D distance `h` to cube coordinates `(x, y, z)`,
+/// each in `[0, 2^bits)`. Inverse of [`hilbert_xyz2d`].
+///
+/// Hand-rolled Skilling transform (J. Skilling, "Programming the Hilbert
+/// curve", 2004): de-interleave `h` into a per-axis "transpose", then run the
+/// recursion-free TransposeToAxes pass. `fast_hilbert` is 2D-only and the
+/// n-dimensional crates pull in `BigUint`; this stays on plain integers, is
+/// allocation-free, and is exercised by the round-trip tests below.
+pub fn hilbert_d2xyz(h: u64, bits: u32) -> [u32; N3] {
+    debug_assert!((1..=21).contains(&bits));
+    // De-interleave the distance into the transpose X[0..3]. Convention (matches
+    // the reference `hilbertcurve` port): bit `b` of axis `i` is bit
+    // `b*3 + (2 - i)` of `h`, i.e. axis 0 carries the most significant of each
+    // interleaved triple.
+    let mut x = [0u32; N3];
+    for b in 0..bits {
+        for (i, xi) in x.iter_mut().enumerate() {
+            let src = (b as usize) * N3 + (N3 - 1 - i);
+            *xi |= (((h >> src) & 1) as u32) << b;
+        }
+    }
+    // TransposeToAxes.
+    let top: u32 = 1 << bits; // sentinel = 2^bits
+    let t = x[N3 - 1] >> 1; // inverse gray code
+    for i in (1..N3).rev() {
+        x[i] ^= x[i - 1];
+    }
+    x[0] ^= t;
+    let mut q: u32 = 2;
+    while q != top {
+        let p = q - 1;
+        for i in (0..N3).rev() {
+            if x[i] & q != 0 {
+                x[0] ^= p;
+            } else {
+                let s = (x[0] ^ x[i]) & p;
+                x[0] ^= s;
+                x[i] ^= s;
+            }
+        }
+        q <<= 1;
+    }
+    x
+}
+
+/// 3D Hilbert curve: map cube coordinates `(x, y, z)`, each in `[0, 2^bits)`,
+/// to the 1D distance along the curve. Inverse of [`hilbert_d2xyz`].
+///
+/// The forward map ([`hilbert_d2xyz`]) is all the render path needs; this
+/// inverse completes the API and anchors the round-trip property tests.
+#[allow(dead_code)]
+pub fn hilbert_xyz2d(mut x: [u32; N3], bits: u32) -> u64 {
+    debug_assert!((1..=21).contains(&bits));
+    // AxesToTranspose.
+    let mut q: u32 = 1 << (bits - 1); // top bit
+    while q > 1 {
+        let p = q - 1;
+        for i in 0..N3 {
+            if x[i] & q != 0 {
+                x[0] ^= p;
+            } else {
+                let t = (x[0] ^ x[i]) & p;
+                x[0] ^= t;
+                x[i] ^= t;
+            }
+        }
+        q >>= 1;
+    }
+    for i in 1..N3 {
+        x[i] ^= x[i - 1]; // gray code
+    }
+    // Skilling's final fixup: fold the top axis's high bits back across all
+    // axes (the inverse of TransposeToAxes's leading gray-decode).
+    let mut t = 0u32;
+    let mut qq: u32 = 1 << (bits - 1);
+    while qq > 1 {
+        if x[N3 - 1] & qq != 0 {
+            t ^= qq - 1;
+        }
+        qq >>= 1;
+    }
+    for xi in x.iter_mut() {
+        *xi ^= t;
+    }
+    // Interleave the transpose back into the distance (inverse of the
+    // de-interleave in `hilbert_d2xyz`).
+    let mut h = 0u64;
+    for b in 0..bits {
+        for (i, &xi) in x.iter().enumerate() {
+            let dst = (b as usize) * N3 + (N3 - 1 - i);
+            h |= (((xi >> b) & 1) as u64) << dst;
+        }
+    }
+    h
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_sampled_in_range_basic() {
-        assert_eq!(sampled_in_range(0, 0, 1), 0);
-        assert_eq!(sampled_in_range(0, 10, 1), 10);
-        assert_eq!(sampled_in_range(0, 10, 3), 4); // 0,3,6,9
-        assert_eq!(sampled_in_range(1, 10, 3), 3); // 3,6,9
-        assert_eq!(sampled_in_range(5, 10, 2), 2); // 6,8
-    }
 
     #[test]
     fn test_xor_intervals_no_overlap() {
@@ -255,5 +342,107 @@ mod tests {
         let (x2, y2) = hilbert_to_xy_u64((side * side - 1) as u64, 8);
         assert!(x2 < side);
         assert!(y2 < side);
+    }
+
+    #[test]
+    fn test_hilbert3d_order_for_cells() {
+        assert_eq!(hilbert3d_order_for_cells(0), 1);
+        assert_eq!(hilbert3d_order_for_cells(8), 1); // 2^3 == 8
+        assert_eq!(hilbert3d_order_for_cells(9), 2); // needs 4^3 = 64
+        assert_eq!(hilbert3d_order_for_cells(64), 2);
+        assert_eq!(hilbert3d_order_for_cells(65), 3);
+        assert_eq!(hilbert3d_order_for_cells(1 << 24), 8); // 256^3
+        assert_eq!(hilbert3d_order_for_cells(u64::MAX), 21); // clamp
+    }
+
+    #[test]
+    fn test_hilbert3d_origin() {
+        for bits in 1..=8 {
+            assert_eq!(hilbert_d2xyz(0, bits), [0, 0, 0]);
+            assert_eq!(hilbert_xyz2d([0, 0, 0], bits), 0);
+        }
+    }
+
+    #[test]
+    fn test_hilbert3d_roundtrip_exhaustive_small() {
+        // Exhaustively round-trip every distance for small orders.
+        for bits in 1..=5 {
+            let cells = 1u64 << (3 * bits);
+            for h in 0..cells {
+                let p = hilbert_d2xyz(h, bits);
+                let side = 1u32 << bits;
+                assert!(
+                    p[0] < side && p[1] < side && p[2] < side,
+                    "coord OOB at h={h} bits={bits}: {p:?}"
+                );
+                assert_eq!(
+                    hilbert_xyz2d(p, bits),
+                    h,
+                    "roundtrip failed h={h} bits={bits}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_hilbert3d_bijection_small() {
+        // Every distance maps to a distinct coordinate (bijection onto the cube).
+        for bits in 1..=5 {
+            let cells = 1u64 << (3 * bits);
+            let side = 1u64 << bits;
+            let mut seen = std::collections::HashSet::with_capacity(cells as usize);
+            for h in 0..cells {
+                let p = hilbert_d2xyz(h, bits);
+                let key = (p[0] as u64) * side * side + (p[1] as u64) * side + p[2] as u64;
+                assert!(seen.insert(key), "duplicate coord at h={h} bits={bits}");
+            }
+            assert_eq!(seen.len() as u64, cells);
+        }
+    }
+
+    #[test]
+    fn test_hilbert3d_adjacency() {
+        // Hilbert locality: consecutive distances are unit-distance neighbors.
+        for bits in 1..=6 {
+            let cells = 1u64 << (3 * bits);
+            for h in 1..cells {
+                let a = hilbert_d2xyz(h - 1, bits);
+                let b = hilbert_d2xyz(h, bits);
+                let d = (a[0].abs_diff(b[0])) + (a[1].abs_diff(b[1])) + (a[2].abs_diff(b[2]));
+                assert_eq!(d, 1, "non-adjacent step h={h} bits={bits}: {a:?} -> {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_hilbert3d_roundtrip_large_orders() {
+        // Sample larger orders (can't enumerate); round-trip a deterministic
+        // pseudo-random spread of distances. Uses a tiny xorshift so there's no
+        // rng dependency.
+        let mut state: u64 = 0x9e3779b97f4a7c15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for bits in [10u32, 15, 21] {
+            let max = if 3 * bits >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << (3 * bits)) - 1
+            };
+            for _ in 0..5000 {
+                let h = next() & max;
+                let p = hilbert_d2xyz(h, bits);
+                let side = 1u64 << bits;
+                assert!((p[0] as u64) < side && (p[1] as u64) < side && (p[2] as u64) < side);
+                assert_eq!(
+                    hilbert_xyz2d(p, bits),
+                    h,
+                    "roundtrip failed h={h} bits={bits}"
+                );
+            }
+        }
     }
 }

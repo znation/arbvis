@@ -3,7 +3,7 @@
 //! arbvis is the generic byte-only foundation: it owns the tile pipeline,
 //! byte-Hilbert layout, JSON-diff, plain-byte diff, HF I/O, and Space deploy.
 //! Everything specialization-specific (a domain's format parsing, structured
-//! layouts, custom source preparation, single-image rendering, custom tile
+//! layouts, custom source preparation, custom tile
 //! loaders/renderers) is registered against this surface by a downstream crate
 //! — `modelweightvis` (tensor/model-weight viz) is one such specialization.
 //!
@@ -11,13 +11,12 @@
 //!   - **Vec slots** (`formats`, `layouts`, `diffs`, `providers`): multiple
 //!     plugins, iterated by descending priority. The byte built-ins are always
 //!     present; a downstream pushes higher-priority entries.
-//!   - **Id-keyed maps** (`leaf`, `single_renderers`): a per-layout-id
-//!     loader/renderer registered by a downstream layout plugin.
+//!   - **Id-keyed maps** (`leaf`): a per-layout-id tile loader/renderer
+//!     registered by a downstream layout plugin.
 //!   - **Option slots** (`prepare_sources_extension`): a single optional tap
 //!     point. When `None` the feature no-ops and the rest of arbvis still works.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -94,11 +93,15 @@ pub trait DiffSourceBuilder: Send + Sync {
 
 /// Coarse output-destination shape — enough for a [`SourceProvider`] to gate
 /// on without seeing the tempdir / upload internals of arbvis's `OutputDest`.
+///
+/// arbvis now has a single output shape: a deployable web-viewer bundle
+/// directory (a 2D tile pyramid, or — under `--3d` — a volume bundle). The
+/// native window and single-PNG destinations were removed; `Bundle` is the
+/// lone variant a provider can see. Whether the run is 2D or 3D is carried
+/// separately on [`SourceCtx::three_d`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DestKind {
-    Window,
-    SingleImage,
-    Tiles,
+    Bundle,
 }
 
 /// The two sides of a `--diff`, exactly as the user wrote them (a local path
@@ -118,9 +121,13 @@ pub struct SourceCtx<'a> {
     pub inputs: &'a [PathBuf],
     /// Present iff `--diff ORIGINAL MODIFIED` was passed.
     pub diff: Option<DiffPair<'a>>,
-    /// The resolved destination shape. Lets a provider reject a destination it
-    /// can't represent (e.g. a multi-scene provider requires [`DestKind::Tiles`]).
+    /// The resolved destination shape. Always [`DestKind::Bundle`] today; kept
+    /// so a provider can gate on it as the surface grows.
     pub dest_kind: DestKind,
+    /// `--3d`: render the volume/point-cloud bundle instead of the 2D tile
+    /// pyramid. Providers still build the same byte `Source`s either way; this
+    /// lets one opt out of a mode it can't represent (e.g. a 2D-only layout).
+    pub three_d: bool,
     /// `--stream`.
     pub stream: bool,
     /// `--show-xet-xorbs`.
@@ -204,31 +211,6 @@ pub trait PrepareSourcesExtension: Send + Sync {
     async fn enrich(&self, sources: &mut [Source]) -> anyhow::Result<()>;
 }
 
-/// Renders a single (non-tiled) image for a structure-aware layout. The
-/// single-image analog of the [`LeafLoader`]/[`LeafRenderer`] pair, which is
-/// likewise keyed by layout id in [`crate::LeafRegistry`]. `single::run_single`
-/// looks up the renderer registered under the chosen layout's
-/// [`LayoutShape::id`] and uses it when [`SingleImageRenderer::applicable`]
-/// returns true; otherwise arbvis falls back to its byte-Hilbert single-image
-/// path. Register one via [`Registry::register_single_renderer`].
-pub trait SingleImageRenderer: Send + Sync {
-    /// The [`LayoutShape::id`] this renderer draws (its key in
-    /// [`Registry::single_renderers`]).
-    fn id(&self) -> &'static str;
-    /// Whether this renderer can draw the given invocation. When it returns
-    /// false, `run_single` logs and falls back to byte-Hilbert. (e.g. a
-    /// synchronous renderer might only handle local, non-diff, non-xet
-    /// sources.)
-    fn applicable(&self, sources: &[Source], diff_mode: bool, show_xet_xorbs: bool) -> bool;
-    fn render(
-        &self,
-        files: &[PathBuf],
-        output: Option<PathBuf>,
-        sources: &[Source],
-        layout: &dyn LayoutShape,
-    ) -> anyhow::Result<()>;
-}
-
 /// Viewer branding: the tool name shown in the HTML title fallbacks
 /// (`"{name}"` / `"{name} diff"` / `"{name} moe"`) and the repo URL used for
 /// the title link + leaflet attribution.
@@ -268,10 +250,6 @@ pub struct Registry {
     /// applicable one. See [`SourceProvider`]; populated with arbvis's two
     /// byte built-ins by [`Registry::with_defaults`].
     pub providers: Vec<Arc<dyn SourceProvider>>,
-    /// Per-layout-id single-image renderers. Keyed by [`LayoutShape::id`];
-    /// `single::run_single` looks up the renderer for the chosen layout. See
-    /// [`SingleImageRenderer`] and [`Registry::register_single_renderer`].
-    pub single_renderers: HashMap<&'static str, Arc<dyn SingleImageRenderer>>,
     /// Cross-source enrichment pass that runs once per render after every
     /// `Source` has been built. See [`PrepareSourcesExtension`].
     pub prepare_sources_extension: Option<Arc<dyn PrepareSourcesExtension>>,
@@ -302,17 +280,9 @@ impl Registry {
                 Arc::new(crate::ByteDiffProvider),
                 Arc::new(crate::NormalBytesProvider),
             ],
-            single_renderers: HashMap::new(),
             prepare_sources_extension: None,
             layout_mode: LayoutMode::Auto,
             branding: Branding::default(),
         }
-    }
-
-    /// Register a single-image renderer under its [`SingleImageRenderer::id`]
-    /// (which must equal the [`LayoutShape::id`] it draws). Mirrors
-    /// [`crate::LeafRegistry`]'s loader/renderer registration.
-    pub fn register_single_renderer(&mut self, renderer: Arc<dyn SingleImageRenderer>) {
-        self.single_renderers.insert(renderer.id(), renderer);
     }
 }

@@ -8,14 +8,13 @@ pub mod hf_cli;
 mod hf_upload;
 pub mod hf_url;
 mod json_diff;
-mod label;
 mod layout;
 mod perf_monitor;
 mod progress;
 mod registry;
-mod single;
 mod throttle;
 mod tiled;
+mod volume;
 pub mod xet;
 
 // Public library surface — the byte-only foundation modelweightvis builds
@@ -30,8 +29,7 @@ pub use geometry::name_hue;
 pub use layout::{CanvasGeom, LayoutMode, LayoutShape};
 pub use registry::{
     Branding, DestKind, DiffBuildCtx, DiffPair, DiffSourceBuilder, FormatPlugin, LayoutBuildCtx,
-    LayoutPlugin, PrepareSourcesExtension, Registry, RenderHints, SingleImageRenderer, SourceCtx,
-    SourceProvider,
+    LayoutPlugin, PrepareSourcesExtension, Registry, RenderHints, SourceCtx, SourceProvider,
 };
 pub use tiled::html::FileEntity;
 pub use tiled::leaf::{encode_tile, TileFormat, TILE};
@@ -194,21 +192,28 @@ pub struct Args {
     #[arg(short = 'l', long, conflicts_with = "diff")]
     file_list: Option<PathBuf>,
 
-    /// Write the canvas to this PNG file instead of displaying a window.
-    /// Accepts a local path or an `hf://` URL (e.g. `hf://datasets/user/repo/path.png`)
-    /// to upload directly to the Hub.
-    #[arg(short, long, conflicts_with = "tiles")]
-    output: Option<PathBuf>,
-
-    /// Write a tiled pyramid for Leaflet.js viewing. Accepts a local directory
-    /// (open `index.html` in a browser) or an `hf://` URL to upload the viewer
-    /// bundle — `tiles/`, `index.html`, and `labels.json` — to a Hub repo.
+    /// Write the viewer bundle to this directory. In the default 2D mode this is
+    /// a Leaflet tile pyramid (`tiles/`, `index.html`, `labels.json`); under
+    /// `--3d` it is the Three.js volume bundle (`index.html`, `volume.bin`,
+    /// `points.bin`, `meta.json`). Open `index.html` over HTTP in a browser.
     ///
-    /// Note: `hf://` upload does NOT stand up a Space; the `index.html` lands in
-    /// the target repo but won't render on the Hub on its own. Use `--space` for
-    /// a working visualization URL.
-    #[arg(short, long, conflicts_with = "output")]
-    tiles: Option<PathBuf>,
+    /// Accepts a local directory or an `hf://` URL to upload the bundle to a Hub
+    /// repo. Note: `hf://` upload does NOT stand up a Space; the `index.html`
+    /// lands in the target repo but won't render on the Hub on its own. Use
+    /// `--space` for a working visualization URL.
+    #[arg(short = 'o', long)]
+    out: Option<PathBuf>,
+
+    /// Render in 3D: lay bytes along a 3D Hilbert curve in a cube and emit a
+    /// Three.js viewer (volume + point-cloud modes) instead of the 2D tile
+    /// pyramid. Opacity encodes density so the cube's interior is visible.
+    #[arg(long = "3d")]
+    three_d: bool,
+
+    /// 3D voxel grid side (a power of two, 2–512). Higher is more detailed but
+    /// a larger download (≈ side³·4 bytes). Ignored in 2D mode.
+    #[arg(long, default_value_t = 128)]
+    grid: u32,
 
     /// Visualize abs(modified - original) byte differences; ORIGINAL and MODIFIED are files or directories
     #[arg(long, num_args = 2, value_names = ["ORIGINAL", "MODIFIED"])]
@@ -219,18 +224,19 @@ pub struct Args {
     // crate's clap struct, which flattens this one. The downstream reads those
     // flags to construct its own `SourceProvider`s / set `Registry::layout_mode`
     // before calling `run`; arbvis-only callers never see them in `arbvis --help`.
-    /// Render tiles and deploy a viewable HF Space (e.g. username/my-vis).
-    /// Creates the Space with a Docker app that serves the Leaflet viewer,
-    /// and stores tiles in a sibling bucket auto-named `<namespace>/<repo>_bucket`.
+    /// Render and deploy a viewable HF Space (e.g. username/my-vis). Creates the
+    /// Space with a Docker app that serves the viewer, and stores the bundle in a
+    /// sibling bucket auto-named `<namespace>/<repo>_bucket`. Works for both 2D
+    /// and `--3d`.
     ///
-    /// Contrast with `--tiles hf://...`, which uploads only the viewer bundle
-    /// (no Space scaffolding). Combine with `--tiles <local_dir>` and no input
-    /// files to re-deploy an already-rendered tile directory without re-rendering.
-    #[arg(long, conflicts_with = "output")]
+    /// Contrast with `--out hf://...`, which uploads only the viewer bundle
+    /// (no Space scaffolding). Combine with `--out <local_dir>` and no input
+    /// files to re-deploy an already-rendered bundle without re-rendering.
+    #[arg(long)]
     space: Option<String>,
 
-    /// Regenerate index.html for an existing tiles directory without re-rendering tiles
-    #[arg(long, value_name = "TILES_DIR", conflicts_with_all = ["files", "diff", "output", "tiles", "space"])]
+    /// Regenerate index.html for an existing bundle directory without re-rendering
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["files", "diff", "out", "space"])]
     regen_html: Option<PathBuf>,
 
     /// Title shown in the HTML info panel (default: the brand name, optionally
@@ -277,6 +283,10 @@ struct RenderConfig {
     layout_mode: LayoutMode,
     leaf_format: TileFormat,
     pyramid_format: TileFormat,
+    /// `--3d`: route to the volume renderer instead of the tile pyramid.
+    three_d: bool,
+    /// 3D voxel grid side (power of two); unused in 2D.
+    grid_side: u32,
 }
 
 /// Where the render output goes after rendering. Owns any temporary
@@ -292,22 +302,14 @@ struct RenderConfig {
 /// IMMEDIATELY at the destructure point — the directory is gone before the
 /// upload starts. Do not rename.
 enum OutputDest {
-    /// No `--output`, no `--tiles`, no `--space`: pop a minifb window.
-    Window,
-    /// `--output <path>`: a single PNG. If `upload_hf` is `Some`, `local` is a
-    /// tempdir path that will be uploaded post-render.
-    SingleImage {
-        local: PathBuf,
-        upload_hf: Option<String>,
-        _tempdir: Option<TempDir>,
-    },
-    /// `--tiles <dir>` and/or `--space`: a tile pyramid.
+    /// `--out <dir>` and/or `--space`: a web-viewer bundle directory (a 2D tile
+    /// pyramid, or — under `--3d` — a volume bundle).
     ///
-    /// `local` is the disk path the pyramid renders into (a user dir, or a
-    /// tempdir inside `_tempdir`). It is `None` when `--stream` is set and
-    /// the destination is HF-bound — in that case the streaming path
-    /// uploads tiles as they are produced and never touches local disk.
-    Tiles {
+    /// `local` is the disk path the bundle renders into (a user dir, or a
+    /// tempdir inside `_tempdir`). It is `None` only for the 2D streaming path
+    /// (`--stream` + HF destination), which pushes tiles as produced and never
+    /// touches local disk; 3D always stages locally.
+    Bundle {
         local: Option<PathBuf>,
         upload_hf: Option<String>,
         space: Option<String>,
@@ -316,82 +318,65 @@ enum OutputDest {
 }
 
 impl OutputDest {
-    /// Resolve the user's `--output`/`--tiles`/`--space` flags into one of
-    /// the three concrete destinations.
+    /// Resolve the user's `--out`/`--space` flags into the bundle destination.
     ///
     /// Tempdirs are allocated lazily: only when the disk-backed path will
-    /// actually use one (`hf://` output without `--stream`). With `--stream`,
-    /// streaming destinations skip the tempdir entirely so a read-only or
-    /// full `/tmp` doesn't kill the run before it starts — which is exactly
-    /// the environment `--stream` exists for.
+    /// actually use one (`hf://` output without `--stream`, or any `--3d` run,
+    /// which always stages locally). With 2D `--stream`, streaming destinations
+    /// skip the tempdir entirely so a read-only or full `/tmp` doesn't kill the
+    /// run before it starts — which is exactly the environment `--stream`
+    /// exists for.
     fn from_args(args: &Args) -> anyhow::Result<Self> {
-        // `--output` always wins (clap forbids combining it with --tiles/--space).
-        // `--stream` does not apply to single-image output — there's no
-        // pyramid to stream, so we still go through a local PNG and upload it.
-        if let Some(ref out) = args.output {
-            return if hf_url::is_hf_path(out) {
-                let td = tempfile::tempdir().context("creating output tempdir")?;
-                let local = td.path().join("output.png");
-                Ok(OutputDest::SingleImage {
-                    local,
-                    upload_hf: Some(out.to_string_lossy().into_owned()),
-                    _tempdir: Some(td),
-                })
-            } else {
-                Ok(OutputDest::SingleImage {
-                    local: out.clone(),
-                    upload_hf: None,
-                    _tempdir: None,
-                })
-            };
-        }
-
-        let tiles_set = args.tiles.is_some();
+        let out_set = args.out.is_some();
         let space_set = args.space.is_some();
-        if !tiles_set && !space_set {
-            return Ok(OutputDest::Window);
+        if !out_set && !space_set {
+            anyhow::bail!(
+                "no output specified: pass --out <DIR> to write the viewer bundle \
+                 (a local dir or an hf:// URL), or --space <NAMESPACE/REPO> to \
+                 render and deploy a Hugging Face Space."
+            );
         }
 
-        // Reject `--tiles hf://X --space S`: the two flags are documented
-        // alternatives (see `--space` help: "Contrast with --tiles hf://..."),
+        // Reject `--out hf://X --space S`: the two flags are documented
+        // alternatives (see `--space` help: "Contrast with --out hf://..."),
         // and silently picking one over the other would mean the same flags
-        // produce different end-states under `--stream` vs. disk-backed.
-        // `--space` + `--tiles <local_dir>` is fine and used by the
-        // deploy-only shortcut for re-deploys.
-        if let (Some(p), true) = (args.tiles.as_ref(), space_set) {
+        // produce different end-states. `--space` + `--out <local_dir>` is fine
+        // and used by the deploy-only shortcut for re-deploys.
+        if let (Some(p), true) = (args.out.as_ref(), space_set) {
             if hf_url::is_hf_path(p) {
                 anyhow::bail!(
-                    "--tiles hf://… and --space are alternatives, not stackable: \
-                     --space deploys via its own bucket; --tiles hf:// uploads to \
-                     a separate repo. Pass one, or combine --space with --tiles \
-                     <local_dir> to (re-)deploy an already-rendered pyramid."
+                    "--out hf://… and --space are alternatives, not stackable: \
+                     --space deploys via its own bucket; --out hf:// uploads to \
+                     a separate repo. Pass one, or combine --space with --out \
+                     <local_dir> to (re-)deploy an already-rendered bundle."
                 );
             }
         }
 
-        // Streaming destinations skip the local pyramid entirely.
-        let needs_staging = !args.stream;
+        // 3D always stages to a local dir (no streaming output path); 2D skips
+        // staging only under --stream to an HF destination.
+        let needs_staging = !args.stream || args.three_d;
 
-        let (local, upload_hf, tempdir) = match &args.tiles {
+        let (local, upload_hf, tempdir) = match &args.out {
             Some(p) => {
                 if hf_url::is_hf_path(p) {
                     let url = p.to_string_lossy().into_owned();
                     if needs_staging {
-                        let td = tempfile::tempdir().context("creating tiles tempdir")?;
+                        let td = tempfile::tempdir().context("creating output tempdir")?;
                         (Some(td.path().to_path_buf()), Some(url), Some(td))
                     } else {
                         (None, Some(url), None)
                     }
                 } else {
-                    // Local --tiles <dir>: always disk-backed.
+                    // Local --out <dir>: always disk-backed.
                     (Some(p.clone()), None, None)
                 }
             }
             None => {
-                // --space without --tiles: tempdir for disk-backed sync;
+                // --space without --out: tempdir for disk-backed sync;
                 // nothing for streaming (uploads go through the bucket sink).
                 if needs_staging {
-                    let td = tempfile::tempdir().context("creating tiles tempdir")?;
+                    let td = tempfile::tempdir().context("creating output tempdir")?;
                     (Some(td.path().to_path_buf()), None, Some(td))
                 } else {
                     (None, None, None)
@@ -399,7 +384,7 @@ impl OutputDest {
             }
         };
 
-        Ok(OutputDest::Tiles {
+        Ok(OutputDest::Bundle {
             local,
             upload_hf,
             space: args.space.clone(),
@@ -411,9 +396,7 @@ impl OutputDest {
     /// internals so a provider can gate on it without depending on them.
     fn kind(&self) -> DestKind {
         match self {
-            OutputDest::Window => DestKind::Window,
-            OutputDest::SingleImage { .. } => DestKind::SingleImage,
-            OutputDest::Tiles { .. } => DestKind::Tiles,
+            OutputDest::Bundle { .. } => DestKind::Bundle,
         }
     }
 }
@@ -432,12 +415,22 @@ impl OutputDest {
 /// `run` builds a neutral [`SourceCtx`] from the parsed args and picks the
 /// highest-priority applicable provider (the `i32::MIN` floor always applies).
 pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()> {
-    if let Some(ref tile_dir) = args.regen_html {
-        return tiled::regen_html(tile_dir, &registry.branding);
+    if let Some(ref dir) = args.regen_html {
+        return if args.three_d {
+            volume::regen_html(dir, &registry.branding)
+        } else {
+            tiled::regen_html(dir, &registry.branding)
+        };
     }
 
     if args.show_xet_xorbs && args.diff.is_some() {
         anyhow::bail!("--show-xet-xorbs is incompatible with --diff");
+    }
+    if args.three_d {
+        validate_grid(args.grid)?;
+        if args.show_xet_xorbs {
+            log::warn!("--show-xet-xorbs has no effect in --3d mode; ignoring");
+        }
     }
 
     let dest = OutputDest::from_args(&args)?;
@@ -447,27 +440,28 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
     let show_xet_xorbs = args.show_xet_xorbs;
 
     // Deploy-only shortcut (a destination concern, so it runs before any source
-    // prep): `--space` + `--tiles <local>` with no input files means the tiles
+    // prep): `--space` + `--out <local>` with no input files means the bundle
     // directory is already fully rendered; just deploy it.
     //
-    // The match is the SAME shape as the rest of the dispatch — only the
-    // `local: Some(p)` (user-provided dir) + `_tempdir: None` (we didn't
-    // allocate one) combo distinguishes 'real on-disk pyramid the user wants
-    // re-deployed' from 'tempdir-staged pyramid currently being rendered'.
-    // If `OutputDest::from_args` is ever changed so that `--tiles <local>` +
+    // The match relies on `local: Some(p)` (user-provided dir) + `_tempdir: None`
+    // (we didn't allocate one) to distinguish 'real on-disk bundle the user
+    // wants re-deployed' from 'tempdir-staged bundle currently being rendered'.
+    // If `OutputDest::from_args` is ever changed so that `--out <local>` +
     // `--space` allocates a tempdir, this shortcut silently stops firing and
-    // we re-render from empty stdin — the regression the original comment
-    // explicitly warns about (`labels.json` overwritten with a useless
-    // `stdin` entry).
+    // we re-render from empty stdin.
     if args.files.is_empty() && args.file_list.is_none() {
-        if let OutputDest::Tiles {
+        if let OutputDest::Bundle {
             local: Some(local),
             upload_hf: None,
             space: Some(space_id),
             _tempdir: None,
         } = &dest
         {
-            return deploy::run_deploy(local, space_id).await;
+            return if args.three_d {
+                deploy::run_deploy_bundle(local, space_id).await
+            } else {
+                deploy::run_deploy(local, space_id).await
+            };
         }
     }
 
@@ -490,6 +484,7 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
         inputs: &files,
         diff,
         dest_kind: dest.kind(),
+        three_d: args.three_d,
         stream,
         show_xet_xorbs,
         registry: &registry,
@@ -515,8 +510,19 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
         layout_mode: registry.layout_mode,
         leaf_format,
         pyramid_format,
+        three_d: args.three_d,
+        grid_side: args.grid,
     };
     dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await
+}
+
+/// Validate `--grid`: a power of two in `[2, 512]`. (512³·4 ≈ 512 MiB on the
+/// wire is already a lot; the lower bound keeps the Hilbert order ≥ 1.)
+fn validate_grid(side: u32) -> anyhow::Result<()> {
+    if !(2..=512).contains(&side) || !side.is_power_of_two() {
+        anyhow::bail!("--grid must be a power of two between 2 and 512, got {side}");
+    }
+    Ok(())
 }
 
 /// Pick the highest-priority [`SourceProvider`] whose `applicable` returns true.
@@ -667,82 +673,69 @@ async fn dispatch_render(
             .await
             .context("prepare_sources_extension hook failed")?;
     }
+    let _ = labels; // labels feed the (2D-only) tile renderer's source names
     match dest {
-        OutputDest::Window => {
-            run_single_blocking(labels.to_vec(), None, sources, total, cfg, registry).await?;
-            Ok(())
-        }
-        OutputDest::SingleImage {
-            local,
-            upload_hf,
-            _tempdir,
-        } => {
-            run_single_blocking(
-                labels.to_vec(),
-                Some(local.clone()),
-                sources,
-                total,
-                cfg,
-                registry,
-            )
-            .await?;
-            if let Some(url) = upload_hf {
-                deploy::upload_file_to(&url, &local).await?;
-            }
-            Ok(())
-        }
-        OutputDest::Tiles {
+        OutputDest::Bundle {
             local,
             upload_hf,
             space,
             _tempdir,
         } => {
-            render_tiles(
-                sources,
-                total,
-                local.as_deref(),
-                upload_hf,
-                space,
-                cfg,
-                stream,
-                registry,
-            )
-            .await
+            if cfg.three_d {
+                render_volume_bundle(sources, total, local, upload_hf, space, cfg, registry).await
+            } else {
+                render_tiles(
+                    sources,
+                    total,
+                    local.as_deref(),
+                    upload_hf,
+                    space,
+                    cfg,
+                    stream,
+                    registry,
+                )
+                .await
+            }
         }
     }
 }
 
-/// Run the synchronous single-image pipeline on the tokio blocking pool so
-/// the tokio runtime stays responsive for any async helpers (`Data::Xet`,
-/// `Data::LazyDiff`) the renderer calls into.
-async fn run_single_blocking(
-    labels: Vec<PathBuf>,
-    output: Option<PathBuf>,
+/// 3D analog of [`render_tiles`]'s disk-backed path: render the volume bundle
+/// into `local`, then upload / deploy. 3D always stages locally (no streaming
+/// output), so `local` is always `Some` (see [`OutputDest::from_args`]).
+async fn render_volume_bundle(
     sources: Vec<Source>,
     total: u64,
+    local: Option<PathBuf>,
+    upload_hf: Option<String>,
+    space: Option<String>,
     cfg: &RenderConfig,
     registry: &registry::Registry,
 ) -> anyhow::Result<()> {
-    let diff_mode = cfg.diff_mode;
-    let show_xet_xorbs = cfg.show_xet_xorbs;
-    let layout_mode = cfg.layout_mode;
-    // `spawn_blocking` requires a `'static` closure, so clone the registry
-    // (cheap — every slot is an `Arc<…>` clone).
-    let registry = registry.clone();
-    tokio::task::spawn_blocking(move || {
-        single::run_single(
-            &labels,
-            output,
-            sources,
-            total,
-            diff_mode,
-            show_xet_xorbs,
-            layout_mode,
-            &registry,
+    let dir = local.ok_or_else(|| {
+        anyhow::anyhow!(
+            "internal: 3D render without a local staging dir \
+             (OutputDest::from_args should have allocated one)"
         )
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("run_single join failure: {e}"))?
+    })?;
+    volume::render_volume(
+        sources,
+        total,
+        dir.clone(),
+        &cfg.title,
+        &cfg.inputs,
+        cfg.diff_mode,
+        cfg.grid_side,
+        &registry.branding,
+    )
+    .await?;
+    if let Some(ref space_id) = space {
+        deploy::run_deploy_bundle(&dir, space_id).await?;
+    }
+    if let Some(ref url) = upload_hf {
+        deploy::upload_dir_to(url, &dir).await?;
+    }
+    Ok(())
 }
 
 /// Tile-pyramid render + upload + Space-deploy fan-out.
@@ -1014,7 +1007,8 @@ mod provider_selection_tests {
         SourceCtx {
             inputs,
             diff,
-            dest_kind: DestKind::Tiles,
+            dest_kind: DestKind::Bundle,
+            three_d: false,
             stream: false,
             show_xet_xorbs: false,
             registry: reg,

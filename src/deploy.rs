@@ -6,56 +6,6 @@ use crate::hf_cli;
 use crate::hf_url::{self, HfOutputSpec, RepoKind};
 use crate::throttle::with_throttle;
 
-/// Upload a single local file to a Hugging Face repo via the `hf` CLI.
-pub async fn upload_file(
-    local: &Path,
-    repo_id: &str,
-    kind: RepoKind,
-    path_in_repo: &str,
-) -> anyhow::Result<()> {
-    log::info!(
-        "Uploading {} → hf://{}/{} ...",
-        local.display(),
-        repo_id,
-        path_in_repo
-    );
-    let local_str = local.to_string_lossy().into_owned();
-    let label = format!("hf upload {repo_id}/{path_in_repo}");
-
-    match kind {
-        RepoKind::Bucket => {
-            let dest = format!("hf://buckets/{repo_id}/{path_in_repo}");
-            with_throttle(&label, || async {
-                hf_cli::run_hf(["buckets", "cp", local_str.as_str(), dest.as_str()]).await
-            })
-            .await
-            .with_context(|| format!("uploading {} -> {dest}", local.display()))?;
-        }
-        kind => {
-            let repo_type = kind.cli_repo_type()?;
-            with_throttle(&label, || async {
-                hf_cli::run_hf([
-                    "upload",
-                    "--repo-type",
-                    repo_type,
-                    repo_id,
-                    local_str.as_str(),
-                    path_in_repo,
-                ])
-                .await
-            })
-            .await
-            .with_context(|| {
-                format!(
-                    "uploading {} -> hf://{repo_id}/{path_in_repo}",
-                    local.display()
-                )
-            })?;
-        }
-    }
-    Ok(())
-}
-
 /// Upload a local directory tree to a path prefix in a Hugging Face repo.
 pub async fn upload_dir(
     local_dir: &Path,
@@ -118,12 +68,6 @@ pub async fn upload_dir(
         }
     }
     Ok(())
-}
-
-/// Parse an `hf://` output URL and upload a single local file to the target repo.
-pub async fn upload_file_to(hf_url_str: &str, local: &Path) -> anyhow::Result<()> {
-    let spec = hf_url::parse_hf_output(hf_url_str)?;
-    upload_file(local, &spec.repo_id, spec.kind, &spec.path_prefix).await
 }
 
 /// Parse an `hf://` output URL and upload a local directory tree to the target repo.
@@ -236,6 +180,26 @@ pub async fn run_deploy(tiles_dir: &Path, space_id: &str) -> anyhow::Result<()> 
 
     let index_html = std::fs::read(tiles_dir.join("index.html"))
         .context("failed to read index.html from tiles directory")?;
+    deploy_space_app(space_id, bucket_id, index_html).await
+}
+
+/// Deploy a 3D (`--3d`) bundle directory to a Space: sync the whole bundle
+/// (`index.html`, `volume.bin`, `points.bin`, `meta.json`) into the backing
+/// bucket and (re)deploy the Space app that serves it. The generalized
+/// `app.py` static catch-all serves the assets from the bucket.
+pub async fn run_deploy_bundle(dir: &Path, space_id: &str) -> anyhow::Result<()> {
+    let index = dir.join("index.html");
+    if !index.exists() {
+        bail!("index.html not found in {}", dir.display());
+    }
+
+    let bucket_spec = create_space_bucket(space_id).await?;
+    let bucket_id = &bucket_spec.repo_id;
+
+    log::info!("Syncing 3D bundle to bucket (this may take a while)...");
+    upload_dir(dir, bucket_id, RepoKind::Bucket, "").await?;
+
+    let index_html = std::fs::read(&index).context("failed to read index.html from bundle")?;
     deploy_space_app(space_id, bucket_id, index_html).await
 }
 

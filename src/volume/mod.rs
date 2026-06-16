@@ -1,0 +1,372 @@
+//! 3D (`--3d`) render path: aggregate the source bytes onto a 3D Hilbert curve
+//! inside a cube and emit a self-contained Three.js viewer bundle.
+//!
+//! This is the 3D analog of [`crate::tiled`]. Where the 2D path lays one pixel
+//! per byte and builds a tile pyramid, the 3D path lays bytes along a 3D
+//! Hilbert curve and aggregates them into a bounded voxel grid — so render and
+//! download cost are governed by the grid resolution, not the (potentially
+//! many-GB) input size. The viewer ray-marches the grid with opacity encoding
+//! density (so the cube's interior is visible) and offers a point-cloud mode
+//! for the exact-position view.
+//!
+//! Output bundle (written to the `--out` directory, deployed verbatim by
+//! `--space`): `index.html`, `volume.bin` (RGBA8 `Data3DTexture` payload),
+//! `points.bin` (packed positions+colors), and `meta.json`.
+
+pub mod encode;
+pub mod html;
+
+use std::path::{Path, PathBuf};
+
+use anyhow::Context;
+use image::Rgb;
+
+use crate::color::{build_diff_signed_lut, build_pixel_lut};
+use crate::data::{load_source_data, Source};
+use crate::geometry;
+use crate::registry::Branding;
+use encode::{VolumeMeta, VoxelAcc};
+
+/// Bytes read per `fetch_range` window during aggregation.
+const CHUNK: u64 = 4 * 1024 * 1024;
+
+/// Target point-cloud size. Files within this many sampled positions render
+/// exactly; larger files are uniformly subsampled (stride sampling). True
+/// exact drill-down on huge clouds (octree LOD streaming) is future work.
+const POINT_BUDGET: u64 = 1_500_000;
+
+/// Max Hilbert order used to place point-cloud positions — caps the coordinate
+/// range at `2^16` per axis (plenty for crisp f32-normalized positions).
+const POINT_ORDER_CAP: u32 = 16;
+
+struct BuildResult {
+    volume_rgba: Vec<u8>,
+    points_buf: Vec<u8>,
+    points_count: u64,
+    max_count: u64,
+    focus_center: [f32; 3],
+    focus_radius: f32,
+}
+
+/// Render the 3D viewer bundle for `sources` into `out_dir`.
+#[allow(clippy::too_many_arguments)]
+pub async fn render_volume(
+    sources: Vec<Source>,
+    total: u64,
+    out_dir: PathBuf,
+    title: &str,
+    inputs: &[String],
+    diff_mode: bool,
+    grid_side: u32,
+    branding: &Branding,
+) -> anyhow::Result<()> {
+    let pixel_lut = if diff_mode {
+        build_diff_signed_lut()
+    } else {
+        build_pixel_lut()
+    };
+
+    log::info!("Aggregating {total} bytes into a {grid_side}³ voxel grid via 3D Hilbert curve...");
+
+    // CPU + per-chunk fetch work on the blocking pool, like the single-image
+    // path — keeps the tokio runtime free for the `Http`/`Xet`/`LazyDiff`
+    // fetches the workers drive via `block_on`.
+    let rt = tokio::runtime::Handle::current();
+    let built = tokio::task::spawn_blocking(move || {
+        aggregate_and_build(sources, total, grid_side, pixel_lut, rt)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("volume aggregation join failure: {e}"))??;
+
+    std::fs::create_dir_all(&out_dir)?;
+    std::fs::write(out_dir.join("volume.bin"), &built.volume_rgba)?;
+    std::fs::write(out_dir.join("points.bin"), &built.points_buf)?;
+
+    let meta = VolumeMeta {
+        title: title.to_string(),
+        brand_name: branding.name.to_string(),
+        repo_url: branding.repo_url.to_string(),
+        grid_side,
+        points: built.points_count,
+        total_bytes: total,
+        max_count: built.max_count,
+        diff_mode,
+        inputs: inputs.to_vec(),
+        focus_center: built.focus_center,
+        focus_radius: built.focus_radius,
+        lut: pixel_lut.iter().map(|c| c.0).collect(),
+    };
+    std::fs::write(out_dir.join("meta.json"), serde_json::to_vec(&meta)?)?;
+    std::fs::write(
+        out_dir.join("index.html"),
+        html::build_volume_html(title, inputs, branding),
+    )?;
+
+    log::info!(
+        "3D viewer bundle written to {} ({} points)",
+        out_dir.display(),
+        built.points_count
+    );
+    Ok(())
+}
+
+/// Rebuild `index.html` for an existing 3D bundle from its `meta.json`,
+/// without re-aggregating. Mirrors [`crate::tiled::regen_html`].
+pub fn regen_html(dir: &Path, branding: &Branding) -> anyhow::Result<()> {
+    let meta_path = dir.join("meta.json");
+    let bytes = std::fs::read(&meta_path)
+        .with_context(|| format!("reading {} (is this a --3d bundle?)", meta_path.display()))?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let title = v
+        .get("title")
+        .and_then(|t| t.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| branding.name.to_string());
+    let inputs: Vec<String> = v
+        .get("inputs")
+        .and_then(|i| i.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    std::fs::write(
+        dir.join("index.html"),
+        html::build_volume_html(&title, &inputs, branding),
+    )?;
+    log::info!("Regenerated 3D viewer index.html in {}", dir.display());
+    Ok(())
+}
+
+/// Single streaming pass over the concatenated source bytes: populate the
+/// voxel grid and sample the point cloud at once. Runs on the blocking pool.
+fn aggregate_and_build(
+    sources: Vec<Source>,
+    total: u64,
+    grid_side: u32,
+    pixel_lut: [Rgb<u8>; 256],
+    rt: tokio::runtime::Handle,
+) -> anyhow::Result<BuildResult> {
+    let order = grid_side.trailing_zeros(); // grid_side is a power of two
+    let cells: u64 = (grid_side as u64).pow(3);
+    let luma = encode::luma_lut(&pixel_lut);
+
+    let mut grid = vec![VoxelAcc::default(); cells as usize];
+    let mut max_count: u64 = 0;
+
+    // Point cloud: at least as fine as the grid, capped so positions are crisp.
+    let point_order =
+        geometry::hilbert3d_order_for_cells(total.max(1)).clamp(order, POINT_ORDER_CAP);
+    let cells_pt: u128 = 1u128 << (3 * point_order);
+    let side_pt = (1u32 << point_order) as f32;
+    let stride = (total / POINT_BUDGET).max(1);
+    let mut positions: Vec<f32> = Vec::new();
+    let mut colors: Vec<u8> = Vec::new();
+    let mut next_point_g: u64 = 0;
+
+    // First byte not belonging to cell `c`. Two regimes: when the cube can't
+    // hold every byte (`total > cells`) each cell aggregates a contiguous byte
+    // run; otherwise each byte is its own cell (a contiguous Hilbert prefix, so
+    // a small file reads as one solid blob rather than a scattered dust).
+    let cell_end = |c: u64| -> u64 {
+        if total <= cells {
+            c + 1
+        } else {
+            (((c as u128 + 1) * total as u128).div_ceil(cells as u128)) as u64
+        }
+    };
+
+    let side = grid_side as usize;
+    let flush = |grid: &mut [VoxelAcc], c: u64, acc: &VoxelAcc, max_count: &mut u64| {
+        if acc.count == 0 {
+            return;
+        }
+        let [x, y, z] = geometry::hilbert_d2xyz(c, order);
+        let lin = x as usize + y as usize * side + z as usize * side * side;
+        grid[lin] = *acc;
+        if acc.count as u64 > *max_count {
+            *max_count = acc.count as u64;
+        }
+    };
+
+    let mut cur_cell: u64 = 0;
+    let mut ce = if total == 0 { 0 } else { cell_end(0) };
+    let mut acc = VoxelAcc::default();
+    let mut global_start: u64 = 0;
+
+    for src in &sources {
+        let data = load_source_data(src)?;
+        let size = src.byte_size;
+        let mut local: u64 = 0;
+        while local < size {
+            let len = (size - local).min(CHUNK) as usize;
+            let buf = rt.block_on(data.fetch_range(local, len))?;
+            for (i, &b) in buf.iter().enumerate() {
+                let g = global_start + local + i as u64;
+
+                // Advance the grid cell, flushing the one we leave behind.
+                while g >= ce {
+                    flush(&mut grid, cur_cell, &acc, &mut max_count);
+                    acc = VoxelAcc::default();
+                    cur_cell += 1;
+                    ce = cell_end(cur_cell);
+                }
+                acc.count += 1;
+                acc.sum_val += b as u64;
+                acc.sum_luma += luma[b as usize] as u64;
+
+                // Stride-sample into the point cloud.
+                if g == next_point_g && positions.len() as u64 / 3 < POINT_BUDGET {
+                    let cp = if total as u128 <= cells_pt {
+                        g
+                    } else {
+                        ((g as u128) * cells_pt / total as u128) as u64
+                    };
+                    let [px, py, pz] = geometry::hilbert_d2xyz(cp, point_order);
+                    positions.push(px as f32 / side_pt);
+                    positions.push(py as f32 / side_pt);
+                    positions.push(pz as f32 / side_pt);
+                    let c = pixel_lut[b as usize].0;
+                    let a = c[0].max(c[1]).max(c[2]); // 0x00 → transparent
+                    colors.extend_from_slice(&[c[0], c[1], c[2], a]);
+                    next_point_g += stride;
+                }
+            }
+            local += len as u64;
+        }
+        global_start += size;
+    }
+    // Flush the trailing in-progress cell.
+    flush(&mut grid, cur_cell, &acc, &mut max_count);
+
+    // Occupied bounding box (voxel coords) → cube-space center + radius, so the
+    // viewer frames the data rather than a mostly-empty cube.
+    let (focus_center, focus_radius) = occupied_focus(&grid, grid_side);
+
+    let volume_rgba = encode::grid_to_rgba(&grid, max_count);
+    let points_count = positions.len() as u64 / 3;
+    let points_buf = encode::pack_points(&positions, &colors);
+
+    Ok(BuildResult {
+        volume_rgba,
+        points_buf,
+        points_count,
+        max_count,
+        focus_center,
+        focus_radius,
+    })
+}
+
+/// Cube-space framing center + radius for the occupied voxels. Targets the
+/// occupancy **centroid** (mass center — the Hilbert prefix clusters
+/// asymmetrically within its bounding box) and sizes the radius so the full
+/// occupied bounding box stays in view from that center. Voxel `v` on an axis
+/// maps to cube position `(v + 0.5)/side - 0.5` (matching the shader's
+/// `uvw = p + 0.5`). Falls back to the whole cube when nothing is occupied.
+fn occupied_focus(grid: &[VoxelAcc], grid_side: u32) -> ([f32; 3], f32) {
+    let side = grid_side as usize;
+    let mut bmin = [u32::MAX; 3];
+    let mut bmax = [0u32; 3];
+    let mut sum = [0f64; 3];
+    let mut n: u64 = 0;
+    for (i, acc) in grid.iter().enumerate() {
+        if acc.count == 0 {
+            continue;
+        }
+        n += 1;
+        let coord = [
+            (i % side) as u32,
+            ((i / side) % side) as u32,
+            (i / (side * side)) as u32,
+        ];
+        for a in 0..3 {
+            bmin[a] = bmin[a].min(coord[a]);
+            bmax[a] = bmax[a].max(coord[a]);
+            sum[a] += coord[a] as f64;
+        }
+    }
+    if n == 0 {
+        return ([0.0, 0.0, 0.0], 0.5);
+    }
+    let s = grid_side as f32;
+    let to_cube = |v: f32| (v + 0.5) / s - 0.5;
+    let mut center = [0f32; 3];
+    let mut radius = 0f32;
+    for a in 0..3 {
+        let c = to_cube((sum[a] / n as f64) as f32);
+        let lo = to_cube(bmin[a] as f32);
+        let hi = to_cube(bmax[a] as f32);
+        center[a] = c;
+        radius = radius.max((c - lo).max(hi - c));
+    }
+    (center, radius.max(0.02))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::SourceKind;
+
+    fn buffered(bytes: Vec<u8>) -> Source {
+        let len = bytes.len() as u64;
+        Source {
+            file_idx: 0,
+            kind: SourceKind::Buffered(bytes),
+            byte_size: len,
+            name_override: None,
+            xet_terms: None,
+            extensions: Default::default(),
+        }
+    }
+
+    /// A half-zero / half-0xFF buffer must produce both fully-transparent
+    /// (activity 0) and fully-active (activity 255) occupied voxels, and a
+    /// well-formed bundle (volume.bin sized to the grid, all bytes sampled as
+    /// points since the input is far under the point budget).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aggregates_zero_and_ff_split() {
+        let mut bytes = vec![0u8; 4096];
+        bytes.extend(std::iter::repeat_n(0xFFu8, 4096));
+        let total = bytes.len() as u64;
+        let dir = tempfile::tempdir().unwrap();
+        let grid_side = 32u32;
+        render_volume(
+            vec![buffered(bytes)],
+            total,
+            dir.path().to_path_buf(),
+            "test",
+            &[],
+            false,
+            grid_side,
+            &Branding::default(),
+        )
+        .await
+        .unwrap();
+
+        let vol = std::fs::read(dir.path().join("volume.bin")).unwrap();
+        assert_eq!(vol.len() as u64, (grid_side as u64).pow(3) * 4);
+
+        let (mut zero_act, mut full_act, mut occupied) = (false, false, 0u64);
+        for px in vol.chunks_exact(4) {
+            if px[3] > 0 {
+                occupied += 1;
+                if px[1] == 0 {
+                    zero_act = true; // the 0x00 half → transparent
+                }
+                if px[1] >= 250 {
+                    full_act = true; // the 0xFF half → opaque
+                }
+            }
+        }
+        assert_eq!(occupied, total, "one byte per voxel below grid capacity");
+        assert!(zero_act && full_act, "expected an activity split");
+
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta["grid_side"], grid_side);
+        assert_eq!(meta["points"], total);
+        assert!(dir.path().join("points.bin").exists());
+        assert!(dir.path().join("index.html").exists());
+    }
+}

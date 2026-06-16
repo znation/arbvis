@@ -4,12 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ab_glyph = "0.2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 fast_hilbert = "2.0"
 image = "0.25"
-imageproc = "0.25"
 # Used directly for indexed-color PNG output of Plain/Dtype leaf tiles, which
 # the `image` crate's PNG encoder doesn't support (it only emits truecolor).
 # Indexed PNG cuts leaf tile size 2-4× vs truecolor PNG for the ≤256-color
@@ -20,7 +18,6 @@ indicatif = "0.17"
 # progress bars never overwrite each other.
 indicatif-log-bridge = "0.2"
 memmap2 = "0.9"
-minifb = "0.27"
 rayon = "1"
 log = "0.4"
 env_logger = "0.11"

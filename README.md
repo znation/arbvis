@@ -1,23 +1,27 @@
 # arbvis
 
-Visualize arbitrary binary files as 2D images that make structure visible at a glance. arbvis lays bytes out along a [Hilbert curve](https://en.wikipedia.org/wiki/Hilbert_curve) — one pixel per byte — and colors them by value range. Null regions, ASCII text, compressed payloads, and section boundaries all produce recognizable visual signatures.
+Visualize arbitrary binary files in a way that makes structure visible at a glance. arbvis lays bytes out along a [Hilbert curve](https://en.wikipedia.org/wiki/Hilbert_curve) and colors them by value range. Null regions, ASCII text, compressed payloads, and section boundaries all produce recognizable visual signatures. The default 2D mode renders a zoomable image (one pixel per byte); the [3D mode](#3d-mode) lifts the same idea into a volume you can fly through, using opacity to reveal the cube's interior.
 
 **For ML model weights**, use [**modelweightvis**](https://github.com/znation/modelweightvis), built on top of arbvis. arbvis renders `.safetensors` / `.gguf` / `.bin` checkpoints as raw bytes; modelweightvis adds tensor-format parsing, an architectural layout that stacks transformer blocks at each tensor's natural element shape, MoE expert-vs-expert diffs, finetune auto-detection, and dtype-aware coloring. Architecturally, modelweightvis is a thin crate that registers tensor-aware plugins and hooks against arbvis's registry — see [Relationship to modelweightvis](#relationship-to-modelweightvis) below.
 
 ## Quick start
 
 ```sh
-arbvis /bin/ls --output ls.png
+arbvis /tmp/foo.bin --out ./out
+# then serve ./out over HTTP and open index.html in a browser
 ```
 
-Renders `/bin/ls` as a single Hilbert-curve PNG. With no `--output`, arbvis opens a display window. For zoomable tiles:
+The output is a [Leaflet.js](https://leafletjs.com/) tile pyramid you can zoom across; at maximum zoom, one pixel is one byte. Add `--3d` for the volume viewer:
 
 ```sh
-arbvis /tmp/foo.bin --tiles ./out
-# then open out/index.html in a browser
+arbvis /tmp/foo.bin --3d --out ./out3d
 ```
 
-The output is a [Leaflet.js](https://leafletjs.com/) tile pyramid you can zoom across; at maximum zoom, one pixel is one byte.
+To publish either as a live, shareable visualization, swap `--out` for `--space`:
+
+```sh
+arbvis hf://datasets/owner/dataset --space me/dataset-vis
+```
 
 ## What you see
 
@@ -41,6 +45,36 @@ Raw bytes are colored by range (based on [Stairwell's approach](https://stairwel
 
 In `--diff` mode, each pixel encodes the byte-wise difference between the two inputs. Identical bytes render as black; the larger the delta, the brighter the pixel.
 
+## 3D mode (`--3d`)
+
+`--3d` lays the bytes along a **3D Hilbert curve** inside a cube — the natural generalization of the 2D layout — and emits a self-contained [Three.js](https://threejs.org/) viewer bundle (`index.html`, `volume.bin`, `points.bin`, `meta.json`). It deploys as a Hugging Face Space exactly like 2D (`--space`).
+
+```sh
+arbvis model.safetensors --3d --out ./out3d      # local bundle (serve over HTTP)
+arbvis hf://datasets/owner/dataset --3d --space me/vis-3d   # deploy a Space
+```
+
+Where 2D color is fully opaque, **3D uses opacity to encode density** so you can see *through* the cube to its internal structure instead of just an opaque shell. The viewer has two modes (toggle in the panel):
+
+- **Volume** (default) — a GPU ray-march of a bounded voxel grid. Color encodes the mean byte value (the same [byte-color scheme](#byte-colors) as 2D); opacity comes from an adjustable, log-style **transfer function**. Render and download cost depend on the grid resolution, *not* the input size, so a multi-GB file renders as smoothly as a small one.
+  - **Opacity source** — *Activity* (default: mean byte "brightness", so null/padding regions fade to transparent and real data stands out) or *Density* (how many bytes fall in each voxel).
+  - **Opacity / Contrast / Threshold / Quality** sliders tune the transfer function and ray-march step count.
+- **Points** — the exact byte positions as a point cloud with additive blending (per-point color + size/opacity). Files up to ~1.5M sampled points render exactly; larger inputs are uniformly subsampled.
+
+**Controls:** drag to rotate · right-drag to pan · scroll to zoom (the camera auto-frames the occupied region on load).
+
+**Grid resolution (`--grid N`)** — the voxel cube side, a power of two in `2–512` (default `128`). Higher is more detailed but a larger download (≈ `N³ · 4` bytes; `128³` ≈ 8 MB, `256³` ≈ 64 MB).
+
+Like the 2D viewer, the 3D bundle loads Three.js from a CDN and fetches its data over HTTP — open `index.html` through a web server, not a `file://` URL.
+
+### Not yet implemented
+
+The 3D mode is intentionally scoped for a first release. Deferred:
+
+- **Octree level-of-detail streaming** for *exact* point-cloud drill-down on multi-GB files (today the point cloud is a uniform subsample beyond ~1.5M points; the volume mode is the unbounded-scale path).
+- **WebGPU compute-shader rendering** for >100M exact points.
+- **3D file-boundary overlays** and an **interactive transfer-function editor** with a density histogram.
+
 ## Supported input formats
 
 - **Plain binary** — anything not specifically detected is rendered byte-for-byte.
@@ -51,8 +85,8 @@ Anything else — `.safetensors`, `.gguf`, PyTorch `.bin` — is rendered as pla
 ## Comparing two files: `--diff`
 
 ```sh
-arbvis --diff a.bin b.bin --tiles ./out
-arbvis --diff hf://owner/repo/a.json hf://owner/repo/b.json --output diff.png
+arbvis --diff a.bin b.bin --out ./out
+arbvis --diff hf://owner/repo/a.json hf://owner/repo/b.json --out hf://datasets/me/vis/diff
 ```
 
 Plain-byte diff aligns the two inputs at offset 0 and computes per-byte deltas. Whole directories work too — each file pairs up by name across the two roots.
@@ -63,53 +97,53 @@ When both `--diff` inputs have a `.json` or `.jsonl` extension, arbvis aligns th
 
 ## Output destinations
 
-### Tiled viewer (`--tiles DIR`, recommended)
+arbvis writes a self-contained web-viewer **bundle**. There are two ways to get one:
+
+- `--out DIR` — write the bundle to a local directory (or an `hf://` URL).
+- `--space NAMESPACE/REPO` — render the bundle and deploy a live Hugging Face Space.
+
+`--out` and `--space` work the same in both 2D and `--3d`.
+
+### Local bundle (`--out DIR`)
 
 ```sh
-arbvis file1.bin file2.bin --tiles ./out
+arbvis file1.bin file2.bin --out ./out
+# serve it locally, e.g.:  python3 -m http.server -d ./out
 ```
 
-Generates a Leaflet pyramid (`out/tiles/{z}/{x}/{y}.{ext}` plus `out/index.html`). Advantages over single-image mode:
+In 2D this generates a Leaflet pyramid (`out/tiles/{z}/{x}/{y}.{ext}`, `out/index.html`, `out/labels.json`):
 
 - Full resolution at every zoom level (1 px = 1 byte at max zoom).
 - Vector file boundaries — sharp at every scale, not baked into pixels.
 - No size limit — works on files of any size; lower zoom levels are averaged.
 - HTML labels positioned at each region's area-weighted centroid.
 
-### Single image and window
-
-```sh
-arbvis /bin/ls                      # open a display window
-arbvis /bin/ls --output out.png     # write a PNG
-cat /dev/urandom | head -c 65536 | arbvis   # read from stdin
-```
-
-With no output flag, arbvis opens a display window (press ESC to close). With `--output`, it writes a single PNG. Both are capped at 4096×4096 — larger inputs are subsampled, so use `--tiles` when detail matters.
+In `--3d` it generates the volume bundle (`index.html`, `volume.bin`, `points.bin`, `meta.json`) — see [3D mode](#3d-mode). Either bundle loads its rendering library from a CDN and fetches its data over HTTP, so open `index.html` through a web server, not a `file://` URL.
 
 ![arbvis screenshot](arbvis.png)
 
-*Byte-Hilbert single-image mode: multiple unrelated files (images, parquet, mp3, an SSH key) concatenated and rendered together — each file's content signature is immediately distinguishable.*
+*Multiple unrelated files (images, parquet, mp3, an SSH key) concatenated and rendered together — each file's content signature is immediately distinguishable.*
 
 ### HF Hub output
 
-Both `--output` and `--tiles` accept `hf://` URLs and upload directly to the Hub:
+`--out` accepts an `hf://` URL and uploads the bundle directly to the Hub:
 
 ```sh
-arbvis file.bin --output hf://datasets/me/vis/file.png
-arbvis dir/ --tiles hf://datasets/me/vis/dir
+arbvis dir/ --out hf://datasets/me/vis/dir
 ```
 
-Note: `--tiles hf://…` uploads `tiles/`, `index.html`, and `labels.json` to the target repo, but the Hub won't render `index.html` on its own. Use `--space` for a working URL.
+Note: `--out hf://…` uploads the bundle files to the target repo, but the Hub won't render `index.html` on its own. Use `--space` for a working URL.
 
 ### Deploy a viewable Space (`--space`)
 
 ```sh
 arbvis hf://datasets/owner/dataset --space me/dataset-vis
+arbvis hf://datasets/owner/dataset --3d --space me/dataset-vis-3d
 ```
 
-Renders the tile pyramid and deploys a Docker Space that serves the Leaflet viewer. Tiles live in an auto-created sibling bucket repo (`me/dataset-vis_bucket`); the Space itself is stateless and just proxies them.
+Renders the bundle and deploys a Docker Space that serves the viewer. The bundle data lives in an auto-created sibling bucket repo (`me/dataset-vis_bucket`); the Space itself is stateless and just proxies it.
 
-### Tile format (`--tile-format`)
+### Tile format (`--tile-format`, 2D only)
 
 `avif` (default) — ~30–50% smaller over the wire and supported in every modern browser. Leaf tiles are encoded near-lossless (each pixel is one source byte); pyramid tiles are lossy at quality 85.
 
@@ -136,7 +170,7 @@ By default, `hf://` inputs are downloaded to the local HF cache (via the [`hf` C
 ### Xet xorb visualization (`--show-xet-xorbs`)
 
 ```sh
-arbvis hf://datasets/owner/dataset --show-xet-xorbs --tiles ./out
+arbvis hf://datasets/owner/dataset --show-xet-xorbs --out ./out
 ```
 
 For xet-backed Hub files, colors each region by the xorb (content-addressed chunk) it was reconstructed from: hue encodes xorb ID, intensity encodes the underlying byte. Useful for seeing how a file is partitioned across the CAS.
@@ -147,23 +181,23 @@ modelweightvis layers a dtype-aware element coloring on top of the same xorb hue
 
 - `--title TEXT` — title shown in the viewer info panel (defaults to `"arbvis"` or `"arbvis diff"`).
 - `-l, --file-list FILE` — read input paths from `FILE`, one per line; `-` reads from stdin.
-- `--regen-html DIR` — rebuild `index.html` for an existing tile directory without re-rendering tiles. Useful after editing the viewer template.
-- `--space OWNER/REPO --tiles LOCAL_DIR` (with no input files) — re-deploy an already-rendered tile directory to a Space without re-rendering.
+- `--regen-html DIR` — rebuild `index.html` for an existing bundle directory without re-rendering (2D or, with `--3d`, the volume bundle). Useful after editing the viewer template.
+- `--space OWNER/REPO --out LOCAL_DIR` (with no input files) — re-deploy an already-rendered bundle to a Space without re-rendering. Add `--3d` to re-deploy a volume bundle.
 
 ```sh
 arbvis --regen-html ./out
-arbvis --space me/vis --tiles ./out
+arbvis --space me/vis --out ./out
 ```
 
 ## Relationship to modelweightvis
 
 arbvis is the byte-only foundation: Hilbert layout, byte coloring, JSON-aware diff, Hub I/O, tile pyramid, Space deploy, xet xorb path, streaming. It has no knowledge of tensors, model formats, or transformer architecture — `.safetensors` and `.gguf` get the same byte-Hilbert treatment as any other binary.
 
-[modelweightvis](https://github.com/znation/modelweightvis) is a separate crate that extends arbvis through its generic plugin surface (no fork, no patch) — it's one *specialization* of arbvis, and a new one (for any structured binary format) plugs in the same way: `FormatPlugin` impls parse `.safetensors` / `.gguf` / pickle headers and stuff `ModelInfo` into each source's extension map; `LayoutPlugin` impls add the architectural transformer layout and the MoE summary / CKA panel layouts; `SourceProvider` impls turn an invocation (`--moe`, a repo-level or directory `--diff`) into render sources; a layout-keyed `SingleImageRenderer` and `LeafLoader`/`LeafRenderer` pair draw the arch layout; `DiffSourceBuilder` adds tensor-aware file-pair diffing; `PrepareSourcesExtension` fetches sidecar config. The `modelweightvis` binary builds an `arbvis::Registry::with_defaults()`, calls `modelweightvis::register_all(&mut registry, &args)`, and hands off to `arbvis::run`. Same renderer, same Hub I/O, same tile pyramid — just with the tensor-aware plugins registered.
+[modelweightvis](https://github.com/znation/modelweightvis) is a separate crate that extends arbvis through its generic plugin surface (no fork, no patch) — it's one *specialization* of arbvis, and a new one (for any structured binary format) plugs in the same way: `FormatPlugin` impls parse `.safetensors` / `.gguf` / pickle headers and stuff `ModelInfo` into each source's extension map; `LayoutPlugin` impls add the architectural transformer layout and the MoE summary / CKA panel layouts; `SourceProvider` impls turn an invocation (`--moe`, a repo-level or directory `--diff`) into render sources; a layout-keyed `LeafLoader`/`LeafRenderer` pair draws the arch layout; `DiffSourceBuilder` adds tensor-aware file-pair diffing; `PrepareSourcesExtension` fetches sidecar config. The `modelweightvis` binary builds an `arbvis::Registry::with_defaults()`, calls `modelweightvis::register_all(&mut registry, &args)`, and hands off to `arbvis::run`. Same renderer, same Hub I/O, same tile pyramid — just with the tensor-aware plugins registered.
 
 **Which to use:**
 - **arbvis** — for non-model binaries (any file format), JSON/JSONL diffs, plain-byte diffs, the xet xorb path on arbitrary content. Smaller dependency footprint (no `candle-core` / `regex` / `zip` / `half`).
-- **modelweightvis** — for `.safetensors` / `.gguf` / `.bin` model checkpoints, architectural transformer layout, `--moe-summary` / `--moe-cka` / `--probe`, `--diff-metric`, `--finetune` / `--no-finetune`, `--layout`. Inherits arbvis's full CLI surface (`--tiles`, `--space`, `--stream`, `--show-xet-xorbs`, `--regen-html`, etc.) — no need to use both binaries.
+- **modelweightvis** — for `.safetensors` / `.gguf` / `.bin` model checkpoints, architectural transformer layout, `--moe-summary` / `--moe-cka` / `--probe`, `--diff-metric`, `--finetune` / `--no-finetune`, `--layout`. Inherits arbvis's full CLI surface (`--out`, `--3d`, `--space`, `--stream`, `--show-xet-xorbs`, `--regen-html`, etc.) — no need to use both binaries.
 
 ## Building
 
@@ -171,7 +205,7 @@ Requires Rust (stable) and the official Hugging Face [`hf` CLI](https://huggingf
 
 ```sh
 cargo build --release
-./target/release/arbvis <file> --tiles ./output
+./target/release/arbvis <file> --out ./output
 ```
 
 Or install into your `PATH`:
@@ -184,4 +218,4 @@ For modelweightvis, see the [standalone modelweightvis repo](https://github.com/
 
 ## Credits
 
-Color scheme inspired by [Stairwell's binary visualization post](https://stairwell.com/blog/hilbert-curves-visualizing-binary-files-with-color-and-patterns/). Built on [clap](https://crates.io/crates/clap) (CLI), [image](https://crates.io/crates/image) + [png](https://crates.io/crates/png) + rav1e (tile encoding), [fast_hilbert](https://crates.io/crates/fast_hilbert) (curve mapping), the official Hugging Face [`hf` CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli) (Hub I/O) + [xet-core-structures](https://crates.io/crates/xet-core-structures) (per-tile xet decode), [minifb](https://crates.io/crates/minifb) (window display), and [Leaflet.js](https://leafletjs.com/) (the viewer).
+Color scheme inspired by [Stairwell's binary visualization post](https://stairwell.com/blog/hilbert-curves-visualizing-binary-files-with-color-and-patterns/). Built on [clap](https://crates.io/crates/clap) (CLI), [image](https://crates.io/crates/image) + [png](https://crates.io/crates/png) + rav1e (tile encoding), [fast_hilbert](https://crates.io/crates/fast_hilbert) (2D curve mapping; the 3D curve is a hand-rolled Skilling transform), the official Hugging Face [`hf` CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli) (Hub I/O) + [xet-core-structures](https://crates.io/crates/xet-core-structures) (per-tile xet decode), [Leaflet.js](https://leafletjs.com/) (the 2D viewer), and [Three.js](https://threejs.org/) (the 3D viewer).

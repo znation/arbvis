@@ -1,8 +1,8 @@
-use std::collections::HashMap;
 use std::io::Cursor;
 
 use image::codecs::avif::AvifEncoder;
 use image::{ImageEncoder, ImageFormat, Rgb};
+use rustc_hash::FxHashMap;
 
 use crate::data::{Data, DiffFill};
 
@@ -91,13 +91,14 @@ fn encode_truecolor_png(img: &image::ImageBuffer<Rgb<u8>, Vec<u8>>) -> Result<Ve
 ///
 /// Builds the palette on the fly from the pixels actually present — works for
 /// any RGB content without needing the source LUT. The forward pass is O(N)
-/// with a `HashMap<[u8;3], u8>` lookup per pixel.
+/// with an `FxHashMap<[u8;3], u8>` lookup per pixel.
 fn encode_indexed_png(
     img: &image::ImageBuffer<Rgb<u8>, Vec<u8>>,
 ) -> Result<Option<Vec<u8>>, String> {
     let pixel_count = (img.width() as usize) * (img.height() as usize);
     let mut palette: Vec<[u8; 3]> = Vec::with_capacity(64);
-    let mut idx_of: HashMap<[u8; 3], u8> = HashMap::with_capacity(64);
+    let mut idx_of: FxHashMap<[u8; 3], u8> = FxHashMap::default();
+    idx_of.reserve(64);
     let mut indexed: Vec<u8> = Vec::with_capacity(pixel_count);
 
     let raw = img.as_raw();

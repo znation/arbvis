@@ -133,6 +133,7 @@ dependencies = [
  "png",
  "rayon",
  "reqwest",
+ "rustc-hash",
  "serde",
  "serde_json",
  "tempfile",

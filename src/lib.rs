@@ -160,9 +160,16 @@ impl TileFormatArg {
     fn split(self) -> (TileFormat, TileFormat) {
         match self {
             TileFormatArg::Avif => (
+                // Leaf speed 8 (was 6) to match the pyramid preset. Only bites
+                // for Xet-mode leaves, which are the sole AVIF leaf tiles —
+                // Plain/Dtype leaves are indexed PNG (see `TileFormat` docs). For
+                // those AVIF leaves it trims rav1e's rate-distortion search
+                // (`rdo_mode_decision`/`rdo_partition_decision`, the dominant cost
+                // in the encode profile) for a modest size bump; at quality 100
+                // the output stays near-lossless regardless of speed.
                 TileFormat::Avif {
                     quality: 100,
-                    speed: 6,
+                    speed: 8,
                 },
                 TileFormat::Avif {
                     quality: 85,

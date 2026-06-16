@@ -19,6 +19,10 @@ indicatif = "0.17"
 indicatif-log-bridge = "0.2"
 memmap2 = "0.9"
 rayon = "1"
+# Fast non-cryptographic hasher for the indexed-PNG palette map, which does one
+# lookup per pixel. SipHash (the std default) showed up as ~2.8% of CPU in the
+# tile-encode profile; FxHash is dramatically cheaper for the tiny `[u8; 3]` key.
+rustc-hash = "2"
 log = "0.4"
 env_logger = "0.11"
 tempfile = "3"

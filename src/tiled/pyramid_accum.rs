@@ -104,6 +104,26 @@ impl<S: TileSink> PyramidAccumulator<S> {
         let half = self.tile_size as usize / 2;
         let ts = self.tile_size as usize;
 
+        // Downscale this child's pixels into a local quadrant buffer *outside*
+        // the lock. This 2×2 box-filter (half·half·4 reads) is the expensive
+        // part, and each child writes a disjoint quadrant of the parent, so it
+        // needs no synchronisation. Only the cheap write-back + count bump below
+        // run under the global `pending` lock, which 10 render workers contend.
+        let mut quad = vec![0u32; half * half * 3];
+        for py in 0..half {
+            for px in 0..half {
+                let q_off = (py * half + px) * 3;
+                for sy in 0..2usize {
+                    for sx in 0..2usize {
+                        let p = pixels.get_pixel((px * 2 + sx) as u32, (py * 2 + sy) as u32);
+                        quad[q_off] += p[0] as u32;
+                        quad[q_off + 1] += p[1] as u32;
+                        quad[q_off + 2] += p[2] as u32;
+                    }
+                }
+            }
+        }
+
         let completed = {
             let mut pending = self.pending.lock().unwrap();
             let acc = pending
@@ -115,21 +135,14 @@ impl<S: TileSink> PyramidAccumulator<S> {
                     })
                 });
 
-            // Accumulate this child's 2×2-downscaled pixels into the parent quadrant.
+            // Copy the precomputed quadrant into the parent's disjoint region,
+            // one contiguous row at a time. Quadrants never overlap, so a plain
+            // copy is equivalent to the previous `+=` into a zeroed buffer.
             for py in 0..half {
-                for px in 0..half {
-                    let out_x = quad_x * half + px;
-                    let out_y = quad_y * half + py;
-                    let out_off = (out_y * ts + out_x) * 3;
-                    for sy in 0..2usize {
-                        for sx in 0..2usize {
-                            let p = pixels.get_pixel((px * 2 + sx) as u32, (py * 2 + sy) as u32);
-                            acc.sums[out_off] += p[0] as u32;
-                            acc.sums[out_off + 1] += p[1] as u32;
-                            acc.sums[out_off + 2] += p[2] as u32;
-                        }
-                    }
-                }
+                let out_y = quad_y * half + py;
+                let dst = (out_y * ts + quad_x * half) * 3;
+                let src = py * half * 3;
+                acc.sums[dst..dst + half * 3].copy_from_slice(&quad[src..src + half * 3]);
             }
             acc.count += 1;
 

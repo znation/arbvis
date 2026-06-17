@@ -1322,6 +1322,21 @@ pub async fn run_tiles(
     layout_mode: LayoutMode,
     registry: &crate::registry::Registry,
 ) -> anyhow::Result<()> {
+    // Clear any tiles left over from a previous run before writing this one.
+    // Output dirs are routinely reused (e.g. `-o tmp_out`), and a prior run on
+    // a differently-sized input leaves a different pyramid shape behind — extra
+    // zoom levels, a different leaf grid, even a different tile format (png vs
+    // avif) at the same coords. None of that gets overwritten by this run, so it
+    // lingers and can surface as black/garbage tiles at some zoom levels (e.g.
+    // when a stale `index.html` with a higher `maxNativeZoom` is cached). Wiping
+    // the whole tile tree keeps each run self-consistent; `index.html` /
+    // `labels.json` are regenerated below regardless.
+    let tiles_root = tile_dir.join("tiles");
+    if tiles_root.exists() {
+        std::fs::remove_dir_all(&tiles_root)
+            .with_context(|| format!("clearing stale tiles in {}", tiles_root.display()))?;
+    }
+
     let scenes = partition_scenes(sources, total);
     let mut views: Vec<html::SceneView> = Vec::with_capacity(scenes.len());
     for group in scenes {

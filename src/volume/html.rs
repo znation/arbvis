@@ -140,7 +140,11 @@ scene.add(edges);
 
 function resize() {
   const w = innerWidth, h = innerHeight;
-  renderer.setSize(w, h, false);
+  // updateStyle must stay on: a bare <canvas> with `inset:0` is a replaced
+  // element, so CSS won't stretch it — without an inline style size it renders
+  // at its (devicePixelRatio-scaled) drawing-buffer size, overflowing the
+  // viewport and throwing off OrbitControls' pointer mapping.
+  renderer.setSize(w, h);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
 }

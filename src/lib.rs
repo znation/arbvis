@@ -41,8 +41,8 @@ pub use tiled::{EncodedTile, LeafMode, LoadedTile};
 // 3D (`--3d`) volume seam — the placement + coloring analogs of the 2D layout
 // and leaf-renderer SPI, for a downstream to render a structure-aware cube.
 pub use volume::{
-    VolumeEntity, VolumeShape, VoxelBox, VoxelCell, VoxelGridMut, VoxelRegistry, VoxelRenderCtx,
-    VoxelRenderer,
+    VolumeEntity, VolumeLabel, VolumeShape, VoxelBox, VoxelCell, VoxelGridMut, VoxelRegistry,
+    VoxelRenderCtx, VoxelRenderer,
 };
 
 use std::borrow::Cow;

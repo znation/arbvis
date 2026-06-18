@@ -50,6 +50,16 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
     padding: 4px 0; border-radius: 6px; cursor: pointer; font-size: 11px; }
   .seg button.on { background: #2f6bff; border-color: #2f6bff; color: #fff; }
   .hint { color: #80858f; font-size: 10px; margin-top: 8px; }
+  #legend { margin-top: 10px; }
+  #legend .bar { height: 10px; border-radius: 3px; margin: 3px 0; }
+  #legend .lab { display: flex; justify-content: space-between; color: #80858f; font-size: 10px; }
+  #legend .swrow { color: #c4c8d0; font-size: 11px; margin: 2px 0; }
+  #legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+    vertical-align: middle; margin-right: 5px; border: 1px solid #00000040; }
+  #picked { color: #e8e8ea; font-size: 11px; margin-top: 10px; min-height: 2.4em; }
+  #picked .pname { word-break: break-all; }
+  #picked .pgroup { color: #9aa0ab; }
+  #picked .phint { color: #80858f; }
   #status { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
     color: #9aa0ab; pointer-events: none; }
   #status[hidden] { display: none; } /* id selector's display:flex would otherwise beat [hidden] */
@@ -92,7 +102,9 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       <input id="popacity" type="range" min="0.05" max="1" step="0.01" value="0.4"></div>
   </div>
   <div id="inputs" class="hint"></div>
-  <div class="hint">drag rotate · right-drag pan · scroll zoom</div>
+  <div id="legend"></div>
+  <div id="picked"><span class="phint">click a region to identify</span></div>
+  <div class="hint">drag rotate · right-drag pan · scroll zoom · click to identify</div>
 </div>
 
 <script type="importmap">
@@ -302,6 +314,9 @@ function refreshNorm() {
 
 // ---- load + build -----------------------------------------------------------
 let volMesh = null, points = null;
+// Kept for click-to-pick: the raw volume buffer + grid side + entity manifest.
+let volBufG = null, sideG = 0, manifestG = [];
+const raycaster = new THREE.Raycaster();
 
 async function load() {
   const meta = await (await fetch('meta.json')).json();
@@ -380,10 +395,91 @@ async function load() {
     if (r) r.hidden = true;
   }
 
+  // Click-to-pick + legend (structured cubes only — the byte path has an
+  // empty manifest, so picking no-ops and the legend stays blank).
+  volBufG = volBuf;
+  sideG = side;
+  manifestG = meta.manifest || [];
+  buildLegend(meta);
+
   $('status').hidden = true;
   $('panel').hidden = false;
   bindControls();
 }
+
+// HTML-escape model-derived tensor names before injecting into the panel.
+const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+
+// March the click ray through the grid (cube space [-0.5,0.5]) to the first
+// opaque voxel — matching what the shader shows — then name the entity whose
+// box contains it. Reuses the already-fetched volume buffer; no proxy meshes.
+function pickAt(clientX, clientY) {
+  if (!manifestG.length || !volBufG) return null;
+  const ndc = new THREE.Vector2((clientX / innerWidth) * 2 - 1, -(clientY / innerHeight) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+  const ro = raycaster.ray.origin, rd = raycaster.ray.direction;
+  // Ray vs cube slab test.
+  let tmin = -Infinity, tmax = Infinity;
+  for (const a of ['x', 'y', 'z']) {
+    const inv = 1 / rd[a];
+    let t0 = (-0.5 - ro[a]) * inv, t1 = (0.5 - ro[a]) * inv;
+    if (t0 > t1) { const t = t0; t0 = t1; t1 = t; }
+    tmin = Math.max(tmin, t0); tmax = Math.min(tmax, t1);
+  }
+  if (tmax < Math.max(tmin, 0)) return null;
+  const side = sideG;
+  const steps = side * 2; // ≥ Nyquist so we don't step over a voxel
+  let t = Math.max(tmin, 0);
+  const dt = (tmax - t) / steps;
+  for (let i = 0; i < steps; i++, t += dt) {
+    const x = Math.floor((ro.x + rd.x * t + 0.5) * side);
+    const y = Math.floor((ro.y + rd.y * t + 0.5) * side);
+    const z = Math.floor((ro.z + rd.z * t + 0.5) * side);
+    if (x < 0 || y < 0 || z < 0 || x >= side || y >= side || z >= side) continue;
+    if (volBufG[(x + y * side + z * side * side) * 4 + 3] > 0) {
+      for (const e of manifestG) {
+        const b = e.bbox;
+        if (x >= b.x0 && x < b.x1 && y >= b.y0 && y < b.y1 && z >= b.z0 && z < b.z1) return e;
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
+// Color legend keyed on the bundle's mode (structured/rgb only).
+function buildLegend(meta) {
+  const el = $('legend');
+  if (meta.color_mode !== 'rgb') { el.innerHTML = ''; return; }
+  if (meta.diff_mode) {
+    el.innerHTML =
+      '<div class="swrow"><span class="sw" style="background:#00ff00"></span>weight grew</div>' +
+      '<div class="swrow"><span class="sw" style="background:#ff0000"></span>weight shrank</div>' +
+      '<div class="swrow"><span class="sw" style="background:#fff"></span>non-finite</div>' +
+      '<div class="hint">opacity = magnitude of change</div>';
+  } else {
+    el.innerHTML =
+      '<div class="bar" style="background:linear-gradient(to right,rgb(0,34,78),rgb(124,123,120),rgb(254,232,56))"></div>' +
+      '<div class="lab"><span>low</span><span>|weight|</span><span>high</span></div>';
+  }
+  const layers = new Set((meta.manifest || []).map((e) => e.group).filter((g) => /^layer /.test(g)));
+  el.innerHTML += '<div class="hint">' +
+    (layers.size ? layers.size + ' layers along depth (front → back)' : 'depth = layer order') +
+    '</div>';
+}
+
+// Click (not drag) → identify the tensor under the cursor.
+let downX = 0, downY = 0;
+canvas.addEventListener('pointerdown', (e) => { downX = e.clientX; downY = e.clientY; });
+canvas.addEventListener('pointerup', (e) => {
+  if (Math.hypot(e.clientX - downX, e.clientY - downY) > 5) return; // orbit drag, not a click
+  const hit = pickAt(e.clientX, e.clientY);
+  const el = $('picked');
+  if (!el) return;
+  el.innerHTML = hit
+    ? '<div class="pname">' + esc(hit.name) + '</div><div class="pgroup">' + esc(hit.group) + '</div>'
+    : '<span class="phint">no tensor there — click a colored region</span>';
+});
 
 // ---- controls ---------------------------------------------------------------
 function seg(id, cb) {

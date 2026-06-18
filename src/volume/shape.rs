@@ -18,13 +18,15 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use serde::Serialize;
+
 use crate::data::Source;
 use crate::layout::LayoutMode;
 use crate::registry::{LayoutBuildCtx, Registry, VolumeShapePlugin};
 
 /// Axis-aligned voxel box `[min, max)` in grid coordinates (each axis in
 /// `0..grid_side`). The upper bounds are exclusive.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize)]
 pub struct VoxelBox {
     pub x0: u32,
     pub y0: u32,
@@ -32,6 +34,20 @@ pub struct VoxelBox {
     pub x1: u32,
     pub y1: u32,
     pub z1: u32,
+}
+
+/// One entry in the viewer's click-to-pick manifest (written to `meta.json`):
+/// a human-facing label + cube box for an entity. Lets the viewer name what the
+/// user clicked without arbvis ever interpreting the opaque
+/// [`VolumeEntity::extra`].
+#[derive(Clone, Debug, Serialize)]
+pub struct VolumeLabel {
+    /// Display name (e.g. the tensor name).
+    pub name: String,
+    /// Coarse grouping shown alongside the name (e.g. `"layer 3"`, `"top-level"`).
+    pub group: String,
+    /// Box in grid voxels — same coordinate space as [`VolumeEntity::bbox`].
+    pub bbox: VoxelBox,
 }
 
 /// One placed entity in the cube. arbvis does not interpret `extra` or
@@ -79,6 +95,12 @@ pub trait VolumeShape: Send + Sync {
     /// `None`, arbvis frames from grid occupancy.
     fn focus(&self) -> Option<([f32; 3], f32)> {
         None
+    }
+
+    /// Per-entity labels for the viewer's click-to-pick manifest, written
+    /// verbatim to `meta.json`. Empty for the byte floor (nothing pickable).
+    fn manifest(&self) -> Vec<VolumeLabel> {
+        Vec::new()
     }
 
     fn as_any(&self) -> &dyn Any;

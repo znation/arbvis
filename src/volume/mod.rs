@@ -18,7 +18,9 @@ pub mod html;
 pub mod shape;
 pub mod voxel;
 
-pub use shape::{select_volume_shape, HilbertVolumePlugin, VolumeEntity, VolumeShape, VoxelBox};
+pub use shape::{
+    select_volume_shape, HilbertVolumePlugin, VolumeEntity, VolumeLabel, VolumeShape, VoxelBox,
+};
 pub use voxel::{VoxelCell, VoxelGridMut, VoxelRegistry, VoxelRenderCtx, VoxelRenderer};
 
 use std::path::{Path, PathBuf};
@@ -98,6 +100,9 @@ pub async fn render_volume(
     let is_byte = shape.is_byte_volume();
     let actual_side = shape.grid_side();
     let color_mode = if is_byte { "lut" } else { "rgb" };
+    // Pick manifest for the click-to-pick viewer (empty for the byte floor).
+    // Captured before `shape` moves into the blocking closure.
+    let manifest = shape.manifest();
 
     if is_byte {
         log::info!(
@@ -151,6 +156,7 @@ pub async fn render_volume(
         focus_center: built.focus_center,
         focus_radius: built.focus_radius,
         lut: pixel_lut.iter().map(|c| c.0).collect(),
+        manifest,
     };
     std::fs::write(out_dir.join("meta.json"), serde_json::to_vec(&meta)?)?;
     std::fs::write(
@@ -393,19 +399,44 @@ fn aggregate_entities(
     let (focus_center, focus_radius) = shape
         .focus()
         .unwrap_or_else(|| occupied_focus_cells(&grid, side));
+
+    // Point cloud derived from the occupied voxels themselves, so the Points
+    // view matches the volume exactly (same positions, same baked colors).
+    // Stride-sampled to the budget; positions in [0,1] like the byte path
+    // (the viewer offsets points by -0.5 to center the cube).
+    let (points_buf, points_count) = points_from_grid(&grid, side);
     let volume_rgba = encode::pack_voxel_cells(&grid);
 
-    // Structured cubes drop the global point cloud: a stride-sampled Hilbert
-    // cloud wouldn't align with the structured voxels. (Per-tensor point
-    // sampling is future work.)
     Ok(BuildResult {
         volume_rgba,
-        points_buf: Vec::new(),
-        points_count: 0,
+        points_buf,
+        points_count,
         max_count: 0,
         focus_center,
         focus_radius,
     })
+}
+
+/// Sample one point per occupied (`a > 0`) voxel — strided down to
+/// [`POINT_BUDGET`] — at the voxel's cube center, carrying its baked RGBA. Keeps
+/// the structured Points view aligned with the volume.
+fn points_from_grid(grid: &[VoxelCell], side: u32) -> (Vec<u8>, u64) {
+    let s = side as usize;
+    let inv = side as f32;
+    let occupied: Vec<usize> = (0..grid.len()).filter(|&i| grid[i].a > 0).collect();
+    let stride = (occupied.len() as u64 / POINT_BUDGET).max(1) as usize;
+    let mut positions: Vec<f32> = Vec::new();
+    let mut colors: Vec<u8> = Vec::new();
+    for &i in occupied.iter().step_by(stride) {
+        let (x, y, z) = (i % s, (i / s) % s, i / (s * s));
+        positions.push((x as f32 + 0.5) / inv);
+        positions.push((y as f32 + 0.5) / inv);
+        positions.push((z as f32 + 0.5) / inv);
+        let c = grid[i];
+        colors.extend_from_slice(&[c.r, c.g, c.b, c.a]);
+    }
+    let count = positions.len() as u64 / 3;
+    (encode::pack_points(&positions, &colors), count)
 }
 
 /// Cube-space framing for a structured (baked-RGBA) grid — occupancy is `a > 0`.
@@ -693,7 +724,10 @@ mod tests {
         let meta: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.path().join("meta.json")).unwrap()).unwrap();
         assert_eq!(meta["color_mode"], "rgb");
-        assert_eq!(meta["points"], 0, "structured cubes drop the point cloud");
+        assert_eq!(
+            meta["points"], 64,
+            "one point per occupied voxel (the 4³ baked box)"
+        );
         assert_eq!(meta["grid_side"], grid_side);
     }
 }

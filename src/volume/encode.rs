@@ -52,6 +52,10 @@ pub struct VolumeMeta {
     pub focus_radius: f32,
     /// 256-entry byte→RGB lookup table (the active 2D LUT: plain or diff).
     pub lut: Vec<[u8; 3]>,
+    /// Per-entity pick manifest (structured cubes only; empty for the byte
+    /// floor). The viewer builds invisible pick boxes from these so a click can
+    /// name the tensor under the cursor.
+    pub manifest: Vec<super::shape::VolumeLabel>,
 }
 
 /// Convert the accumulated grid into the RGBA8 texel buffer.

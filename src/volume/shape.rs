@@ -149,7 +149,8 @@ impl VolumeShapePlugin for HilbertVolumePlugin {
 
 /// Pick the highest-priority applicable [`VolumeShapePlugin`]. Mirrors
 /// [`crate::layout::select_layout`]: descending priority, `i32::MIN` floor
-/// guarantees a result, and a non-winning `Forced(id)` logs a diagnostic.
+/// guarantees a result, and a non-winning `Forced(id)` warns + falls back —
+/// or, under [`Registry::strict_layout`], hard-errors instead.
 pub fn select_volume_shape(
     sources: &[Source],
     cumulative_offsets: &[u64],
@@ -158,7 +159,7 @@ pub fn select_volume_shape(
     diff_mode: bool,
     grid_side: u32,
     registry: &Registry,
-) -> Box<dyn VolumeShape> {
+) -> anyhow::Result<Box<dyn VolumeShape>> {
     let ctx = LayoutBuildCtx {
         sources,
         cumulative_offsets,
@@ -200,21 +201,51 @@ pub fn select_volume_shape(
 
     if let Some(id) = forced_id {
         if chosen.id() != id {
-            if forced_was_applicable {
-                log::warn!(
-                    "--layout {id} requested but it could not build a 3D volume for these inputs; \
-                     falling back to {}",
-                    chosen.id()
-                );
+            // Mirrors `select_layout`'s strict handling: applicable-but-couldn't
+            // -build vs. never-applicable differ only in the reason. Under
+            // strict mode each is a hard error rather than a silent fallback.
+            let reason = if forced_was_applicable {
+                "it could not build a 3D volume for these inputs"
             } else {
-                log::warn!(
-                    "--layout {id} requested but no registered 3D volume layout matched; \
-                     falling back to {}",
+                "no registered 3D volume layout matched"
+            };
+            if registry.strict_layout {
+                anyhow::bail!(
+                    "layout `{id}` requested but {reason}; strict layout mode refuses to \
+                     fall back to `{}`",
                     chosen.id()
                 );
             }
+            log::warn!(
+                "layout `{id}` requested but {reason}; falling back to `{}`",
+                chosen.id()
+            );
         }
     }
 
-    chosen
+    Ok(chosen)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 3D analog of `select_layout`'s strict test: a forced id no volume
+    /// plugin claims falls back to the Hilbert floor — a warn (`Ok`) normally,
+    /// a hard error under strict mode.
+    #[test]
+    fn strict_layout_turns_forced_volume_fallback_into_error() {
+        let mut registry = Registry::with_defaults();
+        registry.layout_mode = LayoutMode::Forced("nonexistent");
+
+        let relaxed = select_volume_shape(&[], &[], 0, registry.layout_mode, false, 64, &registry)
+            .expect("non-strict select_volume_shape must fall back, not error");
+        assert_eq!(relaxed.id(), "hilbert-bytes");
+
+        registry.strict_layout = true;
+        assert!(
+            select_volume_shape(&[], &[], 0, registry.layout_mode, false, 64, &registry).is_err(),
+            "strict select_volume_shape must error when a forced layout falls back"
+        );
+    }
 }

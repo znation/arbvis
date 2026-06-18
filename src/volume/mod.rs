@@ -96,7 +96,7 @@ pub async fn render_volume(
         diff_mode,
         grid_side,
         registry,
-    );
+    )?;
     let is_byte = shape.is_byte_volume();
     let actual_side = shape.grid_side();
     let color_mode = if is_byte { "lut" } else { "rgb" };

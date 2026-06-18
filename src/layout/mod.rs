@@ -204,7 +204,7 @@ pub fn select_layout(
     mode: LayoutMode,
     diff_mode: bool,
     registry: &crate::registry::Registry,
-) -> Box<dyn LayoutShape> {
+) -> anyhow::Result<Box<dyn LayoutShape>> {
     let ctx = crate::registry::LayoutBuildCtx {
         sources,
         cumulative_offsets,
@@ -253,21 +253,59 @@ pub fn select_layout(
 
     if let Some(id) = forced_id {
         if chosen.id() != id {
-            if forced_was_applicable {
-                log::warn!(
-                    "--layout {id} requested but it could not build for these inputs; \
-                     falling back to {}",
-                    chosen.id()
-                );
+            // The two cases differ only in *why* the forced layout lost:
+            // applicable-but-couldn't-build vs. never applicable. Under strict
+            // mode each is a hard error instead of a warn + silent fallback;
+            // worded layout-flag-agnostically since the downstream switch may be
+            // named `--strict-layout` rather than `--layout`.
+            let reason = if forced_was_applicable {
+                "it could not build for these inputs"
             } else {
-                log::warn!(
-                    "--layout {id} requested but no registered layout matched; \
-                     falling back to {}",
+                "no registered layout matched"
+            };
+            if registry.strict_layout {
+                anyhow::bail!(
+                    "layout `{id}` requested but {reason}; strict layout mode refuses to \
+                     fall back to `{}`",
                     chosen.id()
                 );
             }
+            log::warn!(
+                "layout `{id}` requested but {reason}; falling back to `{}`",
+                chosen.id()
+            );
         }
     }
 
-    chosen
+    Ok(chosen)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::Registry;
+
+    /// A forced layout id that no registered plugin claims forces the
+    /// `HilbertLayoutPlugin` floor to win. Without strict mode that's a warn +
+    /// fallback (`Ok`); with strict mode it's a hard error.
+    #[test]
+    fn strict_layout_turns_forced_fallback_into_error() {
+        // `with_defaults()` registers only the byte-Hilbert floor, so any other
+        // forced id necessarily falls back to it.
+        let mut registry = Registry::with_defaults();
+        registry.layout_mode = LayoutMode::Forced("nonexistent");
+
+        // Non-strict: falls back to the Hilbert floor.
+        let relaxed = select_layout(&[], &[], 0, registry.layout_mode, false, &registry);
+        let layout = relaxed.expect("non-strict select_layout must fall back, not error");
+        assert_eq!(layout.id(), "hilbert-bytes");
+
+        // Strict: refuses to fall back.
+        registry.strict_layout = true;
+        let strict = select_layout(&[], &[], 0, registry.layout_mode, false, &registry);
+        assert!(
+            strict.is_err(),
+            "strict select_layout must error when a forced layout falls back"
+        );
+    }
 }

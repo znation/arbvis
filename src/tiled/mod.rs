@@ -678,7 +678,7 @@ pub(super) async fn build_tile_plan(
         layout_mode,
         diff_mode,
         registry,
-    );
+    )?;
 
     // Today the per-plan LeafRegistry is the registry's own; in step 12 once
     // tensor renderers move to modelweightvis it'll be the only path to get

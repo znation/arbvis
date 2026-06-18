@@ -281,6 +281,12 @@ pub struct Registry {
     /// ([`LayoutMode::Auto`]); a downstream maps its own `--layout` flag onto
     /// this (e.g. [`LayoutMode::Forced`] with one of its layout ids).
     pub layout_mode: LayoutMode,
+    /// When `true`, a forced [`LayoutMode::Forced`] layout that can't build for
+    /// the inputs becomes a hard error in [`crate::layout::select_layout`]
+    /// instead of a warning + silent fallback. Downstreams that map a
+    /// `--strict-layout` flag set this alongside `layout_mode`. No effect under
+    /// [`LayoutMode::Auto`]/[`LayoutMode::Hilbert`] (neither can fall back).
+    pub strict_layout: bool,
     /// Viewer branding (tool name + repo URL). See [`Branding`].
     pub branding: Branding,
 }
@@ -308,6 +314,7 @@ impl Registry {
             ],
             prepare_sources_extension: None,
             layout_mode: LayoutMode::Auto,
+            strict_layout: false,
             branding: Branding::default(),
         }
     }

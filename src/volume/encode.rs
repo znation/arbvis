@@ -38,6 +38,11 @@ pub struct VolumeMeta {
     /// opacity channel back to a count on the client if desired.
     pub max_count: u64,
     pub diff_mode: bool,
+    /// How the viewer colors voxels: `"lut"` (byte path — R indexes the
+    /// shader LUT below) or `"rgb"` (structured path — RGB is baked final
+    /// color, A is the opacity/occupancy weight). Absent in pre-seam bundles;
+    /// the viewer defaults to `"lut"`.
+    pub color_mode: String,
     pub inputs: Vec<String>,
     /// Center of the occupied region in cube space (`[-0.5, 0.5]` per axis), so
     /// the viewer can frame the data instead of the whole (often mostly-empty)
@@ -79,6 +84,22 @@ pub fn grid_to_rgba(grid: &[VoxelAcc], max_count: u64) -> Vec<u8> {
         out[o + 1] = activity;
         out[o + 2] = fill;
         out[o + 3] = 255;
+    }
+    out
+}
+
+/// Pack a structured ([`super::voxel::VoxelCell`]) grid into the RGBA8 texel
+/// buffer verbatim — the renderer already baked final color into R/G/B and the
+/// opacity weight into A. Same x-fastest layout as [`grid_to_rgba`], so it
+/// uploads directly as a `THREE.Data3DTexture`.
+pub fn pack_voxel_cells(grid: &[super::voxel::VoxelCell]) -> Vec<u8> {
+    let mut out = vec![0u8; grid.len() * 4];
+    for (i, c) in grid.iter().enumerate() {
+        let o = i * 4;
+        out[o] = c.r;
+        out[o + 1] = c.g;
+        out[o + 2] = c.b;
+        out[o + 3] = c.a;
     }
     out
 }

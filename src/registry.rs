@@ -55,22 +55,37 @@ pub trait FormatPlugin: Send + Sync {
     ) -> BoxFuture<'a, anyhow::Result<()>>;
 }
 
-/// Inputs every [`LayoutPlugin`] sees when deciding whether to apply and
-/// how to build.
+/// Inputs every [`LayoutPlugin`] (2D) and [`VolumeShapePlugin`] (3D) sees when
+/// deciding whether to apply and how to build.
 pub struct LayoutBuildCtx<'a> {
     pub sources: &'a [Source],
     pub cumulative_offsets: &'a [u64],
     pub total_bytes: u64,
     pub mode: LayoutMode,
     pub diff_mode: bool,
+    /// The `--3d` voxel cube side (a power of two). Only meaningful to a
+    /// [`VolumeShapePlugin`]; the 2D tile path sets it to 0 and ignores it.
+    pub grid_side: u32,
 }
 
-/// Builds a layout for the given sources, when applicable.
+/// Builds a 2D layout for the given sources, when applicable.
 pub trait LayoutPlugin: Send + Sync {
     fn id(&self) -> &'static str;
     fn priority(&self) -> i32;
     fn applicable(&self, ctx: &LayoutBuildCtx<'_>) -> bool;
     fn build(&self, ctx: &LayoutBuildCtx<'_>) -> Option<Box<dyn LayoutShape>>;
+}
+
+/// Builds a 3D volume layout for the given sources, when applicable. The 3D
+/// analog of [`LayoutPlugin`]; selected by
+/// [`crate::volume::select_volume_shape`] with the same descending-priority /
+/// `i32::MIN`-floor rules. A downstream gates on [`LayoutBuildCtx::mode`] in
+/// `applicable` exactly as the 2D arch layout does.
+pub trait VolumeShapePlugin: Send + Sync {
+    fn id(&self) -> &'static str;
+    fn priority(&self) -> i32;
+    fn applicable(&self, ctx: &LayoutBuildCtx<'_>) -> bool;
+    fn build(&self, ctx: &LayoutBuildCtx<'_>) -> Option<Box<dyn crate::volume::VolumeShape>>;
 }
 
 /// Inputs every [`DiffSourceBuilder`] sees for a file-pair `--diff` run.
@@ -244,6 +259,15 @@ impl Default for Branding {
 pub struct Registry {
     pub formats: Vec<Arc<dyn FormatPlugin>>,
     pub layouts: Vec<Arc<dyn LayoutPlugin>>,
+    /// 3D (`--3d`) layout plugins, the volume analog of `layouts`. `run` picks
+    /// the highest-priority applicable one via
+    /// [`crate::volume::select_volume_shape`]; the `i32::MIN`
+    /// `HilbertVolumePlugin` floor (installed by [`Registry::with_defaults`])
+    /// always applies.
+    pub volume_shapes: Vec<Arc<dyn VolumeShapePlugin>>,
+    /// Id-keyed 3D voxel renderers, the volume analog of `leaf`. A structured
+    /// `VolumeShape`'s entities dispatch here by `renderer_id`.
+    pub voxel: crate::volume::VoxelRegistry,
     pub leaf: LeafRegistry,
     pub diffs: Vec<Arc<dyn DiffSourceBuilder>>,
     /// Priority-ordered source providers. `run` picks the highest-priority
@@ -271,6 +295,8 @@ impl Registry {
         Self {
             formats: Vec::new(),
             layouts: vec![Arc::new(crate::layout::HilbertLayoutPlugin)],
+            volume_shapes: vec![Arc::new(crate::volume::HilbertVolumePlugin)],
+            voxel: crate::volume::VoxelRegistry::with_defaults(),
             leaf: LeafRegistry::with_defaults(),
             diffs: vec![
                 Arc::new(crate::data::JsonDiffBuilder),

@@ -211,6 +211,8 @@ pub fn select_layout(
         total_bytes,
         mode,
         diff_mode,
+        // 2D tile path: the cube side is irrelevant here.
+        grid_side: 0,
     };
 
     // Snapshot plugins ordered by descending priority. A handful of plugins,

@@ -167,7 +167,7 @@ const volFrag = `
   uniform sampler3D uVolume;
   uniform sampler2D uLut;
   uniform float uOpacity, uGamma, uThreshold, uNorm;
-  uniform int uSource, uSteps;
+  uniform int uSource, uSteps, uDirectColor;
   in vec3 vOrigin;
   in vec3 vDirection;
   out vec4 fragColor;
@@ -194,14 +194,24 @@ const volFrag = `
       if (i >= uSteps) break;
       vec4 vox = texture(uVolume, p + 0.5);
       if (vox.a > 0.0) {
-        float d = (uSource == 0) ? vox.g : vox.b;
+        // "rgb" (structured) mode: RGB is final baked color, A the opacity
+        // weight. "lut" (byte) mode: R indexes the LUT, G/B are the opacity
+        // sources (activity / density) chosen by uSource.
+        vec3 col;
+        float d;
+        if (uDirectColor == 1) {
+          col = vox.rgb;
+          d = vox.a;
+        } else {
+          col = texture(uLut, vec2(vox.r, 0.5)).rgb;
+          d = (uSource == 0) ? vox.g : vox.b;
+        }
         d = max(0.0, d - uThreshold) / denom;
         // uNorm compensates for the data the threshold removed: as the field
         // thins, fewer voxels accumulate along each ray, so we scale per-voxel
         // alpha up to hold the cube's integrated opacity (its viewability)
         // roughly constant. Computed on the client from the channel histogram.
         float a = clamp(pow(d, uGamma) * uOpacity * uNorm, 0.0, 1.0);
-        vec3 col = texture(uLut, vec2(vox.r, 0.5)).rgb;
         acc.rgb += (1.0 - acc.a) * col * a;
         acc.a   += (1.0 - acc.a) * a;
         if (acc.a >= 0.95) break;
@@ -239,7 +249,8 @@ const ptFrag = `
 // each ray and the cube dims. We counter that by scaling per-voxel alpha
 // (uNorm) so the *total* surviving signal stays close to its threshold-0 value
 // — the sparse high-threshold field then reads about as bright as the full one.
-let histAct = null, histDen = null, s0Act = 0, s0Den = 0;
+let histAct = null, histDen = null, histAlpha = null, s0Act = 0, s0Den = 0, s0Alpha = 0;
+let directColor = false; // "rgb" color_mode: RGB baked, A is the lone opacity source
 const NORM_MAX = 12; // cap the boost so a near-empty field doesn't white out
 
 // Sum, over occupied voxels, of the post-threshold opacity signal the shader
@@ -259,22 +270,32 @@ function surviveSignal(hist, t) {
 function buildHistograms(buf) {
   histAct = new Float64Array(256);
   histDen = new Float64Array(256);
+  histAlpha = new Float64Array(256); // A = opacity weight (rgb mode)
   for (let i = 0; i < buf.length; i += 4) {
     if (buf[i + 3] === 0) continue; // empty voxel — never rendered
     histAct[buf[i + 1]]++; // G = activity
     histDen[buf[i + 2]]++; // B = density
+    histAlpha[buf[i + 3]]++;
   }
   s0Act = surviveSignal(histAct, 0);
   s0Den = surviveSignal(histDen, 0);
+  s0Alpha = surviveSignal(histAlpha, 0);
 }
 
-// Recompute uNorm from the current threshold + opacity source.
+// Recompute uNorm from the current threshold + opacity source. In rgb mode the
+// sole source is the alpha channel; in lut mode it's the chosen G/B channel.
 function refreshNorm() {
   if (!volMesh || !histAct) return;
   const u = volMesh.material.uniforms;
-  const density = u.uSource.value === 1;
-  const s0 = density ? s0Den : s0Act;
-  const st = surviveSignal(density ? histDen : histAct, u.uThreshold.value);
+  let hist, s0;
+  if (directColor) {
+    hist = histAlpha; s0 = s0Alpha;
+  } else {
+    const density = u.uSource.value === 1;
+    hist = density ? histDen : histAct;
+    s0 = density ? s0Den : s0Act;
+  }
+  const st = surviveSignal(hist, u.uThreshold.value);
   const n = st > 1e-9 ? s0 / st : 1.0;
   u.uNorm.value = Math.min(Math.max(n, 1.0), NORM_MAX);
 }
@@ -285,6 +306,7 @@ let volMesh = null, points = null;
 async function load() {
   const meta = await (await fetch('meta.json')).json();
   const side = meta.grid_side;
+  directColor = meta.color_mode === 'rgb';
 
   // byte->color LUT as a 256x1 texture
   const lut = new Uint8Array(256 * 4);
@@ -314,7 +336,7 @@ async function load() {
       uVolume: { value: volTex }, uLut: { value: lutTex },
       uOpacity: { value: 0.2 }, uGamma: { value: 1.0 },
       uThreshold: { value: 0.0 }, uSource: { value: 0 }, uSteps: { value: 192 },
-      uNorm: { value: 1.0 },
+      uNorm: { value: 1.0 }, uDirectColor: { value: directColor ? 1 : 0 },
     },
     vertexShader: volVert, fragmentShader: volFrag,
   });
@@ -350,6 +372,13 @@ async function load() {
   const dist = Math.max(fr * 3.2, 0.18);
   camera.position.set(fc[0] + dist, fc[1] + dist * 0.85, fc[2] + dist * 1.1);
   controls.update();
+
+  // rgb (structured) mode has a single opacity source (alpha), so the
+  // Activity/Density toggle is meaningless — hide it.
+  if (directColor) {
+    const r = $('src').closest('.row');
+    if (r) r.hidden = true;
+  }
 
   $('status').hidden = true;
   $('panel').hidden = false;

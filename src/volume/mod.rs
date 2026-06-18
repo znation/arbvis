@@ -15,6 +15,11 @@
 
 pub mod encode;
 pub mod html;
+pub mod shape;
+pub mod voxel;
+
+pub use shape::{select_volume_shape, HilbertVolumePlugin, VolumeEntity, VolumeShape, VoxelBox};
+pub use voxel::{VoxelCell, VoxelGridMut, VoxelRegistry, VoxelRenderCtx, VoxelRenderer};
 
 use std::path::{Path, PathBuf};
 
@@ -24,7 +29,8 @@ use image::Rgb;
 use crate::color::{build_diff_signed_lut, build_pixel_lut};
 use crate::data::{load_source_data, Source};
 use crate::geometry;
-use crate::registry::Branding;
+use crate::layout::LayoutMode;
+use crate::registry::{Branding, Registry};
 use encode::{VolumeMeta, VoxelAcc};
 
 /// Bytes read per `fetch_range` window during aggregation.
@@ -49,6 +55,14 @@ struct BuildResult {
 }
 
 /// Render the 3D viewer bundle for `sources` into `out_dir`.
+///
+/// Picks a [`VolumeShape`] from the registry (mirroring 2D layout selection):
+/// the `i32::MIN` [`HilbertVolumePlugin`] floor runs the legacy whole-stream
+/// byte→Hilbert fill, while a higher-priority structured shape (e.g.
+/// modelweightvis's `"arch"`) places per-tensor entities and colors them via a
+/// [`VoxelRenderer`] that bakes final RGB into each voxel. The viewer's
+/// `color_mode` (`"lut"` for the byte path, `"rgb"` for structured) is recorded
+/// in `meta.json`.
 #[allow(clippy::too_many_arguments)]
 pub async fn render_volume(
     sources: Vec<Source>,
@@ -58,6 +72,8 @@ pub async fn render_volume(
     inputs: &[String],
     diff_mode: bool,
     grid_side: u32,
+    mode: LayoutMode,
+    registry: &Registry,
     branding: &Branding,
 ) -> anyhow::Result<()> {
     let pixel_lut = if diff_mode {
@@ -66,14 +82,53 @@ pub async fn render_volume(
         build_pixel_lut()
     };
 
-    log::info!("Aggregating {total} bytes into a {grid_side}³ voxel grid via 3D Hilbert curve...");
+    // Pick the volume layout. Byte offsets are per-source for the entity path,
+    // but `select_volume_shape` (and a downstream's `build`) still wants the
+    // cumulative offsets, exactly like `select_layout`.
+    let cumulative_offsets = cumulative_offsets(&sources);
+    let shape = select_volume_shape(
+        &sources,
+        &cumulative_offsets,
+        total,
+        mode,
+        diff_mode,
+        grid_side,
+        registry,
+    );
+    let is_byte = shape.is_byte_volume();
+    let actual_side = shape.grid_side();
+    let color_mode = if is_byte { "lut" } else { "rgb" };
+
+    if is_byte {
+        log::info!(
+            "Aggregating {total} bytes into a {actual_side}³ voxel grid via 3D Hilbert curve..."
+        );
+    } else {
+        log::info!(
+            "Rendering structured `{}` 3D volume into a {actual_side}³ voxel grid...",
+            shape.id()
+        );
+    }
 
     // CPU + per-chunk fetch work on the blocking pool, like the single-image
     // path — keeps the tokio runtime free for the `Http`/`Xet`/`LazyDiff`
-    // fetches the workers drive via `block_on`.
+    // fetches the workers drive via `block_on`. The voxel registry is a cheap
+    // Arc-map clone so the blocking closure owns everything it needs.
     let rt = tokio::runtime::Handle::current();
+    let voxel_reg = registry.voxel.clone();
     let built = tokio::task::spawn_blocking(move || {
-        aggregate_and_build(sources, total, grid_side, pixel_lut, rt)
+        if is_byte {
+            aggregate_bytes_hilbert(sources, total, actual_side, pixel_lut, rt)
+        } else {
+            aggregate_entities(
+                sources,
+                shape.as_ref(),
+                actual_side,
+                &voxel_reg,
+                diff_mode,
+                rt,
+            )
+        }
     })
     .await
     .map_err(|e| anyhow::anyhow!("volume aggregation join failure: {e}"))??;
@@ -86,11 +141,12 @@ pub async fn render_volume(
         title: title.to_string(),
         brand_name: branding.name.to_string(),
         repo_url: branding.repo_url.to_string(),
-        grid_side,
+        grid_side: actual_side,
         points: built.points_count,
         total_bytes: total,
         max_count: built.max_count,
         diff_mode,
+        color_mode: color_mode.to_string(),
         inputs: inputs.to_vec(),
         focus_center: built.focus_center,
         focus_radius: built.focus_radius,
@@ -108,6 +164,19 @@ pub async fn render_volume(
         built.points_count
     );
     Ok(())
+}
+
+/// Prefix-sum of source byte sizes: `out[i]` is the absolute start offset of
+/// `sources[i]` in the concatenated stream. Matches the 2D tile path's
+/// `cumulative_offsets`, so a downstream's byte arithmetic carries over.
+fn cumulative_offsets(sources: &[Source]) -> Vec<u64> {
+    let mut offs = Vec::with_capacity(sources.len());
+    let mut acc = 0u64;
+    for s in sources {
+        offs.push(acc);
+        acc += s.byte_size;
+    }
+    offs
 }
 
 /// Rebuild `index.html` for an existing 3D bundle from its `meta.json`,
@@ -139,9 +208,11 @@ pub fn regen_html(dir: &Path, branding: &Branding) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Single streaming pass over the concatenated source bytes: populate the
-/// voxel grid and sample the point cloud at once. Runs on the blocking pool.
-fn aggregate_and_build(
+/// Byte-Hilbert floor: a single streaming pass over the concatenated source
+/// bytes that populates the voxel grid and samples the point cloud at once.
+/// Runs on the blocking pool. Unchanged from the pre-seam path — byte inputs
+/// render identically.
+fn aggregate_bytes_hilbert(
     sources: Vec<Source>,
     total: u64,
     grid_side: u32,
@@ -258,6 +329,126 @@ fn aggregate_and_build(
     })
 }
 
+/// Structured path: render each entity into its voxel box via the matching
+/// [`VoxelRenderer`], which bakes final RGBA8 straight into the grid (no shader
+/// LUT). arbvis owns the fetch — it reads the whole `[byte_start, +byte_len)`
+/// span per entity and hands the bytes to the renderer, which decodes/samples
+/// within. (Peak memory is the largest single entity; a future revision can
+/// switch to a fetch-on-demand callback for very large tensors.)
+fn aggregate_entities(
+    sources: Vec<Source>,
+    shape: &dyn VolumeShape,
+    side: u32,
+    voxel_reg: &VoxelRegistry,
+    diff_mode: bool,
+    rt: tokio::runtime::Handle,
+) -> anyhow::Result<BuildResult> {
+    let cells = (side as usize).pow(3);
+    let mut grid = vec![VoxelCell::default(); cells];
+    let entities = shape.entities().unwrap_or_default();
+    let default_renderer_id = shape.id();
+
+    for ent in &entities {
+        let renderer = voxel_reg
+            .renderer(ent.renderer_id)
+            .or_else(|| voxel_reg.renderer(default_renderer_id))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no voxel renderer registered for id `{}` (shape `{}`)",
+                    ent.renderer_id,
+                    default_renderer_id
+                )
+            })?;
+        let src = sources.get(ent.source_idx).ok_or_else(|| {
+            anyhow::anyhow!(
+                "entity source_idx {} out of range ({} sources)",
+                ent.source_idx,
+                sources.len()
+            )
+        })?;
+        let data = load_source_data(src)?;
+
+        // Fetch the entity's byte span (chunked, on the blocking pool).
+        let mut bytes = vec![0u8; ent.byte_len as usize];
+        let mut off = 0u64;
+        while off < ent.byte_len {
+            let len = (ent.byte_len - off).min(CHUNK) as usize;
+            let chunk = rt.block_on(data.fetch_range(ent.byte_start + off, len))?;
+            bytes[off as usize..off as usize + len].copy_from_slice(&chunk);
+            off += len as u64;
+        }
+
+        let mut view = VoxelGridMut::new(&mut grid, side);
+        renderer.render(
+            &VoxelRenderCtx {
+                entity: ent,
+                bytes: &bytes,
+                side,
+                diff_mode,
+            },
+            &mut view,
+        );
+    }
+
+    let (focus_center, focus_radius) = shape
+        .focus()
+        .unwrap_or_else(|| occupied_focus_cells(&grid, side));
+    let volume_rgba = encode::pack_voxel_cells(&grid);
+
+    // Structured cubes drop the global point cloud: a stride-sampled Hilbert
+    // cloud wouldn't align with the structured voxels. (Per-tensor point
+    // sampling is future work.)
+    Ok(BuildResult {
+        volume_rgba,
+        points_buf: Vec::new(),
+        points_count: 0,
+        max_count: 0,
+        focus_center,
+        focus_radius,
+    })
+}
+
+/// Cube-space framing for a structured (baked-RGBA) grid — occupancy is `a > 0`.
+/// Mirrors [`occupied_focus`] but reads [`VoxelCell`] instead of [`VoxelAcc`].
+fn occupied_focus_cells(grid: &[VoxelCell], grid_side: u32) -> ([f32; 3], f32) {
+    let side = grid_side as usize;
+    let mut bmin = [u32::MAX; 3];
+    let mut bmax = [0u32; 3];
+    let mut sum = [0f64; 3];
+    let mut n: u64 = 0;
+    for (i, cell) in grid.iter().enumerate() {
+        if cell.a == 0 {
+            continue;
+        }
+        n += 1;
+        let coord = [
+            (i % side) as u32,
+            ((i / side) % side) as u32,
+            (i / (side * side)) as u32,
+        ];
+        for a in 0..3 {
+            bmin[a] = bmin[a].min(coord[a]);
+            bmax[a] = bmax[a].max(coord[a]);
+            sum[a] += coord[a] as f64;
+        }
+    }
+    if n == 0 {
+        return ([0.0, 0.0, 0.0], 0.5);
+    }
+    let s = grid_side as f32;
+    let to_cube = |v: f32| (v + 0.5) / s - 0.5;
+    let mut center = [0f32; 3];
+    let mut radius = 0f32;
+    for a in 0..3 {
+        let c = to_cube((sum[a] / n as f64) as f32);
+        let lo = to_cube(bmin[a] as f32);
+        let hi = to_cube(bmax[a] as f32);
+        center[a] = c;
+        radius = radius.max((c - lo).max(hi - c));
+    }
+    (center, radius.max(0.02))
+}
+
 /// Cube-space framing center + radius for the occupied voxels. Targets the
 /// occupancy **centroid** (mass center — the Hilbert prefix clusters
 /// asymmetrically within its bounding box) and sizes the radius so the full
@@ -307,6 +498,7 @@ fn occupied_focus(grid: &[VoxelAcc], grid_side: u32) -> ([f32; 3], f32) {
 mod tests {
     use super::*;
     use crate::data::SourceKind;
+    use std::sync::Arc;
 
     fn buffered(bytes: Vec<u8>) -> Source {
         let len = bytes.len() as u64;
@@ -339,6 +531,8 @@ mod tests {
             &[],
             false,
             grid_side,
+            LayoutMode::Auto,
+            &Registry::with_defaults(),
             &Branding::default(),
         )
         .await
@@ -366,7 +560,140 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.path().join("meta.json")).unwrap()).unwrap();
         assert_eq!(meta["grid_side"], grid_side);
         assert_eq!(meta["points"], total);
+        assert_eq!(
+            meta["color_mode"], "lut",
+            "byte floor must stay LUT-colored"
+        );
         assert!(dir.path().join("points.bin").exists());
         assert!(dir.path().join("index.html").exists());
+    }
+
+    // A structured VolumeShape whose single entity paints a 4³ box; its
+    // VoxelRenderer bakes a fixed RGBA into the cube. Exercises the entity path
+    // end to end: shape selection (priority over the floor), per-entity fetch,
+    // voxel-renderer dispatch, baked-RGB packing, and the `"rgb"` color_mode +
+    // dropped point cloud in `meta.json`.
+    struct TestVolume {
+        side: u32,
+    }
+    impl VolumeShape for TestVolume {
+        fn id(&self) -> &'static str {
+            "test-vol"
+        }
+        fn grid_side(&self) -> u32 {
+            self.side
+        }
+        fn entities(&self) -> Option<Vec<VolumeEntity>> {
+            Some(vec![VolumeEntity {
+                source_idx: 0,
+                byte_start: 0,
+                byte_len: 16,
+                bbox: VoxelBox {
+                    x0: 0,
+                    y0: 0,
+                    z0: 0,
+                    x1: 4,
+                    y1: 4,
+                    z1: 4,
+                },
+                renderer_id: "test-vox",
+                extra: Box::new(()),
+            }])
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    struct TestVolPlugin;
+    impl crate::registry::VolumeShapePlugin for TestVolPlugin {
+        fn id(&self) -> &'static str {
+            "test-vol"
+        }
+        fn priority(&self) -> i32 {
+            1000
+        }
+        fn applicable(&self, _ctx: &crate::registry::LayoutBuildCtx<'_>) -> bool {
+            true
+        }
+        fn build(&self, ctx: &crate::registry::LayoutBuildCtx<'_>) -> Option<Box<dyn VolumeShape>> {
+            Some(Box::new(TestVolume {
+                side: ctx.grid_side,
+            }))
+        }
+    }
+
+    struct TestVox;
+    impl VoxelRenderer for TestVox {
+        fn id(&self) -> &'static str {
+            "test-vox"
+        }
+        fn render(&self, ctx: &VoxelRenderCtx<'_>, grid: &mut VoxelGridMut<'_>) {
+            // Prove arbvis fetched the entity span before dispatch.
+            assert_eq!(ctx.bytes.len(), 16);
+            let bb = ctx.entity.bbox;
+            for z in bb.z0..bb.z1 {
+                for y in bb.y0..bb.y1 {
+                    for x in bb.x0..bb.x1 {
+                        grid.put(
+                            x,
+                            y,
+                            z,
+                            VoxelCell {
+                                r: 10,
+                                g: 20,
+                                b: 30,
+                                a: 200,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn structured_entities_bake_rgb() {
+        let mut reg = Registry::with_defaults();
+        reg.volume_shapes.push(Arc::new(TestVolPlugin));
+        reg.voxel.register_renderer(Arc::new(TestVox));
+
+        let dir = tempfile::tempdir().unwrap();
+        let grid_side = 8u32;
+        render_volume(
+            vec![buffered(vec![0u8; 16])],
+            16,
+            dir.path().to_path_buf(),
+            "test",
+            &[],
+            false,
+            grid_side,
+            LayoutMode::Auto,
+            &reg,
+            &Branding::default(),
+        )
+        .await
+        .unwrap();
+
+        let vol = std::fs::read(dir.path().join("volume.bin")).unwrap();
+        assert_eq!(vol.len() as u64, (grid_side as u64).pow(3) * 4);
+        let mut filled = 0u64;
+        for px in vol.chunks_exact(4) {
+            if px[3] == 200 {
+                assert_eq!(
+                    [px[0], px[1], px[2]],
+                    [10, 20, 30],
+                    "baked RGB survives verbatim"
+                );
+                filled += 1;
+            }
+        }
+        assert_eq!(filled, 4 * 4 * 4, "the 4³ entity box should be baked");
+
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta["color_mode"], "rgb");
+        assert_eq!(meta["points"], 0, "structured cubes drop the point cloud");
+        assert_eq!(meta["grid_side"], grid_side);
     }
 }

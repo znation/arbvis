@@ -1,0 +1,198 @@
+//! 3D placement seam: the volume analog of [`crate::layout`]'s `LayoutShape` /
+//! `LayoutPlugin` / `select_layout`.
+//!
+//! Where a [`crate::LayoutShape`] maps the concatenated byte stream onto a 2D
+//! canvas, a [`VolumeShape`] maps it into a bounded `grid_side³` voxel cube. The
+//! byte-Hilbert floor ([`HilbertVolume`], priority `i32::MIN`) reproduces
+//! today's blind whole-stream Hilbert fill, so byte inputs render identically
+//! to before the seam existed. A downstream specialization registers a
+//! higher-priority [`VolumeShapePlugin`] that returns a list of placed
+//! [`VolumeEntity`]s (e.g. modelweightvis stacking transformer blocks along Z).
+//!
+//! Selection mirrors [`crate::layout::select_layout`] exactly: descending
+//! priority, the `i32::MIN` floor guarantees termination, and a `Forced(id)`
+//! that doesn't win logs the same diagnostic. A downstream plugin gates on
+//! [`crate::LayoutMode`] in its `applicable` (e.g. bow out under
+//! [`LayoutMode::Hilbert`]) just like the 2D arch layout does.
+
+use std::any::Any;
+use std::sync::Arc;
+
+use crate::data::Source;
+use crate::layout::LayoutMode;
+use crate::registry::{LayoutBuildCtx, Registry, VolumeShapePlugin};
+
+/// Axis-aligned voxel box `[min, max)` in grid coordinates (each axis in
+/// `0..grid_side`). The upper bounds are exclusive.
+#[derive(Clone, Copy, Debug)]
+pub struct VoxelBox {
+    pub x0: u32,
+    pub y0: u32,
+    pub z0: u32,
+    pub x1: u32,
+    pub y1: u32,
+    pub z1: u32,
+}
+
+/// One placed entity in the cube. arbvis does not interpret `extra` or
+/// `renderer_id`; it fetches `[byte_start, byte_start + byte_len)` from
+/// `sources[source_idx]` and hands the bytes to the [`VoxelRenderer`] named by
+/// `renderer_id`, exactly as the 2D path routes a `LeafTile` to a `LeafRenderer`.
+pub struct VolumeEntity {
+    /// Index into the run's `sources` list.
+    pub source_idx: usize,
+    /// Byte offset *within that source* (not the concatenated stream).
+    pub byte_start: u64,
+    pub byte_len: u64,
+    /// Target box in the bounded grid.
+    pub bbox: VoxelBox,
+    /// Names the [`VoxelRenderer`] that decodes + colors this entity.
+    pub renderer_id: &'static str,
+    /// Opaque per-entity payload the renderer downcasts (dtype, element shape,
+    /// colormap choice, diff partner span, …).
+    pub extra: Box<dyn Any + Send + Sync>,
+}
+
+/// 3D analog of [`crate::LayoutShape`]: how the byte stream maps into a bounded
+/// voxel cube.
+pub trait VolumeShape: Send + Sync {
+    /// Stable id; also the default [`VoxelRenderer`] id for entities that don't
+    /// override it. Mirrors [`crate::LayoutShape::id`].
+    fn id(&self) -> &'static str;
+
+    /// The cube side this shape renders into (a power of two).
+    fn grid_side(&self) -> u32;
+
+    /// `true` ⇒ arbvis ignores [`entities`](VolumeShape::entities) and runs the
+    /// legacy whole-stream byte→Hilbert fill (the `i32::MIN` floor). The 3D
+    /// analog of `LayoutShape::is_byte_layout`.
+    fn is_byte_volume(&self) -> bool {
+        false
+    }
+
+    /// The placed entities. `None`/empty for the byte floor.
+    fn entities(&self) -> Option<Vec<VolumeEntity>> {
+        None
+    }
+
+    /// Optional camera framing override (cube-space center + radius). When
+    /// `None`, arbvis frames from grid occupancy.
+    fn focus(&self) -> Option<([f32; 3], f32)> {
+        None
+    }
+
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// The byte-Hilbert floor — reproduces today's blind whole-stream aggregation.
+pub struct HilbertVolume {
+    side: u32,
+}
+
+impl VolumeShape for HilbertVolume {
+    fn id(&self) -> &'static str {
+        "hilbert-bytes"
+    }
+    fn grid_side(&self) -> u32 {
+        self.side
+    }
+    fn is_byte_volume(&self) -> bool {
+        true
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Floor plugin (`i32::MIN`), always applicable — guarantees selection
+/// terminates, mirroring `HilbertLayoutPlugin`.
+pub struct HilbertVolumePlugin;
+
+impl VolumeShapePlugin for HilbertVolumePlugin {
+    fn id(&self) -> &'static str {
+        "hilbert-bytes"
+    }
+    fn priority(&self) -> i32 {
+        i32::MIN
+    }
+    fn applicable(&self, _ctx: &LayoutBuildCtx<'_>) -> bool {
+        true
+    }
+    fn build(&self, ctx: &LayoutBuildCtx<'_>) -> Option<Box<dyn VolumeShape>> {
+        Some(Box::new(HilbertVolume {
+            side: ctx.grid_side,
+        }))
+    }
+}
+
+/// Pick the highest-priority applicable [`VolumeShapePlugin`]. Mirrors
+/// [`crate::layout::select_layout`]: descending priority, `i32::MIN` floor
+/// guarantees a result, and a non-winning `Forced(id)` logs a diagnostic.
+pub fn select_volume_shape(
+    sources: &[Source],
+    cumulative_offsets: &[u64],
+    total_bytes: u64,
+    mode: LayoutMode,
+    diff_mode: bool,
+    grid_side: u32,
+    registry: &Registry,
+) -> Box<dyn VolumeShape> {
+    let ctx = LayoutBuildCtx {
+        sources,
+        cumulative_offsets,
+        total_bytes,
+        mode,
+        diff_mode,
+        grid_side,
+    };
+
+    let mut sorted: Vec<&Arc<dyn VolumeShapePlugin>> = registry.volume_shapes.iter().collect();
+    sorted.sort_by_key(|p| std::cmp::Reverse(p.priority()));
+
+    let forced_id = match mode {
+        LayoutMode::Forced(id) => Some(id),
+        _ => None,
+    };
+    let mut chosen: Option<Box<dyn VolumeShape>> = None;
+    let mut forced_was_applicable = false;
+    for plugin in &sorted {
+        if !plugin.applicable(&ctx) {
+            continue;
+        }
+        let pid = plugin.id();
+        match plugin.build(&ctx) {
+            Some(shape) => {
+                chosen = Some(shape);
+                break;
+            }
+            None => {
+                if Some(pid) == forced_id {
+                    forced_was_applicable = true;
+                }
+            }
+        }
+    }
+    let chosen = chosen.expect(
+        "registry.volume_shapes must include a floor plugin (HilbertVolumePlugin at i32::MIN)",
+    );
+
+    if let Some(id) = forced_id {
+        if chosen.id() != id {
+            if forced_was_applicable {
+                log::warn!(
+                    "--layout {id} requested but it could not build a 3D volume for these inputs; \
+                     falling back to {}",
+                    chosen.id()
+                );
+            } else {
+                log::warn!(
+                    "--layout {id} requested but no registered 3D volume layout matched; \
+                     falling back to {}",
+                    chosen.id()
+                );
+            }
+        }
+    }
+
+    chosen
+}

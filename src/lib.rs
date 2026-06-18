@@ -30,6 +30,7 @@ pub use layout::{CanvasGeom, LayoutMode, LayoutShape};
 pub use registry::{
     Branding, DestKind, DiffBuildCtx, DiffPair, DiffSourceBuilder, FormatPlugin, LayoutBuildCtx,
     LayoutPlugin, PrepareSourcesExtension, Registry, RenderHints, SourceCtx, SourceProvider,
+    VolumeShapePlugin,
 };
 pub use tiled::html::FileEntity;
 pub use tiled::leaf::{encode_tile, TileFormat, TILE};
@@ -37,6 +38,12 @@ pub use tiled::leaf_renderer::{
     LeafLoader, LeafRegistry, LeafRenderer, LeafTile, LoadCtx, RenderCtx,
 };
 pub use tiled::{EncodedTile, LeafMode, LoadedTile};
+// 3D (`--3d`) volume seam — the placement + coloring analogs of the 2D layout
+// and leaf-renderer SPI, for a downstream to render a structure-aware cube.
+pub use volume::{
+    VolumeEntity, VolumeShape, VoxelBox, VoxelCell, VoxelGridMut, VoxelRegistry, VoxelRenderCtx,
+    VoxelRenderer,
+};
 
 use std::borrow::Cow;
 use std::fs::File;
@@ -733,6 +740,8 @@ async fn render_volume_bundle(
         &cfg.inputs,
         cfg.diff_mode,
         cfg.grid_side,
+        cfg.layout_mode,
+        registry,
         &registry.branding,
     )
     .await?;

@@ -166,7 +166,7 @@ const volFrag = `
   precision highp sampler3D;
   uniform sampler3D uVolume;
   uniform sampler2D uLut;
-  uniform float uOpacity, uGamma, uThreshold;
+  uniform float uOpacity, uGamma, uThreshold, uNorm;
   uniform int uSource, uSteps;
   in vec3 vOrigin;
   in vec3 vDirection;
@@ -196,7 +196,11 @@ const volFrag = `
       if (vox.a > 0.0) {
         float d = (uSource == 0) ? vox.g : vox.b;
         d = max(0.0, d - uThreshold) / denom;
-        float a = clamp(pow(d, uGamma) * uOpacity, 0.0, 1.0);
+        // uNorm compensates for the data the threshold removed: as the field
+        // thins, fewer voxels accumulate along each ray, so we scale per-voxel
+        // alpha up to hold the cube's integrated opacity (its viewability)
+        // roughly constant. Computed on the client from the channel histogram.
+        float a = clamp(pow(d, uGamma) * uOpacity * uNorm, 0.0, 1.0);
         vec3 col = texture(uLut, vec2(vox.r, 0.5)).rgb;
         acc.rgb += (1.0 - acc.a) * col * a;
         acc.a   += (1.0 - acc.a) * a;
@@ -230,6 +234,51 @@ const ptFrag = `
     fragColor = vec4(vColor.rgb, vColor.a * uPointOpacity);
   }`;
 
+// ---- threshold re-normalization ---------------------------------------------
+// As the threshold rises it removes signal, so fewer voxels accumulate along
+// each ray and the cube dims. We counter that by scaling per-voxel alpha
+// (uNorm) so the *total* surviving signal stays close to its threshold-0 value
+// — the sparse high-threshold field then reads about as bright as the full one.
+let histAct = null, histDen = null, s0Act = 0, s0Den = 0;
+const NORM_MAX = 12; // cap the boost so a near-empty field doesn't white out
+
+// Sum, over occupied voxels, of the post-threshold opacity signal the shader
+// integrates per voxel: max(0, v - t)/(1 - t) with v = byte/255. At t=0 this is
+// the full signal; it falls as the threshold thins the survivors out.
+function surviveSignal(hist, t) {
+  const denom = Math.max(1e-4, 1.0 - t);
+  let s = 0;
+  for (let k = 0; k < 256; k++) {
+    const v = k / 255;
+    if (v > t) s += (v - t) * hist[k];
+  }
+  return s / denom;
+}
+
+// Build per-channel histograms over occupied voxels once at load.
+function buildHistograms(buf) {
+  histAct = new Float64Array(256);
+  histDen = new Float64Array(256);
+  for (let i = 0; i < buf.length; i += 4) {
+    if (buf[i + 3] === 0) continue; // empty voxel — never rendered
+    histAct[buf[i + 1]]++; // G = activity
+    histDen[buf[i + 2]]++; // B = density
+  }
+  s0Act = surviveSignal(histAct, 0);
+  s0Den = surviveSignal(histDen, 0);
+}
+
+// Recompute uNorm from the current threshold + opacity source.
+function refreshNorm() {
+  if (!volMesh || !histAct) return;
+  const u = volMesh.material.uniforms;
+  const density = u.uSource.value === 1;
+  const s0 = density ? s0Den : s0Act;
+  const st = surviveSignal(density ? histDen : histAct, u.uThreshold.value);
+  const n = st > 1e-9 ? s0 / st : 1.0;
+  u.uNorm.value = Math.min(Math.max(n, 1.0), NORM_MAX);
+}
+
 // ---- load + build -----------------------------------------------------------
 let volMesh = null, points = null;
 
@@ -256,6 +305,7 @@ async function load() {
   volTex.wrapS = volTex.wrapT = volTex.wrapR = THREE.ClampToEdgeWrapping;
   volTex.unpackAlignment = 1;
   volTex.needsUpdate = true;
+  buildHistograms(volBuf);
 
   const volMat = new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
@@ -264,6 +314,7 @@ async function load() {
       uVolume: { value: volTex }, uLut: { value: lutTex },
       uOpacity: { value: 0.2 }, uGamma: { value: 1.0 },
       uThreshold: { value: 0.0 }, uSource: { value: 0 }, uSteps: { value: 192 },
+      uNorm: { value: 1.0 },
     },
     vertexShader: volVert, fragmentShader: volFrag,
   });
@@ -329,11 +380,12 @@ function bindControls() {
     $('volctl').hidden = !vol;
     $('ptctl').hidden = vol;
   });
-  seg('src', (s) => { v().uSource.value = parseInt(s); });
+  seg('src', (s) => { v().uSource.value = parseInt(s); refreshNorm(); });
   slider('opacity', 'opv', (x) => x.toFixed(2), (x) => v().uOpacity.value = x);
   slider('gamma', 'gav', (x) => x.toFixed(2), (x) => v().uGamma.value = x);
-  slider('threshold', 'thv', (x) => x.toFixed(2), (x) => v().uThreshold.value = x);
+  slider('threshold', 'thv', (x) => x.toFixed(2), (x) => { v().uThreshold.value = x; refreshNorm(); });
   slider('steps', 'stv', (x) => x.toFixed(0), (x) => v().uSteps.value = x);
+  refreshNorm();
   if (points) {
     const p = () => points.material.uniforms;
     slider('psize', 'psv', (x) => x.toFixed(1), (x) => p().uPointSize.value = x);

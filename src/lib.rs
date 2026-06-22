@@ -283,22 +283,6 @@ pub struct Args {
     stream: bool,
 }
 
-impl Args {
-    /// Whether `--3d` (volume mode) was requested. Lets a downstream that
-    /// flattens `Args` branch on the invocation shape — e.g. to avoid forcing a
-    /// 2D-only layout (with `Registry::strict_layout`) on a volume render.
-    pub fn three_d(&self) -> bool {
-        self.three_d
-    }
-
-    /// Whether `--diff ORIGINAL MODIFIED` was passed. Same purpose as
-    /// [`Args::three_d`]: the downstream's own flags live on its struct, but the
-    /// base invocation shape lives here.
-    pub fn is_diff(&self) -> bool {
-        self.diff.is_some()
-    }
-}
-
 /// Bag of parameters shared by every render entrypoint. Avoids the
 /// repeated-argument-list-of-doom that the call sites had before.
 struct RenderConfig {

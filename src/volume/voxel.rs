@@ -29,43 +29,46 @@ pub struct VoxelCell {
     pub a: u8,
 }
 
-/// Bounds-checked mutable view over the cube a [`VoxelRenderer`] writes into.
+/// Bounds-checked mutable view over the box a [`VoxelRenderer`] writes into.
 ///
-/// Indexed x-fastest (`x + y*side + z*side²`), matching the byte path's grid so
-/// both pack into the same `THREE.Data3DTexture` layout. Out-of-range `put`s are
-/// silently dropped — a renderer can clamp loosely without panicking the run.
+/// Indexed x-fastest (`x + y*ex + z*ex*ey`, with `extent = [ex, ey, ez]`),
+/// matching the byte path's grid so both pack into the same
+/// `THREE.Data3DTexture` layout. Out-of-range `put`s are silently dropped — a
+/// renderer can clamp loosely without panicking the run.
 pub struct VoxelGridMut<'a> {
     cells: &'a mut [VoxelCell],
-    side: u32,
+    extent: [u32; 3],
 }
 
 impl<'a> VoxelGridMut<'a> {
-    pub fn new(cells: &'a mut [VoxelCell], side: u32) -> Self {
-        Self { cells, side }
+    pub fn new(cells: &'a mut [VoxelCell], extent: [u32; 3]) -> Self {
+        Self { cells, extent }
     }
 
-    pub fn side(&self) -> u32 {
-        self.side
+    /// The box dimensions `[x, y, z]` in voxels.
+    pub fn extent(&self) -> [u32; 3] {
+        self.extent
     }
 
-    /// Write one voxel. Coordinates outside the cube are ignored.
+    /// Write one voxel. Coordinates outside the box are ignored.
     pub fn put(&mut self, x: u32, y: u32, z: u32, c: VoxelCell) {
-        let s = self.side as usize;
-        let (xu, yu, zu) = (x as usize, y as usize, z as usize);
-        if xu < s && yu < s && zu < s {
-            self.cells[xu + yu * s + zu * s * s] = c;
+        let [ex, ey, ez] = self.extent;
+        if x < ex && y < ey && z < ez {
+            let (ex, ey) = (ex as usize, ey as usize);
+            self.cells[x as usize + y as usize * ex + z as usize * ex * ey] = c;
         }
     }
 }
 
 /// What a [`VoxelRenderer::render`] call gets: one entity, its (already-fetched)
-/// byte span, the cube side, and the diff-mode flag.
+/// byte span, the grid box dimensions, and the diff-mode flag.
 pub struct VoxelRenderCtx<'a> {
     pub entity: &'a VolumeEntity,
     /// The entity's bytes — `[byte_start, byte_start + byte_len)` of its source,
     /// fetched by arbvis before dispatch. The renderer decodes/samples within.
     pub bytes: &'a [u8],
-    pub side: u32,
+    /// The full grid box `[x, y, z]` the entity's `bbox` lives inside.
+    pub extent: [u32; 3],
     pub diff_mode: bool,
 }
 

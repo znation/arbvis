@@ -2,7 +2,10 @@
 //! `LayoutPlugin` / `select_layout`.
 //!
 //! Where a [`crate::LayoutShape`] maps the concatenated byte stream onto a 2D
-//! canvas, a [`VolumeShape`] maps it into a bounded `grid_side³` voxel cube. The
+//! canvas, a [`VolumeShape`] maps it into a bounded `[x, y, z]` voxel box (see
+//! [`VolumeShape::grid_extent`]). The byte floor is a cube — the 3D Hilbert
+//! curve requires equal power-of-two sides — but a structured shape may pick an
+//! anisotropic box so a stack-shaped model isn't squashed into a cube. The
 //! byte-Hilbert floor ([`HilbertVolume`], priority `i32::MIN`) reproduces
 //! today's blind whole-stream Hilbert fill, so byte inputs render identically
 //! to before the seam existed. A downstream specialization registers a
@@ -24,8 +27,8 @@ use crate::data::Source;
 use crate::layout::LayoutMode;
 use crate::registry::{LayoutBuildCtx, Registry, VolumeShapePlugin};
 
-/// Axis-aligned voxel box `[min, max)` in grid coordinates (each axis in
-/// `0..grid_side`). The upper bounds are exclusive.
+/// Axis-aligned voxel box `[min, max)` in grid coordinates (axis `a` in
+/// `0..grid_extent()[a]`). The upper bounds are exclusive.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct VoxelBox {
     pub x0: u32,
@@ -70,14 +73,19 @@ pub struct VolumeEntity {
 }
 
 /// 3D analog of [`crate::LayoutShape`]: how the byte stream maps into a bounded
-/// voxel cube.
+/// voxel box.
 pub trait VolumeShape: Send + Sync {
     /// Stable id; also the default [`VoxelRenderer`] id for entities that don't
     /// override it. Mirrors [`crate::LayoutShape::id`].
     fn id(&self) -> &'static str;
 
-    /// The cube side this shape renders into (a power of two).
-    fn grid_side(&self) -> u32;
+    /// The voxel box `[x, y, z]` this shape renders into. A byte volume
+    /// ([`is_byte_volume`](VolumeShape::is_byte_volume)) must return a cube of
+    /// equal power-of-two sides — the 3D Hilbert curve is only defined there.
+    /// A structured shape is free to return an anisotropic box (e.g. layers
+    /// stacked along Z) so the rendered proportions match the data; the viewer
+    /// scales the largest axis to the unit cube and keeps voxels cubic.
+    fn grid_extent(&self) -> [u32; 3];
 
     /// `true` ⇒ arbvis ignores [`entities`](VolumeShape::entities) and runs the
     /// legacy whole-stream byte→Hilbert fill (the `i32::MIN` floor). The 3D
@@ -115,8 +123,8 @@ impl VolumeShape for HilbertVolume {
     fn id(&self) -> &'static str {
         "hilbert-bytes"
     }
-    fn grid_side(&self) -> u32 {
-        self.side
+    fn grid_extent(&self) -> [u32; 3] {
+        [self.side; 3] // cube: the 3D Hilbert curve needs equal sides
     }
     fn is_byte_volume(&self) -> bool {
         true

@@ -28,9 +28,10 @@ pub struct VolumeMeta {
     pub title: String,
     pub brand_name: String,
     pub repo_url: String,
-    /// Cube side in voxels (a power of two); `volume.bin` holds `side^3` RGBA8
-    /// texels in x-fastest, then y, then z order.
-    pub grid_side: u32,
+    /// Grid box `[x, y, z]` in voxels; `volume.bin` holds `x*y*z` RGBA8 texels
+    /// in x-fastest, then y, then z order. The byte path emits a cube (equal
+    /// power-of-two sides); a structured path may emit an anisotropic box.
+    pub grid_extent: [u32; 3],
     /// Number of points in `points.bin`.
     pub points: u64,
     pub total_bytes: u64,
@@ -44,11 +45,11 @@ pub struct VolumeMeta {
     /// the viewer defaults to `"lut"`.
     pub color_mode: String,
     pub inputs: Vec<String>,
-    /// Center of the occupied region in cube space (`[-0.5, 0.5]` per axis), so
-    /// the viewer can frame the data instead of the whole (often mostly-empty)
-    /// cube.
+    /// Center of the occupied region in viewer world space (the box is centered
+    /// at the origin; its longest axis spans `[-0.5, 0.5]`), so the viewer can
+    /// frame the data instead of the whole (often mostly-empty) box.
     pub focus_center: [f32; 3],
-    /// Half-extent of the occupied region (cube-space radius) for camera framing.
+    /// Half-extent of the occupied region (world-space radius) for camera framing.
     pub focus_radius: f32,
     /// 256-entry byte→RGB lookup table (the active 2D LUT: plain or diff).
     pub lut: Vec<[u8; 3]>,

@@ -98,19 +98,18 @@ pub async fn render_volume(
         registry,
     )?;
     let is_byte = shape.is_byte_volume();
-    let actual_side = shape.grid_side();
+    let actual_extent = shape.grid_extent();
+    let [ex, ey, ez] = actual_extent;
     let color_mode = if is_byte { "lut" } else { "rgb" };
     // Pick manifest for the click-to-pick viewer (empty for the byte floor).
     // Captured before `shape` moves into the blocking closure.
     let manifest = shape.manifest();
 
     if is_byte {
-        log::info!(
-            "Aggregating {total} bytes into a {actual_side}³ voxel grid via 3D Hilbert curve..."
-        );
+        log::info!("Aggregating {total} bytes into a {ex}³ voxel grid via 3D Hilbert curve...");
     } else {
         log::info!(
-            "Rendering structured `{}` 3D volume into a {actual_side}³ voxel grid...",
+            "Rendering structured `{}` 3D volume into a {ex}×{ey}×{ez} voxel box...",
             shape.id()
         );
     }
@@ -123,12 +122,14 @@ pub async fn render_volume(
     let voxel_reg = registry.voxel.clone();
     let built = tokio::task::spawn_blocking(move || {
         if is_byte {
-            aggregate_bytes_hilbert(sources, total, actual_side, pixel_lut, rt)
+            // Byte volumes are cubes (Hilbert needs equal sides); all three
+            // axes match, so the cube side is `ex`.
+            aggregate_bytes_hilbert(sources, total, ex, pixel_lut, rt)
         } else {
             aggregate_entities(
                 sources,
                 shape.as_ref(),
-                actual_side,
+                actual_extent,
                 &voxel_reg,
                 diff_mode,
                 rt,
@@ -146,7 +147,7 @@ pub async fn render_volume(
         title: title.to_string(),
         brand_name: branding.name.to_string(),
         repo_url: branding.repo_url.to_string(),
-        grid_side: actual_side,
+        grid_extent: actual_extent,
         points: built.points_count,
         total_bytes: total,
         max_count: built.max_count,
@@ -317,9 +318,9 @@ fn aggregate_bytes_hilbert(
     // Flush the trailing in-progress cell.
     flush(&mut grid, cur_cell, &acc, &mut max_count);
 
-    // Occupied bounding box (voxel coords) → cube-space center + radius, so the
+    // Occupied bounding box (voxel coords) → world-space center + radius, so the
     // viewer frames the data rather than a mostly-empty cube.
-    let (focus_center, focus_radius) = occupied_focus(&grid, grid_side);
+    let (focus_center, focus_radius) = occupied_focus(&grid, [grid_side; 3]);
 
     let volume_rgba = encode::grid_to_rgba(&grid, max_count);
     let points_count = positions.len() as u64 / 3;
@@ -344,12 +345,13 @@ fn aggregate_bytes_hilbert(
 fn aggregate_entities(
     sources: Vec<Source>,
     shape: &dyn VolumeShape,
-    side: u32,
+    extent: [u32; 3],
     voxel_reg: &VoxelRegistry,
     diff_mode: bool,
     rt: tokio::runtime::Handle,
 ) -> anyhow::Result<BuildResult> {
-    let cells = (side as usize).pow(3);
+    let [ex, ey, ez] = extent;
+    let cells = ex as usize * ey as usize * ez as usize;
     let mut grid = vec![VoxelCell::default(); cells];
     let entities = shape.entities().unwrap_or_default();
     let default_renderer_id = shape.id();
@@ -384,12 +386,12 @@ fn aggregate_entities(
             off += len as u64;
         }
 
-        let mut view = VoxelGridMut::new(&mut grid, side);
+        let mut view = VoxelGridMut::new(&mut grid, extent);
         renderer.render(
             &VoxelRenderCtx {
                 entity: ent,
                 bytes: &bytes,
-                side,
+                extent,
                 diff_mode,
             },
             &mut view,
@@ -398,13 +400,13 @@ fn aggregate_entities(
 
     let (focus_center, focus_radius) = shape
         .focus()
-        .unwrap_or_else(|| occupied_focus_cells(&grid, side));
+        .unwrap_or_else(|| occupied_focus_cells(&grid, extent));
 
     // Point cloud derived from the occupied voxels themselves, so the Points
     // view matches the volume exactly (same positions, same baked colors).
-    // Stride-sampled to the budget; positions in [0,1] like the byte path
-    // (the viewer offsets points by -0.5 to center the cube).
-    let (points_buf, points_count) = points_from_grid(&grid, side);
+    // Stride-sampled to the budget; positions in [0,1] per axis like the byte
+    // path (the viewer scales + offsets points to the centered box).
+    let (points_buf, points_count) = points_from_grid(&grid, extent);
     let volume_rgba = encode::pack_voxel_cells(&grid);
 
     Ok(BuildResult {
@@ -418,20 +420,23 @@ fn aggregate_entities(
 }
 
 /// Sample one point per occupied (`a > 0`) voxel — strided down to
-/// [`POINT_BUDGET`] — at the voxel's cube center, carrying its baked RGBA. Keeps
-/// the structured Points view aligned with the volume.
-fn points_from_grid(grid: &[VoxelCell], side: u32) -> (Vec<u8>, u64) {
-    let s = side as usize;
-    let inv = side as f32;
+/// [`POINT_BUDGET`] — at the voxel's box-cell center, carrying its baked RGBA.
+/// Positions are normalized per axis into `[0, 1]`; the viewer scales them by
+/// the box's world size. Keeps the structured Points view aligned with the
+/// volume.
+fn points_from_grid(grid: &[VoxelCell], extent: [u32; 3]) -> (Vec<u8>, u64) {
+    let [ex, ey, _ez] = extent;
+    let (ex, ey) = (ex as usize, ey as usize);
+    let inv = [extent[0] as f32, extent[1] as f32, extent[2] as f32];
     let occupied: Vec<usize> = (0..grid.len()).filter(|&i| grid[i].a > 0).collect();
     let stride = (occupied.len() as u64 / POINT_BUDGET).max(1) as usize;
     let mut positions: Vec<f32> = Vec::new();
     let mut colors: Vec<u8> = Vec::new();
     for &i in occupied.iter().step_by(stride) {
-        let (x, y, z) = (i % s, (i / s) % s, i / (s * s));
-        positions.push((x as f32 + 0.5) / inv);
-        positions.push((y as f32 + 0.5) / inv);
-        positions.push((z as f32 + 0.5) / inv);
+        let (x, y, z) = (i % ex, (i / ex) % ey, i / (ex * ey));
+        positions.push((x as f32 + 0.5) / inv[0]);
+        positions.push((y as f32 + 0.5) / inv[1]);
+        positions.push((z as f32 + 0.5) / inv[2]);
         let c = grid[i];
         colors.extend_from_slice(&[c.r, c.g, c.b, c.a]);
     }
@@ -439,10 +444,57 @@ fn points_from_grid(grid: &[VoxelCell], side: u32) -> (Vec<u8>, u64) {
     (encode::pack_points(&positions, &colors), count)
 }
 
-/// Cube-space framing for a structured (baked-RGBA) grid — occupancy is `a > 0`.
+/// World-space framing center + radius from an occupied bounding box (per-axis
+/// `bmin`/`bmax`, centroid `sum/n`) inside a grid of `extent` voxels. Targets
+/// the occupancy **centroid** (mass center — the Hilbert prefix clusters
+/// asymmetrically within its bounding box) and sizes the radius so the full
+/// occupied bounding box stays in view from that center.
+///
+/// Voxel `v` on axis `a` maps to world position `((v + 0.5)/extent[a] - 0.5) *
+/// scale[a]`, where `scale[a] = extent[a]/max(extent)` is the box's world size
+/// on that axis (the viewer scales its longest axis to the unit cube and keeps
+/// voxels cubic — matching the shader's `uvw = p/uSize + 0.5`). For a cube all
+/// scales are 1, so this reduces to the old `(v + 0.5)/side - 0.5`.
+fn box_focus(
+    bmin: [u32; 3],
+    bmax: [u32; 3],
+    sum: [f64; 3],
+    n: u64,
+    extent: [u32; 3],
+) -> ([f32; 3], f32) {
+    if n == 0 {
+        return ([0.0, 0.0, 0.0], 0.5);
+    }
+    let maxext = extent[0].max(extent[1]).max(extent[2]) as f32;
+    let to_world = |v: f32, axis: usize| {
+        let e = extent[axis] as f32;
+        ((v + 0.5) / e - 0.5) * (e / maxext)
+    };
+    let mut center = [0f32; 3];
+    let mut radius = 0f32;
+    for a in 0..3 {
+        let c = to_world((sum[a] / n as f64) as f32, a);
+        let lo = to_world(bmin[a] as f32, a);
+        let hi = to_world(bmax[a] as f32, a);
+        center[a] = c;
+        radius = radius.max((c - lo).max(hi - c));
+    }
+    (center, radius.max(0.02))
+}
+
+/// Decode the x-fastest linear index `i` into voxel coordinates for `extent`.
+fn voxel_coord(i: usize, extent: [u32; 3]) -> [u32; 3] {
+    let (ex, ey) = (extent[0] as usize, extent[1] as usize);
+    [
+        (i % ex) as u32,
+        ((i / ex) % ey) as u32,
+        (i / (ex * ey)) as u32,
+    ]
+}
+
+/// World-space framing for a structured (baked-RGBA) grid — occupancy is `a > 0`.
 /// Mirrors [`occupied_focus`] but reads [`VoxelCell`] instead of [`VoxelAcc`].
-fn occupied_focus_cells(grid: &[VoxelCell], grid_side: u32) -> ([f32; 3], f32) {
-    let side = grid_side as usize;
+fn occupied_focus_cells(grid: &[VoxelCell], extent: [u32; 3]) -> ([f32; 3], f32) {
     let mut bmin = [u32::MAX; 3];
     let mut bmax = [0u32; 3];
     let mut sum = [0f64; 3];
@@ -452,42 +504,20 @@ fn occupied_focus_cells(grid: &[VoxelCell], grid_side: u32) -> ([f32; 3], f32) {
             continue;
         }
         n += 1;
-        let coord = [
-            (i % side) as u32,
-            ((i / side) % side) as u32,
-            (i / (side * side)) as u32,
-        ];
+        let coord = voxel_coord(i, extent);
         for a in 0..3 {
             bmin[a] = bmin[a].min(coord[a]);
             bmax[a] = bmax[a].max(coord[a]);
             sum[a] += coord[a] as f64;
         }
     }
-    if n == 0 {
-        return ([0.0, 0.0, 0.0], 0.5);
-    }
-    let s = grid_side as f32;
-    let to_cube = |v: f32| (v + 0.5) / s - 0.5;
-    let mut center = [0f32; 3];
-    let mut radius = 0f32;
-    for a in 0..3 {
-        let c = to_cube((sum[a] / n as f64) as f32);
-        let lo = to_cube(bmin[a] as f32);
-        let hi = to_cube(bmax[a] as f32);
-        center[a] = c;
-        radius = radius.max((c - lo).max(hi - c));
-    }
-    (center, radius.max(0.02))
+    box_focus(bmin, bmax, sum, n, extent)
 }
 
-/// Cube-space framing center + radius for the occupied voxels. Targets the
-/// occupancy **centroid** (mass center — the Hilbert prefix clusters
-/// asymmetrically within its bounding box) and sizes the radius so the full
-/// occupied bounding box stays in view from that center. Voxel `v` on an axis
-/// maps to cube position `(v + 0.5)/side - 0.5` (matching the shader's
-/// `uvw = p + 0.5`). Falls back to the whole cube when nothing is occupied.
-fn occupied_focus(grid: &[VoxelAcc], grid_side: u32) -> ([f32; 3], f32) {
-    let side = grid_side as usize;
+/// World-space framing center + radius for the occupied voxels of the byte grid.
+/// Falls back to the whole box when nothing is occupied. See [`box_focus`] for
+/// the voxel→world mapping.
+fn occupied_focus(grid: &[VoxelAcc], extent: [u32; 3]) -> ([f32; 3], f32) {
     let mut bmin = [u32::MAX; 3];
     let mut bmax = [0u32; 3];
     let mut sum = [0f64; 3];
@@ -497,32 +527,14 @@ fn occupied_focus(grid: &[VoxelAcc], grid_side: u32) -> ([f32; 3], f32) {
             continue;
         }
         n += 1;
-        let coord = [
-            (i % side) as u32,
-            ((i / side) % side) as u32,
-            (i / (side * side)) as u32,
-        ];
+        let coord = voxel_coord(i, extent);
         for a in 0..3 {
             bmin[a] = bmin[a].min(coord[a]);
             bmax[a] = bmax[a].max(coord[a]);
             sum[a] += coord[a] as f64;
         }
     }
-    if n == 0 {
-        return ([0.0, 0.0, 0.0], 0.5);
-    }
-    let s = grid_side as f32;
-    let to_cube = |v: f32| (v + 0.5) / s - 0.5;
-    let mut center = [0f32; 3];
-    let mut radius = 0f32;
-    for a in 0..3 {
-        let c = to_cube((sum[a] / n as f64) as f32);
-        let lo = to_cube(bmin[a] as f32);
-        let hi = to_cube(bmax[a] as f32);
-        center[a] = c;
-        radius = radius.max((c - lo).max(hi - c));
-    }
-    (center, radius.max(0.02))
+    box_focus(bmin, bmax, sum, n, extent)
 }
 
 #[cfg(test)]
@@ -589,7 +601,11 @@ mod tests {
 
         let meta: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.path().join("meta.json")).unwrap()).unwrap();
-        assert_eq!(meta["grid_side"], grid_side);
+        assert_eq!(
+            meta["grid_extent"],
+            serde_json::json!([grid_side, grid_side, grid_side]),
+            "byte floor is a cube"
+        );
         assert_eq!(meta["points"], total);
         assert_eq!(
             meta["color_mode"], "lut",
@@ -605,14 +621,14 @@ mod tests {
     // voxel-renderer dispatch, baked-RGB packing, and the `"rgb"` color_mode +
     // dropped point cloud in `meta.json`.
     struct TestVolume {
-        side: u32,
+        extent: [u32; 3],
     }
     impl VolumeShape for TestVolume {
         fn id(&self) -> &'static str {
             "test-vol"
         }
-        fn grid_side(&self) -> u32 {
-            self.side
+        fn grid_extent(&self) -> [u32; 3] {
+            self.extent
         }
         fn entities(&self) -> Option<Vec<VolumeEntity>> {
             Some(vec![VolumeEntity {
@@ -648,8 +664,11 @@ mod tests {
             true
         }
         fn build(&self, ctx: &crate::registry::LayoutBuildCtx<'_>) -> Option<Box<dyn VolumeShape>> {
+            // An anisotropic box derived from the requested resolution, to
+            // exercise the non-cube path end to end.
+            let s = ctx.grid_side;
             Some(Box::new(TestVolume {
-                side: ctx.grid_side,
+                extent: [s, s * 2, s / 2],
             }))
         }
     }
@@ -706,8 +725,13 @@ mod tests {
         .await
         .unwrap();
 
+        // TestVolPlugin builds an anisotropic [s, 2s, s/2] box from grid_side.
+        let expect_extent = [grid_side, grid_side * 2, grid_side / 2];
+        let expect_cells =
+            expect_extent[0] as u64 * expect_extent[1] as u64 * expect_extent[2] as u64;
+
         let vol = std::fs::read(dir.path().join("volume.bin")).unwrap();
-        assert_eq!(vol.len() as u64, (grid_side as u64).pow(3) * 4);
+        assert_eq!(vol.len() as u64, expect_cells * 4);
         let mut filled = 0u64;
         for px in vol.chunks_exact(4) {
             if px[3] == 200 {
@@ -728,6 +752,10 @@ mod tests {
             meta["points"], 64,
             "one point per occupied voxel (the 4³ baked box)"
         );
-        assert_eq!(meta["grid_side"], grid_side);
+        assert_eq!(
+            meta["grid_extent"],
+            serde_json::json!(expect_extent),
+            "structured shape keeps its anisotropic box"
+        );
     }
 }

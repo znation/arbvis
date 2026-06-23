@@ -10,7 +10,7 @@
 use crate::registry::Branding;
 
 /// Build the 3D viewer HTML. Branding/title/inputs are injected as a JSON
-/// config blob; everything else (grid side, LUT, point count) is read from
+/// config blob; everything else (grid extent, LUT, point count) is read from
 /// `meta.json` at runtime.
 pub fn build_volume_html(title: &str, inputs: &[String], branding: &Branding) -> String {
     let config = serde_json::json!({
@@ -202,14 +202,17 @@ const volFrag = `
   uniform sampler2D uLut;
   uniform float uOpacity, uGamma, uThreshold, uNorm;
   uniform int uSource, uSteps, uDirectColor;
+  // Box world size per axis (longest axis = 1; isotropic cube = vec3(1)).
+  uniform vec3 uSize;
   in vec3 vOrigin;
   in vec3 vDirection;
   out vec4 fragColor;
 
   vec2 hitBox(vec3 o, vec3 d) {
+    vec3 h = uSize * 0.5;
     vec3 inv = 1.0 / d;
-    vec3 a = (vec3(-0.5) - o) * inv;
-    vec3 b = (vec3( 0.5) - o) * inv;
+    vec3 a = (-h - o) * inv;
+    vec3 b = ( h - o) * inv;
     vec3 tmin = min(a, b), tmax = max(a, b);
     return vec2(max(tmin.x, max(tmin.y, tmin.z)), min(tmax.x, min(tmax.y, tmax.z)));
   }
@@ -226,7 +229,7 @@ const volFrag = `
     vec4 acc = vec4(0.0);
     for (int i = 0; i < 512; i++) {
       if (i >= uSteps) break;
-      vec4 vox = texture(uVolume, p + 0.5);
+      vec4 vox = texture(uVolume, p / uSize + 0.5);
       if (vox.a > 0.0) {
         // "rgb" (structured) mode: RGB is final baked color, A the opacity
         // weight. "lut" (byte) mode: R indexes the LUT, G/B are the opacity
@@ -336,24 +339,33 @@ function refreshNorm() {
 
 // ---- load + build -----------------------------------------------------------
 let volMesh = null, points = null;
-// Kept for click-to-pick: the raw volume buffer + grid side + entity manifest.
-let volBufG = null, sideG = 0, manifestG = [];
+// Kept for click-to-pick: the raw volume buffer + grid extent + world box size
+// + entity manifest.
+let volBufG = null, extG = [0, 0, 0], sizeG = [1, 1, 1], manifestG = [];
 const raycaster = new THREE.Raycaster();
 
 async function load() {
   const meta = await (await fetch('meta.json')).json();
-  const side = meta.grid_side;
+  // Grid box in voxels. `grid_extent` is [x,y,z]; older bundles carried a
+  // single cube side as `grid_side`.
+  const ext = meta.grid_extent || [meta.grid_side, meta.grid_side, meta.grid_side];
+  const [ex, ey, ez] = ext;
+  // World size per axis: scale the longest axis to the unit cube so voxels
+  // stay cubic and the box keeps the data's proportions. A cube → [1,1,1].
+  const mx = Math.max(ex, ey, ez);
+  const size = [ex / mx, ey / mx, ez / mx];
   directColor = meta.color_mode === 'rgb';
 
-  // A side³ volume needs a 3D texture `side` voxels per axis. WebGL2 only
-  // guarantees MAX_3D_TEXTURE_SIZE ≥ 256, and many GPUs cap at 1024 — so a
-  // large --grid can exceed what this device can allocate. Check up front and
-  // fail with a clear message instead of a cryptic GL allocation error.
+  // The volume uploads as a 3D texture sized [ex, ey, ez]; its largest axis is
+  // the binding constraint. WebGL2 only guarantees MAX_3D_TEXTURE_SIZE ≥ 256,
+  // and many GPUs cap at 1024 — so a large --grid can exceed what this device
+  // can allocate. Check up front and fail with a clear message instead of a
+  // cryptic GL allocation error.
   const gl = renderer.getContext();
   const maxSide = gl.getParameter(gl.MAX_3D_TEXTURE_SIZE);
-  if (side > maxSide) {
+  if (mx > maxSide) {
     throw new Error(
-      'grid resolution ' + side + ' exceeds the max 3D texture size this GPU ' +
+      'grid resolution ' + mx + ' exceeds the max 3D texture size this GPU ' +
       'supports (' + maxSide + '). Re-run arbvis with --grid ' + maxSide +
       ' or lower.');
   }
@@ -370,7 +382,7 @@ async function load() {
 
   // volume RGBA8 -> Data3DTexture
   const volBuf = new Uint8Array(await (await fetch('volume.bin')).arrayBuffer());
-  const volTex = new THREE.Data3DTexture(volBuf, side, side, side);
+  const volTex = new THREE.Data3DTexture(volBuf, ex, ey, ez);
   volTex.format = THREE.RGBAFormat;
   volTex.type = THREE.UnsignedByteType;
   volTex.minFilter = volTex.magFilter = THREE.LinearFilter;
@@ -387,11 +399,14 @@ async function load() {
       uOpacity: { value: 0.2 }, uGamma: { value: 1.0 },
       uThreshold: { value: 0.0 }, uSource: { value: 0 }, uSteps: { value: 192 },
       uNorm: { value: 1.0 }, uDirectColor: { value: directColor ? 1 : 0 },
+      uSize: { value: new THREE.Vector3(size[0], size[1], size[2]) },
     },
     vertexShader: volVert, fragmentShader: volFrag,
   });
-  volMesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), volMat);
+  volMesh = new THREE.Mesh(new THREE.BoxGeometry(size[0], size[1], size[2]), volMat);
   scene.add(volMesh);
+  // Match the orientation cube to the (possibly anisotropic) box.
+  edges.scale.set(size[0], size[1], size[2]);
 
   // point cloud
   const n = meta.points | 0;
@@ -409,7 +424,10 @@ async function load() {
       vertexShader: ptVert, fragmentShader: ptFrag,
     });
     points = new THREE.Points(geo, ptMat);
-    points.position.set(-0.5, -0.5, -0.5); // [0,1] coords -> centered cube
+    // [0,1]-per-axis coords -> centered box: scale by the world size, then
+    // shift so the box centers on the origin (a cube → scale 1, shift -0.5).
+    points.scale.set(size[0], size[1], size[2]);
+    points.position.set(-size[0] / 2, -size[1] / 2, -size[2] / 2);
     points.visible = false;
     scene.add(points);
   }
@@ -433,7 +451,8 @@ async function load() {
   // Click-to-pick + legend (structured cubes only — the byte path has an
   // empty manifest, so picking no-ops and the legend stays blank).
   volBufG = volBuf;
-  sideG = side;
+  extG = ext;
+  sizeG = size;
   manifestG = meta.manifest || [];
   buildLegend(meta);
   buildLayerLabels();
@@ -446,36 +465,39 @@ async function load() {
 // HTML-escape model-derived tensor names before injecting into the panel.
 const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 
-// March a ray through the grid (cube space [-0.5,0.5]) to the first opaque voxel
-// — matching what the shader shows — then report that voxel: its grid coords,
-// the alpha-encoded magnitude there, and the entity whose box contains it (null
-// if unlabeled). Reuses the already-fetched volume buffer; no proxy meshes.
-// Returns null when there's no manifest (byte mode), the ray misses the cube,
-// or the first opaque voxel it hits belongs to no entity.
+// March a ray through the grid (world box centered at the origin, each axis
+// spanning [-size/2, size/2]) to the first opaque voxel — matching what the
+// shader shows — then report that voxel: its grid coords, the alpha-encoded
+// magnitude there, and the entity whose box contains it (null if unlabeled).
+// Reuses the already-fetched volume buffer; no proxy meshes. Returns null when
+// there's no manifest (byte mode), the ray misses the box, or the first opaque
+// voxel it hits belongs to no entity.
 function pickAt(clientX, clientY) {
   if (!manifestG.length || !volBufG) return null;
   const ndc = new THREE.Vector2((clientX / innerWidth) * 2 - 1, -(clientY / innerHeight) * 2 + 1);
   raycaster.setFromCamera(ndc, camera);
   const ro = raycaster.ray.origin, rd = raycaster.ray.direction;
-  // Ray vs cube slab test.
+  const half = [sizeG[0] / 2, sizeG[1] / 2, sizeG[2] / 2];
+  // Ray vs box slab test.
   let tmin = -Infinity, tmax = Infinity;
-  for (const a of ['x', 'y', 'z']) {
+  ['x', 'y', 'z'].forEach((a, ai) => {
     const inv = 1 / rd[a];
-    let t0 = (-0.5 - ro[a]) * inv, t1 = (0.5 - ro[a]) * inv;
+    let t0 = (-half[ai] - ro[a]) * inv, t1 = (half[ai] - ro[a]) * inv;
     if (t0 > t1) { const t = t0; t0 = t1; t1 = t; }
     tmin = Math.max(tmin, t0); tmax = Math.min(tmax, t1);
-  }
+  });
   if (tmax < Math.max(tmin, 0)) return null;
-  const side = sideG;
-  const steps = side * 2; // ≥ Nyquist so we don't step over a voxel
+  const [ex, ey, ez] = extG;
+  const steps = Math.max(ex, ey, ez) * 2; // ≥ Nyquist so we don't step over a voxel
   let t = Math.max(tmin, 0);
   const dt = (tmax - t) / steps;
   for (let i = 0; i < steps; i++, t += dt) {
-    const x = Math.floor((ro.x + rd.x * t + 0.5) * side);
-    const y = Math.floor((ro.y + rd.y * t + 0.5) * side);
-    const z = Math.floor((ro.z + rd.z * t + 0.5) * side);
-    if (x < 0 || y < 0 || z < 0 || x >= side || y >= side || z >= side) continue;
-    const alpha = volBufG[(x + y * side + z * side * side) * 4 + 3];
+    // world -> [0,1] per axis (p/size + 0.5) -> voxel index
+    const x = Math.floor(((ro.x + rd.x * t) / sizeG[0] + 0.5) * ex);
+    const y = Math.floor(((ro.y + rd.y * t) / sizeG[1] + 0.5) * ey);
+    const z = Math.floor(((ro.z + rd.z * t) / sizeG[2] + 0.5) * ez);
+    if (x < 0 || y < 0 || z < 0 || x >= ex || y >= ey || z >= ez) continue;
+    const alpha = volBufG[(x + y * ex + z * ex * ey) * 4 + 3];
     if (alpha > 0) {
       for (const e of manifestG) {
         const b = e.bbox;
@@ -533,8 +555,8 @@ canvas.addEventListener('pointerup', (e) => {
 
 // ---- per-voxel hover tooltip ------------------------------------------------
 // Resolve the voxel under the cursor and show a tooltip beside it. pickAt is a
-// CPU ray-march (side*2 steps + a manifest scan), but cheap enough to run per
-// move; suppressed while the user is orbit-dragging.
+// CPU ray-march (~2·longest-axis steps + a manifest scan), but cheap enough to
+// run per move; suppressed while the user is orbit-dragging.
 function showHover(x, y) {
   const tip = $('tip');
   if (dragging) { tip.hidden = true; return; }
@@ -558,8 +580,8 @@ function showHover(x, y) {
 // positioned at the group's depth slab. Thinned to stay legible on deep models.
 function buildLayerLabels() {
   if (!manifestG.length) return; // byte mode ships an empty manifest
-  const side = sideG;
-  const toCube = (v) => (v + 0.5) / side - 0.5;
+  // Voxel v on axis a -> world position (matches the shader/box mapping).
+  const toWorld = (v, a) => ((v + 0.5) / extG[a] - 0.5) * sizeG[a];
   // Union bbox per group.
   const groups = new Map();
   for (const e of manifestG) {
@@ -584,9 +606,9 @@ function buildLayerLabels() {
     el.className = 'layer-label';
     el.textContent = g.name;
     const obj = new CSS2DObject(el);
-    // Pull X/Y to the cube's top-left edge so labels sit beside the slab, not
+    // Pull X/Y to the box's top-left edge so labels sit beside the slab, not
     // buried inside it; Z at the slab center marches them back through depth.
-    obj.position.set(toCube(g.x0) - 0.04, toCube(g.y1 - 1) + 0.04, toCube((g.z0 + g.z1 - 1) / 2));
+    obj.position.set(toWorld(g.x0, 0) - 0.04, toWorld(g.y1 - 1, 1) + 0.04, toWorld((g.z0 + g.z1 - 1) / 2, 2));
     scene.add(obj);
   });
 }

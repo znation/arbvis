@@ -63,10 +63,26 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
   #status { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
     color: #9aa0ab; pointer-events: none; }
   #status[hidden] { display: none; } /* id selector's display:flex would otherwise beat [hidden] */
+  /* CSS2D layer labels float at each depth slab; the overlay must not eat pointer
+     events or it would steal them from OrbitControls. */
+  #labels { position: fixed; inset: 0; pointer-events: none; overflow: hidden; }
+  .layer-label { pointer-events: none; white-space: nowrap; font-size: 11px; font-weight: 600;
+    color: #e8e8ea; background: rgba(18,20,26,.78); border: 1px solid #2a2d36;
+    border-radius: 6px; padding: 2px 7px; box-shadow: 0 2px 8px rgba(0,0,0,.4);
+    transform: translate(-50%, -50%); }
+  /* Per-voxel hover tooltip — follows the cursor, never intercepts it. */
+  #tip { position: fixed; z-index: 10; pointer-events: none; max-width: 260px;
+    padding: 6px 8px; background: rgba(18,20,26,.92); border: 1px solid #2a2d36;
+    border-radius: 7px; box-shadow: 0 4px 16px rgba(0,0,0,.5); font-size: 11px; }
+  #tip[hidden] { display: none; }
+  #tip .tname { color: #e8e8ea; word-break: break-all; }
+  #tip .tmeta { color: #9aa0ab; margin-top: 2px; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
+<div id="labels"></div>
+<div id="tip" hidden></div>
 <div id="status">loading…</div>
 <div id="panel" hidden>
   <h1 id="title">arbvis</h1>
@@ -104,7 +120,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
   <div id="inputs" class="hint"></div>
   <div id="legend"></div>
   <div id="picked"><span class="phint">click a region to identify</span></div>
-  <div class="hint">drag rotate · right-drag pan · scroll zoom · click to identify</div>
+  <div class="hint">drag rotate · right-drag pan · scroll zoom · hover or click to identify</div>
 </div>
 
 <script type="importmap">
@@ -116,6 +132,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
 
 const CFG = __CONFIG_JSON__;
 const $ = (id) => document.getElementById(id);
@@ -144,6 +161,10 @@ const controls = new OrbitControls(camera, canvas);
 controls.enableDamping = true;
 controls.target.set(0, 0, 0);
 
+// DOM-overlay renderer for the per-layer text labels. Its element sits over the
+// canvas; #labels is pointer-events:none so OrbitControls keeps the pointer.
+const labelRenderer = new CSS2DRenderer({ element: $('labels') });
+
 // faint bounding cube for orientation
 const edges = new THREE.LineSegments(
   new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
@@ -157,6 +178,7 @@ function resize() {
   // at its (devicePixelRatio-scaled) drawing-buffer size, overflowing the
   // viewport and throwing off OrbitControls' pointer mapping.
   renderer.setSize(w, h);
+  labelRenderer.setSize(w, h);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
 }
@@ -401,6 +423,7 @@ async function load() {
   sideG = side;
   manifestG = meta.manifest || [];
   buildLegend(meta);
+  buildLayerLabels();
 
   $('status').hidden = true;
   $('panel').hidden = false;
@@ -410,9 +433,12 @@ async function load() {
 // HTML-escape model-derived tensor names before injecting into the panel.
 const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 
-// March the click ray through the grid (cube space [-0.5,0.5]) to the first
-// opaque voxel — matching what the shader shows — then name the entity whose
-// box contains it. Reuses the already-fetched volume buffer; no proxy meshes.
+// March a ray through the grid (cube space [-0.5,0.5]) to the first opaque voxel
+// — matching what the shader shows — then report that voxel: its grid coords,
+// the alpha-encoded magnitude there, and the entity whose box contains it (null
+// if unlabeled). Reuses the already-fetched volume buffer; no proxy meshes.
+// Returns null when there's no manifest (byte mode), the ray misses the cube,
+// or the first opaque voxel it hits belongs to no entity.
 function pickAt(clientX, clientY) {
   if (!manifestG.length || !volBufG) return null;
   const ndc = new THREE.Vector2((clientX / innerWidth) * 2 - 1, -(clientY / innerHeight) * 2 + 1);
@@ -436,12 +462,15 @@ function pickAt(clientX, clientY) {
     const y = Math.floor((ro.y + rd.y * t + 0.5) * side);
     const z = Math.floor((ro.z + rd.z * t + 0.5) * side);
     if (x < 0 || y < 0 || z < 0 || x >= side || y >= side || z >= side) continue;
-    if (volBufG[(x + y * side + z * side * side) * 4 + 3] > 0) {
+    const alpha = volBufG[(x + y * side + z * side * side) * 4 + 3];
+    if (alpha > 0) {
       for (const e of manifestG) {
         const b = e.bbox;
-        if (x >= b.x0 && x < b.x1 && y >= b.y0 && y < b.y1 && z >= b.z0 && z < b.z1) return e;
+        if (x >= b.x0 && x < b.x1 && y >= b.y0 && y < b.y1 && z >= b.z0 && z < b.z1) {
+          return { entity: e, vx: x, vy: y, vz: z, intensity: alpha / 255 };
+        }
       }
-      return null;
+      return null; // opaque voxel, but no entity owns it
     }
   }
   return null;
@@ -468,18 +497,86 @@ function buildLegend(meta) {
     '</div>';
 }
 
-// Click (not drag) → identify the tensor under the cursor.
-let downX = 0, downY = 0;
-canvas.addEventListener('pointerdown', (e) => { downX = e.clientX; downY = e.clientY; });
+// Click (not drag) → pin the tensor under the cursor in the side panel.
+let downX = 0, downY = 0, dragging = false;
+canvas.addEventListener('pointerdown', (e) => { downX = e.clientX; downY = e.clientY; dragging = false; });
+canvas.addEventListener('pointermove', (e) => {
+  // Track orbit drags so the tooltip stays out of the way while rotating; reset
+  // once the button is released so plain hover resumes.
+  if (!e.buttons) dragging = false;
+  else if (Math.hypot(e.clientX - downX, e.clientY - downY) > 5) dragging = true;
+  showHover(e.clientX, e.clientY);
+});
+canvas.addEventListener('pointerleave', () => { $('tip').hidden = true; });
 canvas.addEventListener('pointerup', (e) => {
   if (Math.hypot(e.clientX - downX, e.clientY - downY) > 5) return; // orbit drag, not a click
   const hit = pickAt(e.clientX, e.clientY);
   const el = $('picked');
   if (!el) return;
   el.innerHTML = hit
-    ? '<div class="pname">' + esc(hit.name) + '</div><div class="pgroup">' + esc(hit.group) + '</div>'
+    ? '<div class="pname">' + esc(hit.entity.name) + '</div><div class="pgroup">' + esc(hit.entity.group) + '</div>'
     : '<span class="phint">no tensor there — click a colored region</span>';
 });
+
+// ---- per-voxel hover tooltip ------------------------------------------------
+// Resolve the voxel under the cursor and show a tooltip beside it. pickAt is a
+// CPU ray-march (side*2 steps + a manifest scan), but cheap enough to run per
+// move; suppressed while the user is orbit-dragging.
+function showHover(x, y) {
+  const tip = $('tip');
+  if (dragging) { tip.hidden = true; return; }
+  const hit = pickAt(x, y);
+  if (!hit) { tip.hidden = true; return; }
+  tip.innerHTML = '<div class="tname">' + esc(hit.entity.name) + '</div>' +
+    '<div class="tmeta">' + esc(hit.entity.group) +
+    ' · (' + hit.vx + ', ' + hit.vy + ', ' + hit.vz + ')' +
+    ' · ' + hit.intensity.toFixed(2) + '</div>';
+  tip.hidden = false;
+  // Offset from the cursor, clamped so the box stays on-screen.
+  const r = tip.getBoundingClientRect();
+  const px = Math.min(x + 14, innerWidth - r.width - 6);
+  const py = Math.min(y + 14, innerHeight - r.height - 6);
+  tip.style.left = Math.max(6, px) + 'px';
+  tip.style.top = Math.max(6, py) + 'px';
+}
+
+// ---- per-layer depth labels -------------------------------------------------
+// One floating label per group (each transformer layer + the top-level cap),
+// positioned at the group's depth slab. Thinned to stay legible on deep models.
+function buildLayerLabels() {
+  if (!manifestG.length) return; // byte mode ships an empty manifest
+  const side = sideG;
+  const toCube = (v) => (v + 0.5) / side - 0.5;
+  // Union bbox per group.
+  const groups = new Map();
+  for (const e of manifestG) {
+    const b = e.bbox;
+    let g = groups.get(e.group);
+    if (!g) { g = { name: e.group, x0: b.x0, y0: b.y0, z0: b.z0, x1: b.x1, y1: b.y1, z1: b.z1 }; groups.set(e.group, g); }
+    else { g.x0 = Math.min(g.x0, b.x0); g.y0 = Math.min(g.y0, b.y0); g.z0 = Math.min(g.z0, b.z0);
+           g.x1 = Math.max(g.x1, b.x1); g.y1 = Math.max(g.y1, b.y1); g.z1 = Math.max(g.z1, b.z1); }
+  }
+  // Order by depth (slab Z center) so thinning keeps an even spread.
+  const list = [...groups.values()].sort((a, b) => (a.z0 + a.z1) - (b.z0 + b.z1));
+  // Thin to a sparse set: keep every k-th, plus the first, last, and any
+  // non-"layer N" group (e.g. "top-level"). Kept low because the labels sit on
+  // a single line along depth and foreshorten into each other at oblique camera
+  // angles — a handful of evenly-spaced markers orients the viewer without mush.
+  const CAP = 8;
+  const k = Math.max(1, Math.ceil(list.length / CAP));
+  list.forEach((g, i) => {
+    const keep = i % k === 0 || i === 0 || i === list.length - 1 || !/^layer /.test(g.name);
+    if (!keep) return;
+    const el = document.createElement('div');
+    el.className = 'layer-label';
+    el.textContent = g.name;
+    const obj = new CSS2DObject(el);
+    // Pull X/Y to the cube's top-left edge so labels sit beside the slab, not
+    // buried inside it; Z at the slab center marches them back through depth.
+    obj.position.set(toCube(g.x0) - 0.04, toCube(g.y1 - 1) + 0.04, toCube((g.z0 + g.z1 - 1) / 2));
+    scene.add(obj);
+  });
+}
 
 // ---- controls ---------------------------------------------------------------
 function seg(id, cb) {
@@ -522,6 +619,7 @@ function bindControls() {
 function tick() {
   controls.update();
   renderer.render(scene, camera);
+  labelRenderer.render(scene, camera);
   requestAnimationFrame(tick);
 }
 tick();

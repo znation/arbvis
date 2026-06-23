@@ -5,7 +5,9 @@ use std::sync::{Arc, OnceLock};
 use anyhow::Context;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::hf_cli::{self, HfDownloadResult, HfTreeEntry};
+use serde::Deserialize;
+
+use crate::hf_cli::{self, HfTreeEntry, HfTreeLfs};
 use crate::throttle::with_throttle;
 
 /// Repo kind parsed from an `hf://` URL. Carried as a typed value rather than a
@@ -400,6 +402,137 @@ fn listing_cache() -> &'static AsyncMutex<HashMap<(RepoKind, String, String), Ar
     CACHE.get_or_init(|| AsyncMutex::new(HashMap::new()))
 }
 
+/// Hub tree-API entry (`GET /api/{kind}/{repo}/tree/{rev}?recursive=true`).
+/// Field names follow the JSON API and are mapped into [`HfTreeEntry`].
+#[derive(Debug, Deserialize)]
+struct TreeApiEntry {
+    #[serde(rename = "type")]
+    entry_type: String,
+    path: String,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    oid: Option<String>,
+    #[serde(rename = "xetHash", default)]
+    xet_hash: Option<String>,
+    #[serde(default)]
+    lfs: Option<TreeApiLfs>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TreeApiLfs {
+    #[serde(default)]
+    oid: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(rename = "pointerSize", default)]
+    pointer_size: Option<u64>,
+}
+
+/// List a model/dataset/space repo's files via the Hub tree API.
+///
+/// Replaces the removed `hf {kind} list -R --json` CLI command — newer
+/// huggingface_hub repurposed `hf {kind} list` into a Hub *search*, so the
+/// per-repo file listing no longer exists on the CLI. The JSON tree API
+/// returns the same per-file metadata arbvis needs (size, blob oid, LFS
+/// sha256, xet hash) and paginates large repos via an RFC 5988 `Link`
+/// header, which we follow to completion.
+async fn fetch_tree_via_http(
+    kind: RepoKind,
+    repo_id: &str,
+    revision: &str,
+) -> anyhow::Result<Vec<HfTreeEntry>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+    let token = read_token();
+    let label = format!("list_tree {} {repo_id}@{revision}", kind.api_segment());
+
+    let mut url = format!(
+        "{}/api/{}/{}/tree/{}?recursive=true",
+        endpoint(),
+        kind.api_segment(),
+        repo_id,
+        revision,
+    );
+
+    let mut out: Vec<HfTreeEntry> = Vec::new();
+    loop {
+        let (page, next): (Vec<TreeApiEntry>, Option<String>) = with_throttle(&label, || {
+            let client = &client;
+            let token = token.as_deref();
+            let url = url.clone();
+            async move {
+                let mut req = client.get(&url);
+                if let Some(tok) = token {
+                    req = req.bearer_auth(tok);
+                }
+                let resp = req.send().await?.error_for_status()?;
+                let next = next_link(resp.headers().get(reqwest::header::LINK));
+                let page = resp.json::<Vec<TreeApiEntry>>().await?;
+                Ok::<_, reqwest::Error>((page, next))
+            }
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "GET tree page for {} {repo_id}@{revision}",
+                kind.api_segment()
+            )
+        })?;
+
+        out.reserve(page.len());
+        for e in page {
+            // Directories carry no size; HfTreeEntry::is_file keys off `size`.
+            let size = if e.entry_type == "directory" {
+                None
+            } else {
+                e.size
+            };
+            out.push(HfTreeEntry {
+                path: e.path,
+                size,
+                blob_id: e.oid,
+                xet_hash: e.xet_hash,
+                lfs: e.lfs.map(|l| HfTreeLfs {
+                    sha256: l.oid,
+                    size: l.size,
+                    pointer_size: l.pointer_size,
+                }),
+            });
+        }
+
+        match next {
+            Some(n) => url = n,
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// Extract the `rel="next"` target from an RFC 5988 `Link` header, if any.
+/// The Hub uses this for cursor pagination of the tree API.
+fn next_link(header: Option<&reqwest::header::HeaderValue>) -> Option<String> {
+    let raw = header?.to_str().ok()?;
+    for part in raw.split(',') {
+        let mut segs = part.split(';');
+        let target = segs.next()?.trim();
+        let is_next = segs.any(|s| {
+            let s = s.trim();
+            s == "rel=\"next\"" || s == "rel=next"
+        });
+        if is_next {
+            return Some(
+                target
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string(),
+            );
+        }
+    }
+    None
+}
+
 /// Return the recursive listing for `(kind, repo_id, revision)`, populating
 /// the per-process cache on first call.
 async fn list_repo_entries(
@@ -415,28 +548,21 @@ async fn list_repo_entries(
         }
     }
 
-    let label = format!("list_tree {} {repo_id}@{revision}", kind.api_segment());
-    let entries: Vec<HfTreeEntry> = with_throttle(&label, || async {
-        match kind {
-            RepoKind::Bucket => {
+    let entries: Vec<HfTreeEntry> = match kind {
+        RepoKind::Bucket => {
+            // Buckets keep their dedicated `hf buckets ls` listing (no tree API).
+            let label = format!("list_tree buckets {repo_id}");
+            with_throttle(&label, || async {
                 hf_cli::run_hf_json::<Vec<HfTreeEntry>, _, _>(["buckets", "ls", "-R", repo_id])
                     .await
-            }
-            _ => {
-                hf_cli::run_hf_json::<Vec<HfTreeEntry>, _, _>([
-                    kind.api_segment(),
-                    "list",
-                    "-R",
-                    "--revision",
-                    revision,
-                    repo_id,
-                ])
-                .await
-            }
+            })
+            .await
+            .with_context(|| format!("listing buckets {repo_id}"))?
         }
-    })
-    .await
-    .with_context(|| format!("listing {} {repo_id}@{revision}", kind.api_segment()))?;
+        _ => fetch_tree_via_http(kind, repo_id, revision)
+            .await
+            .with_context(|| format!("listing {} {repo_id}@{revision}", kind.api_segment()))?,
+    };
 
     let arc = Arc::new(entries);
     let mut cache = listing_cache().lock().await;
@@ -468,7 +594,7 @@ pub async fn resolve(path: &Path) -> anyhow::Result<PathBuf> {
         format!("hf download {} {}", hf.repo_id, hf.path_in_repo)
     };
 
-    let result = with_throttle(&label, || async {
+    let local = with_throttle(&label, || async {
         // `hf download <repo> [file]`: with `[file]` returns the file path,
         // without returns the snapshot directory. Either way `path` lands
         // under `~/.cache/huggingface/hub/...` (shared with any direct
@@ -484,12 +610,11 @@ pub async fn resolve(path: &Path) -> anyhow::Result<PathBuf> {
         if !hf.path_in_repo.is_empty() {
             args.push(hf.path_in_repo.clone());
         }
-        hf_cli::run_hf_json::<HfDownloadResult, _, _>(args.iter().map(String::as_str)).await
+        hf_cli::download(args.iter().map(String::as_str)).await
     })
     .await
     .with_context(|| format!("downloading hf://{}/{}", hf.repo_id, hf.path_in_repo))?;
 
-    let local = PathBuf::from(result.path);
     log::info!("Cached at {}", local.display());
     Ok(local)
 }

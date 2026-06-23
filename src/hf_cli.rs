@@ -6,9 +6,14 @@
 //! for free without arbvis pulling in xet's per-call stream-group rebuild.
 //!
 //! Conventions:
-//! - `run_hf_json` appends `--json` and parses stdout as `T`. Used for
-//!   `hf download` (`{ "path": ... }`) and `hf {models,datasets,spaces}
-//!   list -R` (`[ HfTreeEntry... ]`).
+//! - `download` appends `--quiet` and returns the local path `hf download`
+//!   prints to stdout. The `--json` output mode was removed in
+//!   huggingface_hub ≥ 1.0; `--quiet` suppresses progress bars and prints
+//!   only the resulting path (the file when a filename is given, else the
+//!   snapshot dir).
+//! - `run_hf_json` appends `--json` and parses stdout as `T`. Used for the
+//!   `hf buckets ls -R` listing (`[ HfTreeEntry... ]`); model/dataset/space
+//!   listings now go through the Hub tree API in `hf_url`.
 //! - `run_hf` ignores stdout. Used for `upload`, `upload-large-folder`,
 //!   `sync`, `buckets cp`, and the `repos create` / `buckets create`
 //!   bootstrap calls.
@@ -39,14 +44,8 @@ use crate::throttle::{ErrorClassify, Outcome};
 /// when many subprocesses fail in a retry storm.
 const STDERR_CAPTURE_LIMIT: usize = 4 * 1024;
 
-/// `hf download` / `hf upload` payload when `--json` is set.
-#[derive(Debug, Clone, Deserialize)]
-pub struct HfDownloadResult {
-    /// Absolute path the file (or snapshot dir) was written to.
-    pub path: String,
-}
-
-/// Entry in `hf {models,datasets,spaces} list <repo> -R --json` output.
+/// Entry in a recursive repo file listing — `hf buckets ls -R --json` for
+/// buckets, or the Hub tree API (see `hf_url`) for model/dataset/space repos.
 /// Directories surface with `size = None`; only files have `blob_id` /
 /// `xet_hash` / `lfs`. Unknown fields are ignored by serde's default.
 #[derive(Debug, Clone, Deserialize)]
@@ -329,6 +328,57 @@ where
         stderr_excerpt,
         source,
     })
+}
+
+/// Run `hf download <args> --quiet` and return the local path it printed.
+///
+/// `hf download` no longer has a `--json` mode (removed in huggingface_hub
+/// ≥ 1.0). `--quiet` disables progress bars and prints only the resulting
+/// local path to stdout — the file path when a filename is given, otherwise
+/// the snapshot directory. We take the last non-empty stdout line so any
+/// incidental leading output doesn't corrupt the path.
+///
+/// `--quiet` is appended automatically; the caller passes the rest of the
+/// `download …` argv.
+pub async fn download<I, S>(args: I) -> Result<std::path::PathBuf, HfCliError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut argv: Vec<std::ffi::OsString> = args
+        .into_iter()
+        .map(|s| s.as_ref().to_os_string())
+        .collect();
+    argv.push("--quiet".into());
+    let argv_display = argv_for_display(argv.iter());
+
+    let (status, stdout, stderr_excerpt) = run_and_capture(argv).await?;
+    if !status.success() {
+        log::debug!("`hf {argv_display}` failed with {status}; stderr: {stderr_excerpt}");
+        return Err(HfCliError::Exit {
+            argv: argv_display,
+            status,
+            stderr_excerpt,
+        });
+    }
+
+    let text = String::from_utf8_lossy(&stdout);
+    let path = text
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("");
+    if path.is_empty() {
+        return Err(HfCliError::Exit {
+            argv: argv_display,
+            status,
+            stderr_excerpt: format!(
+                "`hf download --quiet` exited 0 but printed no path; stderr tail: {stderr_excerpt}"
+            ),
+        });
+    }
+    Ok(std::path::PathBuf::from(path))
 }
 
 /// One-shot probe: run `hf --version` and return the trimmed version line.

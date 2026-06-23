@@ -745,7 +745,7 @@ pub async fn download_specs_to_paths(
                         }
                     };
                     let result: Result<PathBuf, anyhow::Error> = with_throttle(&label, || async {
-                        let out = hf_cli::run_hf_json::<hf_cli::HfDownloadResult, _, _>([
+                        hf_cli::download([
                             "download",
                             "--type",
                             repo_type,
@@ -754,8 +754,7 @@ pub async fn download_specs_to_paths(
                             repo_id.as_str(),
                             filename.as_str(),
                         ])
-                        .await?;
-                        Ok::<PathBuf, hf_cli::HfCliError>(PathBuf::from(out.path))
+                        .await
                     })
                     .await
                     .map_err(anyhow::Error::from);

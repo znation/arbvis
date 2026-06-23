@@ -63,7 +63,7 @@ Where 2D color is fully opaque, **3D uses opacity to encode density** so you can
 
 **Controls:** drag to rotate · right-drag to pan · scroll to zoom (the camera auto-frames the occupied region on load).
 
-**Grid resolution (`--grid N`)** — the voxel cube side, a power of two in `2–512` (default `128`). Higher is more detailed but a larger download (≈ `N³ · 4` bytes; `128³` ≈ 8 MB, `256³` ≈ 64 MB).
+**Grid resolution (`--grid N`)** — the voxel cube side, a power of two in `2–1024` (default `512`). Higher is more detailed but a larger download (≈ `N³ · 4` bytes; `128³` ≈ 8 MB, `256³` ≈ 64 MB, `512³` ≈ 512 MB, `1024³` ≈ 4 GB).
 
 Like the 2D viewer, the 3D bundle loads Three.js from a CDN and fetches its data over HTTP — open `index.html` through a web server, not a `file://` URL.
 

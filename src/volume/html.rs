@@ -345,6 +345,19 @@ async function load() {
   const side = meta.grid_side;
   directColor = meta.color_mode === 'rgb';
 
+  // A side³ volume needs a 3D texture `side` voxels per axis. WebGL2 only
+  // guarantees MAX_3D_TEXTURE_SIZE ≥ 256, and many GPUs cap at 1024 — so a
+  // large --grid can exceed what this device can allocate. Check up front and
+  // fail with a clear message instead of a cryptic GL allocation error.
+  const gl = renderer.getContext();
+  const maxSide = gl.getParameter(gl.MAX_3D_TEXTURE_SIZE);
+  if (side > maxSide) {
+    throw new Error(
+      'grid resolution ' + side + ' exceeds the max 3D texture size this GPU ' +
+      'supports (' + maxSide + '). Re-run arbvis with --grid ' + maxSide +
+      ' or lower.');
+  }
+
   // byte->color LUT as a 256x1 texture
   const lut = new Uint8Array(256 * 4);
   for (let i = 0; i < 256; i++) {

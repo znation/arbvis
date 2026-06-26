@@ -59,20 +59,25 @@ Where 2D color is fully opaque, **3D uses opacity to encode density** so you can
 - **Volume** (default) — a GPU ray-march of a bounded voxel grid. Color encodes the mean byte value (the same [byte-color scheme](#byte-colors) as 2D); opacity comes from an adjustable, log-style **transfer function**. Render and download cost depend on the grid resolution, *not* the input size, so a multi-GB file renders as smoothly as a small one.
   - **Opacity source** — *Activity* (default: mean byte "brightness", so null/padding regions fade to transparent and real data stands out) or *Density* (how many bytes fall in each voxel).
   - **Opacity / Contrast / Threshold / Quality** sliders tune the transfer function and ray-march step count.
-- **Points** — the exact byte positions as a point cloud with additive blending (per-point color + size/opacity). Files up to ~1.5M sampled points render exactly; larger inputs are uniformly subsampled.
+- **Points** — the exact byte positions as a point cloud with additive blending (per-point color + size/opacity). The cloud is a **streamed level-of-detail octree** (the 3D analog of the 2D tile pyramid): the viewer fetches only the nodes in view at the zoom-appropriate resolution and refines as you zoom in, converging toward one point per byte — so you can drill into individual points without downloading the whole cloud up front. A small wholesale buffer is kept as a `file://` fallback.
 
-**Controls:** drag to rotate · right-drag to pan · scroll to zoom (the camera auto-frames the occupied region on load).
+**Controls:** drag to rotate · right-drag to pan · scroll to zoom (the camera auto-frames the occupied region on load). Zooming in streams finer detail.
 
 **Grid resolution (`--grid N`)** — the voxel cube side, a power of two in `2–512` (default `256`). Higher is more detailed but a larger download (≈ `N³ · 4` bytes; `128³` ≈ 8 MB, `256³` ≈ 64 MB, `512³` ≈ 512 MB).
+
+**Point budget (`--point-budget N`)** — max points stored in the streamed LOD octree (default `8_000_000`). Files within it render every byte exactly; larger files are subsampled to fit. The viewer streams only on-screen nodes, so a bigger budget mostly costs disk and build time, not client bandwidth.
 
 Like the 2D viewer, the 3D bundle loads Three.js from a CDN and fetches its data over HTTP — open `index.html` through a web server, not a `file://` URL.
 
 ### Not yet implemented
 
-The 3D mode is intentionally scoped for a first release. Deferred:
+The 3D mode is scoped for incremental delivery. Shipped so far: **octree
+level-of-detail streaming** for the point cloud (above) — exact drill-down up
+to the `--point-budget`, streamed on demand. Still deferred:
 
-- **Octree level-of-detail streaming** for *exact* point-cloud drill-down on multi-GB files (today the point cloud is a uniform subsample beyond ~1.5M points; the volume mode is the unbounded-scale path).
-- **WebGPU compute-shader rendering** for >100M exact points.
+- **Bricked sparse-voxel streaming** for the *volume* mode (GigaVoxels-style page table + brick pool with empty-space skipping), so the ray-marched volume drills past a single bounded grid too.
+- **WebGPU compute-shader rendering** (software point rasterization) for far higher on-screen point counts.
+- **Structured-layout LOD** (e.g. modelweightvis): per-tensor streaming + a `VoxelRenderer` drill-down seam, so the model-weights view refines toward individual weights.
 - **3D file-boundary overlays** and an **interactive transfer-function editor** with a density histogram.
 
 ## Supported input formats

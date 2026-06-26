@@ -229,6 +229,13 @@ pub struct Args {
     #[arg(long, default_value_t = 256)]
     grid: u32,
 
+    /// 3D point-cloud LOD budget: max points stored in the streamed octree.
+    /// Files within it render every byte exactly; larger files are subsampled
+    /// to fit. The viewer streams only the nodes on screen, so a bigger budget
+    /// mostly costs disk/build time, not client bandwidth. Ignored in 2D mode.
+    #[arg(long = "point-budget", default_value_t = 8_000_000)]
+    point_budget: u64,
+
     /// Visualize abs(modified - original) byte differences; ORIGINAL and MODIFIED are files or directories
     #[arg(long, num_args = 2, value_names = ["ORIGINAL", "MODIFIED"])]
     diff: Option<Vec<PathBuf>>,
@@ -301,6 +308,8 @@ struct RenderConfig {
     three_d: bool,
     /// 3D voxel grid side (power of two); unused in 2D.
     grid_side: u32,
+    /// 3D point-cloud LOD octree budget (max stored points); unused in 2D.
+    point_budget: u64,
 }
 
 /// Where the render output goes after rendering. Owns any temporary
@@ -526,6 +535,7 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
         pyramid_format,
         three_d: args.three_d,
         grid_side: args.grid,
+        point_budget: args.point_budget,
     };
     dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await
 }
@@ -740,6 +750,7 @@ async fn render_volume_bundle(
         &cfg.inputs,
         cfg.diff_mode,
         cfg.grid_side,
+        cfg.point_budget,
         cfg.layout_mode,
         registry,
         &registry.branding,

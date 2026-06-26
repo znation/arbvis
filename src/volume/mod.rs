@@ -39,9 +39,11 @@ use encode::{VolumeMeta, VoxelAcc};
 /// Bytes read per `fetch_range` window during aggregation.
 const CHUNK: u64 = 4 * 1024 * 1024;
 
-/// Target point-cloud size. Files within this many sampled positions render
-/// exactly; larger files are uniformly subsampled (stride sampling). True
-/// exact drill-down on huge clouds (octree LOD streaming) is future work.
+/// Size cap for the **wholesale fallback** point cloud (`points.bin`) — the
+/// one-shot buffer the viewer loads when it can't stream (no octree, or a
+/// `file://` open). Kept small for a bounded download. Exact drill-down past
+/// this is the streamed LOD octree's job (see [`octree`]), bounded separately
+/// by the `--point-budget` knob.
 const POINT_BUDGET: u64 = 1_500_000;
 
 /// Max Hilbert order used to place point-cloud positions — caps the coordinate
@@ -78,6 +80,7 @@ pub async fn render_volume(
     inputs: &[String],
     diff_mode: bool,
     grid_side: u32,
+    point_budget: u64,
     mode: LayoutMode,
     registry: &Registry,
     branding: &Branding,
@@ -128,7 +131,7 @@ pub async fn render_volume(
         if is_byte {
             // Byte volumes are cubes (Hilbert needs equal sides); all three
             // axes match, so the cube side is `ex`.
-            aggregate_bytes_hilbert(sources, total, ex, pixel_lut, rt)
+            aggregate_bytes_hilbert(sources, total, ex, point_budget, pixel_lut, rt)
         } else {
             aggregate_entities(
                 sources,
@@ -193,15 +196,16 @@ pub async fn render_volume(
         html::build_volume_html(title, inputs, branding),
     )?;
 
-    let (nodes, dropped) = built
+    let (nodes, oct_pts, dropped) = built
         .point_octree
         .as_ref()
-        .map(|o| (o.records.len(), o.dropped))
-        .unwrap_or((0, 0));
+        .map(|o| (o.records.len(), o.total_points(), o.dropped))
+        .unwrap_or((0, 0, 0));
     log::info!(
-        "3D viewer bundle written to {} ({} points, {} octree nodes, {} duplicate points dropped)",
+        "3D viewer bundle written to {} ({} fallback points; LOD octree: {} points in {} nodes, {} duplicates dropped)",
         out_dir.display(),
         built.points_count,
+        oct_pts,
         nodes,
         dropped
     );
@@ -258,6 +262,7 @@ fn aggregate_bytes_hilbert(
     sources: Vec<Source>,
     total: u64,
     grid_side: u32,
+    octree_budget: u64,
     pixel_lut: [Rgb<u8>; 256],
     rt: tokio::runtime::Handle,
 ) -> anyhow::Result<BuildResult> {
@@ -273,14 +278,18 @@ fn aggregate_bytes_hilbert(
         geometry::hilbert3d_order_for_cells(total.max(1)).clamp(order, POINT_ORDER_CAP);
     let cells_pt: u128 = 1u128 << (3 * point_order);
     let side_pt = (1u32 << point_order) as f32;
+    // Two independent samplings off the same stream: the wholesale fallback
+    // cloud (capped at POINT_BUDGET for a bounded one-shot download) and the
+    // streamed LOD octree (denser — up to `octree_budget` — since the viewer
+    // fetches only on-screen nodes). They share the point grid (`point_order`),
+    // so coordinates register. The octree is the 3D analog of the 2D pyramid.
     let stride = (total / POINT_BUDGET).max(1);
+    let oct_stride = (total / octree_budget.max(1)).max(1);
     let mut positions: Vec<f32> = Vec::new();
     let mut colors: Vec<u8> = Vec::new();
     let mut next_point_g: u64 = 0;
-    // Organize the same sampled points into a streamed LOD octree (the 3D analog
-    // of the 2D tile pyramid). It shares the point grid (`point_order`) with the
-    // flat cloud, so its coordinates match; the viewer streams its nodes on
-    // demand and falls back to the wholesale `points.bin` when absent.
+    let mut next_oct_g: u64 = 0;
+    let mut oct_count: u64 = 0;
     let mut octree_builder = octree::PointOctreeBuilder::new(point_order, octree::POINT_GRID_LOG2);
 
     // First byte not belonging to cell `c`. Two regimes: when the cube can't
@@ -334,22 +343,31 @@ fn aggregate_bytes_hilbert(
                 acc.sum_val += b as u64;
                 acc.sum_luma += luma[b as usize] as u64;
 
-                // Stride-sample into the point cloud.
-                if g == next_point_g && positions.len() as u64 / 3 < POINT_BUDGET {
+                // Feed both samplings at their own strides. Compute the
+                // point-grid Hilbert distance + color once when either fires.
+                let want_flat = g == next_point_g && (positions.len() as u64 / 3) < POINT_BUDGET;
+                let want_oct = g == next_oct_g && oct_count < octree_budget;
+                if want_flat || want_oct {
                     let cp = if total as u128 <= cells_pt {
                         g
                     } else {
                         ((g as u128) * cells_pt / total as u128) as u64
                     };
-                    let [px, py, pz] = geometry::hilbert_d2xyz(cp, point_order);
-                    positions.push(px as f32 / side_pt);
-                    positions.push(py as f32 / side_pt);
-                    positions.push(pz as f32 / side_pt);
                     let c = pixel_lut[b as usize].0;
                     let a = c[0].max(c[1]).max(c[2]); // 0x00 → transparent
-                    colors.extend_from_slice(&[c[0], c[1], c[2], a]);
-                    octree_builder.push(cp, [c[0], c[1], c[2], a]);
-                    next_point_g += stride;
+                    if want_flat {
+                        let [px, py, pz] = geometry::hilbert_d2xyz(cp, point_order);
+                        positions.push(px as f32 / side_pt);
+                        positions.push(py as f32 / side_pt);
+                        positions.push(pz as f32 / side_pt);
+                        colors.extend_from_slice(&[c[0], c[1], c[2], a]);
+                        next_point_g += stride;
+                    }
+                    if want_oct {
+                        octree_builder.push(cp, [c[0], c[1], c[2], a]);
+                        oct_count += 1;
+                        next_oct_g += oct_stride;
+                    }
                 }
             }
             local += len as u64;
@@ -621,6 +639,7 @@ mod tests {
             &[],
             false,
             grid_side,
+            8_000_000,
             LayoutMode::Auto,
             &Registry::with_defaults(),
             &Branding::default(),
@@ -680,6 +699,7 @@ mod tests {
             &[],
             false,
             8, // small grid ⇒ point grid finer than the voxel grid
+            8_000_000,
             LayoutMode::Auto,
             &Registry::with_defaults(),
             &Branding::default(),
@@ -695,9 +715,9 @@ mod tests {
         assert_eq!(po["record_size"], octree::RECORD_SIZE as u64);
         let node_count = po["node_count"].as_u64().unwrap();
         assert!(node_count > 1, "200 KB overflows the root into a tree, got {node_count}");
-        assert_eq!(
-            po["total_points"], meta["points"],
-            "every sampled point lands in the octree exactly once"
+        assert!(
+            po["total_points"].as_u64().unwrap() > 0,
+            "octree stores points"
         );
 
         // Hierarchy file is fixed-size records; data file is the node blocks.
@@ -833,6 +853,7 @@ mod tests {
             &[],
             false,
             grid_side,
+            8_000_000,
             LayoutMode::Auto,
             &reg,
             &Branding::default(),

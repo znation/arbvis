@@ -201,9 +201,12 @@ const volFrag = `
   uniform sampler3D uVolume;
   uniform sampler2D uLut;
   uniform float uOpacity, uGamma, uThreshold, uNorm;
-  uniform int uSource, uSteps, uDirectColor;
+  uniform int uSource, uSteps, uDirectColor, uUseOcc;
   // Box world size per axis (longest axis = 1; isotropic cube = vec3(1)).
   uniform vec3 uSize;
+  // Coarse occupancy mip + its [x,y,z] cell dims, for empty-space leaping.
+  uniform sampler3D uOccupancy;
+  uniform vec3 uOccExtent;
   in vec3 vOrigin;
   in vec3 vDirection;
   out vec4 fragColor;
@@ -221,15 +224,26 @@ const volFrag = `
     vec3 dir = normalize(vDirection);
     vec2 bounds = hitBox(vOrigin, dir);
     if (bounds.x > bounds.y) discard;
-    bounds.x = max(bounds.x, 0.0);
-    vec3 p = vOrigin + bounds.x * dir;
-    float stepLen = (bounds.y - bounds.x) / float(uSteps);
-    vec3 stepVec = dir * stepLen;
+    float t = max(bounds.x, 0.0);
+    float stepLen = (bounds.y - t) / float(uSteps);
     float denom = max(1e-4, 1.0 - uThreshold);
     vec4 acc = vec4(0.0);
-    for (int i = 0; i < 512; i++) {
-      if (i >= uSteps) break;
-      vec4 vox = texture(uVolume, p / uSize + 0.5);
+    // March in ray parameter t. Occupied regions step at stepLen; empty
+    // macro-cells (per the occupancy mip) are leapt to their far boundary, so
+    // the step budget concentrates where there's actually data.
+    for (int i = 0; i < 1024; i++) {
+      if (t >= bounds.y) break;
+      vec3 uvw = (vOrigin + t * dir) / uSize + 0.5;
+      if (uUseOcc == 1 && texture(uOccupancy, uvw).r < 0.5) {
+        // Empty cell → jump to its exit boundary (always advancing ≥ one step).
+        vec3 cell = floor(uvw * uOccExtent);
+        vec3 nb = (cell + step(0.0, dir)) / uOccExtent;  // next cell boundary (uvw)
+        vec3 tb = ((nb - 0.5) * uSize - vOrigin) / dir;  // → ray t at each axis plane
+        float tnext = min(tb.x, min(tb.y, tb.z));
+        t = max(tnext, t + stepLen) + 1e-4;
+        continue;
+      }
+      vec4 vox = texture(uVolume, uvw);
       if (vox.a > 0.0) {
         // "rgb" (structured) mode: RGB is final baked color, A the opacity
         // weight. "lut" (byte) mode: R indexes the LUT, G/B are the opacity
@@ -253,7 +267,7 @@ const volFrag = `
         acc.a   += (1.0 - acc.a) * a;
         if (acc.a >= 0.95) break;
       }
-      p += stepVec;
+      t += stepLen;
     }
     if (acc.a <= 0.0) discard;
     fragColor = acc;
@@ -396,6 +410,24 @@ async function load() {
   volTex.needsUpdate = true;
   buildHistograms(volBuf);
 
+  // Coarse occupancy mip for empty-space leaping (format_version >= 2). One R8
+  // texel per macro-cell; the shader jumps over cells with no occupied voxel.
+  // A 1³ dummy keeps the sampler bound when a bundle ships no occupancy.
+  let occExtent = [1, 1, 1], useOcc = 0;
+  let occBuf = new Uint8Array([0]);
+  if (meta.occupancy_extent) {
+    occExtent = meta.occupancy_extent;
+    occBuf = new Uint8Array(await (await fetch('occupancy.bin')).arrayBuffer());
+    useOcc = 1;
+  }
+  const occTex = new THREE.Data3DTexture(occBuf, occExtent[0], occExtent[1], occExtent[2]);
+  occTex.format = THREE.RedFormat;
+  occTex.type = THREE.UnsignedByteType;
+  occTex.minFilter = occTex.magFilter = THREE.NearestFilter;
+  occTex.wrapS = occTex.wrapT = occTex.wrapR = THREE.ClampToEdgeWrapping;
+  occTex.unpackAlignment = 1;
+  occTex.needsUpdate = true;
+
   const volMat = new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
     side: THREE.BackSide, transparent: true, depthWrite: false,
@@ -405,6 +437,8 @@ async function load() {
       uThreshold: { value: 0.0 }, uSource: { value: 0 }, uSteps: { value: 192 },
       uNorm: { value: 1.0 }, uDirectColor: { value: directColor ? 1 : 0 },
       uSize: { value: new THREE.Vector3(size[0], size[1], size[2]) },
+      uUseOcc: { value: useOcc }, uOccupancy: { value: occTex },
+      uOccExtent: { value: new THREE.Vector3(occExtent[0], occExtent[1], occExtent[2]) },
     },
     vertexShader: volVert, fragmentShader: volFrag,
   });

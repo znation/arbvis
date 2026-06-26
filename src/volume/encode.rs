@@ -83,10 +83,13 @@ pub struct BrickVolumeMeta {
     pub page_file: String,
     /// Brick edge in voxels.
     pub brick: u32,
-    /// Page-table dims in bricks `[x, y, z]` (`ceil(grid_extent / brick)`).
+    /// Page-table dims in bricks `[x, y, z]` (`ceil(vol_dim / brick)`).
     pub page_dim: [u32; 3],
     /// Atlas dims in voxels `[x, y, z]` (each a multiple of `brick`).
     pub atlas_dim: [u32; 3],
+    /// Voxel extent the page table represents `[x, y, z]` (the virtual
+    /// resolution; ≥ `grid_extent`). The viewer maps `uvw·vol_dim → voxel`.
+    pub vol_dim: [u32; 3],
     /// Number of occupied bricks (atlas slots used).
     pub occupied: u32,
 }

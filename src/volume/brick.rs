@@ -11,14 +11,49 @@
 //! ray-march reads the page table to leap empty bricks and to find the atlas
 //! texels for occupied ones.
 //!
-//! This v1 builds the pool by transforming a finished dense grid (so it is
-//! bounded by the dense grid's resolution and never out-of-cores). Building the
-//! pool directly from a *sparse* accumulator at higher virtual resolution — to
-//! exceed the dense grid entirely — is the natural next step on this format.
+//! Two builders share the format:
+//! - [`build_brick_volume`] transforms a finished dense grid — bounded by the
+//!   dense resolution, used by the structured path and the byte default.
+//! - [`BrickBuilder`] streams bricks straight off the byte→Hilbert pass at a
+//!   higher virtual resolution to *exceed* the dense grid. Because an aligned
+//!   `B³` brick is a contiguous Hilbert range, bricks finalize one at a time as
+//!   the curve advances, so the accumulator is `O(one brick)` regardless of
+//!   resolution (only the occupied-brick atlas itself grows with the data).
+
+use super::encode::VoxelAcc;
+use crate::geometry::{hilbert3d_node_origin, hilbert_d2xyz};
 
 /// Brick edge in voxels. `8³ = 512` voxels = 2 KiB RGBA8 per brick — a good
 /// granularity for both empty-space skipping and the atlas.
 pub const BRICK: u32 = 8;
+
+/// Cap on occupied bricks the streaming builder keeps (≈ a 512³-voxel atlas at
+/// `BRICK=8`). Past this, [`BrickBuilder`] stops admitting new bricks and
+/// counts them as dropped (logged) rather than ballooning the atlas/VRAM.
+pub const MAX_BRICKS: u32 = 262_144;
+
+/// Near-cubic atlas size, in bricks per axis, holding at least `slots` bricks.
+fn atlas_dims_bricks(slots: u32) -> [u32; 3] {
+    let s = slots.max(1);
+    let ax = (s as f64).cbrt().ceil() as u32;
+    let ax = ax.max(1);
+    let ay = ax;
+    let az = s.div_ceil(ax * ay).max(1);
+    [ax, ay, az]
+}
+
+/// Pack a dense page table (`0` = empty, else 1-based slot) into RGBA8 with the
+/// slot encoded little-endian in R,G,B (A = 255).
+fn pack_page_table(slots: &[u32]) -> Vec<u8> {
+    let mut out = vec![0u8; slots.len() * 4];
+    for (i, &slot) in slots.iter().enumerate() {
+        out[i * 4] = (slot & 0xff) as u8;
+        out[i * 4 + 1] = ((slot >> 8) & 0xff) as u8;
+        out[i * 4 + 2] = ((slot >> 16) & 0xff) as u8;
+        out[i * 4 + 3] = 255;
+    }
+    out
+}
 
 /// The packed sparse volume: a brick-pool atlas + a page table indexing it.
 pub struct BrickVolume {
@@ -33,6 +68,11 @@ pub struct BrickVolume {
     pub page_table: Vec<u8>,
     /// Page-table dimensions in bricks `[x, y, z]` (`ceil(extent / BRICK)`).
     pub page_dim: [u32; 3],
+    /// Voxel extent the page table represents `[x, y, z]` — the dense grid
+    /// extent for [`build_brick_volume`], or the virtual side for the
+    /// high-resolution [`BrickBuilder`]. The viewer maps `uvw·vol_dim → voxel`,
+    /// so this (not the dense `grid_extent`) drives brick addressing.
+    pub vol_dim: [u32; 3],
     /// Number of occupied bricks (atlas slots used).
     pub occupied: u32,
 }
@@ -88,11 +128,7 @@ pub fn build_brick_volume(rgba: &[u8], extent: [u32; 3], brick: u32) -> BrickVol
     }
 
     // Near-cubic atlas big enough for every slot.
-    let slots = occupied.max(1);
-    let ax = (slots as f64).cbrt().ceil() as u32;
-    let ax = ax.max(1);
-    let ay = ax;
-    let az = slots.div_ceil(ax * ay).max(1);
+    let [ax, ay, az] = atlas_dims_bricks(occupied);
     let atlas_dim = [ax * brick, ay * brick, az * brick];
     let (adx, ady) = (atlas_dim[0] as usize, atlas_dim[1] as usize);
     let mut atlas = vec![0u8; (atlas_dim[0] as usize) * (atlas_dim[1] as usize) * (atlas_dim[2] as usize) * 4];
@@ -119,21 +155,169 @@ pub fn build_brick_volume(rgba: &[u8], extent: [u32; 3], brick: u32) -> BrickVol
         }
     }
 
-    // Page table: 1-based slot encoded little-endian in R,G,B (A = 255).
-    let mut page_table = vec![0u8; npages * 4];
-    for (i, &slot) in slot_of.iter().enumerate() {
-        page_table[i * 4] = (slot & 0xff) as u8;
-        page_table[i * 4 + 1] = ((slot >> 8) & 0xff) as u8;
-        page_table[i * 4 + 2] = ((slot >> 16) & 0xff) as u8;
-        page_table[i * 4 + 3] = 255;
-    }
-
     BrickVolume {
         atlas,
         atlas_dim,
-        page_table,
+        page_table: pack_page_table(&slot_of),
         page_dim: [pbx, pby, pbz],
+        vol_dim: extent,
         occupied,
+    }
+}
+
+/// Streaming sparse-voxel brick builder for the byte→Hilbert pass. Points are
+/// fed in non-decreasing Hilbert order at virtual order `order_v` (cube side
+/// `2^order_v`); because an aligned `2^brick_log2` brick is a contiguous Hilbert
+/// range, only the *current* brick is open at a time. Finished bricks stream
+/// into a flat block list + a dense page table, assembled into a [`BrickVolume`]
+/// by [`finish`](BrickBuilder::finish). Memory is `O(one brick)` plus the
+/// page table and the occupied-brick output — never the full `2^order_v` cube.
+pub struct BrickBuilder {
+    order_v: u32,
+    brick: u32,
+    brick_log2: u32,
+    luma: [u16; 256],
+    page_dim: [u32; 3],
+    page: Vec<u32>,    // dense (V/B)³: 0 = empty, else 1-based slot
+    blocks: Vec<u8>,   // occupied bricks' RGBA8, B³ each, in slot order
+    open: Vec<VoxelAcc>, // accumulators for the current open brick (B³)
+    cur_hidx: i128,    // Hilbert index of the open brick (-1 = none)
+    cur_origin: [u32; 3],
+    occupied: u32,
+    max_count: u64,
+    dropped: u64,
+}
+
+impl BrickBuilder {
+    /// `order_v` = virtual cube exponent (side `2^order_v`); `brick` = brick
+    /// edge (power of two ≤ `2^order_v`); `luma` = per-byte luminance LUT.
+    pub fn new(order_v: u32, brick: u32, luma: [u16; 256]) -> Self {
+        assert!((1..=21).contains(&order_v));
+        let brick_log2 = brick.trailing_zeros();
+        let side = 1u32 << order_v;
+        let pd = side / brick;
+        BrickBuilder {
+            order_v,
+            brick,
+            brick_log2,
+            luma,
+            page_dim: [pd, pd, pd],
+            page: vec![0u32; (pd as usize).pow(3)],
+            blocks: Vec::new(),
+            open: vec![VoxelAcc::default(); (brick as usize).pow(3)],
+            cur_hidx: -1,
+            cur_origin: [0; 3],
+            occupied: 0,
+            max_count: 0,
+            dropped: 0,
+        }
+    }
+
+    /// Accumulate one byte `b` whose voxel is at Hilbert distance `h` on the
+    /// `2^order_v` cube. `h` must be non-decreasing across calls.
+    pub fn push(&mut self, h: u64, b: u8) {
+        let hidx = (h >> (3 * self.brick_log2)) as i128;
+        if hidx != self.cur_hidx {
+            self.finalize();
+            self.cur_hidx = hidx;
+            self.cur_origin =
+                hilbert3d_node_origin(hidx as u64, self.order_v - self.brick_log2, self.order_v);
+            for a in self.open.iter_mut() {
+                *a = VoxelAcc::default();
+            }
+        }
+        let v = hilbert_d2xyz(h, self.order_v);
+        let bk = self.brick;
+        let li = (v[0] - self.cur_origin[0])
+            + (v[1] - self.cur_origin[1]) * bk
+            + (v[2] - self.cur_origin[2]) * bk * bk;
+        let acc = &mut self.open[li as usize];
+        acc.count += 1;
+        acc.sum_val += b as u64;
+        acc.sum_luma += self.luma[b as usize] as u64;
+    }
+
+    /// Emit the open brick (if non-empty) into the block list + page table.
+    fn finalize(&mut self) {
+        if self.cur_hidx < 0 || self.open.iter().all(|a| a.count == 0) {
+            return;
+        }
+        if self.occupied >= MAX_BRICKS {
+            self.dropped += 1;
+            return;
+        }
+        self.occupied += 1; // 1-based slot
+        let bk = self.brick;
+        let cell = [
+            self.cur_origin[0] / bk,
+            self.cur_origin[1] / bk,
+            self.cur_origin[2] / bk,
+        ];
+        let pidx = cell[0] as usize
+            + cell[1] as usize * self.page_dim[0] as usize
+            + cell[2] as usize * self.page_dim[0] as usize * self.page_dim[1] as usize;
+        self.page[pidx] = self.occupied;
+        for acc in &self.open {
+            if acc.count == 0 {
+                self.blocks.extend_from_slice(&[0, 0, 0, 0]);
+            } else {
+                let c = acc.count as u64;
+                let mean = (acc.sum_val / c).min(255) as u8;
+                let act = (acc.sum_luma / c).min(255) as u8;
+                self.blocks
+                    .extend_from_slice(&[mean, act, c.min(255) as u8, 255]);
+                self.max_count = self.max_count.max(c);
+            }
+        }
+    }
+
+    /// Finish: assemble the flat blocks into a 3D atlas (rescaling the density
+    /// channel by the global max count) and the dense page table.
+    pub fn finish(mut self) -> (BrickVolume, u64) {
+        self.finalize();
+        let bk = self.brick;
+        let [axb, ayb, azb] = atlas_dims_bricks(self.occupied);
+        let atlas_dim = [axb * bk, ayb * bk, azb * bk];
+        let (adx, ady) = (atlas_dim[0] as usize, atlas_dim[1] as usize);
+        let mut atlas = vec![0u8; (atlas_dim[0] * atlas_dim[1] * atlas_dim[2]) as usize * 4];
+        let inv_max = if self.max_count > 0 {
+            255.0 / self.max_count as f32
+        } else {
+            0.0
+        };
+        let bsz = (bk as usize).pow(3) * 4; // bytes per flat brick block
+        for slot in 0..self.occupied {
+            let (sx, sy, sz) = (slot % axb, (slot / axb) % ayb, slot / (axb * ayb));
+            let block = &self.blocks[slot as usize * bsz..(slot as usize + 1) * bsz];
+            for lz in 0..bk {
+                for ly in 0..bk {
+                    for lx in 0..bk {
+                        let si = ((lx + ly * bk + lz * bk * bk) * 4) as usize;
+                        if block[si + 3] == 0 {
+                            continue;
+                        }
+                        let (axx, ayy, azz) =
+                            ((sx * bk + lx) as usize, (sy * bk + ly) as usize, (sz * bk + lz) as usize);
+                        let di = (axx + ayy * adx + azz * adx * ady) * 4;
+                        atlas[di] = block[si];
+                        atlas[di + 1] = block[si + 1];
+                        // Density (B): rescale the raw count by the global max.
+                        atlas[di + 2] = (block[si + 2] as f32 * inv_max).round().clamp(0.0, 255.0) as u8;
+                        atlas[di + 3] = 255;
+                    }
+                }
+            }
+        }
+        let side = 1u32 << self.order_v;
+        let bv = BrickVolume {
+            atlas,
+            atlas_dim,
+            page_table: pack_page_table(&self.page),
+            page_dim: self.page_dim,
+            vol_dim: [side, side, side],
+            occupied: self.occupied,
+        };
+        (bv, self.dropped)
     }
 }
 
@@ -229,5 +413,30 @@ mod tests {
         let bv = build_brick_volume(&vec![0u8; 16 * 16 * 16 * 4], extent, BRICK);
         assert_eq!(bv.occupied, 0);
         assert!(bv.page_table.iter().step_by(4).all(|&r| r == 0), "all cells empty");
+    }
+
+    #[test]
+    fn streaming_builder_round_trips_in_hilbert_order() {
+        // order_v=5 (32³); feed a contiguous Hilbert prefix (one byte/voxel),
+        // spanning several bricks. The accumulator stays O(one brick).
+        let order_v = 5;
+        let n = 1u64 << (3 * 4); // 4096 voxels
+        let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256]);
+        assert_eq!(b.open.len(), (BRICK as usize).pow(3), "accumulator is one brick");
+        for h in 0..n {
+            b.push(h, ((h & 0x7f) as u8) | 1); // byte > 0 ⇒ voxel occupied
+        }
+        let (bv, dropped) = b.finish();
+        assert_eq!(dropped, 0);
+        assert!(bv.occupied >= 1);
+        let ext = [1u32 << order_v; 3];
+        // Every fed voxel reconstructs through page table + atlas.
+        for h in 0..n {
+            let v = hilbert_d2xyz(h, order_v);
+            assert!(sample(&bv, ext, v[0], v[1], v[2])[3] > 0, "h={h} should be occupied");
+        }
+        // A voxel in an unfed (far) brick is empty.
+        let far = hilbert_d2xyz((1u64 << (3 * order_v)) - 1, order_v);
+        assert_eq!(sample(&bv, ext, far[0], far[1], far[2]), [0, 0, 0, 0]);
     }
 }

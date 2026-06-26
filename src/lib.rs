@@ -236,6 +236,14 @@ pub struct Args {
     #[arg(long = "point-budget", default_value_t = 8_000_000)]
     point_budget: u64,
 
+    /// 3D volume virtual resolution (power of two, 8–2048): build the sparse
+    /// brick pool at this side instead of `--grid`, so the *volume* mode can
+    /// exceed the dense grid for sparse data (only occupied bricks are stored
+    /// and streamed). `0` (default) keeps the volume at `--grid`. Byte path
+    /// only; ignored in 2D.
+    #[arg(long = "volume-res", default_value_t = 0)]
+    volume_res: u32,
+
     /// Visualize abs(modified - original) byte differences; ORIGINAL and MODIFIED are files or directories
     #[arg(long, num_args = 2, value_names = ["ORIGINAL", "MODIFIED"])]
     diff: Option<Vec<PathBuf>>,
@@ -310,6 +318,8 @@ struct RenderConfig {
     grid_side: u32,
     /// 3D point-cloud LOD octree budget (max stored points); unused in 2D.
     point_budget: u64,
+    /// 3D volume virtual resolution for the sparse brick pool (`0` = `--grid`).
+    volume_res: u32,
 }
 
 /// Where the render output goes after rendering. Owns any temporary
@@ -451,6 +461,7 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
     }
     if args.three_d {
         validate_grid(args.grid)?;
+        validate_volume_res(args.volume_res)?;
         if args.show_xet_xorbs {
             log::warn!("--show-xet-xorbs has no effect in --3d mode; ignoring");
         }
@@ -536,6 +547,7 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
         three_d: args.three_d,
         grid_side: args.grid,
         point_budget: args.point_budget,
+        volume_res: args.volume_res,
     };
     dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await
 }
@@ -545,6 +557,17 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
 fn validate_grid(side: u32) -> anyhow::Result<()> {
     if !(2..=512).contains(&side) || !side.is_power_of_two() {
         anyhow::bail!("--grid must be a power of two between 2 and 512, got {side}");
+    }
+    Ok(())
+}
+
+/// Validate `--volume-res`: `0` (use `--grid`) or a power of two in `[8, 2048]`.
+/// The sparse brick pool stores only occupied bricks, so a high resolution is
+/// affordable for sparse data; the upper bound caps the page table + Hilbert
+/// order (2048 = order 11).
+fn validate_volume_res(res: u32) -> anyhow::Result<()> {
+    if res != 0 && (!(8..=2048).contains(&res) || !res.is_power_of_two()) {
+        anyhow::bail!("--volume-res must be 0 or a power of two between 8 and 2048, got {res}");
     }
     Ok(())
 }
@@ -751,6 +774,7 @@ async fn render_volume_bundle(
         cfg.diff_mode,
         cfg.grid_side,
         cfg.point_budget,
+        cfg.volume_res,
         cfg.layout_mode,
         registry,
         &registry.branding,

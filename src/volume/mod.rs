@@ -61,6 +61,10 @@ struct BuildResult {
     /// Streamed point-LOD octree (byte floor only); `None` for the structured
     /// path, which keeps the wholesale `points.bin`.
     point_octree: Option<octree::PointOctree>,
+    /// Sparse brick pool built at a higher virtual resolution (byte floor with
+    /// `--volume-res`); `None` ⇒ `render_volume` derives bricks from the dense
+    /// grid instead.
+    bricks: Option<brick::BrickVolume>,
 }
 
 /// Render the 3D viewer bundle for `sources` into `out_dir`.
@@ -82,6 +86,7 @@ pub async fn render_volume(
     diff_mode: bool,
     grid_side: u32,
     point_budget: u64,
+    volume_res: u32,
     mode: LayoutMode,
     registry: &Registry,
     branding: &Branding,
@@ -132,7 +137,7 @@ pub async fn render_volume(
         if is_byte {
             // Byte volumes are cubes (Hilbert needs equal sides); all three
             // axes match, so the cube side is `ex`.
-            aggregate_bytes_hilbert(sources, total, ex, point_budget, pixel_lut, rt)
+            aggregate_bytes_hilbert(sources, total, ex, point_budget, volume_res, pixel_lut, rt)
         } else {
             aggregate_entities(
                 sources,
@@ -155,7 +160,12 @@ pub async fn render_volume(
     // Sparse brick pool + page table the volume ray-march renders from
     // (GigaVoxels-style indirection — only occupied bricks, empty ones leapt).
     // The dense volume.bin above stays for CPU-side histograms + pick.
-    let bricks = brick::build_brick_volume(&built.volume_rgba, actual_extent, brick::BRICK);
+    // Prefer the high-res streamed pool (--volume-res) when present; otherwise
+    // derive bricks from the dense grid.
+    let bricks = match built.bricks {
+        Some(b) => b,
+        None => brick::build_brick_volume(&built.volume_rgba, actual_extent, brick::BRICK),
+    };
     std::fs::write(out_dir.join("bricks.bin"), &bricks.atlas)?;
     std::fs::write(out_dir.join("pagetable.bin"), &bricks.page_table)?;
     let brick_meta = encode::BrickVolumeMeta {
@@ -164,6 +174,7 @@ pub async fn render_volume(
         brick: brick::BRICK,
         page_dim: bricks.page_dim,
         atlas_dim: bricks.atlas_dim,
+        vol_dim: bricks.vol_dim,
         occupied: bricks.occupied,
     };
 
@@ -281,6 +292,7 @@ fn aggregate_bytes_hilbert(
     total: u64,
     grid_side: u32,
     octree_budget: u64,
+    volume_res: u32,
     pixel_lut: [Rgb<u8>; 256],
     rt: tokio::runtime::Handle,
 ) -> anyhow::Result<BuildResult> {
@@ -290,6 +302,19 @@ fn aggregate_bytes_hilbert(
 
     let mut grid = vec![VoxelAcc::default(); cells as usize];
     let mut max_count: u64 = 0;
+
+    // Optional higher-resolution sparse brick pool (--volume-res > --grid).
+    // Built streaming in Hilbert order — one open brick at a time, O(brick)
+    // memory — so the *volume* can exceed the dense grid for sparse data. The
+    // dense grid above is still built (coarser) for histograms + pick.
+    let order_v = if volume_res > grid_side {
+        volume_res.trailing_zeros()
+    } else {
+        0
+    };
+    let cells_v: u128 = if order_v > 0 { 1u128 << (3 * order_v) } else { 0 };
+    let mut brick_builder =
+        (order_v > 0).then(|| brick::BrickBuilder::new(order_v, brick::BRICK, luma));
 
     // Point cloud: at least as fine as the grid, capped so positions are crisp.
     let point_order =
@@ -361,6 +386,17 @@ fn aggregate_bytes_hilbert(
                 acc.sum_val += b as u64;
                 acc.sum_luma += luma[b as usize] as u64;
 
+                // Feed the high-resolution sparse brick pool (every byte, mapped
+                // to its voxel on the 2^order_v cube).
+                if let Some(bb) = brick_builder.as_mut() {
+                    let cp_v = if total as u128 <= cells_v {
+                        g
+                    } else {
+                        ((g as u128) * cells_v / total as u128) as u64
+                    };
+                    bb.push(cp_v, b);
+                }
+
                 // Feed both samplings at their own strides. Compute the
                 // point-grid Hilbert distance + color once when either fires.
                 let want_flat = g == next_point_g && (positions.len() as u64 / 3) < POINT_BUDGET;
@@ -404,6 +440,16 @@ fn aggregate_bytes_hilbert(
     let points_buf = encode::pack_points(&positions, &colors);
     let octree = octree_builder.finish();
     let point_octree = (!octree.records.is_empty()).then_some(octree);
+    let bricks = brick_builder.map(|bb| {
+        let (bv, dropped) = bb.finish();
+        if dropped > 0 {
+            log::warn!(
+                "--volume-res: dropped {dropped} bricks past the {} cap; lower --volume-res for full coverage",
+                brick::MAX_BRICKS
+            );
+        }
+        bv
+    });
 
     Ok(BuildResult {
         volume_rgba,
@@ -413,6 +459,7 @@ fn aggregate_bytes_hilbert(
         focus_center,
         focus_radius,
         point_octree,
+        bricks,
     })
 }
 
@@ -566,6 +613,9 @@ fn aggregate_entities(
         focus_center,
         focus_radius,
         point_octree,
+        // Structured grids are dense + anisotropic; bricks are derived from the
+        // dense grid in render_volume rather than streamed at high resolution.
+        bricks: None,
     })
 }
 
@@ -725,6 +775,7 @@ mod tests {
             false,
             grid_side,
             8_000_000,
+            0,
             LayoutMode::Auto,
             &Registry::with_defaults(),
             &Branding::default(),
@@ -785,6 +836,7 @@ mod tests {
             false,
             8, // small grid ⇒ point grid finer than the voxel grid
             8_000_000,
+            0,
             LayoutMode::Auto,
             &Registry::with_defaults(),
             &Branding::default(),
@@ -939,6 +991,7 @@ mod tests {
             false,
             grid_side,
             8_000_000,
+            0,
             LayoutMode::Auto,
             &reg,
             &Branding::default(),
@@ -1040,6 +1093,7 @@ mod tests {
             false,
             8,
             8_000_000,
+            0,
             LayoutMode::Auto,
             &reg,
             &Branding::default(),

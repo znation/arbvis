@@ -445,7 +445,7 @@ async function load() {
       uThreshold: { value: 0.0 }, uSource: { value: 0 }, uSteps: { value: 192 },
       uNorm: { value: 1.0 }, uDirectColor: { value: directColor ? 1 : 0 },
       uSize: { value: new THREE.Vector3(size[0], size[1], size[2]) },
-      uVolDim: { value: new THREE.Vector3(ex, ey, ez) },
+      uVolDim: { value: new THREE.Vector3(bm.vol_dim[0], bm.vol_dim[1], bm.vol_dim[2]) },
       uPageDim: { value: new THREE.Vector3(bm.page_dim[0], bm.page_dim[1], bm.page_dim[2]) },
       uAtlasBricks: { value: new THREE.Vector3(bm.atlas_dim[0] / bm.brick, bm.atlas_dim[1] / bm.brick, bm.atlas_dim[2] / bm.brick) },
       uBrick: { value: bm.brick },

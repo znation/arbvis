@@ -27,6 +27,12 @@ use crate::geometry::{hilbert3d_node_origin, hilbert_d2xyz};
 /// granularity for both empty-space skipping and the atlas.
 pub const BRICK: u32 = 8;
 
+/// 1-voxel border replicated around each dense-derived brick so the viewer can
+/// trilinearly filter *across* brick boundaries (sampling the apron instead of
+/// bleeding into an unrelated atlas slot). The streaming builder can't see a
+/// brick's neighbors, so it ships `apron = 0` (nearest filtering).
+pub const APRON: u32 = 1;
+
 /// Cap on occupied bricks the streaming builder keeps (≈ a 512³-voxel atlas at
 /// `BRICK=8`). Past this, [`BrickBuilder`] stops admitting new bricks and
 /// counts them as dropped (logged) rather than ballooning the atlas/VRAM.
@@ -73,20 +79,20 @@ pub struct BrickVolume {
     /// high-resolution [`BrickBuilder`]. The viewer maps `uvw·vol_dim → voxel`,
     /// so this (not the dense `grid_extent`) drives brick addressing.
     pub vol_dim: [u32; 3],
+    /// Apron border per brick: stored brick edge is `BRICK + 2·apron`. `1` ⇒ the
+    /// viewer trilinearly filters across brick edges; `0` ⇒ nearest.
+    pub apron: u32,
     /// Number of occupied bricks (atlas slots used).
     pub occupied: u32,
 }
 
 impl BrickVolume {
-    /// Atlas size in bricks per axis (`atlas_dim / BRICK`). The viewer derives
-    /// this in JS; here it backs the format tests.
+    /// Atlas size in bricks per axis (`atlas_dim / (BRICK + 2·apron)`). The
+    /// viewer derives this in JS; here it backs the format tests.
     #[cfg(test)]
     pub fn atlas_bricks(&self) -> [u32; 3] {
-        [
-            self.atlas_dim[0] / BRICK,
-            self.atlas_dim[1] / BRICK,
-            self.atlas_dim[2] / BRICK,
-        ]
+        let bs = BRICK + 2 * self.apron;
+        [self.atlas_dim[0] / bs, self.atlas_dim[1] / bs, self.atlas_dim[2] / bs]
     }
 }
 
@@ -127,30 +133,53 @@ pub fn build_brick_volume(rgba: &[u8], extent: [u32; 3], brick: u32) -> BrickVol
         }
     }
 
-    // Near-cubic atlas big enough for every slot.
+    // Near-cubic atlas big enough for every slot. Each stored brick carries an
+    // APRON-voxel border so the viewer can filter across brick edges; the
+    // stored brick edge is `bs`.
+    let bs = brick + 2 * APRON;
     let [ax, ay, az] = atlas_dims_bricks(occupied);
-    let atlas_dim = [ax * brick, ay * brick, az * brick];
+    let atlas_dim = [ax * bs, ay * bs, az * bs];
     let (adx, ady) = (atlas_dim[0] as usize, atlas_dim[1] as usize);
     let mut atlas = vec![0u8; (atlas_dim[0] as usize) * (atlas_dim[1] as usize) * (atlas_dim[2] as usize) * 4];
 
-    // Pass 2: copy occupied voxels into their brick's atlas slot. Empty voxels
-    // inside an occupied brick stay transparent (atlas is zero-initialized).
-    for z in 0..ez {
-        for y in 0..ey {
-            for x in 0..ex {
-                let src = (x as usize + y as usize * exs + z as usize * exs * eys) * 4;
-                if rgba[src + 3] == 0 {
+    // Pass 2: fill each occupied brick's slot from the dense grid, including the
+    // apron border (neighbor voxels, or transparent past the grid edge / into
+    // empty neighbors).
+    let a = APRON as i64;
+    for bz in 0..pbz {
+        for by in 0..pby {
+            for bx in 0..pbx {
+                let slot = slot_of[page_idx(bx, by, bz)];
+                if slot == 0 {
                     continue;
                 }
-                let slot = slot_of[page_idx(x / brick, y / brick, z / brick)] - 1; // 0-based
-                let (sx, sy, sz) = (slot % ax, (slot / ax) % ay, slot / (ax * ay));
-                let (axx, ayy, azz) = (
-                    (sx * brick + x % brick) as usize,
-                    (sy * brick + y % brick) as usize,
-                    (sz * brick + z % brick) as usize,
-                );
-                let dst = (axx + ayy * adx + azz * adx * ady) * 4;
-                atlas[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+                let s = slot - 1;
+                let (sx, sy, sz) = (s % ax, (s / ax) % ay, s / (ax * ay));
+                for dz in 0..bs {
+                    for dy in 0..bs {
+                        for dx in 0..bs {
+                            let gx = bx as i64 * brick as i64 + dx as i64 - a;
+                            let gy = by as i64 * brick as i64 + dy as i64 - a;
+                            let gz = bz as i64 * brick as i64 + dz as i64 - a;
+                            if gx < 0
+                                || gy < 0
+                                || gz < 0
+                                || gx as u32 >= ex
+                                || gy as u32 >= ey
+                                || gz as u32 >= ez
+                            {
+                                continue; // border past grid edge → transparent
+                            }
+                            let src =
+                                (gx as usize + gy as usize * exs + gz as usize * exs * eys) * 4;
+                            let dst = ((sx * bs + dx) as usize
+                                + (sy * bs + dy) as usize * adx
+                                + (sz * bs + dz) as usize * adx * ady)
+                                * 4;
+                            atlas[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+                        }
+                    }
+                }
             }
         }
     }
@@ -161,6 +190,7 @@ pub fn build_brick_volume(rgba: &[u8], extent: [u32; 3], brick: u32) -> BrickVol
         page_table: pack_page_table(&slot_of),
         page_dim: [pbx, pby, pbz],
         vol_dim: extent,
+        apron: APRON,
         occupied,
     }
 }
@@ -315,6 +345,7 @@ impl BrickBuilder {
             page_table: pack_page_table(&self.page),
             page_dim: self.page_dim,
             vol_dim: [side, side, side],
+            apron: 0, // streaming can't see neighbors → no border, nearest filtering
             occupied: self.occupied,
         };
         (bv, self.dropped)
@@ -350,7 +381,13 @@ mod tests {
         let s = slot - 1;
         let (sx, sy, sz) = (s % ax, (s / ax) % ay, s / (ax * ay));
         let [adx, ady, _] = bv.atlas_dim;
-        let (axx, ayy, azz) = (sx * BRICK + x % BRICK, sy * BRICK + y % BRICK, sz * BRICK + z % BRICK);
+        let bs = BRICK + 2 * bv.apron; // stored brick edge
+        let ap = bv.apron;
+        let (axx, ayy, azz) = (
+            sx * bs + ap + x % BRICK,
+            sy * bs + ap + y % BRICK,
+            sz * bs + ap + z % BRICK,
+        );
         let di = ((axx + ayy * adx + azz * adx * ady) * 4) as usize;
         let _ = extent;
         [bv.atlas[di], bv.atlas[di + 1], bv.atlas[di + 2], bv.atlas[di + 3]]

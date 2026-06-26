@@ -175,6 +175,7 @@ pub async fn render_volume(
         page_dim: bricks.page_dim,
         atlas_dim: bricks.atlas_dim,
         vol_dim: bricks.vol_dim,
+        apron: bricks.apron,
         occupied: bricks.occupied,
     };
 

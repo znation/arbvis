@@ -90,6 +90,9 @@ pub struct BrickVolumeMeta {
     /// Voxel extent the page table represents `[x, y, z]` (the virtual
     /// resolution; ≥ `grid_extent`). The viewer maps `uvw·vol_dim → voxel`.
     pub vol_dim: [u32; 3],
+    /// Apron border per brick (stored brick edge = `brick + 2·apron`). `> 0` ⇒
+    /// the viewer trilinearly filters across brick edges; `0` ⇒ nearest.
+    pub apron: u32,
     /// Number of occupied bricks (atlas slots used).
     pub occupied: u32,
 }

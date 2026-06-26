@@ -201,7 +201,7 @@ const volFrag = `
   uniform sampler3D uBricks;      // brick-pool atlas (RGBA8)
   uniform sampler3D uPageTable;   // page table (RGBA8): 1-based atlas slot in R,G,B; 0 = empty
   uniform sampler2D uLut;
-  uniform float uOpacity, uGamma, uThreshold, uNorm, uBrick;
+  uniform float uOpacity, uGamma, uThreshold, uNorm, uBrick, uBrickStride, uApron;
   uniform int uSource, uSteps, uDirectColor;
   // Box world size per axis (longest axis = 1; isotropic cube = vec3(1)).
   uniform vec3 uSize;
@@ -228,13 +228,16 @@ const volFrag = `
   }
 
   // Sample the brick-pool atlas at a volume voxel position, for the brick slot.
+  // Each stored brick is uBrickStride (= uBrick + 2*uApron) wide; the brick's
+  // own voxels start at the apron offset, and linear filtering stays inside the
+  // brick's apron border (so it never bleeds into a neighbouring atlas slot).
   vec4 sampleBrick(uint slot, vec3 posVox) {
     uint s = slot - 1u;
     uint axb = uint(uAtlasBricks.x), ayb = uint(uAtlasBricks.y);
     vec3 sb = vec3(float(s % axb), float((s / axb) % ayb), float(s / (axb * ayb)));
     vec3 local = posVox - floor(posVox / uBrick) * uBrick;   // in [0, brick)
-    vec3 atlasVox = sb * uBrick + local;
-    return texture(uBricks, (atlasVox + 0.5) / (uAtlasBricks * uBrick));
+    vec3 atlasVox = sb * uBrickStride + vec3(uApron) + local;
+    return texture(uBricks, (atlasVox + 0.5) / (uAtlasBricks * uBrickStride));
   }
 
   void main() {
@@ -435,6 +438,13 @@ async function load() {
   const pageTex = make3d(pageBuf, bm.page_dim[0], bm.page_dim[1], bm.page_dim[2]);
   const brickBuf = new Uint8Array(await (await fetch(bm.atlas_file)).arrayBuffer());
   const brickTex = make3d(brickBuf, bm.atlas_dim[0], bm.atlas_dim[1], bm.atlas_dim[2]);
+  const bstride = bm.brick + 2 * bm.apron; // stored brick edge (incl. apron)
+  if (bm.apron > 0) {
+    // The apron border lets trilinear filtering cross brick edges smoothly
+    // without bleeding into neighbouring atlas slots.
+    brickTex.minFilter = brickTex.magFilter = THREE.LinearFilter;
+    brickTex.needsUpdate = true;
+  }
 
   const volMat = new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
@@ -447,8 +457,8 @@ async function load() {
       uSize: { value: new THREE.Vector3(size[0], size[1], size[2]) },
       uVolDim: { value: new THREE.Vector3(bm.vol_dim[0], bm.vol_dim[1], bm.vol_dim[2]) },
       uPageDim: { value: new THREE.Vector3(bm.page_dim[0], bm.page_dim[1], bm.page_dim[2]) },
-      uAtlasBricks: { value: new THREE.Vector3(bm.atlas_dim[0] / bm.brick, bm.atlas_dim[1] / bm.brick, bm.atlas_dim[2] / bm.brick) },
-      uBrick: { value: bm.brick },
+      uAtlasBricks: { value: new THREE.Vector3(bm.atlas_dim[0] / bstride, bm.atlas_dim[1] / bstride, bm.atlas_dim[2] / bstride) },
+      uBrick: { value: bm.brick }, uBrickStride: { value: bstride }, uApron: { value: bm.apron },
     },
     vertexShader: volVert, fragmentShader: volFrag,
   });

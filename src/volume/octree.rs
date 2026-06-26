@@ -41,7 +41,7 @@
 //! `(node_idx, depth, order)` — no explicit child pointers, no ordering
 //! requirement.
 
-use crate::geometry::{hilbert3d_node_origin, hilbert_d2xyz};
+use crate::geometry::{hilbert3d_node_origin, hilbert_d2xyz, hilbert_xyz2d};
 
 /// Default occupancy-grid exponent: `G = 2^5 = 32`, so a node caps at `32³ =
 /// 32768` points. Small enough to keep per-node download snappy, large enough
@@ -368,6 +368,33 @@ impl PointOctreeBuilder {
     }
 }
 
+/// Build a point octree from points that are **not** already Hilbert-ordered —
+/// the general spatial-octree build (the byte floor skips this; its stream is
+/// born Hilbert-ordered). Positions are normalized to `[0,1]` per axis of the
+/// (possibly anisotropic) box; they're quantized onto a `2^order` cube, sorted
+/// by Hilbert distance, then streamed through [`PointOctreeBuilder`]. Used by
+/// the structured/entity path so a layout's per-element points get the same
+/// LOD streaming as the byte cloud.
+pub fn build_from_normalized_points(
+    points: &[([f32; 3], [u8; 4])],
+    order: u32,
+    grid_log2: u32,
+) -> PointOctree {
+    let span = (1u64 << order) as f32;
+    let maxc = (1u32 << order) - 1;
+    let q = |f: f32| ((f.clamp(0.0, 1.0) * span) as u32).min(maxc);
+    let mut items: Vec<(u64, [u8; 4])> = points
+        .iter()
+        .map(|(p, c)| (hilbert_xyz2d([q(p[0]), q(p[1]), q(p[2])], order), *c))
+        .collect();
+    items.sort_unstable_by_key(|x| x.0);
+    let mut b = PointOctreeBuilder::new(order, grid_log2);
+    for (h, c) in items {
+        b.push(h, c);
+    }
+    b.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,6 +565,38 @@ mod tests {
         for (i, r) in oct.records.iter().enumerate() {
             let parsed = NodeRecord::read_le(&bytes[i * RECORD_SIZE..(i + 1) * RECORD_SIZE]);
             assert_eq!(parsed, *r);
+        }
+    }
+
+    #[test]
+    fn build_from_normalized_points_is_a_valid_octree() {
+        // Pseudo-random points in [0,1]^3 (not Hilbert-ordered).
+        let mut s: u64 = 0x1234_5678_9abc_def1;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut pts = Vec::new();
+        for _ in 0..5000 {
+            let f = |n: u64| (n % 100_000) as f32 / 100_000.0;
+            pts.push(([f(next()), f(next()), f(next())], [(next() % 256) as u8, 9, 9, 255]));
+        }
+        let order = 7;
+        let oct = build_from_normalized_points(&pts, order, 3);
+        assert_eq!(oct.order, order);
+        assert!(oct.total_points() > 0 && oct.total_points() <= pts.len() as u64);
+        assert!(oct.records.iter().any(|r| r.depth == 0), "has a root");
+        // Same structural invariants as the streaming build: points lie in
+        // their node's cube (node_voxels cross-checks origin via Hilbert too).
+        for r in &oct.records {
+            let side = 1u32 << (order - r.depth as u32);
+            for v in node_voxels(&oct, r) {
+                for a in 0..3 {
+                    assert!(v[a] >= r.origin[a] && v[a] < r.origin[a] + side);
+                }
+            }
         }
     }
 

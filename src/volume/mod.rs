@@ -137,6 +137,7 @@ pub async fn render_volume(
                 sources,
                 shape.as_ref(),
                 actual_extent,
+                point_budget,
                 &voxel_reg,
                 diff_mode,
                 rt,
@@ -408,6 +409,7 @@ fn aggregate_entities(
     sources: Vec<Source>,
     shape: &dyn VolumeShape,
     extent: [u32; 3],
+    octree_budget: u64,
     voxel_reg: &VoxelRegistry,
     diff_mode: bool,
     rt: tokio::runtime::Handle,
@@ -418,8 +420,8 @@ fn aggregate_entities(
     let entities = shape.entities().unwrap_or_default();
     let default_renderer_id = shape.id();
 
-    for ent in &entities {
-        let renderer = voxel_reg
+    let resolve = |ent: &VolumeEntity| -> anyhow::Result<std::sync::Arc<dyn VoxelRenderer>> {
+        voxel_reg
             .renderer(ent.renderer_id)
             .or_else(|| voxel_reg.renderer(default_renderer_id))
             .ok_or_else(|| {
@@ -428,7 +430,28 @@ fn aggregate_entities(
                     ent.renderer_id,
                     default_renderer_id
                 )
-            })?;
+            })
+    };
+
+    // Pass 1: total point-octree weight, to split the budget across entities.
+    // `point_weight` must not read bytes (we pass an empty span).
+    let mut total_w: u128 = 0;
+    for ent in &entities {
+        let r = resolve(ent)?;
+        let ctx = VoxelRenderCtx {
+            entity: ent,
+            bytes: &[],
+            extent,
+            diff_mode,
+        };
+        total_w += r.point_weight(&ctx) as u128;
+    }
+
+    // Pass 2: fetch + bake the dense grid, and (if any renderer opts in) collect
+    // per-element points for the streamed LOD octree, mapped into the global box.
+    let mut oct_points: Vec<([f32; 3], [u8; 4])> = Vec::new();
+    for ent in &entities {
+        let renderer = resolve(ent)?;
         let src = sources.get(ent.source_idx).ok_or_else(|| {
             anyhow::anyhow!(
                 "entity source_idx {} out of range ({} sources)",
@@ -448,28 +471,71 @@ fn aggregate_entities(
             off += len as u64;
         }
 
-        let mut view = VoxelGridMut::new(&mut grid, extent);
-        renderer.render(
-            &VoxelRenderCtx {
-                entity: ent,
-                bytes: &bytes,
-                extent,
-                diff_mode,
-            },
-            &mut view,
-        );
+        let ctx = VoxelRenderCtx {
+            entity: ent,
+            bytes: &bytes,
+            extent,
+            diff_mode,
+        };
+        {
+            let mut view = VoxelGridMut::new(&mut grid, extent);
+            renderer.render(&ctx, &mut view);
+        }
+
+        if total_w > 0 {
+            let w = renderer.point_weight(&ctx) as u128;
+            let budget = if w > 0 {
+                (((octree_budget as u128) * w / total_w) as u64).max(1)
+            } else {
+                0
+            };
+            if budget > 0 {
+                let bb = ent.bbox;
+                let (bw, bh, bz) = (
+                    (bb.x1 - bb.x0) as f32,
+                    (bb.y1 - bb.y0) as f32,
+                    (bb.z1 - bb.z0) as f32,
+                );
+                // bbox-local [0,1]³ → global normalized [0,1]³ (per axis).
+                let mut emit = |local: [f32; 3], rgba: [u8; 4]| {
+                    oct_points.push((
+                        [
+                            (bb.x0 as f32 + local[0] * bw) / ex as f32,
+                            (bb.y0 as f32 + local[1] * bh) / ey as f32,
+                            (bb.z0 as f32 + local[2] * bz) / ez as f32,
+                        ],
+                        rgba,
+                    ));
+                };
+                renderer.render_points(&ctx, budget, &mut emit);
+            }
+        }
     }
 
     let (focus_center, focus_radius) = shape
         .focus()
         .unwrap_or_else(|| occupied_focus_cells(&grid, extent));
 
-    // Point cloud derived from the occupied voxels themselves, so the Points
-    // view matches the volume exactly (same positions, same baked colors).
-    // Stride-sampled to the budget; positions in [0,1] per axis like the byte
-    // path (the viewer scales + offsets points to the centered box).
+    // Wholesale fallback cloud (one point per occupied voxel) — kept for the
+    // `file://` / no-octree path, exactly like the byte floor keeps points.bin.
     let (points_buf, points_count) = points_from_grid(&grid, extent);
     let volume_rgba = encode::pack_voxel_cells(&grid);
+
+    // Streamed LOD octree from the renderer-emitted points. They aren't a
+    // Hilbert linearization (the layout places entities freely), so this takes
+    // the spatial-sort build path. The cube order resolves both the point count
+    // and the box's longest axis.
+    let point_octree = if !oct_points.is_empty() {
+        let max_ext = ex.max(ey).max(ez).max(2);
+        let order_ext = 32 - (max_ext - 1).leading_zeros(); // ceil(log2(max_ext))
+        let order = geometry::hilbert3d_order_for_cells(oct_points.len() as u64)
+            .max(order_ext)
+            .clamp(1, POINT_ORDER_CAP);
+        let oct = octree::build_from_normalized_points(&oct_points, order, octree::POINT_GRID_LOG2);
+        (!oct.records.is_empty()).then_some(oct)
+    } else {
+        None
+    };
 
     Ok(BuildResult {
         volume_rgba,
@@ -478,9 +544,7 @@ fn aggregate_entities(
         max_count: 0,
         focus_center,
         focus_radius,
-        // Structured layouts keep the wholesale points.bin (not a Hilbert
-        // linearization); LOD for them is the entity/render_node path.
-        point_octree: None,
+        point_octree,
     })
 }
 
@@ -893,5 +957,84 @@ mod tests {
             serde_json::json!(expect_extent),
             "structured shape keeps its anisotropic box"
         );
+        assert!(
+            meta.get("point_octree").map(|v| v.is_null()).unwrap_or(true),
+            "a renderer without render_points gets the wholesale fallback, no octree"
+        );
+    }
+
+    /// A structured renderer that opts into the LOD octree via `point_weight` +
+    /// `render_points` must produce a streamed point octree in the bundle (the
+    /// modelweightvis drill-down path, exercised here without that crate).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn structured_render_points_builds_octree() {
+        // Reuses TestVolume/TestVolPlugin (one entity, a 4³ box) but binds the
+        // "test-vox" id to a renderer that emits points.
+        struct PtVox;
+        impl VoxelRenderer for PtVox {
+            fn id(&self) -> &'static str {
+                "test-vox"
+            }
+            fn render(&self, ctx: &VoxelRenderCtx<'_>, grid: &mut VoxelGridMut<'_>) {
+                let bb = ctx.entity.bbox;
+                for z in bb.z0..bb.z1 {
+                    for y in bb.y0..bb.y1 {
+                        for x in bb.x0..bb.x1 {
+                            grid.put(x, y, z, VoxelCell { r: 1, g: 2, b: 3, a: 255 });
+                        }
+                    }
+                }
+            }
+            fn point_weight(&self, _ctx: &VoxelRenderCtx<'_>) -> u64 {
+                512 // "element count"
+            }
+            fn render_points(
+                &self,
+                _ctx: &VoxelRenderCtx<'_>,
+                budget: u64,
+                emit: &mut dyn FnMut([f32; 3], [u8; 4]),
+            ) {
+                // An 8³ lattice of distinct points in the entity's bbox.
+                let n = budget.min(512) as usize;
+                for k in 0..n {
+                    let x = (k % 8) as f32 / 8.0;
+                    let y = ((k / 8) % 8) as f32 / 8.0;
+                    let z = ((k / 64) % 8) as f32 / 8.0;
+                    emit([x, y, z], [200, 100, 50, 255]);
+                }
+            }
+        }
+
+        let mut reg = Registry::with_defaults();
+        reg.volume_shapes.push(Arc::new(TestVolPlugin));
+        reg.voxel.register_renderer(Arc::new(PtVox));
+
+        let dir = tempfile::tempdir().unwrap();
+        render_volume(
+            vec![buffered(vec![0u8; 16])],
+            16,
+            dir.path().to_path_buf(),
+            "test",
+            &[],
+            false,
+            8,
+            8_000_000,
+            LayoutMode::Auto,
+            &reg,
+            &Branding::default(),
+        )
+        .await
+        .unwrap();
+
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("meta.json")).unwrap()).unwrap();
+        let po = &meta["point_octree"];
+        assert!(po.is_object(), "render_points opts into the streamed octree");
+        assert!(po["node_count"].as_u64().unwrap() >= 1);
+        assert!(po["total_points"].as_u64().unwrap() > 0);
+        assert!(dir.path().join("points_octree.bin").exists());
+        assert!(dir.path().join("points_hierarchy.bin").exists());
+        // The per-voxel fallback cloud is still emitted (file:// path).
+        assert!(dir.path().join("points.bin").exists());
     }
 }

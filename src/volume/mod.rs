@@ -528,8 +528,12 @@ fn aggregate_entities(
     let point_octree = if !oct_points.is_empty() {
         let max_ext = ex.max(ey).max(ez).max(2);
         let order_ext = 32 - (max_ext - 1).leading_zeros(); // ceil(log2(max_ext))
-        let order = geometry::hilbert3d_order_for_cells(oct_points.len() as u64)
-            .max(order_ext)
+        // Elements are finer than voxels: a tensor packs many weights into each
+        // bbox voxel. Give the cube several extra bits over the box extent so
+        // those sub-voxel elements land in distinct cells (toward one point per
+        // weight) instead of colliding back down to the bounded grid.
+        let order = (order_ext + 4)
+            .max(geometry::hilbert3d_order_for_cells(oct_points.len() as u64))
             .clamp(1, POINT_ORDER_CAP);
         let oct = octree::build_from_normalized_points(&oct_points, order, octree::POINT_GRID_LOG2);
         (!oct.records.is_empty()).then_some(oct)

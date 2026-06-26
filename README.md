@@ -73,11 +73,13 @@ Like the 2D viewer, the 3D bundle loads Three.js from a CDN and fetches its data
 
 The 3D mode is scoped for incremental delivery. Shipped so far: **octree
 level-of-detail streaming** for the point cloud (above) — exact drill-down up
-to the `--point-budget`, streamed on demand. Still deferred:
+to the `--point-budget`, streamed on demand — for both the raw byte cloud
+**and structured layouts** (a `VoxelRenderer` can emit per-element points via
+`point_weight` + `render_points`, so e.g. modelweightvis's arch view refines
+toward individual weights). Still deferred:
 
 - **Bricked sparse-voxel streaming** for the *volume* mode (GigaVoxels-style page table + brick pool with empty-space skipping), so the ray-marched volume drills past a single bounded grid too.
 - **WebGPU compute-shader rendering** (software point rasterization) for far higher on-screen point counts.
-- **Structured-layout LOD** (e.g. modelweightvis): per-tensor streaming + a `VoxelRenderer` drill-down seam, so the model-weights view refines toward individual weights.
 - **3D file-boundary overlays** and an **interactive transfer-function editor** with a density histogram.
 
 ## Supported input formats

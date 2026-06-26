@@ -152,10 +152,20 @@ pub async fn render_volume(
     std::fs::write(out_dir.join("volume.bin"), &built.volume_rgba)?;
     std::fs::write(out_dir.join("points.bin"), &built.points_buf)?;
 
-    // Coarse occupancy mip for empty-space skipping in the volume ray-march.
-    let (occ, occ_extent) =
-        encode::occupancy_from_rgba(&built.volume_rgba, actual_extent, encode::MACRO_CELL);
-    std::fs::write(out_dir.join("occupancy.bin"), &occ)?;
+    // Sparse brick pool + page table the volume ray-march renders from
+    // (GigaVoxels-style indirection — only occupied bricks, empty ones leapt).
+    // The dense volume.bin above stays for CPU-side histograms + pick.
+    let bricks = brick::build_brick_volume(&built.volume_rgba, actual_extent, brick::BRICK);
+    std::fs::write(out_dir.join("bricks.bin"), &bricks.atlas)?;
+    std::fs::write(out_dir.join("pagetable.bin"), &bricks.page_table)?;
+    let brick_meta = encode::BrickVolumeMeta {
+        atlas_file: "bricks.bin".to_string(),
+        page_file: "pagetable.bin".to_string(),
+        brick: brick::BRICK,
+        page_dim: bricks.page_dim,
+        atlas_dim: bricks.atlas_dim,
+        occupied: bricks.occupied,
+    };
 
     // Streamed point-LOD octree (byte floor): two extra files alongside the
     // wholesale points.bin, which stays as the file://-friendly fallback. The
@@ -196,8 +206,7 @@ pub async fn render_volume(
         manifest,
         format_version: 2,
         point_octree: point_octree_meta,
-        occupancy_extent: Some(occ_extent),
-        macro_cell: Some(encode::MACRO_CELL),
+        bricks: Some(brick_meta),
     };
     std::fs::write(out_dir.join("meta.json"), serde_json::to_vec(&meta)?)?;
     std::fs::write(

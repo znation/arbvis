@@ -198,15 +198,16 @@ const volVert = `
 const volFrag = `
   precision highp float;
   precision highp sampler3D;
-  uniform sampler3D uVolume;
+  uniform sampler3D uBricks;      // brick-pool atlas (RGBA8)
+  uniform sampler3D uPageTable;   // page table (RGBA8): 1-based atlas slot in R,G,B; 0 = empty
   uniform sampler2D uLut;
-  uniform float uOpacity, uGamma, uThreshold, uNorm;
-  uniform int uSource, uSteps, uDirectColor, uUseOcc;
+  uniform float uOpacity, uGamma, uThreshold, uNorm, uBrick;
+  uniform int uSource, uSteps, uDirectColor;
   // Box world size per axis (longest axis = 1; isotropic cube = vec3(1)).
   uniform vec3 uSize;
-  // Coarse occupancy mip + its [x,y,z] cell dims, for empty-space leaping.
-  uniform sampler3D uOccupancy;
-  uniform vec3 uOccExtent;
+  uniform vec3 uVolDim;       // volume voxel dims [ex,ey,ez]
+  uniform vec3 uPageDim;      // page-table dims (bricks per axis)
+  uniform vec3 uAtlasBricks;  // atlas size in bricks per axis
   in vec3 vOrigin;
   in vec3 vDirection;
   out vec4 fragColor;
@@ -220,6 +221,22 @@ const volFrag = `
     return vec2(max(tmin.x, max(tmin.y, tmin.z)), min(tmax.x, min(tmax.y, tmax.z)));
   }
 
+  // 1-based atlas slot of the brick at the given page cell (0 = empty brick).
+  uint pageSlot(vec3 cell) {
+    vec3 c = texture(uPageTable, (cell + 0.5) / uPageDim).rgb;
+    return uint(c.r * 255.0 + 0.5) + (uint(c.g * 255.0 + 0.5) << 8u) + (uint(c.b * 255.0 + 0.5) << 16u);
+  }
+
+  // Sample the brick-pool atlas at a volume voxel position, for the brick slot.
+  vec4 sampleBrick(uint slot, vec3 posVox) {
+    uint s = slot - 1u;
+    uint axb = uint(uAtlasBricks.x), ayb = uint(uAtlasBricks.y);
+    vec3 sb = vec3(float(s % axb), float((s / axb) % ayb), float(s / (axb * ayb)));
+    vec3 local = posVox - floor(posVox / uBrick) * uBrick;   // in [0, brick)
+    vec3 atlasVox = sb * uBrick + local;
+    return texture(uBricks, (atlasVox + 0.5) / (uAtlasBricks * uBrick));
+  }
+
   void main() {
     vec3 dir = normalize(vDirection);
     vec2 bounds = hitBox(vOrigin, dir);
@@ -228,22 +245,24 @@ const volFrag = `
     float stepLen = (bounds.y - t) / float(uSteps);
     float denom = max(1e-4, 1.0 - uThreshold);
     vec4 acc = vec4(0.0);
-    // March in ray parameter t. Occupied regions step at stepLen; empty
-    // macro-cells (per the occupancy mip) are leapt to their far boundary, so
-    // the step budget concentrates where there's actually data.
+    // March in ray parameter t through the page table: occupied bricks step at
+    // stepLen and sample the atlas; empty bricks are leapt to their far
+    // boundary, so the step budget concentrates where there's actually data.
     for (int i = 0; i < 1024; i++) {
       if (t >= bounds.y) break;
       vec3 uvw = (vOrigin + t * dir) / uSize + 0.5;
-      if (uUseOcc == 1 && texture(uOccupancy, uvw).r < 0.5) {
-        // Empty cell → jump to its exit boundary (always advancing ≥ one step).
-        vec3 cell = floor(uvw * uOccExtent);
-        vec3 nb = (cell + step(0.0, dir)) / uOccExtent;  // next cell boundary (uvw)
-        vec3 tb = ((nb - 0.5) * uSize - vOrigin) / dir;  // → ray t at each axis plane
+      vec3 posVox = uvw * uVolDim;
+      vec3 cell = floor(posVox / uBrick);
+      uint slot = pageSlot(cell);
+      if (slot == 0u) {
+        // Empty brick → jump to its exit boundary (always advancing ≥ one step).
+        vec3 nb = (cell + step(0.0, dir)) * uBrick / uVolDim;  // next brick boundary (uvw)
+        vec3 tb = ((nb - 0.5) * uSize - vOrigin) / dir;        // → ray t at each axis plane
         float tnext = min(tb.x, min(tb.y, tb.z));
         t = max(tnext, t + stepLen) + 1e-4;
         continue;
       }
-      vec4 vox = texture(uVolume, uvw);
+      vec4 vox = sampleBrick(slot, posVox);
       if (vox.a > 0.0) {
         // "rgb" (structured) mode: RGB is final baked color, A the opacity
         // weight. "lut" (byte) mode: R indexes the LUT, G/B are the opacity
@@ -375,19 +394,12 @@ async function load() {
   const size = [ex / mx, ey / mx, ez / mx];
   directColor = meta.color_mode === 'rgb';
 
-  // The volume uploads as a 3D texture sized [ex, ey, ez]; its largest axis is
-  // the binding constraint. WebGL2 only guarantees MAX_3D_TEXTURE_SIZE ≥ 256,
-  // and many GPUs cap at 1024 — so a large --grid can exceed what this device
-  // can allocate. Check up front and fail with a clear message instead of a
-  // cryptic GL allocation error.
+  // The volume renders from a sparse brick pool indexed by a page table
+  // (meta.bricks): only occupied bricks are stored, so the GPU binding
+  // constraint is the atlas, not the full cube. The dense volume.bin is fetched
+  // only for CPU-side histograms + pick (never uploaded to the GPU).
   const gl = renderer.getContext();
   const maxSide = gl.getParameter(gl.MAX_3D_TEXTURE_SIZE);
-  if (mx > maxSide) {
-    throw new Error(
-      'grid resolution ' + mx + ' exceeds the max 3D texture size this GPU ' +
-      'supports (' + maxSide + '). Re-run arbvis with --grid ' + maxSide +
-      ' or lower.');
-  }
 
   // byte->color LUT as a 256x1 texture
   const lut = new Uint8Array(256 * 4);
@@ -399,46 +411,44 @@ async function load() {
   lutTex.minFilter = lutTex.magFilter = THREE.NearestFilter;
   lutTex.needsUpdate = true;
 
-  // volume RGBA8 -> Data3DTexture
+  // Dense volume buffer: CPU only (threshold histograms + click/hover pick).
   const volBuf = new Uint8Array(await (await fetch('volume.bin')).arrayBuffer());
-  const volTex = new THREE.Data3DTexture(volBuf, ex, ey, ez);
-  volTex.format = THREE.RGBAFormat;
-  volTex.type = THREE.UnsignedByteType;
-  volTex.minFilter = volTex.magFilter = THREE.LinearFilter;
-  volTex.wrapS = volTex.wrapT = volTex.wrapR = THREE.ClampToEdgeWrapping;
-  volTex.unpackAlignment = 1;
-  volTex.needsUpdate = true;
   buildHistograms(volBuf);
 
-  // Coarse occupancy mip for empty-space leaping (format_version >= 2). One R8
-  // texel per macro-cell; the shader jumps over cells with no occupied voxel.
-  // A 1³ dummy keeps the sampler bound when a bundle ships no occupancy.
-  let occExtent = [1, 1, 1], useOcc = 0;
-  let occBuf = new Uint8Array([0]);
-  if (meta.occupancy_extent) {
-    occExtent = meta.occupancy_extent;
-    occBuf = new Uint8Array(await (await fetch('occupancy.bin')).arrayBuffer());
-    useOcc = 1;
+  // Page table + brick-pool atlas (nearest filtering — no apron in v1).
+  const bm = meta.bricks;
+  const atlasMax = Math.max(bm.atlas_dim[0], bm.atlas_dim[1], bm.atlas_dim[2]);
+  if (atlasMax > maxSide) {
+    throw new Error(
+      'brick atlas size ' + atlasMax + ' exceeds the max 3D texture size this ' +
+      'GPU supports (' + maxSide + '). Re-run arbvis with a lower --grid.');
   }
-  const occTex = new THREE.Data3DTexture(occBuf, occExtent[0], occExtent[1], occExtent[2]);
-  occTex.format = THREE.RedFormat;
-  occTex.type = THREE.UnsignedByteType;
-  occTex.minFilter = occTex.magFilter = THREE.NearestFilter;
-  occTex.wrapS = occTex.wrapT = occTex.wrapR = THREE.ClampToEdgeWrapping;
-  occTex.unpackAlignment = 1;
-  occTex.needsUpdate = true;
+  const make3d = (buf, w, h, d) => {
+    const t = new THREE.Data3DTexture(buf, w, h, d);
+    t.format = THREE.RGBAFormat; t.type = THREE.UnsignedByteType;
+    t.minFilter = t.magFilter = THREE.NearestFilter;
+    t.wrapS = t.wrapT = t.wrapR = THREE.ClampToEdgeWrapping;
+    t.unpackAlignment = 1; t.needsUpdate = true;
+    return t;
+  };
+  const pageBuf = new Uint8Array(await (await fetch(bm.page_file)).arrayBuffer());
+  const pageTex = make3d(pageBuf, bm.page_dim[0], bm.page_dim[1], bm.page_dim[2]);
+  const brickBuf = new Uint8Array(await (await fetch(bm.atlas_file)).arrayBuffer());
+  const brickTex = make3d(brickBuf, bm.atlas_dim[0], bm.atlas_dim[1], bm.atlas_dim[2]);
 
   const volMat = new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
     side: THREE.BackSide, transparent: true, depthWrite: false,
     uniforms: {
-      uVolume: { value: volTex }, uLut: { value: lutTex },
+      uBricks: { value: brickTex }, uPageTable: { value: pageTex }, uLut: { value: lutTex },
       uOpacity: { value: 0.2 }, uGamma: { value: 1.0 },
       uThreshold: { value: 0.0 }, uSource: { value: 0 }, uSteps: { value: 192 },
       uNorm: { value: 1.0 }, uDirectColor: { value: directColor ? 1 : 0 },
       uSize: { value: new THREE.Vector3(size[0], size[1], size[2]) },
-      uUseOcc: { value: useOcc }, uOccupancy: { value: occTex },
-      uOccExtent: { value: new THREE.Vector3(occExtent[0], occExtent[1], occExtent[2]) },
+      uVolDim: { value: new THREE.Vector3(ex, ey, ez) },
+      uPageDim: { value: new THREE.Vector3(bm.page_dim[0], bm.page_dim[1], bm.page_dim[2]) },
+      uAtlasBricks: { value: new THREE.Vector3(bm.atlas_dim[0] / bm.brick, bm.atlas_dim[1] / bm.brick, bm.atlas_dim[2] / bm.brick) },
+      uBrick: { value: bm.brick },
     },
     vertexShader: volVert, fragmentShader: volFrag,
   });

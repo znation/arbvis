@@ -15,13 +15,6 @@
 //! bounded by the dense grid's resolution and never out-of-cores). Building the
 //! pool directly from a *sparse* accumulator at higher virtual resolution — to
 //! exceed the dense grid entirely — is the natural next step on this format.
-//!
-//! NOTE: this builder is exercised by its tests but not yet wired into
-//! `render_volume` — the viewer migration (rendering from the brick pool via
-//! page-table indirection, replacing the dense texture + occupancy mip) is the
-//! next increment. `allow(dead_code)` keeps the lib build warning-free until
-//! then; remove it when `render_volume` emits the pool.
-#![allow(dead_code)]
 
 /// Brick edge in voxels. `8³ = 512` voxels = 2 KiB RGBA8 per brick — a good
 /// granularity for both empty-space skipping and the atlas.
@@ -45,7 +38,9 @@ pub struct BrickVolume {
 }
 
 impl BrickVolume {
-    /// Atlas size in bricks per axis (`atlas_dim / BRICK`).
+    /// Atlas size in bricks per axis (`atlas_dim / BRICK`). The viewer derives
+    /// this in JS; here it backs the format tests.
+    #[cfg(test)]
     pub fn atlas_bricks(&self) -> [u32; 3] {
         [
             self.atlas_dim[0] / BRICK,

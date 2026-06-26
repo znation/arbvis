@@ -65,14 +65,30 @@ pub struct VolumeMeta {
     /// back to the wholesale `points.bin`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub point_octree: Option<PointOctreeMeta>,
-    /// Coarse occupancy mip dimensions `[x, y, z]` (one cell per `macro_cell³`
-    /// block of the volume): cell = 255 if any voxel under it is occupied, else
-    /// 0. The ray-march leaps empty cells. Absent ⇒ no empty-space skipping.
+    /// Sparse brick pool + page table the volume ray-march renders from
+    /// (GigaVoxels-style indirection, replacing the dense full-cube texture and
+    /// the occupancy mip). Absent ⇒ the viewer renders the dense `volume.bin`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub occupancy_extent: Option<[u32; 3]>,
-    /// Edge length (in voxels) of an occupancy macro-cell.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub macro_cell: Option<u32>,
+    pub bricks: Option<BrickVolumeMeta>,
+}
+
+/// Descriptor for the sparse brick pool + page table (see [`super::brick`]).
+/// The volume ray-march reads `page_file` to leap empty bricks and to find the
+/// `atlas_file` texels for occupied ones.
+#[derive(Serialize)]
+pub struct BrickVolumeMeta {
+    /// Brick-pool atlas, RGBA8, `atlas_dim` voxels.
+    pub atlas_file: String,
+    /// Page table, RGBA8, `page_dim` cells (1-based atlas slot in R,G,B).
+    pub page_file: String,
+    /// Brick edge in voxels.
+    pub brick: u32,
+    /// Page-table dims in bricks `[x, y, z]` (`ceil(grid_extent / brick)`).
+    pub page_dim: [u32; 3],
+    /// Atlas dims in voxels `[x, y, z]` (each a multiple of `brick`).
+    pub atlas_dim: [u32; 3],
+    /// Number of occupied bricks (atlas slots used).
+    pub occupied: u32,
 }
 
 /// Descriptor for the streamed point-LOD octree (the 3D analog of the 2D tile
@@ -167,58 +183,3 @@ pub fn luma_lut(pixel_lut: &[Rgb<u8>; 256]) -> [u16; 256] {
     out
 }
 
-/// Default occupancy macro-cell edge (voxels). Each cell of the occupancy mip
-/// covers an `m³` block; the ray-march leaps cells with no occupied voxel.
-pub const MACRO_CELL: u32 = 8;
-
-/// Build the coarse occupancy mip from a finished RGBA8 volume: one `u8` per
-/// `m³` macro-cell, `255` if any voxel under it is occupied (`a > 0`), else `0`.
-/// Conservative (any occupied voxel ⇒ the whole cell is kept), so the
-/// empty-space leap never skips real data. Works for both the byte (`lut`) and
-/// structured (`rgb`) paths since both encode emptiness as `a == 0`. Returns
-/// the buffer (x-fastest, like the volume) and its `[x, y, z]` dimensions.
-pub fn occupancy_from_rgba(rgba: &[u8], extent: [u32; 3], m: u32) -> (Vec<u8>, [u32; 3]) {
-    let [ex, ey, ez] = extent;
-    let (ox, oy, oz) = (ex.div_ceil(m), ey.div_ceil(m), ez.div_ceil(m));
-    let mut occ = vec![0u8; (ox as usize) * (oy as usize) * (oz as usize)];
-    let (ex_s, ey_s, ox_s, oy_s) = (ex as usize, ey as usize, ox as usize, oy as usize);
-    for z in 0..ez {
-        for y in 0..ey {
-            for x in 0..ex {
-                let a = rgba[((x as usize + y as usize * ex_s + z as usize * ex_s * ey_s) * 4) + 3];
-                if a > 0 {
-                    let (cx, cy, cz) = ((x / m) as usize, (y / m) as usize, (z / m) as usize);
-                    occ[cx + cy * ox_s + cz * ox_s * oy_s] = 255;
-                }
-            }
-        }
-    }
-    (occ, [ox, oy, oz])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Occupancy is conservative: a macro-cell reads 255 iff *any* voxel under
-    /// it is occupied (`a > 0`), so the empty-space leap never skips real data.
-    #[test]
-    fn occupancy_is_conservative() {
-        let ext = [4u32, 4, 4];
-        let mut rgba = vec![0u8; 4 * 4 * 4 * 4];
-        // One occupied voxel at (1, 0, 0) → only macro-cell (0, 0, 0) is kept.
-        rgba[(1usize + 0 * 4 + 0 * 16) * 4 + 3] = 200;
-        let (occ, oe) = occupancy_from_rgba(&rgba, ext, 2);
-        assert_eq!(oe, [2, 2, 2], "ceil(4/2) per axis");
-        assert_eq!(occ.len(), 8);
-        assert_eq!(occ[0], 255, "cell containing the occupied voxel");
-        assert_eq!(occ.iter().filter(|&&v| v == 255).count(), 1, "only that cell");
-    }
-
-    /// Anisotropic + non-divisible extents round up (`div_ceil`).
-    #[test]
-    fn occupancy_dims_round_up() {
-        let (_, oe) = occupancy_from_rgba(&vec![0u8; 7 * 3 * 5 * 4], [7, 3, 5], 4);
-        assert_eq!(oe, [2, 1, 2]); // ceil(7/4), ceil(3/4), ceil(5/4)
-    }
-}

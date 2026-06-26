@@ -57,6 +57,34 @@ pub struct VolumeMeta {
     /// floor). The viewer builds invisible pick boxes from these so a click can
     /// name the tensor under the cursor.
     pub manifest: Vec<super::shape::VolumeLabel>,
+    /// Bundle format version. Absent/`1` ⇒ wholesale only (the original
+    /// bundle). `2` ⇒ also ships a streamed point-LOD octree (`point_octree`).
+    pub format_version: u32,
+    /// Streamed point-LOD octree descriptor; absent on wholesale-only bundles
+    /// (older bundles, structured layouts, tiny inputs) so the viewer falls
+    /// back to the wholesale `points.bin`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub point_octree: Option<PointOctreeMeta>,
+}
+
+/// Descriptor for the streamed point-LOD octree (the 3D analog of the 2D tile
+/// pyramid). The viewer fetches `hierarchy_file` once, rebuilds the implicit
+/// octree, then range-fetches node blocks from `data_file` on demand as the
+/// camera refines — converging to one point per byte when zoomed in.
+#[derive(Serialize)]
+pub struct PointOctreeMeta {
+    /// Concatenated per-node point blocks (each: 3 local coords + RGBA8).
+    pub data_file: String,
+    /// Fixed-size [`super::octree::NodeRecord`]s, `record_size` bytes each.
+    pub hierarchy_file: String,
+    pub record_size: u32,
+    pub node_count: u64,
+    /// Hilbert order `P`: the virtual point grid is `2^P` per axis.
+    pub order: u32,
+    /// Occupancy-grid exponent used per node (node cap = `(2^grid_log2)³`).
+    pub grid_log2: u32,
+    /// Total stored (post-LOD) points across all nodes.
+    pub total_points: u64,
 }
 
 /// Convert the accumulated grid into the RGBA8 texel buffer.

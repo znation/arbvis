@@ -15,6 +15,7 @@
 
 pub mod encode;
 pub mod html;
+pub mod octree;
 pub mod shape;
 pub mod voxel;
 
@@ -54,6 +55,9 @@ struct BuildResult {
     max_count: u64,
     focus_center: [f32; 3],
     focus_radius: f32,
+    /// Streamed point-LOD octree (byte floor only); `None` for the structured
+    /// path, which keeps the wholesale `points.bin`.
+    point_octree: Option<octree::PointOctree>,
 }
 
 /// Render the 3D viewer bundle for `sources` into `out_dir`.
@@ -143,6 +147,28 @@ pub async fn render_volume(
     std::fs::write(out_dir.join("volume.bin"), &built.volume_rgba)?;
     std::fs::write(out_dir.join("points.bin"), &built.points_buf)?;
 
+    // Streamed point-LOD octree (byte floor): two extra files alongside the
+    // wholesale points.bin, which stays as the file://-friendly fallback. The
+    // viewer prefers the octree when `meta.point_octree` is present.
+    let point_octree_meta = if let Some(oct) = &built.point_octree {
+        std::fs::write(out_dir.join("points_octree.bin"), &oct.data)?;
+        std::fs::write(
+            out_dir.join("points_hierarchy.bin"),
+            oct.serialize_hierarchy(),
+        )?;
+        Some(encode::PointOctreeMeta {
+            data_file: "points_octree.bin".to_string(),
+            hierarchy_file: "points_hierarchy.bin".to_string(),
+            record_size: octree::RECORD_SIZE as u32,
+            node_count: oct.records.len() as u64,
+            order: oct.order,
+            grid_log2: octree::POINT_GRID_LOG2,
+            total_points: oct.total_points(),
+        })
+    } else {
+        None
+    };
+
     let meta = VolumeMeta {
         title: title.to_string(),
         brand_name: branding.name.to_string(),
@@ -158,6 +184,8 @@ pub async fn render_volume(
         focus_radius: built.focus_radius,
         lut: pixel_lut.iter().map(|c| c.0).collect(),
         manifest,
+        format_version: 2,
+        point_octree: point_octree_meta,
     };
     std::fs::write(out_dir.join("meta.json"), serde_json::to_vec(&meta)?)?;
     std::fs::write(
@@ -165,10 +193,17 @@ pub async fn render_volume(
         html::build_volume_html(title, inputs, branding),
     )?;
 
+    let (nodes, dropped) = built
+        .point_octree
+        .as_ref()
+        .map(|o| (o.records.len(), o.dropped))
+        .unwrap_or((0, 0));
     log::info!(
-        "3D viewer bundle written to {} ({} points)",
+        "3D viewer bundle written to {} ({} points, {} octree nodes, {} duplicate points dropped)",
         out_dir.display(),
-        built.points_count
+        built.points_count,
+        nodes,
+        dropped
     );
     Ok(())
 }
@@ -242,6 +277,11 @@ fn aggregate_bytes_hilbert(
     let mut positions: Vec<f32> = Vec::new();
     let mut colors: Vec<u8> = Vec::new();
     let mut next_point_g: u64 = 0;
+    // Organize the same sampled points into a streamed LOD octree (the 3D analog
+    // of the 2D tile pyramid). It shares the point grid (`point_order`) with the
+    // flat cloud, so its coordinates match; the viewer streams its nodes on
+    // demand and falls back to the wholesale `points.bin` when absent.
+    let mut octree_builder = octree::PointOctreeBuilder::new(point_order, octree::POINT_GRID_LOG2);
 
     // First byte not belonging to cell `c`. Two regimes: when the cube can't
     // hold every byte (`total > cells`) each cell aggregates a contiguous byte
@@ -308,6 +348,7 @@ fn aggregate_bytes_hilbert(
                     let c = pixel_lut[b as usize].0;
                     let a = c[0].max(c[1]).max(c[2]); // 0x00 → transparent
                     colors.extend_from_slice(&[c[0], c[1], c[2], a]);
+                    octree_builder.push(cp, [c[0], c[1], c[2], a]);
                     next_point_g += stride;
                 }
             }
@@ -325,6 +366,8 @@ fn aggregate_bytes_hilbert(
     let volume_rgba = encode::grid_to_rgba(&grid, max_count);
     let points_count = positions.len() as u64 / 3;
     let points_buf = encode::pack_points(&positions, &colors);
+    let octree = octree_builder.finish();
+    let point_octree = (!octree.records.is_empty()).then_some(octree);
 
     Ok(BuildResult {
         volume_rgba,
@@ -333,6 +376,7 @@ fn aggregate_bytes_hilbert(
         max_count,
         focus_center,
         focus_radius,
+        point_octree,
     })
 }
 
@@ -416,6 +460,9 @@ fn aggregate_entities(
         max_count: 0,
         focus_center,
         focus_radius,
+        // Structured layouts keep the wholesale points.bin (not a Hilbert
+        // linearization); LOD for them is the entity/render_node path.
+        point_octree: None,
     })
 }
 
@@ -613,6 +660,74 @@ mod tests {
         );
         assert!(dir.path().join("points.bin").exists());
         assert!(dir.path().join("index.html").exists());
+    }
+
+    /// The byte floor must also emit a well-formed streamed point-LOD octree:
+    /// `meta.point_octree` present, the two files sized to match the hierarchy
+    /// records, and (with enough points to overflow the root) a multi-node tree
+    /// whose blocks exactly tile the data file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn emits_streamed_point_octree() {
+        // 200 KB ≫ the root capacity (32³ = 32768) ⇒ the octree must subdivide.
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i * 31 + 7) as u8).collect();
+        let total = bytes.len() as u64;
+        let dir = tempfile::tempdir().unwrap();
+        render_volume(
+            vec![buffered(bytes)],
+            total,
+            dir.path().to_path_buf(),
+            "test",
+            &[],
+            false,
+            8, // small grid ⇒ point grid finer than the voxel grid
+            LayoutMode::Auto,
+            &Registry::with_defaults(),
+            &Branding::default(),
+        )
+        .await
+        .unwrap();
+
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta["format_version"], 2, "byte floor ships format v2");
+        let po = &meta["point_octree"];
+        assert!(po.is_object(), "point_octree descriptor present");
+        assert_eq!(po["record_size"], octree::RECORD_SIZE as u64);
+        let node_count = po["node_count"].as_u64().unwrap();
+        assert!(node_count > 1, "200 KB overflows the root into a tree, got {node_count}");
+        assert_eq!(
+            po["total_points"], meta["points"],
+            "every sampled point lands in the octree exactly once"
+        );
+
+        // Hierarchy file is fixed-size records; data file is the node blocks.
+        let hier = std::fs::read(dir.path().join("points_hierarchy.bin")).unwrap();
+        let data = std::fs::read(dir.path().join("points_octree.bin")).unwrap();
+        assert_eq!(hier.len() as u64, node_count * octree::RECORD_SIZE as u64);
+
+        // Records must tile the data file exactly: every byte covered once.
+        let mut covered = 0u64;
+        let mut depths = std::collections::BTreeSet::new();
+        for chunk in hier.chunks_exact(octree::RECORD_SIZE) {
+            let r = octree::NodeRecord::read_le(chunk);
+            assert!(
+                r.byte_offset + r.byte_length as u64 <= data.len() as u64,
+                "record block out of bounds"
+            );
+            assert_eq!(
+                r.byte_length as usize,
+                r.point_count as usize * r.stride(),
+                "block length matches point count × stride"
+            );
+            covered += r.byte_length as u64;
+            depths.insert(r.depth);
+        }
+        assert_eq!(covered, data.len() as u64, "node blocks tile the data file");
+        assert!(depths.contains(&0), "a root node exists");
+        assert!(depths.len() > 1, "multiple LOD levels present");
+
+        // The wholesale fallback is still emitted.
+        assert!(dir.path().join("points.bin").exists());
     }
 
     // A structured VolumeShape whose single entity paints a 4³ box; its

@@ -228,6 +228,29 @@ pub fn hilbert_d2xyz(h: u64, bits: u32) -> [u32; N3] {
     x
 }
 
+/// Min-corner voxel origin of the octree node that owns the contiguous 3D
+/// Hilbert range `[node_idx · 8^(order-depth), (node_idx+1) · 8^(order-depth))`
+/// on a `2^order` cube.
+///
+/// The 3D Hilbert curve fills each octree sub-cube completely before moving to
+/// the next, so a contiguous index range whose length is a power of eight is
+/// **exactly an axis-aligned sub-cube** of side `2^(order-depth)` — this is the
+/// property the octree LOD is built on. The cube's min corner is the range's
+/// entry voxel (`hilbert_d2xyz` of the first distance) floored to the node-side
+/// grid. `depth ∈ [0, order]`, `node_idx < 8^depth`.
+pub fn hilbert3d_node_origin(node_idx: u64, depth: u32, order: u32) -> [u32; 3] {
+    debug_assert!((1..=21).contains(&order));
+    debug_assert!(depth <= order);
+    let shift = 3 * (order - depth);
+    // First Hilbert distance in the node's range. `node_idx < 8^depth`, so
+    // `node_idx << shift < 8^order = 2^(3·order) ≤ 2^63` for `order ≤ 21`.
+    let h0 = node_idx << shift;
+    let v = hilbert_d2xyz(h0, order);
+    let side = 1u32 << (order - depth); // node cube side in voxels (power of two)
+    let mask = !(side - 1); // floor each coord to a multiple of `side`
+    [v[0] & mask, v[1] & mask, v[2] & mask]
+}
+
 /// 3D Hilbert curve: map cube coordinates `(x, y, z)`, each in `[0, 2^bits)`,
 /// to the 1D distance along the curve. Inverse of [`hilbert_d2xyz`].
 ///
@@ -443,6 +466,50 @@ mod tests {
                     "roundtrip failed h={h} bits={bits}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_hilbert3d_node_origin_nesting() {
+        // The defining octree property: every distance in a node's contiguous
+        // Hilbert range maps to a voxel inside that node's axis-aligned cube
+        // `[origin, origin + side)`. Verify exhaustively across all depths/nodes
+        // for small orders.
+        for order in 1..=4u32 {
+            for depth in 0..=order {
+                let nodes = 1u64 << (3 * depth); // 8^depth
+                let range = 1u64 << (3 * (order - depth)); // 8^(order-depth)
+                let side = 1u32 << (order - depth);
+                for node_idx in 0..nodes {
+                    let o = hilbert3d_node_origin(node_idx, depth, order);
+                    // Origin must be aligned to the node-side grid.
+                    assert!(
+                        o.iter().all(|&c| c % side == 0),
+                        "origin {o:?} not aligned to side {side} (order={order} depth={depth} idx={node_idx})"
+                    );
+                    for h in (node_idx * range)..((node_idx + 1) * range) {
+                        let v = hilbert_d2xyz(h, order);
+                        for a in 0..3 {
+                            assert!(
+                                v[a] >= o[a] && v[a] < o[a] + side,
+                                "h={h} voxel {v:?} escaped node cube origin {o:?} side {side} \
+                                 (order={order} depth={depth} idx={node_idx})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_hilbert3d_node_origin_root_and_leaf() {
+        for order in 1..=8u32 {
+            // Root cube starts at the origin.
+            assert_eq!(hilbert3d_node_origin(0, 0, order), [0, 0, 0]);
+            // A depth==order node is a single voxel == its Hilbert distance.
+            let last = (1u64 << (3 * order)) - 1;
+            assert_eq!(hilbert3d_node_origin(last, order, order), hilbert_d2xyz(last, order));
         }
     }
 }

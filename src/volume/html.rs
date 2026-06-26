@@ -537,9 +537,11 @@ async function load() {
 // from points_octree.bin only when the camera refines into it. Points are laid
 // in normalized [0,1] coords inside a Group whose transform centers the unit
 // box (matching the volume mesh), so the two views register exactly.
-const OCT_REFINE_PX = 220;     // refine a node when its on-screen diameter exceeds this
-const OCT_BUDGET = 3_000_000;  // cap on points drawn per frame
-const OCT_MAX_INFLIGHT = 8;    // concurrent range fetches
+const OCT_REFINE_PX = 220;      // refine a node when its on-screen diameter exceeds this
+const OCT_BUDGET = 3_000_000;   // cap on points drawn per frame
+const OCT_MAX_INFLIGHT = 8;     // concurrent range fetches
+const OCT_RESIDENT_CAP = 8_000_000; // max points kept resident on the GPU (LRU-evicted)
+const octDebug = location.search.includes('debug'); // log octree stats per pass
 
 // Parse points_hierarchy.bin into nodes and rebuild the tree spatially: a
 // node's parent is the depth-1 node whose cube contains it (origin floored to
@@ -579,7 +581,8 @@ function setupOctree(po, size, material) {
     group.position.set(-size[0] / 2, -size[1] / 2, -size[2] / 2);
     group.visible = false;
     scene.add(group);
-    octree = { order, span, root, nodes, group, material, dataUrl: po.data_file, size, inflight: 0 };
+    octree = { order, span, root, nodes, group, material, dataUrl: po.data_file, size,
+               inflight: 0, residentPoints: 0, frame: 0 };
     octreeDirty = true;
   }).catch((e) => console.error('octree hierarchy load failed', e));
 }
@@ -626,6 +629,8 @@ function loadNode(node) {
       }
       node.buf = new Uint8Array(buf);
       node.obj = makeNodePoints(node);
+      node.lastUsed = octree.frame;
+      octree.residentPoints += node.pointCount;
       octree.group.add(node.obj);
       octreeDirty = true; // a new node arrived — re-evaluate the visible cut
     }))
@@ -640,6 +645,7 @@ function loadNode(node) {
 const _oBox = new THREE.Box3(), _oCenter = new THREE.Vector3();
 function octreeUpdate() {
   if (!octree || !octree.root || !pointsActive) return;
+  octree.frame++;
   camera.updateMatrixWorld();
   const m = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
   const frustum = new THREE.Frustum().setFromProjectionMatrix(m);
@@ -670,11 +676,31 @@ function octreeUpdate() {
   }
   for (const node of octree.nodes) {
     if (visible.has(node)) {
+      node.lastUsed = octree.frame;
       if (node.obj) node.obj.visible = true;
       else if (!node.loading && octree.inflight < OCT_MAX_INFLIGHT) loadNode(node);
     } else if (node.obj) {
       node.obj.visible = false;
     }
+  }
+
+  // Bounded-memory streaming: if resident points exceed the cap, evict the
+  // least-recently-used loaded nodes that aren't in the current cut (freeing
+  // their GPU geometry; they re-stream if revisited).
+  if (octree.residentPoints > OCT_RESIDENT_CAP) {
+    const evictable = octree.nodes
+      .filter((nd) => nd.obj && !visible.has(nd))
+      .sort((a, b) => a.lastUsed - b.lastUsed);
+    for (const nd of evictable) {
+      if (octree.residentPoints <= OCT_RESIDENT_CAP) break;
+      nd.obj.geometry.dispose();
+      octree.group.remove(nd.obj);
+      nd.obj = null;
+      octree.residentPoints -= nd.pointCount;
+    }
+  }
+  if (octDebug) {
+    console.log('octree: resident', octree.residentPoints, 'loaded', octree.group.children.length, 'cut', visible.size);
   }
 }
 

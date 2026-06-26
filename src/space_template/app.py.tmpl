@@ -1,10 +1,15 @@
 import os
-from fastapi import FastAPI, Response
+import re
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse
 from huggingface_hub import HfFileSystem
 from huggingface_hub.errors import EntryNotFoundError
 
 BUCKET_ID = "__BUCKET_ID__"
+
+# Single-range "bytes=start-end" (either bound optional). Multi-range requests
+# fall through to a normal 200 — the 3D viewer only issues single ranges.
+_RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 
 app = FastAPI()
 _fs = None
@@ -36,16 +41,55 @@ _MEDIA_TYPES = {
 
 # Serve any bundle asset from the backing bucket. This single catch-all covers
 # the 2D layout (tiles/<z>/<x>/<y>.<ext>, the multi-scene tiles/<scene>/...,
-# and labels.json) and the 3D bundle (volume.bin, points.bin, meta.json).
+# and labels.json) and the 3D bundle (volume.bin, points.bin, meta.json, and
+# the streamed point-octree files). HTTP Range is honored so the 3D viewer can
+# fetch one octree node at a time instead of the whole points_octree.bin —
+# range reads pull only the requested bytes from the Hub.
 @app.get("/{rest:path}")
-def asset(rest: str):
+def asset(rest: str, request: Request):
     if not rest or rest == "index.html":
         return FileResponse("index.html")
     path = f"hf://buckets/{BUCKET_ID}/{rest}"
+    ext = rest.rsplit(".", 1)[-1].lower() if "." in rest else ""
+    media_type = _MEDIA_TYPES.get(ext, "application/octet-stream")
+
+    range_header = request.headers.get("range")
+    m = _RANGE_RE.fullmatch(range_header.strip()) if range_header else None
+    if m:
+        try:
+            size = fs().size(path)
+        except (FileNotFoundError, EntryNotFoundError):
+            return Response(status_code=404)
+        start_s, end_s = m.group(1), m.group(2)
+        if start_s == "":
+            # Suffix range "bytes=-N": the last N bytes.
+            start = max(0, size - int(end_s)) if end_s else 0
+            end = size - 1
+        else:
+            start = int(start_s)
+            end = int(end_s) if end_s else size - 1
+        if start >= size or start > end:
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+        end = min(end, size - 1)
+        try:
+            with fs().open(path, "rb") as f:
+                f.seek(start)
+                chunk = f.read(end - start + 1)
+        except (FileNotFoundError, EntryNotFoundError):
+            return Response(status_code=404)
+        return Response(
+            content=chunk,
+            status_code=206,
+            media_type=media_type,
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(len(chunk)),
+            },
+        )
+
     try:
         data = fs().read_bytes(path)
     except (FileNotFoundError, EntryNotFoundError):
         return Response(status_code=404)
-    ext = rest.rsplit(".", 1)[-1].lower() if "." in rest else ""
-    media_type = _MEDIA_TYPES.get(ext, "application/octet-stream")
-    return Response(content=data, media_type=media_type)
+    return Response(content=data, media_type=media_type, headers={"Accept-Ranges": "bytes"})

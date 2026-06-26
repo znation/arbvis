@@ -13,6 +13,7 @@
 //! `--space`): `index.html`, `volume.bin` (RGBA8 `Data3DTexture` payload),
 //! `points.bin` (packed positions+colors), and `meta.json`.
 
+pub mod brick;
 pub mod encode;
 pub mod html;
 pub mod octree;

@@ -344,6 +344,11 @@ let volMesh = null, points = null;
 let volBufG = null, extG = [0, 0, 0], sizeG = [1, 1, 1], manifestG = [];
 const raycaster = new THREE.Raycaster();
 
+// Streamed point-LOD octree (format_version >= 2). Null when the bundle ships
+// only the wholesale points.bin. `ptMaterial` is the shared point material so
+// the size/opacity sliders drive both the flat cloud and every octree node.
+let octree = null, ptMaterial = null, pointsActive = false, octreeDirty = true;
+
 async function load() {
   const meta = await (await fetch('meta.json')).json();
   // Grid box in voxels. `grid_extent` is [x,y,z]; older bundles carried a
@@ -408,28 +413,38 @@ async function load() {
   // Match the orientation cube to the (possibly anisotropic) box.
   edges.scale.set(size[0], size[1], size[2]);
 
-  // point cloud
-  const n = meta.points | 0;
-  if (n > 0) {
-    const pBuf = await (await fetch('points.bin')).arrayBuffer();
-    const pos = new Float32Array(pBuf, 0, n * 3);
-    const col = new Uint8Array(pBuf, n * 12, n * 4);
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    geo.setAttribute('aColor', new THREE.BufferAttribute(col, 4, true));
-    const ptMat = new THREE.ShaderMaterial({
-      glslVersion: THREE.GLSL3,
-      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
-      uniforms: { uPointSize: { value: 1.6 }, uPointOpacity: { value: 0.4 } },
-      vertexShader: ptVert, fragmentShader: ptFrag,
-    });
-    points = new THREE.Points(geo, ptMat);
-    // [0,1]-per-axis coords -> centered box: scale by the world size, then
-    // shift so the box centers on the origin (a cube → scale 1, shift -0.5).
-    points.scale.set(size[0], size[1], size[2]);
-    points.position.set(-size[0] / 2, -size[1] / 2, -size[2] / 2);
-    points.visible = false;
-    scene.add(points);
+  // Point cloud. One shared material drives the size/opacity sliders for both
+  // the wholesale cloud and the streamed octree nodes.
+  const ptMat = new THREE.ShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    uniforms: { uPointSize: { value: 1.6 }, uPointOpacity: { value: 0.4 } },
+    vertexShader: ptVert, fragmentShader: ptFrag,
+  });
+  ptMaterial = ptMat;
+
+  if (meta.point_octree) {
+    // Streamed LOD octree (the 3D analog of the 2D tile pyramid): nodes are
+    // fetched on demand as the camera refines. See octreeUpdate().
+    setupOctree(meta.point_octree, size, ptMat);
+  } else {
+    // Wholesale fallback: one buffer, one draw.
+    const n = meta.points | 0;
+    if (n > 0) {
+      const pBuf = await (await fetch('points.bin')).arrayBuffer();
+      const pos = new Float32Array(pBuf, 0, n * 3);
+      const col = new Uint8Array(pBuf, n * 12, n * 4);
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      geo.setAttribute('aColor', new THREE.BufferAttribute(col, 4, true));
+      points = new THREE.Points(geo, ptMat);
+      // [0,1]-per-axis coords -> centered box: scale by the world size, then
+      // shift so the box centers on the origin (a cube → scale 1, shift -0.5).
+      points.scale.set(size[0], size[1], size[2]);
+      points.position.set(-size[0] / 2, -size[1] / 2, -size[2] / 2);
+      points.visible = false;
+      scene.add(points);
+    }
   }
 
   // Frame the camera on the occupied region (data often fills only part of
@@ -460,6 +475,153 @@ async function load() {
   $('status').hidden = true;
   $('panel').hidden = false;
   bindControls();
+}
+
+// ---- streamed point-LOD octree ----------------------------------------------
+// The 3D analog of the 2D Leaflet tile pyramid. The hierarchy index (one fixed
+// record per node) is fetched once; each node's point block is range-fetched
+// from points_octree.bin only when the camera refines into it. Points are laid
+// in normalized [0,1] coords inside a Group whose transform centers the unit
+// box (matching the volume mesh), so the two views register exactly.
+const OCT_REFINE_PX = 220;     // refine a node when its on-screen diameter exceeds this
+const OCT_BUDGET = 3_000_000;  // cap on points drawn per frame
+const OCT_MAX_INFLIGHT = 8;    // concurrent range fetches
+
+// Parse points_hierarchy.bin into nodes and rebuild the tree spatially: a
+// node's parent is the depth-1 node whose cube contains it (origin floored to
+// the parent's side grid) — no Hilbert math needed on the client.
+function setupOctree(po, size, material) {
+  const order = po.order, span = Math.pow(2, order);
+  fetch(po.hierarchy_file).then((r) => r.arrayBuffer()).then((hb) => {
+    const dv = new DataView(hb), REC = po.record_size;
+    const nrec = (hb.byteLength / REC) | 0;
+    const byKey = new Map(), nodes = [];
+    let root = null;
+    for (let i = 0; i < nrec; i++) {
+      const o = i * REC;
+      const node = {
+        byteOffset: Number(dv.getBigUint64(o + 8, true)),
+        byteLength: dv.getUint32(o + 16, true),
+        pointCount: dv.getUint32(o + 20, true),
+        origin: [dv.getUint32(o + 24, true), dv.getUint32(o + 28, true), dv.getUint32(o + 32, true)],
+        depth: dv.getUint8(o + 36),
+        coordBits: dv.getUint8(o + 38),
+        children: [], obj: null, loading: false,
+      };
+      node.side = Math.pow(2, order - node.depth);
+      nodes.push(node);
+      byKey.set(node.depth + ':' + node.origin.join(','), node);
+      if (node.depth === 0) root = node;
+    }
+    for (const node of nodes) {
+      if (node.depth === 0) continue;
+      const ps = node.side * 2;
+      const par = node.origin.map((c) => Math.floor(c / ps) * ps);
+      const parent = byKey.get((node.depth - 1) + ':' + par.join(','));
+      if (parent) parent.children.push(node);
+    }
+    const group = new THREE.Group();
+    group.scale.set(size[0], size[1], size[2]);
+    group.position.set(-size[0] / 2, -size[1] / 2, -size[2] / 2);
+    group.visible = false;
+    scene.add(group);
+    octree = { order, span, root, nodes, group, material, dataUrl: po.data_file, size, inflight: 0 };
+    octreeDirty = true;
+  }).catch((e) => console.error('octree hierarchy load failed', e));
+}
+
+// Decode a node's range-fetched block into a THREE.Points (normalized [0,1]
+// coords reconstructed from per-node-local quantized coords + the node origin).
+function makeNodePoints(node) {
+  const n = node.pointCount, span = octree.span, o = node.origin, side = node.side;
+  const cb = node.coordBits, stride = 3 * (cb / 8) + 4;
+  const dv = new DataView(node.buf.buffer, node.buf.byteOffset, node.buf.byteLength);
+  const pos = new Float32Array(n * 3), col = new Uint8Array(n * 4);
+  for (let i = 0; i < n; i++) {
+    const b = i * stride;
+    let lx, ly, lz, coff;
+    if (cb === 8) { lx = dv.getUint8(b); ly = dv.getUint8(b + 1); lz = dv.getUint8(b + 2); coff = b + 3; }
+    else {
+      lx = dv.getUint16(b, true); ly = dv.getUint16(b + 2, true); lz = dv.getUint16(b + 4, true); coff = b + 6;
+      if (side > 65536) { const d = (q) => Math.round(q * (side - 1) / 65535); lx = d(lx); ly = d(ly); lz = d(lz); }
+    }
+    pos[i * 3] = (o[0] + lx) / span;
+    pos[i * 3 + 1] = (o[1] + ly) / span;
+    pos[i * 3 + 2] = (o[2] + lz) / span;
+    col[i * 4] = dv.getUint8(coff); col[i * 4 + 1] = dv.getUint8(coff + 1);
+    col[i * 4 + 2] = dv.getUint8(coff + 2); col[i * 4 + 3] = dv.getUint8(coff + 3);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('aColor', new THREE.BufferAttribute(col, 4, true));
+  node.buf = null; // free the raw block
+  return new THREE.Points(geo, octree.material);
+}
+
+// Range-fetch a node's block and add its points to the group. Falls back to a
+// client-side slice if the host ignores the Range header (returns 200, whole
+// file) — correct everywhere, fast where 206 is supported (HF Spaces serve
+// many small tile files for 2D; a range-capable static host streams 3D nodes).
+function loadNode(node) {
+  node.loading = true; octree.inflight++;
+  const end = node.byteOffset + node.byteLength - 1;
+  fetch(octree.dataUrl, { headers: { Range: 'bytes=' + node.byteOffset + '-' + end } })
+    .then((res) => res.arrayBuffer().then((buf) => {
+      if (res.status !== 206 && buf.byteLength !== node.byteLength) {
+        buf = buf.slice(node.byteOffset, node.byteOffset + node.byteLength);
+      }
+      node.buf = new Uint8Array(buf);
+      node.obj = makeNodePoints(node);
+      octree.group.add(node.obj);
+      octreeDirty = true; // a new node arrived — re-evaluate the visible cut
+    }))
+    .catch((e) => console.error('octree node load failed', e))
+    .finally(() => { node.loading = false; octree.inflight--; });
+}
+
+// Per-frame LOD pass: walk the tree, frustum-cull, render the "cut" (every node
+// from the root down to where its on-screen size drops below the threshold or
+// the budget runs out). Parent and child points are disjoint, so rendering the
+// whole cut draws each point at most once. Out-of-view subtrees are skipped.
+const _oBox = new THREE.Box3(), _oCenter = new THREE.Vector3();
+function octreeUpdate() {
+  if (!octree || !octree.root || !pointsActive) return;
+  camera.updateMatrixWorld();
+  const m = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  const frustum = new THREE.Frustum().setFromProjectionMatrix(m);
+  const H = innerHeight, tanHalf = Math.tan((camera.fov * Math.PI / 180) / 2);
+  const sz = octree.size, span = octree.span;
+  // Projected on-screen radius (px) of a node's cube, or -1 if frustum-culled.
+  const projPx = (node) => {
+    const o = node.origin, s = node.side;
+    _oBox.min.set(o[0] / span * sz[0] - sz[0] / 2, o[1] / span * sz[1] - sz[1] / 2, o[2] / span * sz[2] - sz[2] / 2);
+    _oBox.max.set((o[0] + s) / span * sz[0] - sz[0] / 2, (o[1] + s) / span * sz[1] - sz[1] / 2, (o[2] + s) / span * sz[2] - sz[2] / 2);
+    if (!frustum.intersectsBox(_oBox)) return -1;
+    _oBox.getCenter(_oCenter);
+    const dist = Math.max(1e-4, _oCenter.distanceTo(camera.position));
+    return (0.5 * _oBox.min.distanceTo(_oBox.max) / (dist * tanHalf)) * (H / 2);
+  };
+  const visible = new Set();
+  let budget = OCT_BUDGET;
+  const stack = [octree.root];
+  while (stack.length) {
+    const node = stack.pop();
+    const p = projPx(node);
+    if (p < 0 || budget - node.pointCount < 0) continue;
+    visible.add(node);
+    budget -= node.pointCount;
+    if (node.children.length && p * 2 > OCT_REFINE_PX) {
+      for (const c of node.children) stack.push(c);
+    }
+  }
+  for (const node of octree.nodes) {
+    if (visible.has(node)) {
+      if (node.obj) node.obj.visible = true;
+      else if (!node.loading && octree.inflight < OCT_MAX_INFLIGHT) loadNode(node);
+    } else if (node.obj) {
+      node.obj.visible = false;
+    }
+  }
 }
 
 // HTML-escape model-derived tensor names before injecting into the panel.
@@ -633,7 +795,9 @@ function bindControls() {
   seg('mode', (m) => {
     const vol = m === 'volume';
     if (volMesh) volMesh.visible = vol;
+    pointsActive = !vol;
     if (points) points.visible = !vol;
+    if (octree) { octree.group.visible = !vol; octreeDirty = true; }
     $('volctl').hidden = !vol;
     $('ptctl').hidden = vol;
   });
@@ -643,16 +807,20 @@ function bindControls() {
   slider('threshold', 'thv', (x) => x.toFixed(2), (x) => { v().uThreshold.value = x; refreshNorm(); });
   slider('steps', 'stv', (x) => x.toFixed(0), (x) => v().uSteps.value = x);
   refreshNorm();
-  if (points) {
-    const p = () => points.material.uniforms;
-    slider('psize', 'psv', (x) => x.toFixed(1), (x) => p().uPointSize.value = x);
-    slider('popacity', 'pov', (x) => x.toFixed(2), (x) => p().uPointOpacity.value = x);
+  // Point sliders drive the shared material (flat cloud or every octree node).
+  if (ptMaterial) {
+    const u = ptMaterial.uniforms;
+    slider('psize', 'psv', (x) => x.toFixed(1), (x) => u.uPointSize.value = x);
+    slider('popacity', 'pov', (x) => x.toFixed(2), (x) => u.uPointOpacity.value = x);
   }
 }
 
 // ---- loop -------------------------------------------------------------------
+// Camera motion (incl. OrbitControls damping) re-evaluates the octree LOD cut.
+controls.addEventListener('change', () => { octreeDirty = true; });
 function tick() {
   controls.update();
+  if (octreeDirty) { octreeUpdate(); octreeDirty = false; }
   renderer.render(scene, camera);
   labelRenderer.render(scene, camera);
   requestAnimationFrame(tick);

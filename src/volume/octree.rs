@@ -49,11 +49,15 @@ use crate::geometry::{hilbert3d_node_origin, hilbert_d2xyz};
 pub const POINT_GRID_LOG2: u32 = 5;
 
 /// Serialized size of one [`NodeRecord`] (little-endian, fixed-width).
-pub const RECORD_SIZE: usize = 28;
+pub const RECORD_SIZE: usize = 40;
 
-/// One octree node's metadata. Written verbatim to the `*_hierarchy.bin` index;
-/// the viewer builds the tree by mapping `(depth, node_idx)` → record and
-/// walking `child_idx = node_idx*8 + octant` for each set `child_mask` bit.
+/// One octree node's metadata. Written verbatim to the `*_hierarchy.bin` index.
+///
+/// `origin` + `depth` (+ the bundle's `order`) fully describe the node's cube,
+/// so the viewer rebuilds the tree spatially — a node's parent is the depth-1
+/// node whose cube contains it — needing no Hilbert decode or 64-bit arithmetic
+/// in JS. `node_idx`/`child_mask` are kept as the canonical id and a
+/// has-children hint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeRecord {
     /// Hilbert octree node index (base-8 path digits, most significant first).
@@ -63,6 +67,9 @@ pub struct NodeRecord {
     /// Block length in bytes (`point_count · stride`).
     pub byte_length: u32,
     pub point_count: u32,
+    /// Min-corner voxel of the node's cube (on the `2^order` grid). Side is
+    /// `2^(order-depth)`.
+    pub origin: [u32; 3],
     pub depth: u8,
     /// Bit `k` set ⇒ child octant `k` (node `node_idx*8 + k`) exists.
     pub child_mask: u8,
@@ -84,6 +91,9 @@ impl NodeRecord {
         out.extend_from_slice(&self.byte_offset.to_le_bytes());
         out.extend_from_slice(&self.byte_length.to_le_bytes());
         out.extend_from_slice(&self.point_count.to_le_bytes());
+        out.extend_from_slice(&self.origin[0].to_le_bytes());
+        out.extend_from_slice(&self.origin[1].to_le_bytes());
+        out.extend_from_slice(&self.origin[2].to_le_bytes());
         out.push(self.depth);
         out.push(self.child_mask);
         out.push(self.coord_bits);
@@ -102,9 +112,10 @@ impl NodeRecord {
             byte_offset: u64le(8),
             byte_length: u32le(16),
             point_count: u32le(20),
-            depth: b[24],
-            child_mask: b[25],
-            coord_bits: b[26],
+            origin: [u32le(24), u32le(28), u32le(32)],
+            depth: b[36],
+            child_mask: b[37],
+            coord_bits: b[38],
         }
     }
 }
@@ -349,6 +360,7 @@ impl PointOctreeBuilder {
             byte_offset,
             byte_length: point_count * stride,
             point_count,
+            origin: node.origin,
             depth: node.depth as u8,
             child_mask: node.child_mask,
             coord_bits,
@@ -366,7 +378,10 @@ mod tests {
     /// slicing its byte range out of the data buffer — exactly what a
     /// range-request viewer does.
     fn node_voxels(oct: &PointOctree, r: &NodeRecord) -> Vec<[u32; 3]> {
-        let origin = hilbert3d_node_origin(r.node_idx, r.depth as u32, oct.order);
+        // The stored origin must match the Hilbert recompute — the viewer trusts
+        // the stored value, so cross-check it here.
+        let origin = r.origin;
+        assert_eq!(origin, hilbert3d_node_origin(r.node_idx, r.depth as u32, oct.order));
         let side = 1u32 << (oct.order - r.depth as u32);
         let stride = r.stride();
         let block = &oct.data[r.byte_offset as usize..(r.byte_offset + r.byte_length as u64) as usize];

@@ -102,6 +102,11 @@ pub async fn deploy_space_app(
     bucket_id: &str,
     index_html: Vec<u8>,
 ) -> anyhow::Result<()> {
+    // Probe before create so we know whether this command is creating the
+    // Space fresh (no restart needed — it builds and starts on its own) or
+    // redeploying onto an existing one (restart below to pick up new content).
+    let pre_existing = space_exists(space_id).await?;
+
     log::info!("Ensuring Space {} exists...", space_id);
     with_throttle(&format!("hf repos create {space_id}"), || async {
         hf_cli::run_hf([
@@ -140,6 +145,68 @@ pub async fn deploy_space_app(
     .with_context(|| format!("uploading Space files to {space_id}"))?;
 
     log::info!("Deployed to https://huggingface.co/spaces/{}", space_id);
+
+    // An `hf upload` that changes no app files won't trigger a Hub rebuild, so a
+    // redeploy onto an existing Space can keep serving stale bucket content.
+    // Restart it explicitly. Best-effort: the upload already succeeded, so a
+    // failed control-plane restart is a warning, not a deploy failure.
+    if pre_existing {
+        log::info!("Restarting existing Space {}...", space_id);
+        if let Err(e) = restart_space(space_id).await {
+            log::warn!(
+                "Deployed, but failed to restart Space {space_id}: {e:#}. \
+                 Restart it manually from the Space's Settings if it serves stale content."
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether a Space repo already exists. Mirrors `hf_url::fetch_model_card`'s
+/// direct-reqwest pattern. A `404` is a clean "does not exist"; `2xx` and the
+/// gated `401`/`403` both mean it exists (we just may lack read access).
+async fn space_exists(space_id: &str) -> anyhow::Result<bool> {
+    let url = format!("{}/api/spaces/{space_id}", hf_url::endpoint());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("building reqwest client")?;
+    let mut req = client.get(&url);
+    if let Some(tok) = hf_url::read_token() {
+        req = req.bearer_auth(tok);
+    }
+    let resp = req.send().await.context("HF space_info request failed")?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        Ok(false)
+    } else if status.is_success()
+        || status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN
+    {
+        Ok(true)
+    } else {
+        bail!("HF space_info for {space_id} returned unexpected status {status}");
+    }
+}
+
+/// Trigger a normal restart of a Space (not a factory reboot — that would wipe
+/// persistent storage). Matches `HfApi.restart_space`: `POST /api/spaces/{id}/restart`.
+async fn restart_space(space_id: &str) -> anyhow::Result<()> {
+    let url = format!("{}/api/spaces/{space_id}/restart", hf_url::endpoint());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("building reqwest client")?;
+    let mut req = client.post(&url);
+    if let Some(tok) = hf_url::read_token() {
+        req = req.bearer_auth(tok);
+    }
+    req.send()
+        .await
+        .context("HF restart request failed")?
+        .error_for_status()
+        .context("HF restart returned non-2xx status")?;
     Ok(())
 }
 

@@ -59,6 +59,7 @@ pub struct VolumeMeta {
     pub manifest: Vec<super::shape::VolumeLabel>,
     /// Bundle format version. Absent/`1` ⇒ wholesale only (the original
     /// bundle). `2` ⇒ also ships a streamed point-LOD octree (`point_octree`).
+    /// `3` ⇒ the brick volume may be ray-guided streamed (`bricks.streamed`).
     pub format_version: u32,
     /// Streamed point-LOD octree descriptor; absent on wholesale-only bundles
     /// (older bundles, structured layouts, tiny inputs) so the viewer falls
@@ -93,8 +94,18 @@ pub struct BrickVolumeMeta {
     /// Apron border per brick (stored brick edge = `brick + 2·apron`). `> 0` ⇒
     /// the viewer trilinearly filters across brick edges; `0` ⇒ nearest.
     pub apron: u32,
-    /// Number of occupied bricks (atlas slots used).
+    /// Number of occupied bricks (`atlas_file` slots, or flat blocks when
+    /// streamed).
     pub occupied: u32,
+    /// `false` (or absent in pre-v3 bundles) ⇒ `atlas_file` is a packed 3D atlas
+    /// (`atlas_dim` voxels) uploaded whole and the page table holds resident
+    /// atlas slots. `true` ⇒ ray-guided streaming: `atlas_file` is a flat array
+    /// of `occupied` bricks (`brick³·4` bytes each, brick id `S` at
+    /// `(S-1)·brick³·4`), `atlas_dim` is unused, and `page_file` holds 1-based
+    /// brick **ids**. The viewer streams bricks into a bounded GPU cache on
+    /// demand, so VRAM is decoupled from the data's total size.
+    #[serde(default)]
+    pub streamed: bool,
 }
 
 /// Descriptor for the streamed point-LOD octree (the 3D analog of the 2D tile

@@ -198,16 +198,17 @@ const volVert = `
 const volFrag = `
   precision highp float;
   precision highp sampler3D;
-  uniform sampler3D uBricks;      // brick-pool atlas (RGBA8)
-  uniform sampler3D uPageTable;   // page table (RGBA8): 1-based atlas slot in R,G,B; 0 = empty
+  uniform sampler3D uBricks;      // brick-pool atlas / streamed cache (RGBA8)
+  uniform sampler3D uPageTable;   // page table (RGBA8) — see pageCell()
+  uniform sampler3D uCoarse;      // dense low-res fallback (streamed mode only)
   uniform sampler2D uLut;
   uniform float uOpacity, uGamma, uThreshold, uNorm, uBrick, uBrickStride, uApron;
-  uniform int uSource, uSteps, uDirectColor;
+  uniform int uSource, uSteps, uDirectColor, uStreamed;
   // Box world size per axis (longest axis = 1; isotropic cube = vec3(1)).
   uniform vec3 uSize;
   uniform vec3 uVolDim;       // volume voxel dims [ex,ey,ez]
   uniform vec3 uPageDim;      // page-table dims (bricks per axis)
-  uniform vec3 uAtlasBricks;  // atlas size in bricks per axis
+  uniform vec3 uAtlasBricks;  // atlas/cache size in bricks per axis
   in vec3 vOrigin;
   in vec3 vDirection;
   out vec4 fragColor;
@@ -221,18 +222,21 @@ const volFrag = `
     return vec2(max(tmin.x, max(tmin.y, tmin.z)), min(tmax.x, min(tmax.y, tmax.z)));
   }
 
-  // 1-based atlas slot of the brick at the given page cell (0 = empty brick).
-  uint pageSlot(vec3 cell) {
-    vec3 c = texture(uPageTable, (cell + 0.5) / uPageDim).rgb;
+  // Decode a page-table cell. Returns the RGB payload (24-bit) and the A-channel
+  // state byte. Non-streamed: A is unused (255), payload is the 1-based atlas
+  // slot (0 = empty). Streamed: A tags the cell — 0 empty, 1 occupied but not
+  // resident, 2 resident — and payload is the 0-based cache slot when resident.
+  uint pageCell(vec3 cell, out uint state) {
+    vec4 c = texture(uPageTable, (cell + 0.5) / uPageDim);
+    state = uint(c.a * 255.0 + 0.5);
     return uint(c.r * 255.0 + 0.5) + (uint(c.g * 255.0 + 0.5) << 8u) + (uint(c.b * 255.0 + 0.5) << 16u);
   }
 
-  // Sample the brick-pool atlas at a volume voxel position, for the brick slot.
+  // Sample the brick atlas/cache at a volume voxel position, for a 0-based slot.
   // Each stored brick is uBrickStride (= uBrick + 2*uApron) wide; the brick's
   // own voxels start at the apron offset, and linear filtering stays inside the
   // brick's apron border (so it never bleeds into a neighbouring atlas slot).
-  vec4 sampleBrick(uint slot, vec3 posVox) {
-    uint s = slot - 1u;
+  vec4 sampleBrick(uint s, vec3 posVox) {
     uint axb = uint(uAtlasBricks.x), ayb = uint(uAtlasBricks.y);
     vec3 sb = vec3(float(s % axb), float((s / axb) % ayb), float(s / (axb * ayb)));
     vec3 local = posVox - floor(posVox / uBrick) * uBrick;   // in [0, brick)
@@ -251,13 +255,17 @@ const volFrag = `
     // March in ray parameter t through the page table: occupied bricks step at
     // stepLen and sample the atlas; empty bricks are leapt to their far
     // boundary, so the step budget concentrates where there's actually data.
+    // In streamed mode, occupied-but-not-resident bricks sample the coarse
+    // fallback and step (they must NOT leap, or the region would be invisible
+    // until its brick streams in).
     for (int i = 0; i < 1024; i++) {
       if (t >= bounds.y) break;
       vec3 uvw = (vOrigin + t * dir) / uSize + 0.5;
       vec3 posVox = uvw * uVolDim;
       vec3 cell = floor(posVox / uBrick);
-      uint slot = pageSlot(cell);
-      if (slot == 0u) {
+      uint state; uint payload = pageCell(cell, state);
+      bool empty = (uStreamed == 1) ? (state == 0u) : (payload == 0u);
+      if (empty) {
         // Empty brick → jump to its exit boundary (always advancing ≥ one step).
         vec3 nb = (cell + step(0.0, dir)) * uBrick / uVolDim;  // next brick boundary (uvw)
         vec3 tb = ((nb - 0.5) * uSize - vOrigin) / dir;        // → ray t at each axis plane
@@ -265,7 +273,13 @@ const volFrag = `
         t = max(tnext, t + stepLen) + 1e-4;
         continue;
       }
-      vec4 vox = sampleBrick(slot, posVox);
+      vec4 vox;
+      if (uStreamed == 1) {
+        vox = (state == 2u) ? sampleBrick(payload, posVox)  // resident → cache
+                            : texture(uCoarse, uvw);         // not resident → coarse LOD
+      } else {
+        vox = sampleBrick(payload - 1u, posVox);             // 1-based slot → 0-based
+      }
       if (vox.a > 0.0) {
         // "rgb" (structured) mode: RGB is final baked color, A the opacity
         // weight. "lut" (byte) mode: R indexes the LUT, G/B are the opacity
@@ -293,6 +307,63 @@ const volFrag = `
     }
     if (acc.a <= 0.0) discard;
     fragColor = acc;
+  }`;
+
+// Ray-guided brick-request (feedback) shader — the GigaVoxels probe. Marches the
+// same page table as volFrag (sharing volVert), but instead of compositing color
+// it reports the FIRST occupied-but-not-resident brick along each ray: the
+// linear page-cell index (+1, so 0 means "no miss") packed little-endian across
+// RGBA8. Rendered to a small off-screen target and read back so the CPU can
+// fetch exactly the bricks the visible surface needs, front-to-back.
+const fbFrag = `
+  precision highp float;
+  precision highp sampler3D;
+  uniform sampler3D uPageTable;
+  uniform float uBrick;
+  uniform int uSteps;
+  uniform vec3 uSize, uVolDim, uPageDim;
+  in vec3 vOrigin;
+  in vec3 vDirection;
+  out vec4 fragColor;
+
+  vec2 hitBox(vec3 o, vec3 d) {
+    vec3 h = uSize * 0.5;
+    vec3 inv = 1.0 / d;
+    vec3 a = (-h - o) * inv;
+    vec3 b = ( h - o) * inv;
+    vec3 tmin = min(a, b), tmax = max(a, b);
+    return vec2(max(tmin.x, max(tmin.y, tmin.z)), min(tmax.x, min(tmax.y, tmax.z)));
+  }
+
+  void main() {
+    vec3 dir = normalize(vDirection);
+    vec2 bounds = hitBox(vOrigin, dir);
+    if (bounds.x > bounds.y) { fragColor = vec4(0.0); return; }
+    float t = max(bounds.x, 0.0);
+    float stepLen = (bounds.y - t) / float(uSteps);
+    for (int i = 0; i < 1024; i++) {
+      if (t >= bounds.y) break;
+      vec3 uvw = (vOrigin + t * dir) / uSize + 0.5;
+      vec3 cell = floor(uvw * uVolDim / uBrick);
+      uint state = uint(texture(uPageTable, (cell + 0.5) / uPageDim).a * 255.0 + 0.5);
+      if (state == 0u) {
+        vec3 nb = (cell + step(0.0, dir)) * uBrick / uVolDim;
+        vec3 tb = ((nb - 0.5) * uSize - vOrigin) / dir;
+        float tnext = min(tb.x, min(tb.y, tb.z));
+        t = max(tnext, t + stepLen) + 1e-4;
+        continue;
+      }
+      if (state == 1u) {
+        uint cl = uint(cell.x) + uint(cell.y) * uint(uPageDim.x)
+                + uint(cell.z) * uint(uPageDim.x) * uint(uPageDim.y);
+        uint v = cl + 1u;
+        fragColor = vec4(float(v & 255u) / 255.0, float((v >> 8u) & 255u) / 255.0,
+                         float((v >> 16u) & 255u) / 255.0, float((v >> 24u) & 255u) / 255.0);
+        return;
+      }
+      t += stepLen; // resident → keep walking to find the first miss behind it
+    }
+    fragColor = vec4(0.0);
   }`;
 
 const ptVert = `
@@ -384,6 +455,11 @@ const raycaster = new THREE.Raycaster();
 // only the wholesale points.bin. `ptMaterial` is the shared point material so
 // the size/opacity sliders drive both the flat cloud and every octree node.
 let octree = null, ptMaterial = null, pointsActive = false, octreeDirty = true;
+// Ray-guided brick streaming (meta.bricks.streamed): bounded GPU cache fed on
+// demand by what the rays need. Null for the fully-resident (non-streamed) path.
+// `volumeDirty` re-runs the feedback probe after the camera moves or a brick
+// lands, and falls quiet once the visible set is fully resident.
+let brickStream = null, volumeDirty = true;
 
 async function load() {
   const meta = await (await fetch('meta.json')).json();
@@ -418,32 +494,82 @@ async function load() {
   const volBuf = new Uint8Array(await (await fetch('volume.bin')).arrayBuffer());
   buildHistograms(volBuf);
 
-  // Page table + brick-pool atlas (nearest filtering — no apron in v1).
+  // Page table + brick pool. Two modes (meta.bricks.streamed):
+  //  • non-streamed (default / structured): the whole atlas + page table are
+  //    fetched and uploaded once; the page table holds 1-based resident slots.
+  //  • streamed (--volume-res): ray-guided GigaVoxels streaming — only a bounded
+  //    GPU cache is resident, bricks fetch on demand into free cache slots, the
+  //    page table is mutated per-cell as bricks arrive/evict, and not-resident
+  //    regions sample the coarse dense grid. See setupBrickStream / streamBricks.
   const bm = meta.bricks;
-  const atlasMax = Math.max(bm.atlas_dim[0], bm.atlas_dim[1], bm.atlas_dim[2]);
-  if (atlasMax > maxSide) {
-    throw new Error(
-      'brick atlas size ' + atlasMax + ' exceeds the max 3D texture size this ' +
-      'GPU supports (' + maxSide + '). Re-run arbvis with a lower --grid.');
-  }
-  const make3d = (buf, w, h, d) => {
+  const streamed = !!bm.streamed;
+  const bstride = bm.brick + 2 * bm.apron; // stored brick edge (incl. apron)
+  const make3d = (buf, w, h, d, linear) => {
     const t = new THREE.Data3DTexture(buf, w, h, d);
     t.format = THREE.RGBAFormat; t.type = THREE.UnsignedByteType;
-    t.minFilter = t.magFilter = THREE.NearestFilter;
+    const f = linear ? THREE.LinearFilter : THREE.NearestFilter;
+    t.minFilter = t.magFilter = f;
     t.wrapS = t.wrapT = t.wrapR = THREE.ClampToEdgeWrapping;
     t.unpackAlignment = 1; t.needsUpdate = true;
     return t;
   };
-  const pageBuf = new Uint8Array(await (await fetch(bm.page_file)).arrayBuffer());
-  const pageTex = make3d(pageBuf, bm.page_dim[0], bm.page_dim[1], bm.page_dim[2]);
-  const brickBuf = new Uint8Array(await (await fetch(bm.atlas_file)).arrayBuffer());
-  const brickTex = make3d(brickBuf, bm.atlas_dim[0], bm.atlas_dim[1], bm.atlas_dim[2]);
-  const bstride = bm.brick + 2 * bm.apron; // stored brick edge (incl. apron)
-  if (bm.apron > 0) {
-    // The apron border lets trilinear filtering cross brick edges smoothly
-    // without bleeding into neighbouring atlas slots.
-    brickTex.minFilter = brickTex.magFilter = THREE.LinearFilter;
-    brickTex.needsUpdate = true;
+
+  let pageTex, brickTex, coarseTex, atlasBricks;
+  if (streamed) {
+    // Coarse fallback LOD: the dense grid (already fetched for histograms/pick),
+    // sampled linearly where a brick isn't yet resident → an instant blurry
+    // image that sharpens in place. Clamp to ≤256³ so VRAM stays bounded; a
+    // bundle whose --grid exceeds that is rare, but guard it.
+    if (Math.max(ex, ey, ez) > 256) {
+      throw new Error('streamed coarse fallback expects --grid ≤ 256, got ' + Math.max(ex, ey, ez));
+    }
+    coarseTex = make3d(volBuf, ex, ey, ez, true);
+
+    // Fixed-size GPU cache atlas — bounded VRAM, independent of total data size.
+    const cdim = BRICK_CACHE_DIM * bm.brick; // cache atlas edge in voxels (apron 0)
+    if (cdim > maxSide) {
+      throw new Error('brick cache ' + cdim + ' exceeds this GPU\'s max 3D texture (' + maxSide + ')');
+    }
+    brickTex = make3d(new Uint8Array(cdim * cdim * cdim * 4), cdim, cdim, cdim, false);
+    atlasBricks = [BRICK_CACHE_DIM, BRICK_CACHE_DIM, BRICK_CACHE_DIM];
+
+    // Mutable page table. The shipped pagetable.bin holds each cell's 1-based
+    // brick id (0 = empty); rebuild it into the viewer's A-state encoding
+    // (0 empty / 1 occupied-not-resident / 2 resident) and keep the ids + a CPU
+    // state mirror for fetch + the LRU touch walk.
+    const idBuf = new Uint8Array(await (await fetch(bm.page_file)).arrayBuffer());
+    const nCells = bm.page_dim[0] * bm.page_dim[1] * bm.page_dim[2];
+    const pageBuf = new Uint8Array(nCells * 4);
+    const brickIds = new Uint32Array(nCells);
+    const cellState = new Uint8Array(nCells); // 0 empty, 1 not-resident, 2 resident
+    for (let i = 0; i < nCells; i++) {
+      const id = idBuf[i * 4] | (idBuf[i * 4 + 1] << 8) | (idBuf[i * 4 + 2] << 16);
+      brickIds[i] = id;
+      const s = id ? 1 : 0;
+      cellState[i] = s;
+      pageBuf[i * 4 + 3] = s; // A = state; RGB stay 0 until resident
+    }
+    pageTex = make3d(pageBuf, bm.page_dim[0], bm.page_dim[1], bm.page_dim[2], false);
+    // Force GPU allocation now so per-texel/per-brick texSubImage3D works.
+    renderer.initTexture(pageTex);
+    renderer.initTexture(brickTex);
+    brickStream = setupBrickStream(bm, pageTex, brickTex, pageBuf, cellState, brickIds, size);
+  } else {
+    const atlasMax = Math.max(bm.atlas_dim[0], bm.atlas_dim[1], bm.atlas_dim[2]);
+    if (atlasMax > maxSide) {
+      throw new Error(
+        'brick atlas size ' + atlasMax + ' exceeds the max 3D texture size this ' +
+        'GPU supports (' + maxSide + '). Re-run arbvis with a lower --grid.');
+    }
+    const pageBuf = new Uint8Array(await (await fetch(bm.page_file)).arrayBuffer());
+    pageTex = make3d(pageBuf, bm.page_dim[0], bm.page_dim[1], bm.page_dim[2], false);
+    const brickBuf = new Uint8Array(await (await fetch(bm.atlas_file)).arrayBuffer());
+    // The apron border lets trilinear filtering cross brick edges smoothly.
+    brickTex = make3d(brickBuf, bm.atlas_dim[0], bm.atlas_dim[1], bm.atlas_dim[2], bm.apron > 0);
+    atlasBricks = [bm.atlas_dim[0] / bstride, bm.atlas_dim[1] / bstride, bm.atlas_dim[2] / bstride];
+    // uCoarse is never sampled in this mode, but the sampler still needs a bound
+    // 3D texture — a 1-voxel dummy.
+    coarseTex = make3d(new Uint8Array(4), 1, 1, 1, false);
   }
 
   const volMat = new THREE.ShaderMaterial({
@@ -451,17 +577,19 @@ async function load() {
     side: THREE.BackSide, transparent: true, depthWrite: false,
     uniforms: {
       uBricks: { value: brickTex }, uPageTable: { value: pageTex }, uLut: { value: lutTex },
+      uCoarse: { value: coarseTex }, uStreamed: { value: streamed ? 1 : 0 },
       uOpacity: { value: 0.2 }, uGamma: { value: 1.0 },
       uThreshold: { value: 0.0 }, uSource: { value: 0 }, uSteps: { value: 192 },
       uNorm: { value: 1.0 }, uDirectColor: { value: directColor ? 1 : 0 },
       uSize: { value: new THREE.Vector3(size[0], size[1], size[2]) },
       uVolDim: { value: new THREE.Vector3(bm.vol_dim[0], bm.vol_dim[1], bm.vol_dim[2]) },
       uPageDim: { value: new THREE.Vector3(bm.page_dim[0], bm.page_dim[1], bm.page_dim[2]) },
-      uAtlasBricks: { value: new THREE.Vector3(bm.atlas_dim[0] / bstride, bm.atlas_dim[1] / bstride, bm.atlas_dim[2] / bstride) },
+      uAtlasBricks: { value: new THREE.Vector3(atlasBricks[0], atlasBricks[1], atlasBricks[2]) },
       uBrick: { value: bm.brick }, uBrickStride: { value: bstride }, uApron: { value: bm.apron },
     },
     vertexShader: volVert, fragmentShader: volFrag,
   });
+  if (brickStream) brickStream.volMat = volMat;
   volMesh = new THREE.Mesh(new THREE.BoxGeometry(size[0], size[1], size[2]), volMat);
   scene.add(volMesh);
   // Match the orientation cube to the (possibly anisotropic) box.
@@ -704,6 +832,284 @@ function octreeUpdate() {
   }
 }
 
+// ---- ray-guided brick streaming ---------------------------------------------
+// The volume analog of the streamed point octree, for meta.bricks.streamed
+// (--volume-res) bundles. A low-res feedback pass (fbFrag) reports the first
+// occupied-but-not-resident brick along each ray; the CPU range-fetches those
+// bricks into a bounded GPU cache atlas, mutating the page table per-cell as
+// they arrive. A cheap CPU "touch walk" over the page-state mirror drives LRU
+// eviction + light prefetch, so VRAM tracks the visible working set, not the
+// data's total size. No compute shaders / SSBOs — feedback is a render-to-
+// texture probe read back to the CPU.
+const BRICK_CACHE_DIM = 32;                                  // cache atlas side in bricks → 32768 slots
+const BRICK_CACHE_CAP = BRICK_CACHE_DIM ** 3;
+const BRICK_CACHE_SOFT = Math.floor(BRICK_CACHE_CAP * 0.92); // evict above this (hysteresis vs CAP)
+const BRICK_MAX_INFLIGHT = 8;                                // concurrent range fetches
+const FB_DIV = 8;                                            // feedback target = drawing buffer / FB_DIV
+const FB_EVERY = 2;                                          // probe at most every N frames
+const brickDebug = location.search.includes('debug');
+const _tNdc = new THREE.Vector2();
+
+// Build the brick-stream state. `pageTex`/`brickTex` are the mutable page table
+// and the (initially empty) cache atlas; `pageBuf`/`cellState` are CPU mirrors;
+// `brickIds[cell]` is the 1-based file brick id (range offset = (id-1)·stride).
+function setupBrickStream(bm, pageTex, brickTex, pageBuf, cellState, brickIds, size) {
+  const pd = bm.page_dim;
+  const freeSlots = [];
+  for (let s = BRICK_CACHE_CAP - 1; s >= 0; s--) freeSlots.push(s); // pop() → 0,1,2,…
+  // Feedback material: reuses volVert, shares the *mutable* page-table texture
+  // (so it never re-requests a brick that already arrived). Coarse step count —
+  // it only needs to find the first miss, not integrate color.
+  const fbMat = new THREE.ShaderMaterial({
+    glslVersion: THREE.GLSL3, side: THREE.BackSide,
+    uniforms: {
+      uPageTable: { value: pageTex },
+      uBrick: { value: bm.brick }, uSteps: { value: 128 },
+      uSize: { value: new THREE.Vector3(size[0], size[1], size[2]) },
+      uVolDim: { value: new THREE.Vector3(bm.vol_dim[0], bm.vol_dim[1], bm.vol_dim[2]) },
+      uPageDim: { value: new THREE.Vector3(pd[0], pd[1], pd[2]) },
+    },
+    vertexShader: volVert, fragmentShader: fbFrag,
+  });
+  const fbScene = new THREE.Scene();
+  fbScene.add(new THREE.Mesh(new THREE.BoxGeometry(size[0], size[1], size[2]), fbMat));
+  const fbTarget = new THREE.WebGLRenderTarget(1, 1, {
+    format: THREE.RGBAFormat, type: THREE.UnsignedByteType,
+    minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, depthBuffer: false,
+  });
+  return {
+    bm, brick: bm.brick, pd, stride: bm.brick ** 3 * 4,
+    pageTex, brickTex, pageBuf, cellState, brickIds,
+    fbScene, fbTarget, fbBuf: null,
+    resident: new Map(),        // cellLinear → { slot, lastUsed }
+    freeSlots, inflight: 0, pending: new Set(),
+    frame: 0, fbFrame: -100, probeIdle: true, glDirty: false,
+    stats: { requested: 0, evicted: 0 },
+    size, volMat: null,
+  };
+}
+
+// Raw-GL subregion upload into a three-owned Data3DTexture (page cell or brick).
+// three.js has no first-class partial 3D update, so go direct — but it caches GL
+// binding state, so flag it stale (reset once per frame before the next draw).
+function texSub3D(bs, tex, x, y, z, w, h, d, data) {
+  const gl = renderer.getContext();
+  const glTex = renderer.properties.get(tex).__webglTexture;
+  if (!glTex) return;
+  gl.bindTexture(gl.TEXTURE_3D, glTex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texSubImage3D(gl.TEXTURE_3D, 0, x, y, z, w, h, d, gl.RGBA, gl.UNSIGNED_BYTE, data);
+  gl.bindTexture(gl.TEXTURE_3D, null);
+  bs.glDirty = true;
+}
+
+const _cellTexel = new Uint8Array(4);
+// Write one page-table cell (CPU mirror + GPU texel). state: 0 empty, 1 not
+// resident, 2 resident; slot is the 0-based cache slot (only used when resident).
+function writePageCell(bs, cl, state, slot) {
+  const pd = bs.pd;
+  const cx = cl % pd[0], cy = ((cl / pd[0]) | 0) % pd[1], cz = (cl / (pd[0] * pd[1])) | 0;
+  _cellTexel[0] = slot & 0xff; _cellTexel[1] = (slot >> 8) & 0xff;
+  _cellTexel[2] = (slot >> 16) & 0xff; _cellTexel[3] = state;
+  const o = cl * 4;
+  bs.pageBuf[o] = _cellTexel[0]; bs.pageBuf[o + 1] = _cellTexel[1];
+  bs.pageBuf[o + 2] = _cellTexel[2]; bs.pageBuf[o + 3] = _cellTexel[3];
+  texSub3D(bs, bs.pageTex, cx, cy, cz, 1, 1, 1, _cellTexel);
+}
+
+// Evict a resident brick: free its cache slot, flip the page cell back to
+// not-resident. Its atlas texels are never cleared — the page state gates reads.
+function evictBrick(bs, cl) {
+  const e = bs.resident.get(cl);
+  if (!e) return;
+  bs.freeSlots.push(e.slot);
+  bs.resident.delete(cl);
+  bs.cellState[cl] = 1;
+  writePageCell(bs, cl, 1, 0);
+  bs.stats.evicted++;
+}
+
+// Fallback eviction when a brick arrives with no free slot: drop the global LRU
+// brick, unless even the coldest was touched this frame (cache full of visible
+// bricks → defer rather than evict something on screen).
+function evictLru(bs) {
+  let lru = null, used = Infinity;
+  for (const [cl, e] of bs.resident) {
+    if (e.lastUsed < used) { used = e.lastUsed; lru = cl; }
+  }
+  if (lru === null || used === bs.frame) return false;
+  evictBrick(bs, lru);
+  return true;
+}
+
+// Place an arrived brick (brick³ RGBA8, x-fastest) into a cache slot and mark
+// its page cell resident. apron 0 → the stored brick edge is exactly bm.brick.
+function uploadBrick(bs, cl, data) {
+  if (bs.cellState[cl] !== 1) return; // evicted/raced before the fetch returned
+  let slot = bs.freeSlots.pop();
+  if (slot === undefined) { if (!evictLru(bs)) return; slot = bs.freeSlots.pop(); }
+  const D = BRICK_CACHE_DIM, b = bs.brick;
+  const sx = slot % D, sy = ((slot / D) | 0) % D, sz = (slot / (D * D)) | 0;
+  texSub3D(bs, bs.brickTex, sx * b, sy * b, sz * b, b, b, b, data);
+  bs.resident.set(cl, { slot, lastUsed: bs.frame });
+  bs.cellState[cl] = 2;
+  writePageCell(bs, cl, 2, slot);
+  volumeDirty = true; // a brick landed — re-probe (more may be needed behind it)
+}
+
+// Range-fetch one brick's block from bricks.bin and upload it. Mirrors loadNode:
+// 206 (partial) is the fast path; a host that ignores Range (200, whole file) is
+// sliced client-side so it stays correct everywhere.
+function loadBrick(bs, cl) {
+  const id = bs.brickIds[cl];
+  if (!id) return;
+  const off = (id - 1) * bs.stride, end = off + bs.stride - 1;
+  bs.inflight++;
+  fetch(bs.bm.atlas_file, { headers: { Range: 'bytes=' + off + '-' + end } })
+    .then((res) => res.arrayBuffer().then((ab) => {
+      let u8 = new Uint8Array(ab);
+      if (res.status !== 206 && u8.length !== bs.stride) u8 = u8.subarray(off, off + bs.stride);
+      uploadBrick(bs, cl, u8);
+    }))
+    .catch((e) => console.error('brick load failed', e))
+    .finally(() => { bs.inflight--; pumpBrickFetches(bs); });
+}
+
+// Drain queued requests into fetches, bounded by inflight + free cache slots.
+// When the cache is full we wait for the touch walk to evict rather than evict
+// blind here (it lacks the current visible cut).
+function pumpBrickFetches(bs) {
+  if (bs.pending.size === 0) return;
+  for (const cl of [...bs.pending]) {
+    if (bs.inflight >= BRICK_MAX_INFLIGHT || bs.freeSlots.length === 0) break;
+    if (bs.cellState[cl] !== 1) { bs.pending.delete(cl); continue; }
+    bs.pending.delete(cl);
+    loadBrick(bs, cl);
+  }
+}
+
+// Decode the feedback target: each pixel is (cellLinear+1) of the first miss
+// along its ray, little-endian RGBA8 (0 = no miss). Enqueue unique misses.
+function processFeedback(bs, buf) {
+  let added = 0;
+  for (let i = 0; i < buf.length; i += 4) {
+    const v = (buf[i] | (buf[i + 1] << 8) | (buf[i + 2] << 16) | (buf[i + 3] << 24)) >>> 0;
+    if (v === 0) continue;
+    const cl = v - 1;
+    if (bs.cellState[cl] !== 1 || bs.pending.has(cl)) continue;
+    bs.pending.add(cl);
+    bs.stats.requested++;
+    added++;
+  }
+  pumpBrickFetches(bs);
+  // Converge: keep probing while there's outstanding work; otherwise fall quiet
+  // until the camera moves (controls 'change' re-arms volumeDirty).
+  if (added > 0 || bs.pending.size > 0 || bs.inflight > 0) volumeDirty = true;
+}
+
+// Render the feedback probe to a small target and read it back (async PBO when
+// available; sync otherwise). One probe in flight at a time (probeIdle).
+function runFeedback(bs) {
+  bs.probeIdle = false;
+  bs.fbFrame = bs.frame;
+  volumeDirty = false; // consume; re-armed by misses / brick arrival / camera move
+  const fw = Math.max(1, Math.ceil(renderer.domElement.width / FB_DIV));
+  const fh = Math.max(1, Math.ceil(renderer.domElement.height / FB_DIV));
+  if (bs.fbTarget.width !== fw || bs.fbTarget.height !== fh) bs.fbTarget.setSize(fw, fh);
+  const prevTarget = renderer.getRenderTarget();
+  renderer.setRenderTarget(bs.fbTarget);
+  renderer.setClearColor(0x000000, 0); // outside-box / no-miss rays read back as 0
+  renderer.render(bs.fbScene, camera);
+  renderer.setRenderTarget(prevTarget);
+  const n = fw * fh * 4;
+  if (!bs.fbBuf || bs.fbBuf.length !== n) bs.fbBuf = new Uint8Array(n);
+  const buf = bs.fbBuf;
+  const finish = () => { bs.probeIdle = true; processFeedback(bs, buf); };
+  if (renderer.readRenderTargetPixelsAsync) {
+    renderer.readRenderTargetPixelsAsync(bs.fbTarget, 0, 0, fw, fh, buf)
+      .then(finish)
+      .catch((e) => { console.error('brick feedback readback failed', e); bs.probeIdle = true; });
+  } else {
+    renderer.readRenderTargetPixels(bs.fbTarget, 0, 0, fw, fh, buf);
+    finish();
+  }
+}
+
+// Coarse CPU march over the page-state mirror along a grid of view rays: stamp
+// resident bricks seen as in-cut (lastUsed, for LRU), and lightly prefetch the
+// nearest not-resident bricks just ahead. Then evict LRU non-cut bricks if the
+// cache is over its soft cap. Cheap (≈ RAYS² · steps state lookups, no GPU).
+function touchAndEvictBricks(bs) {
+  const pd = bs.pd, pdx = pd[0], pdxy = pd[0] * pd[1];
+  const sz = bs.size, vd = bs.bm.vol_dim, brick = bs.brick;
+  const cut = new Set();
+  camera.updateMatrixWorld();
+  const RAYS = 28, STEPS = 96;
+  for (let iy = 0; iy < RAYS; iy++) {
+    for (let ix = 0; ix < RAYS; ix++) {
+      _tNdc.set((ix + 0.5) / RAYS * 2 - 1, (iy + 0.5) / RAYS * 2 - 1);
+      raycaster.setFromCamera(_tNdc, camera);
+      const ro = raycaster.ray.origin, rd = raycaster.ray.direction;
+      let tmin = -Infinity, tmax = Infinity;
+      for (const a of ['x', 'y', 'z']) {
+        const half = sz[a === 'x' ? 0 : a === 'y' ? 1 : 2] / 2;
+        const inv = 1 / rd[a];
+        let t0 = (-half - ro[a]) * inv, t1 = (half - ro[a]) * inv;
+        if (t0 > t1) { const tmp = t0; t0 = t1; t1 = tmp; }
+        tmin = Math.max(tmin, t0); tmax = Math.min(tmax, t1);
+      }
+      let t = Math.max(tmin, 0);
+      if (tmax < t) continue;
+      const dt = (tmax - t) / STEPS;
+      let pre = 0;
+      for (let s = 0; s < STEPS; s++, t += dt) {
+        const ux = (ro.x + rd.x * t) / sz[0] + 0.5;
+        const uy = (ro.y + rd.y * t) / sz[1] + 0.5;
+        const uz = (ro.z + rd.z * t) / sz[2] + 0.5;
+        if (ux < 0 || uy < 0 || uz < 0 || ux >= 1 || uy >= 1 || uz >= 1) continue;
+        const cx = (ux * vd[0] / brick) | 0, cy = (uy * vd[1] / brick) | 0, cz = (uz * vd[2] / brick) | 0;
+        const cl = cx + cy * pdx + cz * pdxy;
+        const st = bs.cellState[cl];
+        if (st === 2) {
+          const e = bs.resident.get(cl);
+          if (e) { e.lastUsed = bs.frame; cut.add(cl); }
+        } else if (st === 1 && pre < 3 && !bs.pending.has(cl)) {
+          bs.pending.add(cl); bs.stats.requested++; pre++;
+        }
+      }
+    }
+  }
+  pumpBrickFetches(bs);
+  if (bs.resident.size > BRICK_CACHE_SOFT) {
+    const ev = [];
+    for (const [cl, e] of bs.resident) if (!cut.has(cl)) ev.push([cl, e.lastUsed]);
+    ev.sort((a, b) => a[1] - b[1]); // oldest first
+    for (const [cl] of ev) {
+      if (bs.resident.size <= BRICK_CACHE_SOFT) break;
+      evictBrick(bs, cl);
+    }
+  }
+}
+
+// Per-frame brick streaming step (called from tick before the main render).
+function streamBricks() {
+  const bs = brickStream;
+  if (!bs || !volMesh || !volMesh.visible) return; // pause while in Points view
+  bs.frame++;
+  if ((volumeDirty || bs.pending.size > 0) && bs.probeIdle && (bs.frame - bs.fbFrame) >= FB_EVERY) {
+    runFeedback(bs);
+  }
+  if (bs.pending.size > 0 || bs.resident.size > BRICK_CACHE_SOFT) touchAndEvictBricks(bs);
+  // Raw-GL writes this frame left three's binding cache stale — clear it once
+  // before the next draw (cheaper than resetting per texSubImage3D).
+  if (bs.glDirty) { renderer.resetState(); bs.glDirty = false; }
+  if (brickDebug && bs.frame % 30 === 0) {
+    console.log('bricks: resident', bs.resident.size, '/', BRICK_CACHE_CAP,
+      'free', bs.freeSlots.length, 'inflight', bs.inflight, 'pending', bs.pending.size,
+      'requested', bs.stats.requested, 'evicted', bs.stats.evicted);
+  }
+}
+
 // HTML-escape model-derived tensor names before injecting into the panel.
 const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 
@@ -896,11 +1302,13 @@ function bindControls() {
 }
 
 // ---- loop -------------------------------------------------------------------
-// Camera motion (incl. OrbitControls damping) re-evaluates the octree LOD cut.
-controls.addEventListener('change', () => { octreeDirty = true; });
+// Camera motion (incl. OrbitControls damping) re-evaluates the octree LOD cut
+// and re-arms the brick-streaming feedback probe.
+controls.addEventListener('change', () => { octreeDirty = true; volumeDirty = true; });
 function tick() {
   controls.update();
   if (octreeDirty) { octreeUpdate(); octreeDirty = false; }
+  if (brickStream) streamBricks();
   renderer.render(scene, camera);
   labelRenderer.render(scene, camera);
   requestAnimationFrame(tick);

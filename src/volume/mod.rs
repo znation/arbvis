@@ -177,6 +177,7 @@ pub async fn render_volume(
         vol_dim: bricks.vol_dim,
         apron: bricks.apron,
         occupied: bricks.occupied,
+        streamed: bricks.streamed,
     };
 
     // Streamed point-LOD octree (byte floor): two extra files alongside the
@@ -216,7 +217,7 @@ pub async fn render_volume(
         focus_radius: built.focus_radius,
         lut: pixel_lut.iter().map(|c| c.0).collect(),
         manifest,
-        format_version: 2,
+        format_version: 3,
         point_octree: point_octree_meta,
         bricks: Some(brick_meta),
     };
@@ -442,10 +443,10 @@ fn aggregate_bytes_hilbert(
     let octree = octree_builder.finish();
     let point_octree = (!octree.records.is_empty()).then_some(octree);
     let bricks = brick_builder.map(|bb| {
-        let (bv, dropped) = bb.finish();
+        let (bv, dropped) = bb.finish_streaming();
         if dropped > 0 {
             log::warn!(
-                "--volume-res: dropped {dropped} bricks past the {} cap; lower --volume-res for full coverage",
+                "--volume-res: dropped {dropped} bricks past the {} safety cap; lower --volume-res for full coverage",
                 brick::MAX_BRICKS
             );
         }
@@ -847,7 +848,10 @@ mod tests {
 
         let meta: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.path().join("meta.json")).unwrap()).unwrap();
-        assert_eq!(meta["format_version"], 2, "byte floor ships format v2");
+        assert_eq!(meta["format_version"], 3, "current bundles ship format v3");
+        // No --volume-res here, so bricks come from the dense grid: fully
+        // resident, not the ray-guided streamed pool.
+        assert_eq!(meta["bricks"]["streamed"], false, "dense-derived bricks aren't streamed");
         let po = &meta["point_octree"];
         assert!(po.is_object(), "point_octree descriptor present");
         assert_eq!(po["record_size"], octree::RECORD_SIZE as u64);
@@ -886,6 +890,58 @@ mod tests {
 
         // The wholesale fallback is still emitted.
         assert!(dir.path().join("points.bin").exists());
+    }
+
+    /// `--volume-res` above `--grid` must emit the ray-guided **streamed** brick
+    /// pool: `meta.bricks.streamed == true`, the page table holds 1-based brick
+    /// ids, and `bricks.bin` is exactly `occupied · brick³ · 4` bytes (a flat,
+    /// range-addressable block array the viewer streams into a bounded cache).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn emits_streamed_brick_pool_above_grid() {
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i * 31 + 7) as u8).collect();
+        let total = bytes.len() as u64;
+        let dir = tempfile::tempdir().unwrap();
+        render_volume(
+            vec![buffered(bytes)],
+            total,
+            dir.path().to_path_buf(),
+            "test",
+            &[],
+            false,
+            8,  // --grid: dense voxel grid
+            8_000_000,
+            16, // --volume-res > --grid ⇒ the streaming brick builder runs
+            LayoutMode::Auto,
+            &Registry::with_defaults(),
+            &Branding::default(),
+        )
+        .await
+        .unwrap();
+
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("meta.json")).unwrap()).unwrap();
+        let bm = &meta["bricks"];
+        assert_eq!(bm["streamed"], true, "--volume-res ships the streamed pool");
+        assert_eq!(bm["vol_dim"][0], 16, "page table sized to the virtual resolution");
+        let occupied = bm["occupied"].as_u64().unwrap();
+        assert!(occupied > 0, "some bricks are occupied");
+
+        // bricks.bin is a flat array of occupied blocks; the page table tiles the
+        // virtual cube with one id cell per brick.
+        let bricks = std::fs::read(dir.path().join("bricks.bin")).unwrap();
+        let brick = bm["brick"].as_u64().unwrap() as usize;
+        assert_eq!(bricks.len() as u64, occupied * (brick.pow(3) * 4) as u64,
+            "bricks.bin holds occupied flat brick blocks");
+        let page = std::fs::read(dir.path().join("pagetable.bin")).unwrap();
+        let pd = &bm["page_dim"];
+        let ncells = pd[0].as_u64().unwrap() * pd[1].as_u64().unwrap() * pd[2].as_u64().unwrap();
+        assert_eq!(page.len() as u64, ncells * 4, "page table is one RGBA cell per brick");
+        // The largest id in the page table addresses a real block in bricks.bin.
+        let mut max_id = 0u32;
+        for cell in page.chunks_exact(4) {
+            max_id = max_id.max(cell[0] as u32 | (cell[1] as u32) << 8 | (cell[2] as u32) << 16);
+        }
+        assert_eq!(max_id as u64, occupied, "page ids run 1..=occupied");
     }
 
     // A structured VolumeShape whose single entity paints a 4³ box; its

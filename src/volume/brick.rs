@@ -33,10 +33,13 @@ pub const BRICK: u32 = 8;
 /// brick's neighbors, so it ships `apron = 0` (nearest filtering).
 pub const APRON: u32 = 1;
 
-/// Cap on occupied bricks the streaming builder keeps (≈ a 512³-voxel atlas at
-/// `BRICK=8`). Past this, [`BrickBuilder`] stops admitting new bricks and
-/// counts them as dropped (logged) rather than ballooning the atlas/VRAM.
-pub const MAX_BRICKS: u32 = 262_144;
+/// Safety cap on occupied bricks the streaming builder keeps. The streamed path
+/// ([`BrickBuilder::finish_streaming`]) writes bricks to a range-addressable
+/// file and the viewer keeps only a bounded GPU *cache* resident, so the bound
+/// here is disk/build memory (≈ 4 GiB of `bricks.bin` at `2 KiB`/brick), not
+/// VRAM. Past this, [`BrickBuilder`] stops admitting new bricks and counts them
+/// as dropped (logged).
+pub const MAX_BRICKS: u32 = 2_097_152;
 
 /// Near-cubic atlas size, in bricks per axis, holding at least `slots` bricks.
 fn atlas_dims_bricks(slots: u32) -> [u32; 3] {
@@ -84,6 +87,13 @@ pub struct BrickVolume {
     pub apron: u32,
     /// Number of occupied bricks (atlas slots used).
     pub occupied: u32,
+    /// `false` ⇒ `atlas` is a packed 3D atlas (`atlas_dim` voxels) the viewer
+    /// uploads whole, and the page table holds resident atlas slots. `true` ⇒
+    /// `atlas` is a flat, range-addressable array of `occupied` bricks
+    /// (`BRICK³·4` bytes each, brick `S` at `(S-1)·BRICK³·4`), `atlas_dim` is
+    /// unused, and the page table holds 1-based brick **ids**; the viewer
+    /// ray-guides bricks into a bounded GPU cache on demand.
+    pub streamed: bool,
 }
 
 impl BrickVolume {
@@ -192,6 +202,7 @@ pub fn build_brick_volume(rgba: &[u8], extent: [u32; 3], brick: u32) -> BrickVol
         vol_dim: extent,
         apron: APRON,
         occupied,
+        streamed: false,
     }
 }
 
@@ -301,52 +312,43 @@ impl BrickBuilder {
         }
     }
 
-    /// Finish: assemble the flat blocks into a 3D atlas (rescaling the density
-    /// channel by the global max count) and the dense page table.
-    pub fn finish(mut self) -> (BrickVolume, u64) {
+    /// Finish for the **streamed** viewer path: keep the occupied bricks as a
+    /// flat, range-addressable block array — brick `S` (1-based) at byte
+    /// `(S-1)·brick³·4`, `brick³·4` bytes long — instead of scattering them into
+    /// a packed atlas, and ship the page table holding each cell's 1-based brick
+    /// **id**. The viewer streams bricks into a bounded GPU cache on demand
+    /// (ray-guided), so the full occupied set never has to be GPU-resident — the
+    /// reason the streaming path can exceed the dense grid without a VRAM cap.
+    ///
+    /// The only transform over the accumulated [`blocks`](Self::blocks) is the
+    /// global density (B-channel) rescale the dense atlas path also applies.
+    pub fn finish_streaming(mut self) -> (BrickVolume, u64) {
         self.finalize();
-        let bk = self.brick;
-        let [axb, ayb, azb] = atlas_dims_bricks(self.occupied);
-        let atlas_dim = [axb * bk, ayb * bk, azb * bk];
-        let (adx, ady) = (atlas_dim[0] as usize, atlas_dim[1] as usize);
-        let mut atlas = vec![0u8; (atlas_dim[0] * atlas_dim[1] * atlas_dim[2]) as usize * 4];
         let inv_max = if self.max_count > 0 {
             255.0 / self.max_count as f32
         } else {
             0.0
         };
-        let bsz = (bk as usize).pow(3) * 4; // bytes per flat brick block
-        for slot in 0..self.occupied {
-            let (sx, sy, sz) = (slot % axb, (slot / axb) % ayb, slot / (axb * ayb));
-            let block = &self.blocks[slot as usize * bsz..(slot as usize + 1) * bsz];
-            for lz in 0..bk {
-                for ly in 0..bk {
-                    for lx in 0..bk {
-                        let si = ((lx + ly * bk + lz * bk * bk) * 4) as usize;
-                        if block[si + 3] == 0 {
-                            continue;
-                        }
-                        let (axx, ayy, azz) =
-                            ((sx * bk + lx) as usize, (sy * bk + ly) as usize, (sz * bk + lz) as usize);
-                        let di = (axx + ayy * adx + azz * adx * ady) * 4;
-                        atlas[di] = block[si];
-                        atlas[di + 1] = block[si + 1];
-                        // Density (B): rescale the raw count by the global max.
-                        atlas[di + 2] = (block[si + 2] as f32 * inv_max).round().clamp(0.0, 255.0) as u8;
-                        atlas[di + 3] = 255;
-                    }
-                }
+        // Density (B): rescale the raw per-voxel count by the global max, in
+        // place — the blocks then ship as bricks.bin verbatim (x-fastest within
+        // each brick, bricks concatenated in 1-based id order). Empty voxels
+        // (a == 0) stay transparent.
+        let mut blocks = self.blocks;
+        for v in blocks.chunks_exact_mut(4) {
+            if v[3] != 0 {
+                v[2] = (v[2] as f32 * inv_max).round().clamp(0.0, 255.0) as u8;
             }
         }
         let side = 1u32 << self.order_v;
         let bv = BrickVolume {
-            atlas,
-            atlas_dim,
+            atlas: blocks,
+            atlas_dim: [0, 0, 0], // streamed: bricks.bin is a flat block array
             page_table: pack_page_table(&self.page),
             page_dim: self.page_dim,
             vol_dim: [side, side, side],
             apron: 0, // streaming can't see neighbors → no border, nearest filtering
             occupied: self.occupied,
+            streamed: true,
         };
         (bv, self.dropped)
     }
@@ -452,6 +454,25 @@ mod tests {
         assert!(bv.page_table.iter().step_by(4).all(|&r| r == 0), "all cells empty");
     }
 
+    /// Reconstruct a voxel's RGBA from a **streamed** `BrickVolume`: the page
+    /// table holds a 1-based brick id, and `atlas` is the flat block array
+    /// (brick `id` at `(id-1)·BRICK³·4`), exactly as the viewer addresses it.
+    fn sample_streamed(bv: &BrickVolume, x: u32, y: u32, z: u32) -> [u8; 4] {
+        assert!(bv.streamed);
+        let [pbx, pby, _] = bv.page_dim;
+        let pi = ((z / BRICK) * pby * pbx + (y / BRICK) * pbx + (x / BRICK)) as usize;
+        let id = bv.page_table[pi * 4] as u32
+            | (bv.page_table[pi * 4 + 1] as u32) << 8
+            | (bv.page_table[pi * 4 + 2] as u32) << 16;
+        if id == 0 {
+            return [0, 0, 0, 0];
+        }
+        let bk = BRICK;
+        let local = (x % bk + (y % bk) * bk + (z % bk) * bk * bk) as usize;
+        let off = ((id as usize - 1) * (bk as usize).pow(3) + local) * 4;
+        [bv.atlas[off], bv.atlas[off + 1], bv.atlas[off + 2], bv.atlas[off + 3]]
+    }
+
     #[test]
     fn streaming_builder_round_trips_in_hilbert_order() {
         // order_v=5 (32³); feed a contiguous Hilbert prefix (one byte/voxel),
@@ -463,17 +484,27 @@ mod tests {
         for h in 0..n {
             b.push(h, ((h & 0x7f) as u8) | 1); // byte > 0 ⇒ voxel occupied
         }
-        let (bv, dropped) = b.finish();
+        let (bv, dropped) = b.finish_streaming();
         assert_eq!(dropped, 0);
         assert!(bv.occupied >= 1);
-        let ext = [1u32 << order_v; 3];
-        // Every fed voxel reconstructs through page table + atlas.
+        assert!(bv.streamed, "the --volume-res path ships the streamable format");
+        // bricks.bin is exactly `occupied` flat brick blocks.
+        assert_eq!(bv.atlas.len(), bv.occupied as usize * (BRICK as usize).pow(3) * 4);
+        // Every fed voxel reconstructs through the id page table + flat blocks.
         for h in 0..n {
             let v = hilbert_d2xyz(h, order_v);
-            assert!(sample(&bv, ext, v[0], v[1], v[2])[3] > 0, "h={h} should be occupied");
+            assert!(sample_streamed(&bv, v[0], v[1], v[2])[3] > 0, "h={h} should be occupied");
         }
         // A voxel in an unfed (far) brick is empty.
         let far = hilbert_d2xyz((1u64 << (3 * order_v)) - 1, order_v);
-        assert_eq!(sample(&bv, ext, far[0], far[1], far[2]), [0, 0, 0, 0]);
+        assert_eq!(sample_streamed(&bv, far[0], far[1], far[2]), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn streaming_builder_keeps_bricks_past_the_old_vram_cap() {
+        // The streamed path writes bricks to a range-addressable file and only a
+        // bounded GPU cache is resident, so MAX_BRICKS is a high disk-bound
+        // safety valve — far above the old 262_144 VRAM cap.
+        assert!(MAX_BRICKS > 262_144, "streamed cap is disk-bound, not the old VRAM cap");
     }
 }

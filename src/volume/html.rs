@@ -87,14 +87,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
 <div id="panel" hidden>
   <h1 id="title">arbvis</h1>
   <div class="sub"><a id="repo" href="#" target="_blank" rel="noopener"></a></div>
-  <div class="row">
-    <label>View</label>
-    <div class="seg" id="mode">
-      <button data-v="volume" class="on">Volume</button>
-      <button data-v="points">Points</button>
-    </div>
-  </div>
-  <div id="volctl">
+  <div id="ctl">
     <div class="row">
       <label>Opacity source</label>
       <div class="seg" id="src">
@@ -102,20 +95,14 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
         <button data-v="1">Density</button>
       </div>
     </div>
-    <div class="row"><label>Opacity <span id="opv"></span></label>
+    <div class="row"><label>Volume opacity <span id="opv"></span></label>
       <input id="opacity" type="range" min="0" max="1" step="0.01" value="0.2"></div>
-    <div class="row"><label>Contrast <span id="gav"></span></label>
+    <div class="row"><label>Volume contrast <span id="gav"></span></label>
       <input id="gamma" type="range" min="0.2" max="3" step="0.05" value="1"></div>
     <div class="row"><label>Threshold <span id="thv"></span></label>
       <input id="threshold" type="range" min="0" max="0.95" step="0.01" value="0"></div>
-    <div class="row"><label>Quality <span id="stv"></span></label>
-      <input id="steps" type="range" min="48" max="384" step="16" value="192"></div>
-  </div>
-  <div id="ptctl" hidden>
     <div class="row"><label>Point size <span id="psv"></span></label>
       <input id="psize" type="range" min="0.5" max="6" step="0.1" value="1.6"></div>
-    <div class="row"><label>Point opacity <span id="pov"></span></label>
-      <input id="popacity" type="range" min="0.05" max="1" step="0.01" value="0.4"></div>
   </div>
   <div id="inputs" class="hint"></div>
   <div id="legend"></div>
@@ -171,6 +158,48 @@ const edges = new THREE.LineSegments(
   new THREE.LineBasicMaterial({ color: 0x3a3f4b }));
 scene.add(edges);
 
+// ---- hybrid compositing ----------------------------------------------------
+// The unified Volume↔Points view is drawn in three passes per frame (see
+// renderHybrid): (1) the opaque scene (points + edges) into sceneTarget, which
+// carries a depth texture; (2) a verbatim blit of that color to the canvas;
+// (3) the volume ray-march composited over it, with rays cut off at the opaque
+// depth so near points correctly occlude the volume behind them. The volume
+// lives on layer 1 so each pass can select points-only / volume-only by camera
+// layer rather than juggling per-object visibility.
+const VOL_LAYER = 1;
+// Debug-only override of the auto hybrid: ?view=volume (no points) or ?view=points
+// (no volume). Unset → the normal distance-driven hybrid. No UI by design.
+const forceView = new URLSearchParams(location.search).get('view');
+let sceneTarget = null;
+let volMesh = null; // the volume box mesh; declared here so resize() can reach it
+const _dbSize = new THREE.Vector2();
+function makeSceneTarget(w, h) {
+  const dt = new THREE.DepthTexture(w, h);
+  dt.type = THREE.UnsignedIntType;
+  // sRGB storage so edge/line colors match the old direct-to-canvas path; the
+  // points' custom shader writes verbatim regardless, and the blit reads verbatim.
+  const rt = new THREE.WebGLRenderTarget(w, h, {
+    minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+    depthTexture: dt, depthBuffer: true, stencilBuffer: false,
+    colorSpace: THREE.SRGBColorSpace,
+  });
+  return rt;
+}
+// Fullscreen blit of sceneTarget's color to the canvas. A custom GLSL3 shader
+// (no colorspace/tonemap injection) copies the stored bytes verbatim, matching
+// the original look exactly.
+const copyMat = new THREE.ShaderMaterial({
+  glslVersion: THREE.GLSL3, depthTest: false, depthWrite: false,
+  uniforms: { tColor: { value: null } },
+  vertexShader: 'out vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }',
+  fragmentShader: 'precision highp float; uniform sampler2D tColor; in vec2 vUv; out vec4 o; void main(){ o = texture(tColor, vUv); }',
+});
+const copyScene = new THREE.Scene();
+const copyCam = new THREE.Camera();
+const copyQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), copyMat);
+copyQuad.frustumCulled = false;
+copyScene.add(copyQuad);
+
 function resize() {
   const w = innerWidth, h = innerHeight;
   // updateStyle must stay on: a bare <canvas> with `inset:0` is a replaced
@@ -181,6 +210,13 @@ function resize() {
   labelRenderer.setSize(w, h);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
+  // (Re)size the offscreen target to the drawing buffer so gl_FragCoord lines up
+  // with the depth lookup. Recreate it (a DepthTexture can't be resized in place).
+  renderer.getDrawingBufferSize(_dbSize);
+  if (sceneTarget) { sceneTarget.depthTexture.dispose(); sceneTarget.dispose(); }
+  sceneTarget = makeSceneTarget(_dbSize.x, _dbSize.y);
+  copyMat.uniforms.tColor.value = sceneTarget.texture;
+  if (volMesh) volMesh.material.uniforms.uSceneDepth.value = sceneTarget.depthTexture;
 }
 addEventListener('resize', resize);
 resize();
@@ -202,7 +238,11 @@ const volFrag = `
   uniform sampler3D uPageTable;   // page table (RGBA8) — see pageCell()
   uniform sampler3D uCoarse;      // dense low-res fallback (streamed mode only)
   uniform sampler2D uLut;
+  uniform sampler2D uSceneDepth; // depth of the opaque (points) pass — ray cutoff
+  uniform vec2 uResolution;      // drawing-buffer size, for the gl_FragCoord lookup
+  uniform mat4 uInvProjView, uInvModel; // reconstruct the scene hit in box space
   uniform float uOpacity, uGamma, uThreshold, uNorm, uBrick, uBrickStride, uApron;
+  uniform float uNearDist; // skip the near zone (it's drawn as points) — see below
   uniform int uSource, uSteps, uDirectColor, uStreamed;
   // Box world size per axis (longest axis = 1; isotropic cube = vec3(1)).
   uniform vec3 uSize;
@@ -248,6 +288,17 @@ const volFrag = `
     vec3 dir = normalize(vDirection);
     vec2 bounds = hitBox(vOrigin, dir);
     if (bounds.x > bounds.y) discard;
+    // Depth-correct hybrid: stop the ray at the nearest opaque point. Reconstruct
+    // the opaque-pass hit position from its depth and clamp the ray's far bound so
+    // volume haze never composites in front of a point that's physically closer.
+    float sd = texture(uSceneDepth, gl_FragCoord.xy / uResolution).x;
+    if (sd < 1.0) {
+      vec3 ndc = vec3(gl_FragCoord.xy / uResolution * 2.0 - 1.0, sd * 2.0 - 1.0);
+      vec4 wp = uInvProjView * vec4(ndc, 1.0); wp /= wp.w;
+      vec3 mh = (uInvModel * wp).xyz;             // scene hit in box-local space
+      bounds.y = min(bounds.y, dot(mh - vOrigin, dir)); // dir is normalized → t
+      if (bounds.x > bounds.y) discard;
+    }
     float t = max(bounds.x, 0.0);
     float stepLen = (bounds.y - t) / float(uSteps);
     float denom = max(1e-4, 1.0 - uThreshold);
@@ -258,7 +309,7 @@ const volFrag = `
     // In streamed mode, occupied-but-not-resident bricks sample the coarse
     // fallback and step (they must NOT leap, or the region would be invisible
     // until its brick streams in).
-    for (int i = 0; i < 1024; i++) {
+    for (int i = 0; i < 2048; i++) {
       if (t >= bounds.y) break;
       vec3 uvw = (vOrigin + t * dir) / uSize + 0.5;
       vec3 posVox = uvw * uVolDim;
@@ -299,6 +350,12 @@ const volFrag = `
         // alpha up to hold the cube's integrated opacity (its viewability)
         // roughly constant. Computed on the client from the channel histogram.
         float a = clamp(pow(d, uGamma) * uOpacity * uNorm, 0.0, 1.0);
+        // Near-zone fade: within uNearDist of the camera the points take over, so
+        // taper the volume's contribution to ~0 at the camera and full at uNearDist.
+        // This keeps points from being buried by haze in front of them, yet leaves
+        // a faint fill between sparse points (no black voids) — and far/zoomed-out
+        // (t ≥ uNearDist everywhere) the volume is unaffected.
+        a *= clamp(t / uNearDist, 0.0, 1.0);
         acc.rgb += (1.0 - acc.a) * col * a;
         acc.a   += (1.0 - acc.a) * a;
         if (acc.a >= 0.95) break;
@@ -370,10 +427,18 @@ const ptVert = `
   in vec4 aColor;
   out vec4 vColor;
   uniform float uPointSize;
+  uniform float uPointThreshold;
   void main() {
+    // Drop points whose data value (alpha) is below the threshold — the point
+    // analog of the volume's uThreshold. Collapse to a degenerate vertex so the
+    // rasterizer discards it outright (cheaper than a per-fragment discard).
+    if (aColor.a < uPointThreshold) { gl_Position = vec4(2.0); gl_PointSize = 0.0; return; }
     vColor = aColor;
     vec4 mv = modelViewMatrix * vec4(position, 1.0);
-    gl_PointSize = uPointSize * (320.0 / -mv.z);
+    // Perspective-scaled but clamped to a dot-like range: unbounded 1/z growth
+    // turns near points into screen-filling blobs once you zoom in, which is
+    // exactly when we want crisp individual points. Keep them a few px each.
+    gl_PointSize = clamp(uPointSize * 90.0 / -mv.z, 1.0, uPointSize * 4.0);
     gl_Position = projectionMatrix * mv;
   }`;
 
@@ -381,11 +446,13 @@ const ptFrag = `
   precision highp float;
   in vec4 vColor;
   out vec4 fragColor;
-  uniform float uPointOpacity;
   void main() {
+    // Opaque points: a round sprite, fully opaque so it writes depth and occludes
+    // whatever is behind it (no additive haze). The data value rides in the alpha
+    // channel for thresholding (see ptVert), not for blending.
     vec2 d = gl_PointCoord - vec2(0.5);
     if (dot(d, d) > 0.25) discard;
-    fragColor = vec4(vColor.rgb, vColor.a * uPointOpacity);
+    fragColor = vec4(vColor.rgb, 1.0);
   }`;
 
 // ---- threshold re-normalization ---------------------------------------------
@@ -445,7 +512,7 @@ function refreshNorm() {
 }
 
 // ---- load + build -----------------------------------------------------------
-let volMesh = null, points = null;
+let points = null;
 // Kept for click-to-pick: the raw volume buffer + grid extent + world box size
 // + entity manifest.
 let volBufG = null, extG = [0, 0, 0], sizeG = [1, 1, 1], manifestG = [];
@@ -454,7 +521,7 @@ const raycaster = new THREE.Raycaster();
 // Streamed point-LOD octree (format_version >= 2). Null when the bundle ships
 // only the wholesale points.bin. `ptMaterial` is the shared point material so
 // the size/opacity sliders drive both the flat cloud and every octree node.
-let octree = null, ptMaterial = null, pointsActive = false, octreeDirty = true;
+let octree = null, ptMaterial = null, pointsActive = true, octreeDirty = true;
 // Ray-guided brick streaming (meta.bricks.streamed): bounded GPU cache fed on
 // demand by what the rays need. Null for the fully-resident (non-streamed) path.
 // `volumeDirty` re-runs the feedback probe after the camera moves or a brick
@@ -574,23 +641,37 @@ async function load() {
 
   const volMat = new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
-    side: THREE.BackSide, transparent: true, depthWrite: false,
+    // Composited over the already-drawn opaque (points) background. volFrag emits
+    // premultiplied color (acc.rgb is pre-multiplied by acc.a), so blend with
+    // (ONE, ONE_MINUS_SRC_ALPHA). Depth is handled manually via uSceneDepth, so
+    // the hardware depth test is off.
+    side: THREE.BackSide, transparent: true, depthTest: false, depthWrite: false,
+    blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor,
     uniforms: {
       uBricks: { value: brickTex }, uPageTable: { value: pageTex }, uLut: { value: lutTex },
       uCoarse: { value: coarseTex }, uStreamed: { value: streamed ? 1 : 0 },
       uOpacity: { value: 0.2 }, uGamma: { value: 1.0 },
-      uThreshold: { value: 0.0 }, uSource: { value: 0 }, uSteps: { value: 192 },
+      // Quality is fixed high (no slider) — well above the old 384 max. The 2048
+      // loop cap in volFrag keeps up with the finer step in dense regions.
+      uThreshold: { value: 0.0 }, uSource: { value: 0 }, uSteps: { value: 512 },
       uNorm: { value: 1.0 }, uDirectColor: { value: directColor ? 1 : 0 },
       uSize: { value: new THREE.Vector3(size[0], size[1], size[2]) },
       uVolDim: { value: new THREE.Vector3(bm.vol_dim[0], bm.vol_dim[1], bm.vol_dim[2]) },
       uPageDim: { value: new THREE.Vector3(bm.page_dim[0], bm.page_dim[1], bm.page_dim[2]) },
       uAtlasBricks: { value: new THREE.Vector3(atlasBricks[0], atlasBricks[1], atlasBricks[2]) },
       uBrick: { value: bm.brick }, uBrickStride: { value: bstride }, uApron: { value: bm.apron },
+      uSceneDepth: { value: sceneTarget.depthTexture }, uResolution: { value: new THREE.Vector2(1, 1) },
+      uInvProjView: { value: new THREE.Matrix4() }, uInvModel: { value: new THREE.Matrix4() },
+      uNearDist: { value: OCT_POINTS_DIST }, // matches the octree's points-takeover radius
     },
     vertexShader: volVert, fragmentShader: volFrag,
   });
   if (brickStream) brickStream.volMat = volMat;
   volMesh = new THREE.Mesh(new THREE.BoxGeometry(size[0], size[1], size[2]), volMat);
+  volMesh.layers.set(VOL_LAYER); // volume-only pass selects this layer
+  // sceneTarget already exists (resize ran at startup); point the depth sampler at
+  // it now that the material is built.
+  volMesh.material.uniforms.uSceneDepth.value = sceneTarget.depthTexture;
   scene.add(volMesh);
   // Match the orientation cube to the (possibly anisotropic) box.
   edges.scale.set(size[0], size[1], size[2]);
@@ -599,8 +680,8 @@ async function load() {
   // the wholesale cloud and the streamed octree nodes.
   const ptMat = new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
-    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
-    uniforms: { uPointSize: { value: 1.6 }, uPointOpacity: { value: 0.4 } },
+    transparent: false, depthTest: true, depthWrite: true, blending: THREE.NoBlending,
+    uniforms: { uPointSize: { value: 1.6 }, uPointThreshold: { value: 0.0 } },
     vertexShader: ptVert, fragmentShader: ptFrag,
   });
   ptMaterial = ptMat;
@@ -624,7 +705,7 @@ async function load() {
       // shift so the box centers on the origin (a cube → scale 1, shift -0.5).
       points.scale.set(size[0], size[1], size[2]);
       points.position.set(-size[0] / 2, -size[1] / 2, -size[2] / 2);
-      points.visible = false;
+      points.visible = forceView !== 'volume'; // debug override only
       scene.add(points);
     }
   }
@@ -669,6 +750,11 @@ const OCT_REFINE_PX = 220;      // refine a node when its on-screen diameter exc
 const OCT_BUDGET = 3_000_000;   // cap on points drawn per frame
 const OCT_MAX_INFLIGHT = 8;     // concurrent range fetches
 const OCT_RESIDENT_CAP = 8_000_000; // max points kept resident on the GPU (LRU-evicted)
+// Volume↔points takeover: a node renders as opaque points only when its cube
+// center is within this distance of the camera (world units; the box's longest
+// axis = 1). Near regions — the area you've zoomed toward — become points; the
+// rest of the model recedes into the volume haze behind them. Tunable.
+const OCT_POINTS_DIST = 0.7;
 const octDebug = location.search.includes('debug'); // log octree stats per pass
 
 // Parse points_hierarchy.bin into nodes and rebuild the tree spatially: a
@@ -707,7 +793,6 @@ function setupOctree(po, size, material) {
     const group = new THREE.Group();
     group.scale.set(size[0], size[1], size[2]);
     group.position.set(-size[0] / 2, -size[1] / 2, -size[2] / 2);
-    group.visible = false;
     scene.add(group);
     octree = { order, span, root, nodes, group, material, dataUrl: po.data_file, size,
                inflight: 0, residentPoints: 0, frame: 0 };
@@ -794,10 +879,15 @@ function octreeUpdate() {
   const stack = [octree.root];
   while (stack.length) {
     const node = stack.pop();
-    const p = projPx(node);
-    if (p < 0 || budget - node.pointCount < 0) continue;
-    visible.add(node);
-    budget -= node.pointCount;
+    const p = projPx(node);          // also frustum-culls (-1) and sets _oCenter
+    if (p < 0) continue;
+    // Render points only for nodes near the camera; the volume covers the rest.
+    // Refinement (descent) is independent of this so a far parent can still lead
+    // to near children as you push in.
+    if (forceView !== 'volume' && _oCenter.distanceTo(camera.position) < OCT_POINTS_DIST && budget - node.pointCount >= 0) {
+      visible.add(node);
+      budget -= node.pointCount;
+    }
     if (node.children.length && p * 2 > OCT_REFINE_PX) {
       for (const c of node.children) stack.push(c);
     }
@@ -1094,7 +1184,7 @@ function touchAndEvictBricks(bs) {
 // Per-frame brick streaming step (called from tick before the main render).
 function streamBricks() {
   const bs = brickStream;
-  if (!bs || !volMesh || !volMesh.visible) return; // pause while in Points view
+  if (!bs || !volMesh) return; // volume is always part of the unified view now
   bs.frame++;
   if ((volumeDirty || bs.pending.size > 0) && bs.probeIdle && (bs.frame - bs.fbFrame) >= FB_EVERY) {
     runFeedback(bs);
@@ -1278,26 +1368,20 @@ function slider(id, label, fmt, cb) {
 
 function bindControls() {
   const v = () => volMesh.material.uniforms;
-  seg('mode', (m) => {
-    const vol = m === 'volume';
-    if (volMesh) volMesh.visible = vol;
-    pointsActive = !vol;
-    if (points) points.visible = !vol;
-    if (octree) { octree.group.visible = !vol; octreeDirty = true; }
-    $('volctl').hidden = !vol;
-    $('ptctl').hidden = vol;
-  });
   seg('src', (s) => { v().uSource.value = parseInt(s); refreshNorm(); });
   slider('opacity', 'opv', (x) => x.toFixed(2), (x) => v().uOpacity.value = x);
   slider('gamma', 'gav', (x) => x.toFixed(2), (x) => v().uGamma.value = x);
-  slider('threshold', 'thv', (x) => x.toFixed(2), (x) => { v().uThreshold.value = x; refreshNorm(); });
-  slider('steps', 'stv', (x) => x.toFixed(0), (x) => v().uSteps.value = x);
+  // One threshold for both representations: it raises the volume floor (with the
+  // renorm compensation) and drops below-value points (uPointThreshold) in step.
+  slider('threshold', 'thv', (x) => x.toFixed(2), (x) => {
+    v().uThreshold.value = x;
+    if (ptMaterial) ptMaterial.uniforms.uPointThreshold.value = x;
+    refreshNorm();
+  });
   refreshNorm();
-  // Point sliders drive the shared material (flat cloud or every octree node).
+  // Point size drives the shared material (flat cloud or every octree node).
   if (ptMaterial) {
-    const u = ptMaterial.uniforms;
-    slider('psize', 'psv', (x) => x.toFixed(1), (x) => u.uPointSize.value = x);
-    slider('popacity', 'pov', (x) => x.toFixed(2), (x) => u.uPointOpacity.value = x);
+    slider('psize', 'psv', (x) => x.toFixed(1), (x) => ptMaterial.uniforms.uPointSize.value = x);
   }
 }
 
@@ -1305,11 +1389,46 @@ function bindControls() {
 // Camera motion (incl. OrbitControls damping) re-evaluates the octree LOD cut
 // and re-arms the brick-streaming feedback probe.
 controls.addEventListener('change', () => { octreeDirty = true; volumeDirty = true; });
+
+// Depth-correct hybrid in three passes (see the "hybrid compositing" block):
+//   1. opaque points/edges (layer 0) → sceneTarget (color + depth)
+//   2. blit that color verbatim to the canvas
+//   3. volume (layer 1) ray-marched over it, rays cut at the opaque depth
+// labelRenderer draws the CSS2D layer text on top afterwards.
+const _projView = new THREE.Matrix4();
+function renderHybrid() {
+  // 1 — opaque pass.
+  camera.layers.set(0);
+  renderer.setRenderTarget(sceneTarget);
+  renderer.render(scene, camera);
+  renderer.setRenderTarget(null);
+  // 2 — blit opaque color to the canvas (clears the canvas first).
+  copyMat.uniforms.tColor.value = sceneTarget.texture;
+  renderer.render(copyScene, copyCam);
+  // 3 — volume composited over the blit.
+  if (volMesh && forceView !== 'points') {
+    const u = volMesh.material.uniforms;
+    renderer.getDrawingBufferSize(_dbSize);
+    u.uResolution.value.copy(_dbSize);
+    u.uSceneDepth.value = sceneTarget.depthTexture;
+    camera.updateMatrixWorld();
+    _projView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    u.uInvProjView.value.copy(_projView).invert();
+    volMesh.updateMatrixWorld();
+    u.uInvModel.value.copy(volMesh.matrixWorld).invert();
+    camera.layers.set(VOL_LAYER);
+    renderer.autoClear = false;
+    renderer.render(scene, camera);
+    renderer.autoClear = true;
+  }
+  camera.layers.set(0); // restore for the label renderer + next-frame feedback
+}
+
 function tick() {
   controls.update();
   if (octreeDirty) { octreeUpdate(); octreeDirty = false; }
   if (brickStream) streamBricks();
-  renderer.render(scene, camera);
+  renderHybrid();
   labelRenderer.render(scene, camera);
   requestAnimationFrame(tick);
 }

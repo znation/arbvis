@@ -1,6 +1,5 @@
 //! Encoding of the aggregated 3D volume into the on-disk bundle the Three.js
-//! viewer consumes: a raw RGBA8 `Data3DTexture` payload, an interleaved point
-//! buffer, and a JSON sidecar.
+//! viewer consumes: a raw RGBA8 `Data3DTexture` payload and a JSON sidecar.
 
 use image::Rgb;
 use serde::Serialize;
@@ -20,9 +19,9 @@ pub struct VoxelAcc {
 }
 
 /// JSON sidecar describing the bundle. The viewer fetches this first, then
-/// `volume.bin` / `points.bin`, sizing its `Data3DTexture` and point buffer
-/// from these fields. The byte→color LUT travels here too so the shader colors
-/// voxels exactly like the 2D renderer.
+/// `volume.bin`, sizing its `Data3DTexture` from these fields. The byte→color
+/// LUT travels here too so the shader colors voxels exactly like the 2D
+/// renderer.
 #[derive(Serialize)]
 pub struct VolumeMeta {
     pub title: String,
@@ -32,8 +31,6 @@ pub struct VolumeMeta {
     /// in x-fastest, then y, then z order. The byte path emits a cube (equal
     /// power-of-two sides); a structured path may emit an anisotropic box.
     pub grid_extent: [u32; 3],
-    /// Number of points in `points.bin`.
-    pub points: u64,
     pub total_bytes: u64,
     /// Largest per-voxel byte count, used to normalize the "fill density"
     /// opacity channel back to a count on the client if desired.
@@ -57,15 +54,10 @@ pub struct VolumeMeta {
     /// floor). The viewer builds invisible pick boxes from these so a click can
     /// name the tensor under the cursor.
     pub manifest: Vec<super::shape::VolumeLabel>,
-    /// Bundle format version. Absent/`1` ⇒ wholesale only (the original
-    /// bundle). `2` ⇒ also ships a streamed point-LOD octree (`point_octree`).
-    /// `3` ⇒ the brick volume may be ray-guided streamed (`bricks.streamed`).
+    /// Bundle format version. `3` ⇒ the brick volume may be ray-guided streamed
+    /// (`bricks.streamed`); earlier versions also shipped a point cloud, since
+    /// removed. `4` ⇒ volume-only (no point cloud).
     pub format_version: u32,
-    /// Streamed point-LOD octree descriptor; absent on wholesale-only bundles
-    /// (older bundles, structured layouts, tiny inputs) so the viewer falls
-    /// back to the wholesale `points.bin`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub point_octree: Option<PointOctreeMeta>,
     /// Sparse brick pool + page table the volume ray-march renders from
     /// (GigaVoxels-style indirection, replacing the dense full-cube texture and
     /// the occupancy mip). Absent ⇒ the viewer renders the dense `volume.bin`.
@@ -106,26 +98,6 @@ pub struct BrickVolumeMeta {
     /// demand, so VRAM is decoupled from the data's total size.
     #[serde(default)]
     pub streamed: bool,
-}
-
-/// Descriptor for the streamed point-LOD octree (the 3D analog of the 2D tile
-/// pyramid). The viewer fetches `hierarchy_file` once, rebuilds the implicit
-/// octree, then range-fetches node blocks from `data_file` on demand as the
-/// camera refines — converging to one point per byte when zoomed in.
-#[derive(Serialize)]
-pub struct PointOctreeMeta {
-    /// Concatenated per-node point blocks (each: 3 local coords + RGBA8).
-    pub data_file: String,
-    /// Fixed-size [`super::octree::NodeRecord`]s, `record_size` bytes each.
-    pub hierarchy_file: String,
-    pub record_size: u32,
-    pub node_count: u64,
-    /// Hilbert order `P`: the virtual point grid is `2^P` per axis.
-    pub order: u32,
-    /// Occupancy-grid exponent used per node (node cap = `(2^grid_log2)³`).
-    pub grid_log2: u32,
-    /// Total stored (post-LOD) points across all nodes.
-    pub total_points: u64,
 }
 
 /// Convert the accumulated grid into the RGBA8 texel buffer.
@@ -175,18 +147,6 @@ pub fn pack_voxel_cells(grid: &[super::voxel::VoxelCell]) -> Vec<u8> {
         out[o + 2] = c.b;
         out[o + 3] = c.a;
     }
-    out
-}
-
-/// Pack the point cloud into one buffer: `positions` (f32 ×3 per point, in
-/// `[0,1]`) immediately followed by `colors` (u8 ×4 per point, RGBA). The
-/// viewer slices the two blocks using the point count from [`VolumeMeta`].
-pub fn pack_points(positions: &[f32], colors: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(positions.len() * 4 + colors.len());
-    for &f in positions {
-        out.extend_from_slice(&f.to_le_bytes());
-    }
-    out.extend_from_slice(colors);
     out
 }
 

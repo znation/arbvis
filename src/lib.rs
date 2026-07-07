@@ -229,13 +229,6 @@ pub struct Args {
     #[arg(long, default_value_t = 256)]
     grid: u32,
 
-    /// 3D point-cloud LOD budget: max points stored in the streamed octree.
-    /// Files within it render every byte exactly; larger files are subsampled
-    /// to fit. The viewer streams only the nodes on screen, so a bigger budget
-    /// mostly costs disk/build time, not client bandwidth. Ignored in 2D mode.
-    #[arg(long = "point-budget", default_value_t = 8_000_000)]
-    point_budget: u64,
-
     /// 3D volume virtual resolution (power of two, 8–2048): build the sparse
     /// brick pool at this side instead of `--grid`, so the *volume* mode can
     /// exceed the dense grid for sparse data (only occupied bricks are stored
@@ -316,8 +309,6 @@ struct RenderConfig {
     three_d: bool,
     /// 3D voxel grid side (power of two); unused in 2D.
     grid_side: u32,
-    /// 3D point-cloud LOD octree budget (max stored points); unused in 2D.
-    point_budget: u64,
     /// 3D volume virtual resolution for the sparse brick pool (`0` = `--grid`).
     volume_res: u32,
 }
@@ -546,7 +537,6 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
         pyramid_format,
         three_d: args.three_d,
         grid_side: args.grid,
-        point_budget: args.point_budget,
         volume_res: args.volume_res,
     };
     dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await
@@ -773,7 +763,6 @@ async fn render_volume_bundle(
         &cfg.inputs,
         cfg.diff_mode,
         cfg.grid_side,
-        cfg.point_budget,
         cfg.volume_res,
         cfg.layout_mode,
         registry,

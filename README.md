@@ -47,39 +47,33 @@ In `--diff` mode, each pixel encodes the byte-wise difference between the two in
 
 ## 3D mode (`--3d`)
 
-`--3d` lays the bytes along a **3D Hilbert curve** inside a cube — the natural generalization of the 2D layout — and emits a self-contained [Three.js](https://threejs.org/) viewer bundle (`index.html`, `volume.bin`, `points.bin`, `meta.json`). It deploys as a Hugging Face Space exactly like 2D (`--space`).
+`--3d` lays the bytes along a **3D Hilbert curve** inside a cube — the natural generalization of the 2D layout — and emits a self-contained [Three.js](https://threejs.org/) viewer bundle (`index.html`, `volume.bin`, `bricks.bin`, `pagetable.bin`, `meta.json`). It deploys as a Hugging Face Space exactly like 2D (`--space`).
 
 ```sh
 arbvis model.safetensors --3d --out ./out3d      # local bundle (serve over HTTP)
 arbvis hf://datasets/owner/dataset --3d --space me/vis-3d   # deploy a Space
 ```
 
-Where 2D color is fully opaque, **3D uses opacity to encode density** so you can see *through* the cube to its internal structure instead of just an opaque shell. The viewer has two modes (toggle in the panel):
+Where 2D color is fully opaque, **3D uses opacity to encode density** so you can see *through* the cube to its internal structure instead of just an opaque shell. The viewer is a GPU ray-march of a bounded voxel grid: color encodes the mean byte value (the same [byte-color scheme](#byte-colors) as 2D); opacity comes from an adjustable, log-style **transfer function**. Render and download cost depend on the grid resolution, *not* the input size, so a multi-GB file renders as smoothly as a small one.
 
-- **Volume** (default) — a GPU ray-march of a bounded voxel grid. Color encodes the mean byte value (the same [byte-color scheme](#byte-colors) as 2D); opacity comes from an adjustable, log-style **transfer function**. Render and download cost depend on the grid resolution, *not* the input size, so a multi-GB file renders as smoothly as a small one.
-  - **Opacity source** — *Activity* (default: mean byte "brightness", so null/padding regions fade to transparent and real data stands out) or *Density* (how many bytes fall in each voxel).
-  - **Opacity / Contrast / Threshold / Quality** sliders tune the transfer function and ray-march step count.
-- **Points** — the exact byte positions as a point cloud with additive blending (per-point color + size/opacity). The cloud is a **streamed level-of-detail octree** (the 3D analog of the 2D tile pyramid): the viewer fetches only the nodes in view at the zoom-appropriate resolution and refines as you zoom in, converging toward one point per byte — so you can drill into individual points without downloading the whole cloud up front. A small wholesale buffer is kept as a `file://` fallback.
+- **Opacity source** — *Activity* (default: mean byte "brightness", so null/padding regions fade to transparent and real data stands out) or *Density* (how many bytes fall in each voxel).
+- **Volume opacity / Volume contrast / Threshold** sliders tune the transfer function.
 
-**Controls:** drag to rotate · right-drag to pan · scroll to zoom (the camera auto-frames the occupied region on load). Zooming in streams finer detail.
+**Controls:** drag to rotate · right-drag to pan · scroll to zoom (the camera auto-frames the occupied region on load). Hover or click a region to identify the tensor under the cursor (structured layouts).
 
 **Grid resolution (`--grid N`)** — the voxel cube side, a power of two in `2–512` (default `256`). Higher is more detailed but a larger download (≈ `N³ · 4` bytes; `128³` ≈ 8 MB, `256³` ≈ 64 MB, `512³` ≈ 512 MB).
 
-**Point budget (`--point-budget N`)** — max points stored in the streamed LOD octree (default `8_000_000`). Files within it render every byte exactly; larger files are subsampled to fit. The viewer streams only on-screen nodes, so a bigger budget mostly costs disk and build time, not client bandwidth.
+**Volume resolution (`--volume-res N`)** — build the sparse brick pool at this virtual side (power of two, above `--grid`) instead of the dense grid, so the *volume* can exceed `--grid` for sparse data. Only occupied bricks are stored and streamed into a bounded GPU cache on demand (ray-guided, GigaVoxels-style), so VRAM tracks the visible working set, not the total data size. `0` (default) keeps the volume at `--grid`.
 
 Like the 2D viewer, the 3D bundle loads Three.js from a CDN and fetches its data over HTTP — open `index.html` through a web server, not a `file://` URL.
 
 ### Not yet implemented
 
-The 3D mode is scoped for incremental delivery. Shipped so far: **octree
-level-of-detail streaming** for the point cloud (above) — exact drill-down up
-to the `--point-budget`, streamed on demand — for both the raw byte cloud
-**and structured layouts** (a `VoxelRenderer` can emit per-element points via
-`point_weight` + `render_points`, so e.g. modelweightvis's arch view refines
-toward individual weights). Still deferred:
+The 3D mode is scoped for incremental delivery. Shipped so far: **ray-guided
+bricked sparse-voxel streaming** for the volume (GigaVoxels-style page table +
+brick pool with empty-space skipping and a bounded on-demand GPU cache), so the
+ray-marched volume can drill past a single bounded grid. Still deferred:
 
-- **Bricked sparse-voxel streaming** for the *volume* mode (GigaVoxels-style page table + brick pool with empty-space skipping), so the ray-marched volume drills past a single bounded grid too.
-- **WebGPU compute-shader rendering** (software point rasterization) for far higher on-screen point counts.
 - **3D file-boundary overlays** and an **interactive transfer-function editor** with a density histogram.
 
 ## Supported input formats
@@ -125,7 +119,7 @@ In 2D this generates a Leaflet pyramid (`out/tiles/{z}/{x}/{y}.{ext}`, `out/inde
 - No size limit — works on files of any size; lower zoom levels are averaged.
 - HTML labels positioned at each region's area-weighted centroid.
 
-In `--3d` it generates the volume bundle (`index.html`, `volume.bin`, `points.bin`, `meta.json`) — see [3D mode](#3d-mode). Either bundle loads its rendering library from a CDN and fetches its data over HTTP, so open `index.html` through a web server, not a `file://` URL.
+In `--3d` it generates the volume bundle (`index.html`, `volume.bin`, `bricks.bin`, `pagetable.bin`, `meta.json`) — see [3D mode](#3d-mode). Either bundle loads its rendering library from a CDN and fetches its data over HTTP, so open `index.html` through a web server, not a `file://` URL.
 
 ![arbvis screenshot](arbvis.png)
 

@@ -41,10 +41,10 @@ _MEDIA_TYPES = {
 
 # Serve any bundle asset from the backing bucket. This single catch-all covers
 # the 2D layout (tiles/<z>/<x>/<y>.<ext>, the multi-scene tiles/<scene>/...,
-# and labels.json) and the 3D bundle (volume.bin, points.bin, meta.json, and
-# the streamed point-octree files). HTTP Range is honored so the 3D viewer can
-# fetch one octree node at a time instead of the whole points_octree.bin —
-# range reads pull only the requested bytes from the Hub.
+# and labels.json) and the 3D bundle (volume.bin, bricks.bin, pagetable.bin,
+# meta.json). HTTP Range is honored so the 3D viewer can stream one brick at a
+# time instead of the whole bricks.bin — range reads pull only the requested
+# bytes from the Hub.
 @app.get("/{rest:path}")
 def asset(rest: str, request: Request):
     if not rest or rest == "index.html":

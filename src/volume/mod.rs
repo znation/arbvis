@@ -6,17 +6,16 @@
 //! Hilbert curve and aggregates them into a bounded voxel grid — so render and
 //! download cost are governed by the grid resolution, not the (potentially
 //! many-GB) input size. The viewer ray-marches the grid with opacity encoding
-//! density (so the cube's interior is visible) and offers a point-cloud mode
-//! for the exact-position view.
+//! density (so the cube's interior is visible).
 //!
 //! Output bundle (written to the `--out` directory, deployed verbatim by
 //! `--space`): `index.html`, `volume.bin` (RGBA8 `Data3DTexture` payload),
-//! `points.bin` (packed positions+colors), and `meta.json`.
+//! `bricks.bin` / `pagetable.bin` (the sparse brick pool the ray-march reads),
+//! and `meta.json`.
 
 pub mod brick;
 pub mod encode;
 pub mod html;
-pub mod octree;
 pub mod shape;
 pub mod voxel;
 
@@ -40,27 +39,11 @@ use encode::{VolumeMeta, VoxelAcc};
 /// Bytes read per `fetch_range` window during aggregation.
 const CHUNK: u64 = 4 * 1024 * 1024;
 
-/// Size cap for the **wholesale fallback** point cloud (`points.bin`) — the
-/// one-shot buffer the viewer loads when it can't stream (no octree, or a
-/// `file://` open). Kept small for a bounded download. Exact drill-down past
-/// this is the streamed LOD octree's job (see [`octree`]), bounded separately
-/// by the `--point-budget` knob.
-const POINT_BUDGET: u64 = 1_500_000;
-
-/// Max Hilbert order used to place point-cloud positions — caps the coordinate
-/// range at `2^16` per axis (plenty for crisp f32-normalized positions).
-const POINT_ORDER_CAP: u32 = 16;
-
 struct BuildResult {
     volume_rgba: Vec<u8>,
-    points_buf: Vec<u8>,
-    points_count: u64,
     max_count: u64,
     focus_center: [f32; 3],
     focus_radius: f32,
-    /// Streamed point-LOD octree (byte floor only); `None` for the structured
-    /// path, which keeps the wholesale `points.bin`.
-    point_octree: Option<octree::PointOctree>,
     /// Sparse brick pool built at a higher virtual resolution (byte floor with
     /// `--volume-res`); `None` ⇒ `render_volume` derives bricks from the dense
     /// grid instead.
@@ -85,7 +68,6 @@ pub async fn render_volume(
     inputs: &[String],
     diff_mode: bool,
     grid_side: u32,
-    point_budget: u64,
     volume_res: u32,
     mode: LayoutMode,
     registry: &Registry,
@@ -137,17 +119,9 @@ pub async fn render_volume(
         if is_byte {
             // Byte volumes are cubes (Hilbert needs equal sides); all three
             // axes match, so the cube side is `ex`.
-            aggregate_bytes_hilbert(sources, total, ex, point_budget, volume_res, pixel_lut, rt)
+            aggregate_bytes_hilbert(sources, total, ex, volume_res, pixel_lut, rt)
         } else {
-            aggregate_entities(
-                sources,
-                shape.as_ref(),
-                actual_extent,
-                point_budget,
-                &voxel_reg,
-                diff_mode,
-                rt,
-            )
+            aggregate_entities(sources, shape.as_ref(), actual_extent, &voxel_reg, diff_mode, rt)
         }
     })
     .await
@@ -155,7 +129,6 @@ pub async fn render_volume(
 
     std::fs::create_dir_all(&out_dir)?;
     std::fs::write(out_dir.join("volume.bin"), &built.volume_rgba)?;
-    std::fs::write(out_dir.join("points.bin"), &built.points_buf)?;
 
     // Sparse brick pool + page table the volume ray-march renders from
     // (GigaVoxels-style indirection — only occupied bricks, empty ones leapt).
@@ -180,34 +153,11 @@ pub async fn render_volume(
         streamed: bricks.streamed,
     };
 
-    // Streamed point-LOD octree (byte floor): two extra files alongside the
-    // wholesale points.bin, which stays as the file://-friendly fallback. The
-    // viewer prefers the octree when `meta.point_octree` is present.
-    let point_octree_meta = if let Some(oct) = &built.point_octree {
-        std::fs::write(out_dir.join("points_octree.bin"), &oct.data)?;
-        std::fs::write(
-            out_dir.join("points_hierarchy.bin"),
-            oct.serialize_hierarchy(),
-        )?;
-        Some(encode::PointOctreeMeta {
-            data_file: "points_octree.bin".to_string(),
-            hierarchy_file: "points_hierarchy.bin".to_string(),
-            record_size: octree::RECORD_SIZE as u32,
-            node_count: oct.records.len() as u64,
-            order: oct.order,
-            grid_log2: octree::POINT_GRID_LOG2,
-            total_points: oct.total_points(),
-        })
-    } else {
-        None
-    };
-
     let meta = VolumeMeta {
         title: title.to_string(),
         brand_name: branding.name.to_string(),
         repo_url: branding.repo_url.to_string(),
         grid_extent: actual_extent,
-        points: built.points_count,
         total_bytes: total,
         max_count: built.max_count,
         diff_mode,
@@ -217,8 +167,7 @@ pub async fn render_volume(
         focus_radius: built.focus_radius,
         lut: pixel_lut.iter().map(|c| c.0).collect(),
         manifest,
-        format_version: 3,
-        point_octree: point_octree_meta,
+        format_version: 4,
         bricks: Some(brick_meta),
     };
     std::fs::write(out_dir.join("meta.json"), serde_json::to_vec(&meta)?)?;
@@ -227,19 +176,7 @@ pub async fn render_volume(
         html::build_volume_html(title, inputs, branding),
     )?;
 
-    let (nodes, oct_pts, dropped) = built
-        .point_octree
-        .as_ref()
-        .map(|o| (o.records.len(), o.total_points(), o.dropped))
-        .unwrap_or((0, 0, 0));
-    log::info!(
-        "3D viewer bundle written to {} ({} fallback points; LOD octree: {} points in {} nodes, {} duplicates dropped)",
-        out_dir.display(),
-        built.points_count,
-        oct_pts,
-        nodes,
-        dropped
-    );
+    log::info!("3D viewer bundle written to {}", out_dir.display());
     Ok(())
 }
 
@@ -286,14 +223,12 @@ pub fn regen_html(dir: &Path, branding: &Branding) -> anyhow::Result<()> {
 }
 
 /// Byte-Hilbert floor: a single streaming pass over the concatenated source
-/// bytes that populates the voxel grid and samples the point cloud at once.
-/// Runs on the blocking pool. Unchanged from the pre-seam path — byte inputs
-/// render identically.
+/// bytes that populates the voxel grid (and, with `--volume-res`, the
+/// higher-resolution sparse brick pool). Runs on the blocking pool.
 fn aggregate_bytes_hilbert(
     sources: Vec<Source>,
     total: u64,
     grid_side: u32,
-    octree_budget: u64,
     volume_res: u32,
     pixel_lut: [Rgb<u8>; 256],
     rt: tokio::runtime::Handle,
@@ -317,25 +252,6 @@ fn aggregate_bytes_hilbert(
     let cells_v: u128 = if order_v > 0 { 1u128 << (3 * order_v) } else { 0 };
     let mut brick_builder =
         (order_v > 0).then(|| brick::BrickBuilder::new(order_v, brick::BRICK, luma));
-
-    // Point cloud: at least as fine as the grid, capped so positions are crisp.
-    let point_order =
-        geometry::hilbert3d_order_for_cells(total.max(1)).clamp(order, POINT_ORDER_CAP);
-    let cells_pt: u128 = 1u128 << (3 * point_order);
-    let side_pt = (1u32 << point_order) as f32;
-    // Two independent samplings off the same stream: the wholesale fallback
-    // cloud (capped at POINT_BUDGET for a bounded one-shot download) and the
-    // streamed LOD octree (denser — up to `octree_budget` — since the viewer
-    // fetches only on-screen nodes). They share the point grid (`point_order`),
-    // so coordinates register. The octree is the 3D analog of the 2D pyramid.
-    let stride = (total / POINT_BUDGET).max(1);
-    let oct_stride = (total / octree_budget.max(1)).max(1);
-    let mut positions: Vec<f32> = Vec::new();
-    let mut colors: Vec<u8> = Vec::new();
-    let mut next_point_g: u64 = 0;
-    let mut next_oct_g: u64 = 0;
-    let mut oct_count: u64 = 0;
-    let mut octree_builder = octree::PointOctreeBuilder::new(point_order, octree::POINT_GRID_LOG2);
 
     // First byte not belonging to cell `c`. Two regimes: when the cube can't
     // hold every byte (`total > cells`) each cell aggregates a contiguous byte
@@ -398,33 +314,6 @@ fn aggregate_bytes_hilbert(
                     };
                     bb.push(cp_v, b);
                 }
-
-                // Feed both samplings at their own strides. Compute the
-                // point-grid Hilbert distance + color once when either fires.
-                let want_flat = g == next_point_g && (positions.len() as u64 / 3) < POINT_BUDGET;
-                let want_oct = g == next_oct_g && oct_count < octree_budget;
-                if want_flat || want_oct {
-                    let cp = if total as u128 <= cells_pt {
-                        g
-                    } else {
-                        ((g as u128) * cells_pt / total as u128) as u64
-                    };
-                    let c = pixel_lut[b as usize].0;
-                    let a = c[0].max(c[1]).max(c[2]); // 0x00 → transparent
-                    if want_flat {
-                        let [px, py, pz] = geometry::hilbert_d2xyz(cp, point_order);
-                        positions.push(px as f32 / side_pt);
-                        positions.push(py as f32 / side_pt);
-                        positions.push(pz as f32 / side_pt);
-                        colors.extend_from_slice(&[c[0], c[1], c[2], a]);
-                        next_point_g += stride;
-                    }
-                    if want_oct {
-                        octree_builder.push(cp, [c[0], c[1], c[2], a]);
-                        oct_count += 1;
-                        next_oct_g += oct_stride;
-                    }
-                }
             }
             local += len as u64;
         }
@@ -438,10 +327,6 @@ fn aggregate_bytes_hilbert(
     let (focus_center, focus_radius) = occupied_focus(&grid, [grid_side; 3]);
 
     let volume_rgba = encode::grid_to_rgba(&grid, max_count);
-    let points_count = positions.len() as u64 / 3;
-    let points_buf = encode::pack_points(&positions, &colors);
-    let octree = octree_builder.finish();
-    let point_octree = (!octree.records.is_empty()).then_some(octree);
     let bricks = brick_builder.map(|bb| {
         let (bv, dropped) = bb.finish_streaming();
         if dropped > 0 {
@@ -455,12 +340,9 @@ fn aggregate_bytes_hilbert(
 
     Ok(BuildResult {
         volume_rgba,
-        points_buf,
-        points_count,
         max_count,
         focus_center,
         focus_radius,
-        point_octree,
         bricks,
     })
 }
@@ -475,13 +357,11 @@ fn aggregate_entities(
     sources: Vec<Source>,
     shape: &dyn VolumeShape,
     extent: [u32; 3],
-    octree_budget: u64,
     voxel_reg: &VoxelRegistry,
     diff_mode: bool,
     rt: tokio::runtime::Handle,
 ) -> anyhow::Result<BuildResult> {
-    let [ex, ey, ez] = extent;
-    let cells = ex as usize * ey as usize * ez as usize;
+    let cells = extent[0] as usize * extent[1] as usize * extent[2] as usize;
     let mut grid = vec![VoxelCell::default(); cells];
     let entities = shape.entities().unwrap_or_default();
     let default_renderer_id = shape.id();
@@ -499,23 +379,7 @@ fn aggregate_entities(
             })
     };
 
-    // Pass 1: total point-octree weight, to split the budget across entities.
-    // `point_weight` must not read bytes (we pass an empty span).
-    let mut total_w: u128 = 0;
-    for ent in &entities {
-        let r = resolve(ent)?;
-        let ctx = VoxelRenderCtx {
-            entity: ent,
-            bytes: &[],
-            extent,
-            diff_mode,
-        };
-        total_w += r.point_weight(&ctx) as u128;
-    }
-
-    // Pass 2: fetch + bake the dense grid, and (if any renderer opts in) collect
-    // per-element points for the streamed LOD octree, mapped into the global box.
-    let mut oct_points: Vec<([f32; 3], [u8; 4])> = Vec::new();
+    // Fetch + bake the dense grid, one entity at a time.
     for ent in &entities {
         let renderer = resolve(ent)?;
         let src = sources.get(ent.source_idx).ok_or_else(|| {
@@ -543,107 +407,25 @@ fn aggregate_entities(
             extent,
             diff_mode,
         };
-        {
-            let mut view = VoxelGridMut::new(&mut grid, extent);
-            renderer.render(&ctx, &mut view);
-        }
-
-        if total_w > 0 {
-            let w = renderer.point_weight(&ctx) as u128;
-            let budget = if w > 0 {
-                (((octree_budget as u128) * w / total_w) as u64).max(1)
-            } else {
-                0
-            };
-            if budget > 0 {
-                let bb = ent.bbox;
-                let (bw, bh, bz) = (
-                    (bb.x1 - bb.x0) as f32,
-                    (bb.y1 - bb.y0) as f32,
-                    (bb.z1 - bb.z0) as f32,
-                );
-                // bbox-local [0,1]³ → global normalized [0,1]³ (per axis).
-                let mut emit = |local: [f32; 3], rgba: [u8; 4]| {
-                    oct_points.push((
-                        [
-                            (bb.x0 as f32 + local[0] * bw) / ex as f32,
-                            (bb.y0 as f32 + local[1] * bh) / ey as f32,
-                            (bb.z0 as f32 + local[2] * bz) / ez as f32,
-                        ],
-                        rgba,
-                    ));
-                };
-                renderer.render_points(&ctx, budget, &mut emit);
-            }
-        }
+        let mut view = VoxelGridMut::new(&mut grid, extent);
+        renderer.render(&ctx, &mut view);
     }
 
     let (focus_center, focus_radius) = shape
         .focus()
         .unwrap_or_else(|| occupied_focus_cells(&grid, extent));
 
-    // Wholesale fallback cloud (one point per occupied voxel) — kept for the
-    // `file://` / no-octree path, exactly like the byte floor keeps points.bin.
-    let (points_buf, points_count) = points_from_grid(&grid, extent);
     let volume_rgba = encode::pack_voxel_cells(&grid);
-
-    // Streamed LOD octree from the renderer-emitted points. They aren't a
-    // Hilbert linearization (the layout places entities freely), so this takes
-    // the spatial-sort build path. The cube order resolves both the point count
-    // and the box's longest axis.
-    let point_octree = if !oct_points.is_empty() {
-        let max_ext = ex.max(ey).max(ez).max(2);
-        let order_ext = 32 - (max_ext - 1).leading_zeros(); // ceil(log2(max_ext))
-        // Elements are finer than voxels: a tensor packs many weights into each
-        // bbox voxel. Give the cube several extra bits over the box extent so
-        // those sub-voxel elements land in distinct cells (toward one point per
-        // weight) instead of colliding back down to the bounded grid.
-        let order = (order_ext + 4)
-            .max(geometry::hilbert3d_order_for_cells(oct_points.len() as u64))
-            .clamp(1, POINT_ORDER_CAP);
-        let oct = octree::build_from_normalized_points(&oct_points, order, octree::POINT_GRID_LOG2);
-        (!oct.records.is_empty()).then_some(oct)
-    } else {
-        None
-    };
 
     Ok(BuildResult {
         volume_rgba,
-        points_buf,
-        points_count,
         max_count: 0,
         focus_center,
         focus_radius,
-        point_octree,
         // Structured grids are dense + anisotropic; bricks are derived from the
         // dense grid in render_volume rather than streamed at high resolution.
         bricks: None,
     })
-}
-
-/// Sample one point per occupied (`a > 0`) voxel — strided down to
-/// [`POINT_BUDGET`] — at the voxel's box-cell center, carrying its baked RGBA.
-/// Positions are normalized per axis into `[0, 1]`; the viewer scales them by
-/// the box's world size. Keeps the structured Points view aligned with the
-/// volume.
-fn points_from_grid(grid: &[VoxelCell], extent: [u32; 3]) -> (Vec<u8>, u64) {
-    let [ex, ey, _ez] = extent;
-    let (ex, ey) = (ex as usize, ey as usize);
-    let inv = [extent[0] as f32, extent[1] as f32, extent[2] as f32];
-    let occupied: Vec<usize> = (0..grid.len()).filter(|&i| grid[i].a > 0).collect();
-    let stride = (occupied.len() as u64 / POINT_BUDGET).max(1) as usize;
-    let mut positions: Vec<f32> = Vec::new();
-    let mut colors: Vec<u8> = Vec::new();
-    for &i in occupied.iter().step_by(stride) {
-        let (x, y, z) = (i % ex, (i / ex) % ey, i / (ex * ey));
-        positions.push((x as f32 + 0.5) / inv[0]);
-        positions.push((y as f32 + 0.5) / inv[1]);
-        positions.push((z as f32 + 0.5) / inv[2]);
-        let c = grid[i];
-        colors.extend_from_slice(&[c.r, c.g, c.b, c.a]);
-    }
-    let count = positions.len() as u64 / 3;
-    (encode::pack_points(&positions, &colors), count)
 }
 
 /// World-space framing center + radius from an occupied bounding box (per-axis
@@ -759,8 +541,7 @@ mod tests {
 
     /// A half-zero / half-0xFF buffer must produce both fully-transparent
     /// (activity 0) and fully-active (activity 255) occupied voxels, and a
-    /// well-formed bundle (volume.bin sized to the grid, all bytes sampled as
-    /// points since the input is far under the point budget).
+    /// well-formed bundle (volume.bin sized to the grid).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn aggregates_zero_and_ff_split() {
         let mut bytes = vec![0u8; 4096];
@@ -776,7 +557,6 @@ mod tests {
             &[],
             false,
             grid_side,
-            8_000_000,
             0,
             LayoutMode::Auto,
             &Registry::with_defaults(),
@@ -810,86 +590,11 @@ mod tests {
             serde_json::json!([grid_side, grid_side, grid_side]),
             "byte floor is a cube"
         );
-        assert_eq!(meta["points"], total);
         assert_eq!(
             meta["color_mode"], "lut",
             "byte floor must stay LUT-colored"
         );
-        assert!(dir.path().join("points.bin").exists());
         assert!(dir.path().join("index.html").exists());
-    }
-
-    /// The byte floor must also emit a well-formed streamed point-LOD octree:
-    /// `meta.point_octree` present, the two files sized to match the hierarchy
-    /// records, and (with enough points to overflow the root) a multi-node tree
-    /// whose blocks exactly tile the data file.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn emits_streamed_point_octree() {
-        // 200 KB ≫ the root capacity (32³ = 32768) ⇒ the octree must subdivide.
-        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i * 31 + 7) as u8).collect();
-        let total = bytes.len() as u64;
-        let dir = tempfile::tempdir().unwrap();
-        render_volume(
-            vec![buffered(bytes)],
-            total,
-            dir.path().to_path_buf(),
-            "test",
-            &[],
-            false,
-            8, // small grid ⇒ point grid finer than the voxel grid
-            8_000_000,
-            0,
-            LayoutMode::Auto,
-            &Registry::with_defaults(),
-            &Branding::default(),
-        )
-        .await
-        .unwrap();
-
-        let meta: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dir.path().join("meta.json")).unwrap()).unwrap();
-        assert_eq!(meta["format_version"], 3, "current bundles ship format v3");
-        // No --volume-res here, so bricks come from the dense grid: fully
-        // resident, not the ray-guided streamed pool.
-        assert_eq!(meta["bricks"]["streamed"], false, "dense-derived bricks aren't streamed");
-        let po = &meta["point_octree"];
-        assert!(po.is_object(), "point_octree descriptor present");
-        assert_eq!(po["record_size"], octree::RECORD_SIZE as u64);
-        let node_count = po["node_count"].as_u64().unwrap();
-        assert!(node_count > 1, "200 KB overflows the root into a tree, got {node_count}");
-        assert!(
-            po["total_points"].as_u64().unwrap() > 0,
-            "octree stores points"
-        );
-
-        // Hierarchy file is fixed-size records; data file is the node blocks.
-        let hier = std::fs::read(dir.path().join("points_hierarchy.bin")).unwrap();
-        let data = std::fs::read(dir.path().join("points_octree.bin")).unwrap();
-        assert_eq!(hier.len() as u64, node_count * octree::RECORD_SIZE as u64);
-
-        // Records must tile the data file exactly: every byte covered once.
-        let mut covered = 0u64;
-        let mut depths = std::collections::BTreeSet::new();
-        for chunk in hier.chunks_exact(octree::RECORD_SIZE) {
-            let r = octree::NodeRecord::read_le(chunk);
-            assert!(
-                r.byte_offset + r.byte_length as u64 <= data.len() as u64,
-                "record block out of bounds"
-            );
-            assert_eq!(
-                r.byte_length as usize,
-                r.point_count as usize * r.stride(),
-                "block length matches point count × stride"
-            );
-            covered += r.byte_length as u64;
-            depths.insert(r.depth);
-        }
-        assert_eq!(covered, data.len() as u64, "node blocks tile the data file");
-        assert!(depths.contains(&0), "a root node exists");
-        assert!(depths.len() > 1, "multiple LOD levels present");
-
-        // The wholesale fallback is still emitted.
-        assert!(dir.path().join("points.bin").exists());
     }
 
     /// `--volume-res` above `--grid` must emit the ray-guided **streamed** brick
@@ -909,7 +614,6 @@ mod tests {
             &[],
             false,
             8,  // --grid: dense voxel grid
-            8_000_000,
             16, // --volume-res > --grid ⇒ the streaming brick builder runs
             LayoutMode::Auto,
             &Registry::with_defaults(),
@@ -947,8 +651,8 @@ mod tests {
     // A structured VolumeShape whose single entity paints a 4³ box; its
     // VoxelRenderer bakes a fixed RGBA into the cube. Exercises the entity path
     // end to end: shape selection (priority over the floor), per-entity fetch,
-    // voxel-renderer dispatch, baked-RGB packing, and the `"rgb"` color_mode +
-    // dropped point cloud in `meta.json`.
+    // voxel-renderer dispatch, baked-RGB packing, and the `"rgb"` color_mode in
+    // `meta.json`.
     struct TestVolume {
         extent: [u32; 3],
     }
@@ -1047,7 +751,6 @@ mod tests {
             &[],
             false,
             grid_side,
-            8_000_000,
             0,
             LayoutMode::Auto,
             &reg,
@@ -1080,93 +783,9 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.path().join("meta.json")).unwrap()).unwrap();
         assert_eq!(meta["color_mode"], "rgb");
         assert_eq!(
-            meta["points"], 64,
-            "one point per occupied voxel (the 4³ baked box)"
-        );
-        assert_eq!(
             meta["grid_extent"],
             serde_json::json!(expect_extent),
             "structured shape keeps its anisotropic box"
         );
-        assert!(
-            meta.get("point_octree").map(|v| v.is_null()).unwrap_or(true),
-            "a renderer without render_points gets the wholesale fallback, no octree"
-        );
-    }
-
-    /// A structured renderer that opts into the LOD octree via `point_weight` +
-    /// `render_points` must produce a streamed point octree in the bundle (the
-    /// modelweightvis drill-down path, exercised here without that crate).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn structured_render_points_builds_octree() {
-        // Reuses TestVolume/TestVolPlugin (one entity, a 4³ box) but binds the
-        // "test-vox" id to a renderer that emits points.
-        struct PtVox;
-        impl VoxelRenderer for PtVox {
-            fn id(&self) -> &'static str {
-                "test-vox"
-            }
-            fn render(&self, ctx: &VoxelRenderCtx<'_>, grid: &mut VoxelGridMut<'_>) {
-                let bb = ctx.entity.bbox;
-                for z in bb.z0..bb.z1 {
-                    for y in bb.y0..bb.y1 {
-                        for x in bb.x0..bb.x1 {
-                            grid.put(x, y, z, VoxelCell { r: 1, g: 2, b: 3, a: 255 });
-                        }
-                    }
-                }
-            }
-            fn point_weight(&self, _ctx: &VoxelRenderCtx<'_>) -> u64 {
-                512 // "element count"
-            }
-            fn render_points(
-                &self,
-                _ctx: &VoxelRenderCtx<'_>,
-                budget: u64,
-                emit: &mut dyn FnMut([f32; 3], [u8; 4]),
-            ) {
-                // An 8³ lattice of distinct points in the entity's bbox.
-                let n = budget.min(512) as usize;
-                for k in 0..n {
-                    let x = (k % 8) as f32 / 8.0;
-                    let y = ((k / 8) % 8) as f32 / 8.0;
-                    let z = ((k / 64) % 8) as f32 / 8.0;
-                    emit([x, y, z], [200, 100, 50, 255]);
-                }
-            }
-        }
-
-        let mut reg = Registry::with_defaults();
-        reg.volume_shapes.push(Arc::new(TestVolPlugin));
-        reg.voxel.register_renderer(Arc::new(PtVox));
-
-        let dir = tempfile::tempdir().unwrap();
-        render_volume(
-            vec![buffered(vec![0u8; 16])],
-            16,
-            dir.path().to_path_buf(),
-            "test",
-            &[],
-            false,
-            8,
-            8_000_000,
-            0,
-            LayoutMode::Auto,
-            &reg,
-            &Branding::default(),
-        )
-        .await
-        .unwrap();
-
-        let meta: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dir.path().join("meta.json")).unwrap()).unwrap();
-        let po = &meta["point_octree"];
-        assert!(po.is_object(), "render_points opts into the streamed octree");
-        assert!(po["node_count"].as_u64().unwrap() >= 1);
-        assert!(po["total_points"].as_u64().unwrap() > 0);
-        assert!(dir.path().join("points_octree.bin").exists());
-        assert!(dir.path().join("points_hierarchy.bin").exists());
-        // The per-voxel fallback cloud is still emitted (file:// path).
-        assert!(dir.path().join("points.bin").exists());
     }
 }

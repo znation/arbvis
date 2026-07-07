@@ -80,25 +80,21 @@ pub trait VoxelRenderer: Send + Sync {
     fn id(&self) -> &'static str;
     fn render(&self, ctx: &VoxelRenderCtx<'_>, grid: &mut VoxelGridMut<'_>);
 
-    /// Relative weight (e.g. element count) used to divide the streamed
-    /// point-octree budget across entities. `0` (the default) ⇒ this renderer
-    /// emits no points, so arbvis builds the Points view from one point per
-    /// occupied voxel of the dense grid (the wholesale fallback). A renderer
-    /// that overrides this *and* [`render_points`](VoxelRenderer::render_points)
-    /// opts the structured Points view into streamed LOD drill-down.
-    ///
-    /// Called with an empty `ctx.bytes` (budget splitting must not need the
-    /// fetched span), so derive the weight from `ctx.entity` (e.g. its shape).
+    /// Reserved extension point. Historically the relative weight (e.g. element
+    /// count) used to divide a streamed point-octree budget across entities;
+    /// the point cloud has since been removed, so arbvis no longer calls this.
+    /// Kept (with a no-op default) so downstream renderers that still override
+    /// it — e.g. modelweightvis's arch view — keep compiling. Safe to drop in a
+    /// coordinated change with those consumers.
     fn point_weight(&self, _ctx: &VoxelRenderCtx<'_>) -> u64 {
         0
     }
 
-    /// Emit up to `budget` points for the streamed LOD point octree, as
-    /// `(position within the entity's bbox ∈ [0,1]³, RGBA)`. arbvis maps each
-    /// point into the global box and feeds them all to the octree builder
-    /// (which subsamples coarse levels and streams nodes on demand), so a
-    /// layout can refine toward one point per element on zoom. Only called when
-    /// [`point_weight`](VoxelRenderer::point_weight) returned `> 0`.
+    /// Reserved extension point, paired with
+    /// [`point_weight`](VoxelRenderer::point_weight). Historically emitted the
+    /// per-element points for the streamed LOD octree; that view is gone, so
+    /// arbvis no longer calls this. Kept (no-op default) for the same
+    /// source-compatibility reason as `point_weight`.
     fn render_points(
         &self,
         _ctx: &VoxelRenderCtx<'_>,

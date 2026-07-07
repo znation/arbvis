@@ -251,9 +251,9 @@ pub async fn run_deploy(tiles_dir: &Path, space_id: &str) -> anyhow::Result<()> 
 }
 
 /// Deploy a 3D (`--3d`) bundle directory to a Space: sync the whole bundle
-/// (`index.html`, `volume.bin`, `points.bin`, `meta.json`) into the backing
-/// bucket and (re)deploy the Space app that serves it. The generalized
-/// `app.py` static catch-all serves the assets from the bucket.
+/// (`index.html`, `volume.bin`, `bricks.bin`, `pagetable.bin`, `meta.json`)
+/// into the backing bucket and (re)deploy the Space app that serves it. The
+/// generalized `app.py` static catch-all serves the assets from the bucket.
 pub async fn run_deploy_bundle(dir: &Path, space_id: &str) -> anyhow::Result<()> {
     let index = dir.join("index.html");
     if !index.exists() {

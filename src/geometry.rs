@@ -171,18 +171,6 @@ pub fn hilbert_to_xy_u64(idx: u64, order: u8) -> (u32, u32) {
 /// Number of axes for the 3D Hilbert curve.
 const N3: usize = 3;
 
-/// Smallest curve order `bits` such that a `2^bits` cube holds at least
-/// `cells` points (i.e. `2^(3*bits) >= cells`). Used to pick the 3D Hilbert
-/// order for a voxel grid of a given side. Clamped to `[1, 21]` — order 21
-/// fills a `2^21` cube and uses 63 of a `u64`'s 64 bits.
-pub fn hilbert3d_order_for_cells(cells: u64) -> u32 {
-    let mut bits = 1u32;
-    while (bits < 21) && ((1u128 << (3 * bits)) < cells as u128) {
-        bits += 1;
-    }
-    bits
-}
-
 /// 3D Hilbert curve: map a 1D distance `h` to cube coordinates `(x, y, z)`,
 /// each in `[0, 2^bits)`. Inverse of [`hilbert_xyz2d`].
 ///
@@ -365,17 +353,6 @@ mod tests {
         let (x2, y2) = hilbert_to_xy_u64((side * side - 1) as u64, 8);
         assert!(x2 < side);
         assert!(y2 < side);
-    }
-
-    #[test]
-    fn test_hilbert3d_order_for_cells() {
-        assert_eq!(hilbert3d_order_for_cells(0), 1);
-        assert_eq!(hilbert3d_order_for_cells(8), 1); // 2^3 == 8
-        assert_eq!(hilbert3d_order_for_cells(9), 2); // needs 4^3 = 64
-        assert_eq!(hilbert3d_order_for_cells(64), 2);
-        assert_eq!(hilbert3d_order_for_cells(65), 3);
-        assert_eq!(hilbert3d_order_for_cells(1 << 24), 8); // 256^3
-        assert_eq!(hilbert3d_order_for_cells(u64::MAX), 21); // clamp
     }
 
     #[test]

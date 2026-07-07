@@ -63,6 +63,9 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
   #status { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
     color: #9aa0ab; pointer-events: none; }
   #status[hidden] { display: none; } /* id selector's display:flex would otherwise beat [hidden] */
+  .load-box { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+  .load-track { width: 220px; height: 4px; background: #2a2d36; border-radius: 2px; overflow: hidden; }
+  #load-bar { width: 0; height: 100%; background: #9aa0ab; border-radius: 2px; transition: width .15s ease-out; }
   /* CSS2D layer labels float at each depth slab; the overlay must not eat pointer
      events or it would steal them from OrbitControls. */
   #labels { position: fixed; inset: 0; pointer-events: none; overflow: hidden; }
@@ -83,7 +86,12 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
 <canvas id="c"></canvas>
 <div id="labels"></div>
 <div id="tip" hidden></div>
-<div id="status">loading…</div>
+<div id="status">
+  <div class="load-box">
+    <div class="load-label" id="load-label">loading…</div>
+    <div class="load-track" id="load-track"><div id="load-bar"></div></div>
+  </div>
+</div>
 <div id="panel" hidden>
   <h1 id="title">arbvis</h1>
   <div class="sub"><a id="repo" href="#" target="_blank" rel="noopener"></a></div>
@@ -123,6 +131,40 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
 
 const CFG = __CONFIG_JSON__;
 const $ = (id) => document.getElementById(id);
+
+// ---- load progress ----------------------------------------------------------
+// The overlay bar tracks the up-front blocking fetches in load() (volume.bin,
+// the page table, the whole atlas, and wholesale points.bin). Its denominator
+// is computed from meta.json sizes; demand-driven octree/brick streaming runs
+// after the overlay hides and is deliberately excluded (it never "completes").
+let loadTotal = 0, loadDone = 0;
+function setProgress() {
+  const bar = $('load-bar');
+  if (bar) bar.style.width = (loadTotal ? Math.min(100, loadDone / loadTotal * 100) : 0) + '%';
+}
+function setStatus(msg) {
+  const label = $('load-label');
+  if (label) label.textContent = msg;
+  const track = $('load-track');
+  if (track) track.hidden = true;
+}
+// Stream a response body, feeding each chunk into the global progress. Falls
+// back to a whole-buffer read when the body isn't a readable stream. Returns a
+// Uint8Array (callers needing an ArrayBuffer use .buffer — byteOffset is 0).
+async function fetchBytes(url, opts) {
+  const res = await fetch(url, opts);
+  if (!res.ok || !res.body) return new Uint8Array(await res.arrayBuffer());
+  const reader = res.body.getReader();
+  const chunks = []; let n = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value); n += value.length; loadDone += value.length; setProgress();
+  }
+  const out = new Uint8Array(n); let o = 0;
+  for (const c of chunks) { out.set(c, o); o += c.length; }
+  return out;
+}
 
 // ---- branding / info panel --------------------------------------------------
 $('title').textContent = CFG.title || CFG.brandName || 'arbvis';
@@ -540,6 +582,17 @@ async function load() {
   const size = [ex / mx, ey / mx, ez / mx];
   directColor = meta.color_mode === 'rgb';
 
+  // Progress denominator: exact byte size of the up-front blocking fetches for
+  // this bundle's mode (all RGBA8 except points, which are 12B pos + 4B color).
+  // Matches the fetchBytes calls below; octree/brick streaming is excluded.
+  {
+    const b = meta.bricks;
+    loadTotal = ex * ey * ez * 4;                                   // volume.bin
+    loadTotal += b.page_dim[0] * b.page_dim[1] * b.page_dim[2] * 4; // pagetable.bin
+    if (!b.streamed) loadTotal += b.atlas_dim[0] * b.atlas_dim[1] * b.atlas_dim[2] * 4; // bricks.bin
+    if (!meta.point_octree) loadTotal += (meta.points | 0) * 16;    // wholesale points.bin
+  }
+
   // The volume renders from a sparse brick pool indexed by a page table
   // (meta.bricks): only occupied bricks are stored, so the GPU binding
   // constraint is the atlas, not the full cube. The dense volume.bin is fetched
@@ -558,7 +611,7 @@ async function load() {
   lutTex.needsUpdate = true;
 
   // Dense volume buffer: CPU only (threshold histograms + click/hover pick).
-  const volBuf = new Uint8Array(await (await fetch('volume.bin')).arrayBuffer());
+  const volBuf = await fetchBytes('volume.bin');
   buildHistograms(volBuf);
 
   // Page table + brick pool. Two modes (meta.bricks.streamed):
@@ -604,7 +657,7 @@ async function load() {
     // brick id (0 = empty); rebuild it into the viewer's A-state encoding
     // (0 empty / 1 occupied-not-resident / 2 resident) and keep the ids + a CPU
     // state mirror for fetch + the LRU touch walk.
-    const idBuf = new Uint8Array(await (await fetch(bm.page_file)).arrayBuffer());
+    const idBuf = await fetchBytes(bm.page_file);
     const nCells = bm.page_dim[0] * bm.page_dim[1] * bm.page_dim[2];
     const pageBuf = new Uint8Array(nCells * 4);
     const brickIds = new Uint32Array(nCells);
@@ -628,9 +681,9 @@ async function load() {
         'brick atlas size ' + atlasMax + ' exceeds the max 3D texture size this ' +
         'GPU supports (' + maxSide + '). Re-run arbvis with a lower --grid.');
     }
-    const pageBuf = new Uint8Array(await (await fetch(bm.page_file)).arrayBuffer());
+    const pageBuf = await fetchBytes(bm.page_file);
     pageTex = make3d(pageBuf, bm.page_dim[0], bm.page_dim[1], bm.page_dim[2], false);
-    const brickBuf = new Uint8Array(await (await fetch(bm.atlas_file)).arrayBuffer());
+    const brickBuf = await fetchBytes(bm.atlas_file);
     // The apron border lets trilinear filtering cross brick edges smoothly.
     brickTex = make3d(brickBuf, bm.atlas_dim[0], bm.atlas_dim[1], bm.atlas_dim[2], bm.apron > 0);
     atlasBricks = [bm.atlas_dim[0] / bstride, bm.atlas_dim[1] / bstride, bm.atlas_dim[2] / bstride];
@@ -694,7 +747,7 @@ async function load() {
     // Wholesale fallback: one buffer, one draw.
     const n = meta.points | 0;
     if (n > 0) {
-      const pBuf = await (await fetch('points.bin')).arrayBuffer();
+      const pBuf = (await fetchBytes('points.bin')).buffer;
       const pos = new Float32Array(pBuf, 0, n * 3);
       const col = new Uint8Array(pBuf, n * 12, n * 4);
       const geo = new THREE.BufferGeometry();
@@ -1434,7 +1487,7 @@ function tick() {
 }
 tick();
 
-load().catch((e) => { $('status').textContent = 'error: ' + e.message; console.error(e); });
+load().catch((e) => { setStatus('error: ' + e.message); console.error(e); });
 </script>
 </body>
 </html>

@@ -66,6 +66,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
   .load-box { display: flex; flex-direction: column; align-items: center; gap: 10px; }
   .load-track { width: 220px; height: 4px; background: #2a2d36; border-radius: 2px; overflow: hidden; }
   #load-bar { width: 0; height: 100%; background: #9aa0ab; border-radius: 2px; transition: width .15s ease-out; }
+  .load-stats { color: #6b7078; font-size: 11px; font-variant-numeric: tabular-nums; min-height: 14px; }
   /* CSS2D layer labels float at each depth slab; the overlay must not eat pointer
      events or it would steal them from OrbitControls. */
   #labels { position: fixed; inset: 0; pointer-events: none; overflow: hidden; }
@@ -90,6 +91,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
   <div class="load-box">
     <div class="load-label" id="load-label">loading…</div>
     <div class="load-track" id="load-track"><div id="load-bar"></div></div>
+    <div class="load-stats" id="load-stats"></div>
   </div>
 </div>
 <div id="panel" hidden>
@@ -135,16 +137,48 @@ const $ = (id) => document.getElementById(id);
 // the page table, and — non-streamed — the whole atlas). Its denominator is
 // computed from meta.json sizes; demand-driven brick streaming runs after the
 // overlay hides and is deliberately excluded (it never "completes").
-let loadTotal = 0, loadDone = 0;
+let loadTotal = 0, loadDone = 0, loadStartMs = 0, loadTimer = null;
 function setProgress() {
   const bar = $('load-bar');
   if (bar) bar.style.width = (loadTotal ? Math.min(100, loadDone / loadTotal * 100) : 0) + '%';
 }
+// Compact "12.3s" / "1m05s" duration formatting; sub-10s keeps one decimal so a
+// fast load still shows motion.
+function fmtDur(s) {
+  if (!isFinite(s) || s < 0) return '—';
+  if (s < 10) return s.toFixed(1) + 's';
+  if (s < 60) return Math.round(s) + 's';
+  return Math.floor(s / 60) + 'm' + String(Math.round(s % 60)).padStart(2, '0') + 's';
+}
+// Elapsed + a byte-rate ETA extrapolated from progress so far. ETA only appears
+// once loadTotal is known (set after meta.json) and some bytes have landed, so
+// early frames just show elapsed rather than a wild estimate.
+function updateLoadStats() {
+  const el = $('load-stats');
+  if (!el || !loadStartMs) return;
+  const elapsed = (Date.now() - loadStartMs) / 1000;
+  let txt = fmtDur(elapsed) + ' elapsed';
+  if (loadTotal && loadDone > 0 && loadDone < loadTotal) {
+    txt += ' · ~' + fmtDur(elapsed * (loadTotal - loadDone) / loadDone) + ' left';
+  }
+  el.textContent = txt;
+}
+function startLoadClock() {
+  loadStartMs = Date.now();
+  if (!loadTimer) loadTimer = setInterval(updateLoadStats, 200);
+  updateLoadStats();
+}
+function stopLoadClock() {
+  if (loadTimer) { clearInterval(loadTimer); loadTimer = null; }
+}
 function setStatus(msg) {
+  stopLoadClock();
   const label = $('load-label');
   if (label) label.textContent = msg;
   const track = $('load-track');
   if (track) track.hidden = true;
+  const stats = $('load-stats');
+  if (stats) stats.hidden = true;
 }
 // Stream a response body, feeding each chunk into the global progress. Falls
 // back to a whole-buffer read when the body isn't a readable stream. Returns a
@@ -543,6 +577,7 @@ const raycaster = new THREE.Raycaster();
 let brickStream = null;
 
 async function load() {
+  startLoadClock();
   const meta = await (await fetch('meta.json')).json();
   // Grid box in voxels. `grid_extent` is [x,y,z]; older bundles carried a
   // single cube side as `grid_side`.
@@ -724,6 +759,7 @@ async function load() {
   buildLegend(meta);
   buildLayerLabels();
 
+  stopLoadClock();
   $('status').hidden = true;
   $('panel').hidden = false;
   bindControls();

@@ -214,6 +214,11 @@ const VOL_LAYER = 1;
 const forceView = new URLSearchParams(location.search).get('view');
 let sceneTarget = null;
 let volMesh = null; // the volume box mesh; declared here so resize() can reach it
+// Streaming re-evaluation flags. Declared up here (not with the octree/brick
+// state below) so resize() can re-arm them: a resize that first gives the
+// viewport real dimensions must re-run the LOD/feedback passes, which a prior
+// zero-size frame would otherwise have consumed and left quiet.
+let octreeDirty = true, volumeDirty = true;
 const _dbSize = new THREE.Vector2();
 function makeSceneTarget(w, h) {
   const dt = new THREE.DepthTexture(w, h);
@@ -244,6 +249,12 @@ copyScene.add(copyQuad);
 
 function resize() {
   const w = innerWidth, h = innerHeight;
+  // Bail on a zero/degenerate viewport. On a cold (newly-restarted) Space the
+  // deferred CDN module can run before the iframe's layout settles, so this
+  // fires once with 0×0 — building sceneTarget at 0×0 and setting a NaN camera
+  // aspect would blit an empty canvas (blank black) until the next resize. The
+  // ResizeObserver below re-invokes us with real dimensions once they exist.
+  if (!w || !h) return;
   // updateStyle must stay on: a bare <canvas> with `inset:0` is a replaced
   // element, so CSS won't stretch it — without an inline style size it renders
   // at its (devicePixelRatio-scaled) drawing-buffer size, overflowing the
@@ -259,8 +270,17 @@ function resize() {
   sceneTarget = makeSceneTarget(_dbSize.x, _dbSize.y);
   copyMat.uniforms.tColor.value = sceneTarget.texture;
   if (volMesh) volMesh.material.uniforms.uSceneDepth.value = sceneTarget.depthTexture;
+  // Re-arm the streaming passes: if an earlier zero-size frame ran octreeUpdate/
+  // the feedback probe with H=0 (refining/streaming nothing) it left these quiet,
+  // so without this the view stays empty until the camera first moves.
+  octreeDirty = true; volumeDirty = true;
 }
 addEventListener('resize', resize);
+// A window 'resize' only fires on *changes*, never for the initial layout, so it
+// can't rescue a first paint that raced ahead of the iframe getting its size. A
+// ResizeObserver delivers an initial observation once the element is laid out
+// (and every change after), which is what actually recovers the cold-start race.
+new ResizeObserver(resize).observe(document.documentElement);
 resize();
 
 // ---- shaders ----------------------------------------------------------------
@@ -563,12 +583,12 @@ const raycaster = new THREE.Raycaster();
 // Streamed point-LOD octree (format_version >= 2). Null when the bundle ships
 // only the wholesale points.bin. `ptMaterial` is the shared point material so
 // the size/opacity sliders drive both the flat cloud and every octree node.
-let octree = null, ptMaterial = null, pointsActive = true, octreeDirty = true;
+let octree = null, ptMaterial = null, pointsActive = true;
 // Ray-guided brick streaming (meta.bricks.streamed): bounded GPU cache fed on
 // demand by what the rays need. Null for the fully-resident (non-streamed) path.
-// `volumeDirty` re-runs the feedback probe after the camera moves or a brick
-// lands, and falls quiet once the visible set is fully resident.
-let brickStream = null, volumeDirty = true;
+// `volumeDirty` (declared near the scene setup) re-runs the feedback probe after
+// the camera moves or a brick lands, and falls quiet once the set is resident.
+let brickStream = null;
 
 async function load() {
   const meta = await (await fetch('meta.json')).json();
@@ -1450,6 +1470,10 @@ controls.addEventListener('change', () => { octreeDirty = true; volumeDirty = tr
 // labelRenderer draws the CSS2D layer text on top afterwards.
 const _projView = new THREE.Matrix4();
 function renderHybrid() {
+  // No target yet (a zero-size viewport deferred its creation) — skip this frame
+  // rather than dereference a null sceneTarget and kill the rAF loop. The
+  // ResizeObserver will build it as soon as real dimensions arrive.
+  if (!sceneTarget) return;
   // 1 — opaque pass.
   camera.layers.set(0);
   renderer.setRenderTarget(sceneTarget);

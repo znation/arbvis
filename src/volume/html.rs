@@ -644,10 +644,10 @@ async function load() {
   if (streamed) {
     // Coarse fallback LOD: the dense grid (already fetched for histograms/pick),
     // sampled linearly where a brick isn't yet resident → an instant blurry
-    // image that sharpens in place. Clamp to ≤256³ so VRAM stays bounded; a
-    // bundle whose --grid exceeds that is rare, but guard it.
-    if (Math.max(ex, ey, ez) > 256) {
-      throw new Error('streamed coarse fallback expects --grid ≤ 256, got ' + Math.max(ex, ey, ez));
+    // image that sharpens in place. Clamp to ≤1024³ (the --grid max) so VRAM
+    // stays bounded; a bundle exceeding that shouldn't exist, but guard it.
+    if (Math.max(ex, ey, ez) > 1024) {
+      throw new Error('streamed coarse fallback expects --grid ≤ 1024, got ' + Math.max(ex, ey, ez));
     }
     coarseTex = make3d(volBuf, ex, ey, ez, true);
 

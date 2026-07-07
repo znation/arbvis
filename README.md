@@ -61,7 +61,7 @@ Where 2D color is fully opaque, **3D uses opacity to encode density** so you can
 
 **Controls:** drag to rotate · right-drag to pan · scroll to zoom (the camera auto-frames the occupied region on load). Hover or click a region to identify the tensor under the cursor (structured layouts).
 
-**Grid resolution (`--grid N`)** — the voxel cube side, a power of two in `2–512` (default `256`). Higher is more detailed but a larger download (≈ `N³ · 4` bytes; `128³` ≈ 8 MB, `256³` ≈ 64 MB, `512³` ≈ 512 MB).
+**Grid resolution (`--grid N`)** — the voxel cube side, a power of two in `2–1024` (default `512`). Higher is more detailed but a larger download (≈ `N³ · 4` bytes; `128³` ≈ 8 MB, `256³` ≈ 64 MB, `512³` ≈ 512 MB, `1024³` ≈ 4 GB).
 
 **Volume resolution (`--volume-res N`)** — build the sparse brick pool at this virtual side (power of two, above `--grid`) instead of the dense grid, so the *volume* can exceed `--grid` for sparse data. Only occupied bricks are stored and streamed into a bounded GPU cache on demand (ray-guided, GigaVoxels-style), so VRAM tracks the visible working set, not the total data size. `0` (default) keeps the volume at `--grid`.
 

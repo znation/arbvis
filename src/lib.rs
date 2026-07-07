@@ -224,9 +224,9 @@ pub struct Args {
     #[arg(long = "3d")]
     three_d: bool,
 
-    /// 3D voxel grid side (a power of two, 2–512). Higher is more detailed but
+    /// 3D voxel grid side (a power of two, 2–1024). Higher is more detailed but
     /// a larger download (≈ side³·4 bytes). Ignored in 2D mode.
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 512)]
     grid: u32,
 
     /// 3D volume virtual resolution (power of two, 8–2048): build the sparse
@@ -542,11 +542,11 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
     dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await
 }
 
-/// Validate `--grid`: a power of two in `[2, 512]`. (512³·4 ≈ 512 MiB on the
+/// Validate `--grid`: a power of two in `[2, 1024]`. (1024³·4 ≈ 4 GiB on the
 /// wire is already a lot; the lower bound keeps the Hilbert order ≥ 1.)
 fn validate_grid(side: u32) -> anyhow::Result<()> {
-    if !(2..=512).contains(&side) || !side.is_power_of_two() {
-        anyhow::bail!("--grid must be a power of two between 2 and 512, got {side}");
+    if !(2..=1024).contains(&side) || !side.is_power_of_two() {
+        anyhow::bail!("--grid must be a power of two between 2 and 1024, got {side}");
     }
     Ok(())
 }

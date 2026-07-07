@@ -106,7 +106,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       </div>
     </div>
     <div class="row"><label>Volume opacity <span id="opv"></span></label>
-      <input id="opacity" type="range" min="0" max="1" step="0.01" value="0.2"></div>
+      <input id="opacity" type="range" min="0" max="1" step="0.01" value="0.45"></div>
     <div class="row"><label>Volume contrast <span id="gav"></span></label>
       <input id="gamma" type="range" min="0.2" max="3" step="0.05" value="1"></div>
     <div class="row"><label>Threshold <span id="thv"></span></label>
@@ -443,7 +443,12 @@ const volFrag = `
         float a = clamp(pow(d, uGamma) * uOpacity * uNorm, 0.0, 1.0);
         acc.rgb += (1.0 - acc.a) * col * a;
         acc.a   += (1.0 - acc.a) * a;
-        if (acc.a >= 0.95) break;
+        // Early-ray termination: once the ray is near-opaque, voxels behind it
+        // are occluded and never sampled (the raymarch analog of occlusion
+        // culling). The denser default opacity above makes this fire much
+        // sooner; 0.9 (vs 1.0) drops only the last <10% of an already-saturated
+        // ray for a free step-budget win.
+        if (acc.a >= 0.9) break;
       }
       t += stepLen;
     }
@@ -709,7 +714,7 @@ async function load() {
     uniforms: {
       uBricks: { value: brickTex }, uPageTable: { value: pageTex }, uLut: { value: lutTex },
       uCoarse: { value: coarseTex }, uStreamed: { value: streamed ? 1 : 0 },
-      uOpacity: { value: 0.2 }, uGamma: { value: 1.0 },
+      uOpacity: { value: 0.45 }, uGamma: { value: 1.0 },
       // Quality is fixed high (no slider) — well above the old 384 max. The 2048
       // loop cap in volFrag keeps up with the finer step in dense regions.
       uThreshold: { value: 0.0 }, uSource: { value: 0 }, uSteps: { value: 512 },
@@ -719,7 +724,12 @@ async function load() {
       uPageDim: { value: new THREE.Vector3(bm.page_dim[0], bm.page_dim[1], bm.page_dim[2]) },
       uAtlasBricks: { value: new THREE.Vector3(atlasBricks[0], atlasBricks[1], atlasBricks[2]) },
       uBrick: { value: bm.brick }, uBrickStride: { value: bstride }, uApron: { value: bm.apron },
-      uSceneDepth: { value: sceneTarget.depthTexture }, uResolution: { value: new THREE.Vector2(1, 1) },
+      // sceneTarget may not exist yet on a cold start (the ResizeObserver hasn't
+      // fired — likely now that the small streamed up-front fetch lets load()
+      // reach here before layout settles). renderHybrid re-points this every
+      // volume-pass frame and bails while sceneTarget is null, so a null start
+      // is safe; resize() also sets it once the target is built.
+      uSceneDepth: { value: sceneTarget ? sceneTarget.depthTexture : null }, uResolution: { value: new THREE.Vector2(1, 1) },
       uInvProjView: { value: new THREE.Matrix4() }, uInvModel: { value: new THREE.Matrix4() },
     },
     vertexShader: volVert, fragmentShader: volFrag,
@@ -727,9 +737,10 @@ async function load() {
   if (brickStream) brickStream.volMat = volMat;
   volMesh = new THREE.Mesh(new THREE.BoxGeometry(size[0], size[1], size[2]), volMat);
   volMesh.layers.set(VOL_LAYER); // volume-only pass selects this layer
-  // sceneTarget already exists (resize ran at startup); point the depth sampler at
-  // it now that the material is built.
-  volMesh.material.uniforms.uSceneDepth.value = sceneTarget.depthTexture;
+  // Point the depth sampler at sceneTarget now that the material is built — but
+  // only if it exists yet (see the cold-start note on uSceneDepth above;
+  // renderHybrid/resize set it otherwise).
+  if (sceneTarget) volMesh.material.uniforms.uSceneDepth.value = sceneTarget.depthTexture;
   scene.add(volMesh);
   // Match the orientation cube to the (possibly anisotropic) box.
   edges.scale.set(size[0], size[1], size[2]);

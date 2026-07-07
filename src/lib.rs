@@ -224,16 +224,22 @@ pub struct Args {
     #[arg(long = "3d")]
     three_d: bool,
 
-    /// 3D voxel grid side (a power of two, 2–1024). Higher is more detailed but
-    /// a larger download (≈ side³·4 bytes). Ignored in 2D mode.
-    #[arg(long, default_value_t = 512)]
+    /// 3D target detail resolution: the voxel grid side (a power of two,
+    /// 2–8192, default 2048). Higher is more detailed. Above `COARSE_CAP` (128)
+    /// the up-front download stays small and fixed — a coarse `COARSE_CAP`³
+    /// fallback plus a page table — while the fine detail streams on demand from
+    /// a sparse brick pool as you pan/zoom. Note the page table itself grows
+    /// with resolution (≈ `(N/8)³·4` bytes), so very high `N` (≥ 4096) produces a
+    /// large page table; see `validate_grid`. Ignored in 2D mode.
+    #[arg(long, default_value_t = 2048)]
     grid: u32,
 
-    /// 3D volume virtual resolution (power of two, 8–2048): build the sparse
-    /// brick pool at this side instead of `--grid`, so the *volume* mode can
-    /// exceed the dense grid for sparse data (only occupied bricks are stored
-    /// and streamed). `0` (default) keeps the volume at `--grid`. Byte path
-    /// only; ignored in 2D.
+    /// Advanced 3D override (power of two, 8–8192): hand-tune the coarse/detail
+    /// split. When set, the dense coarse grid is built at `--grid` and the
+    /// streamed brick pool at `--volume-res` (so the volume can exceed the
+    /// coarse grid for sparse data). `0` (default) derives the split from
+    /// `--grid` automatically (see `volume::derive_volume_resolution`). Byte
+    /// path only; ignored in 2D.
     #[arg(long = "volume-res", default_value_t = 0)]
     volume_res: u32,
 
@@ -536,28 +542,36 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
         leaf_format,
         pyramid_format,
         three_d: args.three_d,
+        // The requested detail resolution; `render_volume` splits it into a
+        // small coarse dense grid + a streamed brick pool (byte path only).
         grid_side: args.grid,
         volume_res: args.volume_res,
     };
     dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await
 }
 
-/// Validate `--grid`: a power of two in `[2, 1024]`. (1024³·4 ≈ 4 GiB on the
-/// wire is already a lot; the lower bound keeps the Hilbert order ≥ 1.)
+/// Validate `--grid`: a power of two in `[2, 8192]`. Detail above the coarse cap
+/// streams (see `volume::derive_volume_resolution`), so the *wire* cost is
+/// bounded by the coarse grid + page table rather than side³·4. The upper bound
+/// caps the Hilbert order (8192 = order 13). Caveat at the top end: the page
+/// table is still a flat dense array (≈ `(side/8)³·4` bytes — ~64 MiB at 2048³,
+/// ~512 MiB at 4096³, ~4 GiB at 8192³) fetched and held client-side, so
+/// resolutions ≥ 4096 are only practical for the deployed (gzipped) viewer and
+/// may exceed browser memory until the page table goes sparse/octree.
 fn validate_grid(side: u32) -> anyhow::Result<()> {
-    if !(2..=1024).contains(&side) || !side.is_power_of_two() {
-        anyhow::bail!("--grid must be a power of two between 2 and 1024, got {side}");
+    if !(2..=8192).contains(&side) || !side.is_power_of_two() {
+        anyhow::bail!("--grid must be a power of two between 2 and 8192, got {side}");
     }
     Ok(())
 }
 
-/// Validate `--volume-res`: `0` (use `--grid`) or a power of two in `[8, 2048]`.
-/// The sparse brick pool stores only occupied bricks, so a high resolution is
-/// affordable for sparse data; the upper bound caps the page table + Hilbert
-/// order (2048 = order 11).
+/// Validate `--volume-res`: `0` (derive from `--grid`) or a power of two in
+/// `[8, 8192]`. The sparse brick pool stores only occupied bricks, so a high
+/// resolution is affordable for sparse data; the upper bound caps the page
+/// table + Hilbert order (8192 = order 13).
 fn validate_volume_res(res: u32) -> anyhow::Result<()> {
-    if res != 0 && (!(8..=2048).contains(&res) || !res.is_power_of_two()) {
-        anyhow::bail!("--volume-res must be 0 or a power of two between 8 and 2048, got {res}");
+    if res != 0 && (!(8..=8192).contains(&res) || !res.is_power_of_two()) {
+        anyhow::bail!("--volume-res must be 0 or a power of two between 8 and 8192, got {res}");
     }
     Ok(())
 }
@@ -1009,6 +1023,19 @@ mod title_tests {
             default_title(Some("custom".to_string()), "arbvis", "moe"),
             "custom"
         );
+    }
+}
+
+#[cfg(test)]
+mod grid_validation_tests {
+    use super::validate_grid;
+
+    #[test]
+    fn grid_cap_raised_to_8192() {
+        assert!(validate_grid(8192).is_ok());
+        assert!(validate_grid(2048).is_ok()); // the new default
+        assert!(validate_grid(16384).is_err()); // above the cap
+        assert!(validate_grid(768).is_err()); // not a power of two
     }
 }
 

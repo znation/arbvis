@@ -39,6 +39,35 @@ use encode::{VolumeMeta, VoxelAcc};
 /// Bytes read per `fetch_range` window during aggregation.
 const CHUNK: u64 = 4 * 1024 * 1024;
 
+/// The dense `volume.bin` (coarse fallback LOD + CPU pick/histogram buffer) is
+/// capped at this side so the mandatory up-front download stays small and fixed
+/// (128³·4 ≈ 8 MiB) regardless of the requested detail resolution. Detail finer
+/// than this streams on demand from the sparse brick pool.
+pub(crate) const COARSE_CAP: u32 = 128;
+
+/// Split the requested detail resolution (`--grid`) into the effective
+/// `(coarse dense-grid side, streamed brick resolution)` the byte volume path
+/// consumes:
+///
+/// * An explicit `--volume-res` is an advanced override — keep the historical
+///   meaning: coarse grid at `--grid`, streamed pool at `--volume-res`.
+/// * Otherwise, anything finer than [`COARSE_CAP`] is streamed: build the coarse
+///   dense grid at `COARSE_CAP` and the brick pool at the full `--grid`, so the
+///   up-front download is bounded while detail arrives on demand.
+/// * At or below the cap, keep the simple dense path (no streaming, `0`).
+///
+/// Only the byte path streams (the brick pool is byte-only); structured layouts
+/// bypass this and keep the full dense grid — see [`render_volume`].
+pub(crate) fn derive_volume_resolution(grid: u32, volume_res: u32) -> (u32, u32) {
+    if volume_res != 0 {
+        (grid, volume_res)
+    } else if grid > COARSE_CAP {
+        (COARSE_CAP, grid)
+    } else {
+        (grid, 0)
+    }
+}
+
 struct BuildResult {
     volume_rgba: Vec<u8>,
     max_count: u64,
@@ -93,7 +122,20 @@ pub async fn render_volume(
         registry,
     )?;
     let is_byte = shape.is_byte_volume();
-    let actual_extent = shape.grid_extent();
+    // Byte volumes scale by streaming fine detail from the sparse brick pool
+    // while keeping the dense grid (coarse fallback LOD + CPU pick) small and
+    // fixed; `derive_volume_resolution` caps the coarse side and routes the
+    // full requested resolution into the streamed pool. Structured layouts
+    // don't stream (the pool is byte-only), so they keep the full dense grid the
+    // shape sized. `volume_res` below is the effective streamed brick side.
+    let (dense_side, volume_res) = if is_byte {
+        derive_volume_resolution(grid_side, volume_res)
+    } else {
+        (grid_side, volume_res)
+    };
+    // The byte floor is a cube; override its extent to the (possibly capped)
+    // coarse side so `volume.bin` stays small while detail streams.
+    let actual_extent = if is_byte { [dense_side; 3] } else { shape.grid_extent() };
     let [ex, ey, ez] = actual_extent;
     let color_mode = if is_byte { "lut" } else { "rgb" };
     // Pick manifest for the click-to-pick viewer (empty for the byte floor).
@@ -141,6 +183,38 @@ pub async fn render_volume(
     };
     std::fs::write(out_dir.join("bricks.bin"), &bricks.atlas)?;
     std::fs::write(out_dir.join("pagetable.bin"), &bricks.page_table)?;
+
+    // Report the blocking up-front download: the coarse dense grid + page table
+    // (bricks.bin streams on demand and is excluded). This is what the viewer's
+    // progress bar tracks; when it streams, keeping this small is the whole
+    // point of the coarse/detail split. The page table grows with detail
+    // resolution (≈ (side/BRICK)³·4); the deployed Space gzips both assets on
+    // the wire (see space_template/app.py.tmpl).
+    if bricks.streamed {
+        let upfront = built.volume_rgba.len() + bricks.page_table.len();
+        log::info!(
+            "3D up-front download ≈ {:.1} MiB (coarse {ex}³ grid {:.1} MiB + page table {:.1} MiB); \
+             {} bricks stream on demand from bricks.bin ({:.1} MiB)",
+            upfront as f64 / (1 << 20) as f64,
+            built.volume_rgba.len() as f64 / (1 << 20) as f64,
+            bricks.page_table.len() as f64 / (1 << 20) as f64,
+            bricks.occupied,
+            bricks.atlas.len() as f64 / (1 << 20) as f64,
+        );
+        // The page table is a flat dense array the viewer downloads and holds in
+        // RAM whole (plus parallel id/state mirrors ≈ 2.25× on the client). Past
+        // a few hundred MiB it can exceed browser memory — warn so a very high
+        // --grid doesn't silently produce a bundle that won't load.
+        const PAGE_TABLE_WARN: usize = 256 << 20; // 256 MiB (~4096³)
+        if bricks.page_table.len() >= PAGE_TABLE_WARN {
+            log::warn!(
+                "page table is {:.0} MiB (grid detail is high); the viewer loads it whole \
+                 (~2.25× that in client RAM) and may fail in a browser — lower --grid or wait \
+                 for the sparse/octree page table",
+                bricks.page_table.len() as f64 / (1 << 20) as f64,
+            );
+        }
+    }
     let brick_meta = encode::BrickVolumeMeta {
         atlas_file: "bricks.bin".to_string(),
         page_file: "pagetable.bin".to_string(),
@@ -526,6 +600,27 @@ mod tests {
     use super::*;
     use crate::data::SourceKind;
     use std::sync::Arc;
+
+    #[test]
+    fn derive_split_streams_detail_above_cap() {
+        // A single high --grid becomes (coarse cap, streamed detail).
+        assert_eq!(derive_volume_resolution(512, 0), (COARSE_CAP, 512));
+        assert_eq!(derive_volume_resolution(2048, 0), (COARSE_CAP, 2048));
+    }
+
+    #[test]
+    fn derive_split_stays_dense_at_or_below_cap() {
+        // No streaming (0) at or below the cap; coarse grid == --grid.
+        assert_eq!(derive_volume_resolution(COARSE_CAP, 0), (COARSE_CAP, 0));
+        assert_eq!(derive_volume_resolution(64, 0), (64, 0));
+    }
+
+    #[test]
+    fn derive_split_explicit_volume_res_overrides() {
+        // The advanced knob keeps the historical meaning: coarse at --grid,
+        // stream at --volume-res.
+        assert_eq!(derive_volume_resolution(256, 1024), (256, 1024));
+    }
 
     fn buffered(bytes: Vec<u8>) -> Source {
         let len = bytes.len() as u64;

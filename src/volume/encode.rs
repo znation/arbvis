@@ -172,6 +172,89 @@ pub fn pack_voxel_cells(grid: &[super::voxel::VoxelCell]) -> Vec<u8> {
     out
 }
 
+/// Aspect-preserving coarse extent: scale so the longest axis lands at `cap`
+/// (keeping the box's proportions), clamped to `[1, full]` per axis. Returns
+/// `full` unchanged when it already fits within `cap`. Sizes the small dense
+/// `volume.bin` (coarse fallback LOD + CPU pick/histograms) for the streamed
+/// structured path while the fine detail streams from the brick pool.
+pub fn coarse_extent(full: [u32; 3], cap: u32) -> [u32; 3] {
+    let m = full[0].max(full[1]).max(full[2]);
+    if m <= cap {
+        return full;
+    }
+    let mut ce = [0u32; 3];
+    for a in 0..3 {
+        // Round to nearest, clamp to [1, full[a]]; the longest axis lands at cap.
+        ce[a] = (((full[a] as u64 * cap as u64) + (m as u64 / 2)) / m as u64)
+            .max(1)
+            .min(full[a] as u64) as u32;
+    }
+    ce
+}
+
+/// Box-average downsample of an RGBA8 dense grid from `full_extent` to a smaller
+/// `coarse` extent (both x-fastest). Color is the alpha-weighted mean of the
+/// occupied source voxels in each coarse cell's block (premultiplied-correct, so
+/// transparent voxels don't wash the color toward black); alpha is the
+/// coverage-weighted mean over the whole block (sparse regions dim, like a real
+/// LOD). Empty blocks stay `[0,0,0,0]`. This is a blurry fallback only visible
+/// until the fine bricks stream in, so an approximate LOD is fine.
+pub fn downsample_rgba(full: &[u8], full_extent: [u32; 3], coarse: [u32; 3]) -> Vec<u8> {
+    let [fx, fy, fz] = full_extent;
+    let [cx, cy, cz] = coarse;
+    let (fxs, fys) = (fx as usize, fy as usize);
+    let mut out = vec![0u8; cx as usize * cy as usize * cz as usize * 4];
+    // Source block [lo, hi) covering coarse index `i` on an axis of length f→c.
+    let block = |i: u32, c: u32, f: u32| -> (u32, u32) {
+        let lo = ((i as u64 * f as u64) / c as u64) as u32;
+        let hi = ((((i as u64 + 1) * f as u64).div_ceil(c as u64)) as u32)
+            .max(lo + 1)
+            .min(f);
+        (lo, hi)
+    };
+    for oz in 0..cz {
+        let (z0, z1) = block(oz, cz, fz);
+        for oy in 0..cy {
+            let (y0, y1) = block(oy, cy, fy);
+            for ox in 0..cx {
+                let (x0, x1) = block(ox, cx, fx);
+                let (mut sr, mut sg, mut sb) = (0f64, 0f64, 0f64);
+                let mut wsum = 0f64; // Σ alpha over occupied voxels (color weight)
+                let mut asum = 0f64; // Σ alpha over the whole block
+                let mut n = 0u64; // block voxel count (coverage denominator)
+                for z in z0..z1 {
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            let s = (x as usize + y as usize * fxs + z as usize * fxs * fys) * 4;
+                            let a = full[s + 3] as f64;
+                            if a > 0.0 {
+                                sr += full[s] as f64 * a;
+                                sg += full[s + 1] as f64 * a;
+                                sb += full[s + 2] as f64 * a;
+                                wsum += a;
+                            }
+                            asum += a;
+                            n += 1;
+                        }
+                    }
+                }
+                if wsum > 0.0 {
+                    let dst = (ox as usize
+                        + oy as usize * cx as usize
+                        + oz as usize * cx as usize * cy as usize)
+                        * 4;
+                    out[dst] = (sr / wsum).round().clamp(0.0, 255.0) as u8;
+                    out[dst + 1] = (sg / wsum).round().clamp(0.0, 255.0) as u8;
+                    out[dst + 2] = (sb / wsum).round().clamp(0.0, 255.0) as u8;
+                    out[dst + 3] = (asum / n as f64).round().clamp(0.0, 255.0) as u8;
+                }
+                // else: fully transparent block → leave [0,0,0,0]
+            }
+        }
+    }
+    out
+}
+
 /// Precompute the 0–255 luminance of each byte's LUT color, used as the
 /// per-byte "activity" weight during aggregation.
 pub fn luma_lut(pixel_lut: &[Rgb<u8>; 256]) -> [u16; 256] {
@@ -180,5 +263,52 @@ pub fn luma_lut(pixel_lut: &[Rgb<u8>; 256]) -> [u16; 256] {
         out[i] = (c.0[0] as u16 + c.0[1] as u16 + c.0[2] as u16) / 3;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coarse_extent_preserves_aspect_and_caps_longest_axis() {
+        // Already within cap → unchanged.
+        assert_eq!(coarse_extent([64, 32, 16], 128), [64, 32, 16]);
+        // Longest axis → cap, proportions kept (2:4:1).
+        assert_eq!(coarse_extent([80, 160, 40], 128), [64, 128, 32]);
+        // Cube.
+        assert_eq!(coarse_extent([256, 256, 256], 128), [128, 128, 128]);
+        // Never zero on a thin axis.
+        assert_eq!(coarse_extent([2048, 4, 4], 128)[1], 1);
+    }
+
+    #[test]
+    fn downsample_rgba_alpha_weights_color_and_covers_alpha() {
+        // 2 voxels → 1 coarse cell: color is the alpha-weighted mean of occupied
+        // voxels; alpha is the coverage mean over the whole block.
+        // (240·200 + 40·100)/(200+100) = 173.33 → 173; alpha (200+100)/2 = 150.
+        let full = [2u32, 1, 1];
+        let g = [240u8, 0, 0, 200, 40, 0, 0, 100];
+        assert_eq!(downsample_rgba(&g, full, [1, 1, 1]), vec![173, 0, 0, 150]);
+
+        // A transparent voxel must not drag the color toward black (premultiplied
+        // weighting): color stays the occupied voxel's, alpha halves for coverage.
+        let g2 = [100u8, 0, 0, 200, 0, 0, 0, 0];
+        assert_eq!(downsample_rgba(&g2, full, [1, 1, 1]), vec![100, 0, 0, 100]);
+
+        // Fully-transparent block → [0,0,0,0].
+        let g3 = [0u8; 8];
+        assert_eq!(downsample_rgba(&g3, full, [1, 1, 1]), vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn downsample_rgba_splits_blocks_evenly() {
+        // 4→2 on x: coarse[0] covers src x∈[0,2), coarse[1] covers x∈[2,4).
+        let full = [4u32, 1, 1];
+        let mut g = vec![0u8; 4 * 4];
+        g[0..4].copy_from_slice(&[100, 0, 0, 200]); // x0 (in coarse 0)
+        g[12..16].copy_from_slice(&[50, 0, 0, 100]); // x3 (in coarse 1)
+        let out = downsample_rgba(&g, full, [2, 1, 1]);
+        assert_eq!(out, vec![100, 0, 0, 100, /*|*/ 50, 0, 0, 50]);
+    }
 }
 

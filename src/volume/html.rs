@@ -150,16 +150,18 @@ function fmtDur(s) {
   if (s < 60) return Math.round(s) + 's';
   return Math.floor(s / 60) + 'm' + String(Math.round(s % 60)).padStart(2, '0') + 's';
 }
-// Elapsed + a byte-rate ETA extrapolated from progress so far. ETA only appears
-// once loadTotal is known (set after meta.json) and some bytes have landed, so
-// early frames just show elapsed rather than a wild estimate.
+// Elapsed + a byte-rate ETA extrapolated from progress so far. The ETA appears
+// as soon as any bytes land (loadDone > 0); it's inherently brief now that the
+// up-front payload is a small coarse grid + octree (the fine detail streams
+// after the overlay hides). At loadDone === loadTotal it reads "~0.0s left" for
+// at most one 200ms tick before load() stops the clock — harmless.
 function updateLoadStats() {
   const el = $('load-stats');
   if (!el || !loadStartMs) return;
   const elapsed = (Date.now() - loadStartMs) / 1000;
   let txt = fmtDur(elapsed) + ' elapsed';
-  if (loadTotal && loadDone > 0 && loadDone < loadTotal) {
-    txt += ' · ~' + fmtDur(elapsed * (loadTotal - loadDone) / loadDone) + ' left';
+  if (loadTotal && loadDone > 0) {
+    txt += ' · ~' + fmtDur(elapsed * Math.max(0, loadTotal - loadDone) / loadDone) + ' left';
   }
   el.textContent = txt;
 }
@@ -185,7 +187,10 @@ function setStatus(msg) {
 // Uint8Array (callers needing an ArrayBuffer use .buffer — byteOffset is 0).
 async function fetchBytes(url, opts) {
   const res = await fetch(url, opts);
-  if (!res.ok || !res.body) return new Uint8Array(await res.arrayBuffer());
+  // Fail loud: a 5xx/OOM mid-load must surface as an error overlay (via load()'s
+  // .catch → setStatus), not silently yield empty bytes and render a blank cube.
+  if (!res.ok) throw new Error('load failed: ' + res.status + ' ' + res.statusText + ' (' + url + ')');
+  if (!res.body) return new Uint8Array(await res.arrayBuffer());
   const reader = res.body.getReader();
   const chunks = []; let n = 0;
   for (;;) {
@@ -652,8 +657,10 @@ function refreshNorm() {
 
 // ---- load + build -----------------------------------------------------------
 // Kept for click-to-pick: the raw volume buffer + grid extent + world box size
-// + entity manifest.
-let volBufG = null, extG = [0, 0, 0], sizeG = [1, 1, 1], manifestG = [];
+// + entity manifest. extG is the (possibly coarse) volume.bin extent the CPU
+// ray-march samples; volDimG is the full detail resolution the manifest bboxes
+// live in (== extG unless the structured path is streamed).
+let volBufG = null, extG = [0, 0, 0], sizeG = [1, 1, 1], manifestG = [], volDimG = [1, 1, 1];
 const raycaster = new THREE.Raycaster();
 
 // Ray-guided brick streaming (meta.bricks.streamed): bounded GPU cache fed on
@@ -851,6 +858,10 @@ async function load() {
   volBufG = volBuf;
   extG = ext;
   sizeG = size;
+  // Full detail resolution the manifest bboxes are expressed in. For a streamed
+  // structured bundle volume.bin (extG) is a smaller coarse grid, so pick/labels
+  // map through this; for non-streamed bundles it equals extG (identity).
+  volDimG = bm.vol_dim || ext;
   manifestG = meta.manifest || [];
   buildLegend(meta);
   buildLayerLabels();
@@ -1197,21 +1208,30 @@ function pickAt(clientX, clientY) {
   });
   if (tmax < Math.max(tmin, 0)) return null;
   const [ex, ey, ez] = extG;
+  const [dx, dy, dz] = volDimG;
   const steps = Math.max(ex, ey, ez) * 2; // ≥ Nyquist so we don't step over a voxel
   let t = Math.max(tmin, 0);
   const dt = (tmax - t) / steps;
   for (let i = 0; i < steps; i++, t += dt) {
-    // world -> [0,1] per axis (p/size + 0.5) -> voxel index
-    const x = Math.floor(((ro.x + rd.x * t) / sizeG[0] + 0.5) * ex);
-    const y = Math.floor(((ro.y + rd.y * t) / sizeG[1] + 0.5) * ey);
-    const z = Math.floor(((ro.z + rd.z * t) / sizeG[2] + 0.5) * ez);
+    // world -> [0,1] per axis (p/size + 0.5)
+    const u = (ro.x + rd.x * t) / sizeG[0] + 0.5;
+    const v = (ro.y + rd.y * t) / sizeG[1] + 0.5;
+    const w = (ro.z + rd.z * t) / sizeG[2] + 0.5;
+    // Alpha comes off the (possibly coarse) volume.bin we actually hold.
+    const x = Math.floor(u * ex), y = Math.floor(v * ey), z = Math.floor(w * ez);
     if (x < 0 || y < 0 || z < 0 || x >= ex || y >= ey || z >= ez) continue;
     const alpha = volBufG[(x + y * ex + z * ex * ey) * 4 + 3];
     if (alpha > 0) {
+      // Entity test + reported coords are in full detail (vol_dim) space, where
+      // the manifest bboxes live — so identification stays accurate and the
+      // tooltip shows the tensor's native voxel coords even on a coarse grid.
+      const fx = Math.min(dx - 1, Math.floor(u * dx));
+      const fy = Math.min(dy - 1, Math.floor(v * dy));
+      const fz = Math.min(dz - 1, Math.floor(w * dz));
       for (const e of manifestG) {
         const b = e.bbox;
-        if (x >= b.x0 && x < b.x1 && y >= b.y0 && y < b.y1 && z >= b.z0 && z < b.z1) {
-          return { entity: e, vx: x, vy: y, vz: z, intensity: alpha / 255 };
+        if (fx >= b.x0 && fx < b.x1 && fy >= b.y0 && fy < b.y1 && fz >= b.z0 && fz < b.z1) {
+          return { entity: e, vx: fx, vy: fy, vz: fz, intensity: alpha / 255 };
         }
       }
       return null; // opaque voxel, but no entity owns it
@@ -1289,8 +1309,10 @@ function showHover(x, y) {
 // positioned at the group's depth slab. Thinned to stay legible on deep models.
 function buildLayerLabels() {
   if (!manifestG.length) return; // byte mode ships an empty manifest
-  // Voxel v on axis a -> world position (matches the shader/box mapping).
-  const toWorld = (v, a) => ((v + 0.5) / extG[a] - 0.5) * sizeG[a];
+  // Voxel v on axis a -> world position (matches the shader/box mapping). Group
+  // bboxes are in full detail (vol_dim) space, so normalize by volDimG (== extG
+  // for non-streamed bundles); sizeG carries the box aspect either way.
+  const toWorld = (v, a) => ((v + 0.5) / volDimG[a] - 0.5) * sizeG[a];
   // Union bbox per group.
   const groups = new Map();
   for (const e of manifestG) {

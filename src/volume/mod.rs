@@ -70,12 +70,17 @@ pub(crate) fn derive_volume_resolution(grid: u32, volume_res: u32) -> (u32, u32)
 
 struct BuildResult {
     volume_rgba: Vec<u8>,
+    /// Extent of the grid actually written to `volume.bin` (`volume_rgba`). Equals
+    /// the bake extent for the dense paths, but the **coarse** extent when the
+    /// structured path streams (the full detail lives in `bricks`, and `volume.bin`
+    /// is a small aspect-preserving downsample for the fallback LOD + CPU pick).
+    grid_extent: [u32; 3],
     max_count: u64,
     focus_center: [f32; 3],
     focus_radius: f32,
     /// Sparse brick pool built at a higher virtual resolution (byte floor with
-    /// `--volume-res`); `None` ⇒ `render_volume` derives bricks from the dense
-    /// grid instead.
+    /// `--volume-res`, or the streamed structured path); `None` ⇒ `render_volume`
+    /// derives bricks from the dense grid instead.
     bricks: Option<brick::BrickVolume>,
 }
 
@@ -138,16 +143,23 @@ pub async fn render_volume(
     let actual_extent = if is_byte { [dense_side; 3] } else { shape.grid_extent() };
     let [ex, ey, ez] = actual_extent;
     let color_mode = if is_byte { "lut" } else { "rgb" };
+    // Structured layouts above the coarse cap now stream too (like the byte path):
+    // the full dense grid is baked, then diced into a sparse octree + range-served
+    // brick pool while `volume.bin` ships as a small aspect-preserving coarse
+    // downsample. Below the cap they keep the simple dense (non-streamed) path.
+    let structured_streamed = !is_byte && actual_extent.iter().copied().max().unwrap() > COARSE_CAP;
     // Pick manifest for the click-to-pick viewer (empty for the byte floor).
-    // Captured before `shape` moves into the blocking closure.
+    // Captured before `shape` moves into the blocking closure. Bboxes stay in the
+    // full `vol_dim` voxel space; the viewer maps them onto the coarse grid.
     let manifest = shape.manifest();
 
     if is_byte {
         log::info!("Aggregating {total} bytes into a {ex}³ voxel grid via 3D Hilbert curve...");
     } else {
         log::info!(
-            "Rendering structured `{}` 3D volume into a {ex}×{ey}×{ez} voxel box...",
-            shape.id()
+            "Rendering structured `{}` 3D volume into a {ex}×{ey}×{ez} voxel box{}...",
+            shape.id(),
+            if structured_streamed { " (streamed)" } else { "" }
         );
     }
 
@@ -163,7 +175,15 @@ pub async fn render_volume(
             // axes match, so the cube side is `ex`.
             aggregate_bytes_hilbert(sources, total, ex, volume_res, pixel_lut, rt)
         } else {
-            aggregate_entities(sources, shape.as_ref(), actual_extent, &voxel_reg, diff_mode, rt)
+            aggregate_entities(
+                sources,
+                shape.as_ref(),
+                actual_extent,
+                &voxel_reg,
+                diff_mode,
+                structured_streamed,
+                rt,
+            )
         }
     })
     .await
@@ -179,7 +199,9 @@ pub async fn render_volume(
     // derive bricks from the dense grid.
     let bricks = match built.bricks {
         Some(b) => b,
-        None => brick::build_brick_volume(&built.volume_rgba, actual_extent, brick::BRICK),
+        // Non-streamed: derive bricks from the dense grid actually written
+        // (`grid_extent` == the bake extent here, since streaming set `bricks`).
+        None => brick::build_brick_volume(&built.volume_rgba, built.grid_extent, brick::BRICK),
     };
     std::fs::write(out_dir.join("bricks.bin"), &bricks.atlas)?;
     // Page structure: the streamed path ships a sparse octree node pool
@@ -200,8 +222,9 @@ pub async fn render_volume(
     // space_template/app.py.tmpl).
     if bricks.streamed {
         let upfront = built.volume_rgba.len() + bricks.node_pool.len();
+        let [cx, cy, cz] = built.grid_extent;
         log::info!(
-            "3D up-front download ≈ {:.1} MiB (coarse {ex}³ grid {:.1} MiB + octree {:.1} MiB, \
+            "3D up-front download ≈ {:.1} MiB (coarse {cx}×{cy}×{cz} grid {:.1} MiB + octree {:.1} MiB, \
              {} nodes, depth {}); {} bricks stream on demand from bricks.bin ({:.1} MiB)",
             upfront as f64 / (1 << 20) as f64,
             built.volume_rgba.len() as f64 / (1 << 20) as f64,
@@ -232,7 +255,7 @@ pub async fn render_volume(
         title: title.to_string(),
         brand_name: branding.name.to_string(),
         repo_url: branding.repo_url.to_string(),
-        grid_extent: actual_extent,
+        grid_extent: built.grid_extent,
         total_bytes: total,
         max_count: built.max_count,
         diff_mode,
@@ -423,6 +446,9 @@ fn aggregate_bytes_hilbert(
 
     Ok(BuildResult {
         volume_rgba,
+        // The dense `volume.bin` is the (capped) coarse cube; the streamed pool
+        // carries the fine detail at its own `vol_dim`.
+        grid_extent: [grid_side; 3],
         max_count,
         focus_center,
         focus_radius,
@@ -442,6 +468,7 @@ fn aggregate_entities(
     extent: [u32; 3],
     voxel_reg: &VoxelRegistry,
     diff_mode: bool,
+    stream: bool,
     rt: tokio::runtime::Handle,
 ) -> anyhow::Result<BuildResult> {
     let cells = extent[0] as usize * extent[1] as usize * extent[2] as usize;
@@ -494,19 +521,47 @@ fn aggregate_entities(
         renderer.render(&ctx, &mut view);
     }
 
+    let full_rgba = encode::pack_voxel_cells(&grid);
+
+    if stream {
+        // Dice the full baked grid into a sparse octree + range-served brick pool
+        // (O(occupied)); ship `volume.bin` as a small aspect-preserving coarse
+        // downsample for the fallback LOD + CPU pick. Frame from the fine
+        // occupied region (the brick builder's bbox), not the coarse grid.
+        drop(grid); // free the dense VoxelCell grid; work from full_rgba below
+        let (bricks, dropped) =
+            brick::build_streamed_brick_volume(&full_rgba, extent, brick::BRICK);
+        if dropped > 0 {
+            log::warn!(
+                "structured volume dropped {dropped} bricks past the {} safety cap; \
+                 the fine detail is truncated (lower --grid for full coverage)",
+                brick::MAX_BRICKS
+            );
+        }
+        let ce = encode::coarse_extent(extent, COARSE_CAP);
+        let coarse = encode::downsample_rgba(&full_rgba, extent, ce);
+        return Ok(BuildResult {
+            volume_rgba: coarse,
+            grid_extent: ce,
+            max_count: 0,
+            focus_center: bricks.focus_center,
+            focus_radius: bricks.focus_radius,
+            bricks: Some(bricks),
+        });
+    }
+
+    // Below the coarse cap: keep the simple dense (non-streamed) path — bricks are
+    // derived from the dense grid in render_volume.
     let (focus_center, focus_radius) = shape
         .focus()
         .unwrap_or_else(|| occupied_focus_cells(&grid, extent));
 
-    let volume_rgba = encode::pack_voxel_cells(&grid);
-
     Ok(BuildResult {
-        volume_rgba,
+        volume_rgba: full_rgba,
+        grid_extent: extent,
         max_count: 0,
         focus_center,
         focus_radius,
-        // Structured grids are dense + anisotropic; bricks are derived from the
-        // dense grid in render_volume rather than streamed at high resolution.
         bricks: None,
     })
 }
@@ -791,6 +846,17 @@ mod tests {
                 extra: Box::new(()),
             }])
         }
+        fn manifest(&self) -> Vec<VolumeLabel> {
+            // A label spanning the whole (full-res) box, in `vol_dim` voxel space
+            // — the contract the viewer relies on (never rescaled to the coarse
+            // grid at build time).
+            let [ex, ey, ez] = self.extent;
+            vec![VolumeLabel {
+                name: "test-tensor".to_string(),
+                group: "layer 0".to_string(),
+                bbox: VoxelBox { x0: 0, y0: 0, z0: 0, x1: ex, y1: ey, z1: ez },
+            }]
+        }
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
@@ -897,6 +963,92 @@ mod tests {
             meta["grid_extent"],
             serde_json::json!(expect_extent),
             "structured shape keeps its anisotropic box"
+        );
+    }
+
+    /// A structured shape whose extent exceeds `COARSE_CAP` must now **stream**
+    /// like the byte path: `color_mode == "rgb"`, `bricks.streamed == true`, a
+    /// small aspect-preserving coarse `volume.bin`, the full anisotropic extent in
+    /// `bricks.vol_dim`, an octree `tree.bin` (no flat page table), and a flat
+    /// `bricks.bin` of `occupied · brick³ · 4` bytes. The manifest bbox stays in
+    /// full `vol_dim` coords (never rescaled to the coarse grid).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn structured_streams_above_coarse_cap() {
+        let mut reg = Registry::with_defaults();
+        reg.volume_shapes.push(Arc::new(TestVolPlugin));
+        reg.voxel.register_renderer(Arc::new(TestVox));
+
+        let dir = tempfile::tempdir().unwrap();
+        // grid_side 80 → TestVolPlugin box [80, 160, 40]; max 160 > COARSE_CAP(128)
+        // ⇒ streamed. ~512k cells (2 MiB) keeps the test cheap.
+        let grid_side = 80u32;
+        render_volume(
+            vec![buffered(vec![0u8; 16])],
+            16,
+            dir.path().to_path_buf(),
+            "test",
+            &[],
+            false,
+            grid_side,
+            0,
+            LayoutMode::Auto,
+            &reg,
+            &Branding::default(),
+        )
+        .await
+        .unwrap();
+
+        let full_extent = [grid_side, grid_side * 2, grid_side / 2]; // [80,160,40]
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("meta.json")).unwrap()).unwrap();
+
+        assert_eq!(meta["color_mode"], "rgb", "structured stays RGB-baked");
+        let bm = &meta["bricks"];
+        assert_eq!(bm["streamed"], true, "above the cap ⇒ streamed pool");
+        assert_eq!(bm["apron"], 0, "streamed bricks have no apron");
+        assert_eq!(
+            bm["vol_dim"],
+            serde_json::json!(full_extent),
+            "octree addresses the full anisotropic extent"
+        );
+
+        // Coarse volume.bin: aspect-preserving, longest axis == COARSE_CAP.
+        let ce = &meta["grid_extent"];
+        let ge = [
+            ce[0].as_u64().unwrap() as u32,
+            ce[1].as_u64().unwrap() as u32,
+            ce[2].as_u64().unwrap() as u32,
+        ];
+        assert_eq!(ge, [64, 128, 32], "coarse grid preserves 2:4:1 aspect at cap 128");
+        assert!(ge.iter().max().unwrap() <= &COARSE_CAP);
+        let vol = std::fs::read(dir.path().join("volume.bin")).unwrap();
+        assert_eq!(
+            vol.len() as u64,
+            ge[0] as u64 * ge[1] as u64 * ge[2] as u64 * 4,
+            "volume.bin is the small coarse grid, not the 15 GB full one"
+        );
+
+        // Octree page structure, no flat page table; flat brick blocks.
+        assert!(dir.path().join("tree.bin").exists(), "streamed ships tree.bin");
+        assert!(!dir.path().join("pagetable.bin").exists(), "no flat page table");
+        let occupied = bm["occupied"].as_u64().unwrap();
+        assert_eq!(occupied, 1, "the 4³ entity sits in a single brick");
+        let brick = bm["brick"].as_u64().unwrap() as usize;
+        let bricks = std::fs::read(dir.path().join("bricks.bin")).unwrap();
+        assert_eq!(
+            bricks.len() as u64,
+            occupied * (brick.pow(3) * 4) as u64,
+            "bricks.bin is a flat occupied-block array"
+        );
+        // The baked RGBA survives verbatim in the streamed block (no LUT channels).
+        assert_eq!(&bricks[0..4], &[10, 20, 30, 200], "brick RGBA is baked color, verbatim");
+
+        // Manifest bbox stays in full vol_dim coords (client maps it, not the build).
+        let mb = &meta["manifest"][0]["bbox"];
+        assert_eq!(
+            [mb["x1"].as_u64().unwrap(), mb["y1"].as_u64().unwrap(), mb["z1"].as_u64().unwrap()],
+            [full_extent[0] as u64, full_extent[1] as u64, full_extent[2] as u64],
+            "manifest bbox is NOT rescaled to the coarse grid"
         );
     }
 }

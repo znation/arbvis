@@ -41,6 +41,12 @@ pub const APRON: u32 = 1;
 /// as dropped (logged).
 pub const MAX_BRICKS: u32 = 2_097_152;
 
+/// Marks an octree entry as a **leaf** (a brick), as opposed to an internal
+/// child-node pointer. Set on the packed entry during building so the serializer
+/// can tell the two apart; the low bits carry the 1-based brick id. Both brick
+/// ids and node indices stay well under 2³¹, so the top bit is free.
+const LEAF_BIT: u32 = 1 << 31;
+
 /// Near-cubic atlas size, in bricks per axis, holding at least `slots` bricks.
 fn atlas_dims_bricks(slots: u32) -> [u32; 3] {
     let s = slots.max(1);
@@ -91,9 +97,36 @@ pub struct BrickVolume {
     /// uploads whole, and the page table holds resident atlas slots. `true` ⇒
     /// `atlas` is a flat, range-addressable array of `occupied` bricks
     /// (`BRICK³·4` bytes each, brick `S` at `(S-1)·BRICK³·4`), `atlas_dim` is
-    /// unused, and the page table holds 1-based brick **ids**; the viewer
-    /// ray-guides bricks into a bounded GPU cache on demand.
+    /// unused, and instead of `page_table` the sparse **octree** `node_pool`
+    /// indexes bricks; the viewer ray-guides bricks into a bounded GPU cache on
+    /// demand.
     pub streamed: bool,
+
+    // --- Streamed-path sparse octree (empty unless `streamed`). Replaces the
+    // flat O((vol/BRICK)³) page table with an O(occupied) N³-tree so the page
+    // structure — download, client RAM, and VRAM — no longer scales with the
+    // volume. See [`BrickBuilder`].
+    /// Octree node pool, RGBA8, `node_pool_dim` texels (x-fastest). Each node is
+    /// a 2×2×2 block of child entries; entry `A>0` ⇒ a leaf (brick: RGB = 1-based
+    /// brick id on disk, `A = 1` occupied-not-resident), `A==0 && RGB>0` ⇒ an
+    /// internal pointer (RGB = 1-based child-node index), all-zero ⇒ empty
+    /// subtree. Node 0 is the root, covering the whole `2^tree_depth` brick cube.
+    pub node_pool: Vec<u8>,
+    /// Node-pool texture dims in texels `[x, y, z]` (each even: nodes packed
+    /// near-cubically, 2 texels/node/axis).
+    pub node_pool_dim: [u32; 3],
+    /// Octree depth `D = log2(bricks per side)`; the descent walks at most `D`
+    /// levels. `0` ⇒ no octree (the flat `page_table` is used instead).
+    pub tree_depth: u32,
+    /// Number of octree nodes (root + internal), for logging/meta.
+    pub node_count: u32,
+    /// World-space camera framing (center, radius) of the **fine** occupied
+    /// region. The streamed path must frame this, not the coarse grid: for a
+    /// small file at high resolution the coarse grid fills the whole cube while
+    /// the fine data is a tiny Hilbert-prefix corner, so coarse framing would
+    /// point the camera at empty space. `(origin, 0.5)` for the non-streamed path.
+    pub focus_center: [f32; 3],
+    pub focus_radius: f32,
 }
 
 impl BrickVolume {
@@ -203,6 +236,14 @@ pub fn build_brick_volume(rgba: &[u8], extent: [u32; 3], brick: u32) -> BrickVol
         apron: APRON,
         occupied,
         streamed: false,
+        // Non-streamed uses the flat page table above, not the octree; the
+        // caller derives framing from the dense grid instead.
+        node_pool: Vec::new(),
+        node_pool_dim: [0, 0, 0],
+        tree_depth: 0,
+        node_count: 0,
+        focus_center: [0.0, 0.0, 0.0],
+        focus_radius: 0.5,
     }
 }
 
@@ -218,8 +259,13 @@ pub struct BrickBuilder {
     brick: u32,
     brick_log2: u32,
     luma: [u16; 256],
-    page_dim: [u32; 3],
-    page: Vec<u32>,    // dense (V/B)³: 0 = empty, else 1-based slot
+    page_dim: [u32; 3], // bricks per axis: [P, P, P], P = 2^depth
+    depth: u32,         // octree depth D = log2(P) = order_v - brick_log2
+    // Sparse octree over the P³ brick grid, built by insertion as bricks
+    // finalize (O(occupied) memory, never the P³ cube). `nodes[0]` is the root.
+    // Each node is 8 child entries (octant `x | y<<1 | z<<2`): 0 = empty subtree,
+    // `LEAF_BIT | id` = a 1-based brick leaf, else a 1-based child-node index.
+    nodes: Vec<[u32; 8]>,
     blocks: Vec<u8>,   // occupied bricks' RGBA8, B³ each, in slot order
     open: Vec<VoxelAcc>, // accumulators for the current open brick (B³)
     cur_hidx: i128,    // Hilbert index of the open brick (-1 = none)
@@ -227,6 +273,11 @@ pub struct BrickBuilder {
     occupied: u32,
     max_count: u64,
     dropped: u64,
+    // Voxel-space bounding box + centroid of occupied bricks, for framing the
+    // camera on the *fine* data (see BrickVolume::focus_center).
+    fmin: [u32; 3],
+    fmax: [u32; 3],
+    fsum: [f64; 3],
 }
 
 impl BrickBuilder {
@@ -237,13 +288,16 @@ impl BrickBuilder {
         let brick_log2 = brick.trailing_zeros();
         let side = 1u32 << order_v;
         let pd = side / brick;
+        let depth = order_v - brick_log2; // P = 2^depth bricks per side
+        assert!(depth >= 1, "streamed octree needs ≥ 2 bricks per side");
         BrickBuilder {
             order_v,
             brick,
             brick_log2,
             luma,
             page_dim: [pd, pd, pd],
-            page: vec![0u32; (pd as usize).pow(3)],
+            depth,
+            nodes: vec![[0u32; 8]], // root
             blocks: Vec::new(),
             open: vec![VoxelAcc::default(); (brick as usize).pow(3)],
             cur_hidx: -1,
@@ -251,7 +305,74 @@ impl BrickBuilder {
             occupied: 0,
             max_count: 0,
             dropped: 0,
+            fmin: [u32::MAX; 3],
+            fmax: [0; 3],
+            fsum: [0.0; 3],
         }
+    }
+
+    /// Insert an occupied brick at cell `(cx, cy, cz)` (in brick coords) with the
+    /// 1-based `id`, creating internal nodes along the path as needed. Descends
+    /// `depth` levels; at each level the octant bit is taken from the coordinate
+    /// bit `depth-1-d`, so the shader's boundary-compare descent visits the same
+    /// child. The deepest level stores the leaf entry (`LEAF_BIT | id`).
+    fn insert_brick(&mut self, cell: [u32; 3], id: u32) {
+        let mut node = 0usize;
+        for d in 0..self.depth {
+            let shift = self.depth - 1 - d;
+            let octant = (((cell[0] >> shift) & 1)
+                | (((cell[1] >> shift) & 1) << 1)
+                | (((cell[2] >> shift) & 1) << 2)) as usize;
+            if d == self.depth - 1 {
+                self.nodes[node][octant] = LEAF_BIT | id;
+            } else {
+                let child = self.nodes[node][octant];
+                node = if child == 0 {
+                    self.nodes.push([0u32; 8]);
+                    let ni = (self.nodes.len() - 1) as u32; // 0-based
+                    self.nodes[node][octant] = ni + 1; // store 1-based
+                    ni as usize
+                } else {
+                    (child - 1) as usize
+                };
+            }
+        }
+    }
+
+    /// Pack the octree into an RGBA8 node-pool texture: each node is a 2×2×2
+    /// block of child entries, nodes laid out near-cubically (like the brick
+    /// atlas). Leaf entries carry `A = 1` (occupied, not resident) + RGB brick
+    /// id; internal entries carry `A = 0` + RGB 1-based child-node index; empty
+    /// entries stay all-zero. Returns `(bytes, dims_in_texels, node_count)`.
+    fn serialize_octree(&self) -> (Vec<u8>, [u32; 3], u32) {
+        let n = self.nodes.len() as u32;
+        let nx = ((n as f64).cbrt().ceil() as u32).max(1);
+        let ny = nx;
+        let nz = n.div_ceil(nx * ny).max(1);
+        let (tw, th, td) = (nx * 2, ny * 2, nz * 2);
+        let mut out = vec![0u8; (tw as usize) * (th as usize) * (td as usize) * 4];
+        for (ni, node) in self.nodes.iter().enumerate() {
+            let ni = ni as u32;
+            let (bx, by, bz) = (ni % nx, (ni / nx) % ny, ni / (nx * ny));
+            for (octant, &e) in node.iter().enumerate() {
+                if e == 0 {
+                    continue;
+                }
+                let (ox, oy, oz) = (octant as u32 & 1, (octant as u32 >> 1) & 1, (octant as u32 >> 2) & 1);
+                let (tx, ty, tz) = (bx * 2 + ox, by * 2 + oy, bz * 2 + oz);
+                let ti = ((tx + ty * tw + tz * tw * th) as usize) * 4;
+                let (payload, state) = if e & LEAF_BIT != 0 {
+                    (e & !LEAF_BIT, 1u8) // leaf: brick id, occupied-not-resident
+                } else {
+                    (e, 0u8) // internal: 1-based child-node index
+                };
+                out[ti] = (payload & 0xff) as u8;
+                out[ti + 1] = ((payload >> 8) & 0xff) as u8;
+                out[ti + 2] = ((payload >> 16) & 0xff) as u8;
+                out[ti + 3] = state;
+            }
+        }
+        (out, [tw, th, td], n)
     }
 
     /// Accumulate one byte `b` whose voxel is at Hilbert distance `h` on the
@@ -287,17 +408,20 @@ impl BrickBuilder {
             self.dropped += 1;
             return;
         }
-        self.occupied += 1; // 1-based slot
+        self.occupied += 1; // 1-based brick id
         let bk = self.brick;
         let cell = [
             self.cur_origin[0] / bk,
             self.cur_origin[1] / bk,
             self.cur_origin[2] / bk,
         ];
-        let pidx = cell[0] as usize
-            + cell[1] as usize * self.page_dim[0] as usize
-            + cell[2] as usize * self.page_dim[0] as usize * self.page_dim[1] as usize;
-        self.page[pidx] = self.occupied;
+        // Track the occupied region (in voxels) for fine-data camera framing.
+        for a in 0..3 {
+            self.fmin[a] = self.fmin[a].min(self.cur_origin[a]);
+            self.fmax[a] = self.fmax[a].max(self.cur_origin[a] + bk - 1);
+            self.fsum[a] += (self.cur_origin[a] + bk / 2) as f64;
+        }
+        self.insert_brick(cell, self.occupied);
         for acc in &self.open {
             if acc.count == 0 {
                 self.blocks.extend_from_slice(&[0, 0, 0, 0]);
@@ -315,10 +439,12 @@ impl BrickBuilder {
     /// Finish for the **streamed** viewer path: keep the occupied bricks as a
     /// flat, range-addressable block array — brick `S` (1-based) at byte
     /// `(S-1)·brick³·4`, `brick³·4` bytes long — instead of scattering them into
-    /// a packed atlas, and ship the page table holding each cell's 1-based brick
-    /// **id**. The viewer streams bricks into a bounded GPU cache on demand
-    /// (ray-guided), so the full occupied set never has to be GPU-resident — the
-    /// reason the streaming path can exceed the dense grid without a VRAM cap.
+    /// a packed atlas, and ship the sparse **octree** `node_pool` indexing them.
+    /// The viewer streams bricks into a bounded GPU cache on demand (ray-guided),
+    /// so the full occupied set never has to be GPU-resident, and the octree
+    /// keeps the page structure O(occupied) rather than O((side/brick)³) — the
+    /// reason the streaming path can exceed the dense grid in both VRAM *and*
+    /// download/RAM without either scaling with the volume.
     ///
     /// The only transform over the accumulated [`blocks`](Self::blocks) is the
     /// global density (B-channel) rescale the dense atlas path also applies.
@@ -329,6 +455,17 @@ impl BrickBuilder {
         } else {
             0.0
         };
+        let (node_pool, node_pool_dim, node_count) = self.serialize_octree();
+        let side = 1u32 << self.order_v;
+        // Frame on the fine occupied region (voxel bbox → world). box_focus
+        // falls back to the whole cube when nothing is occupied.
+        let (focus_center, focus_radius) = super::box_focus(
+            if self.occupied > 0 { self.fmin } else { [0; 3] },
+            self.fmax,
+            self.fsum,
+            self.occupied as u64,
+            [side, side, side],
+        );
         // Density (B): rescale the raw per-voxel count by the global max, in
         // place — the blocks then ship as bricks.bin verbatim (x-fastest within
         // each brick, bricks concatenated in 1-based id order). Empty voxels
@@ -339,16 +476,21 @@ impl BrickBuilder {
                 v[2] = (v[2] as f32 * inv_max).round().clamp(0.0, 255.0) as u8;
             }
         }
-        let side = 1u32 << self.order_v;
         let bv = BrickVolume {
             atlas: blocks,
             atlas_dim: [0, 0, 0], // streamed: bricks.bin is a flat block array
-            page_table: pack_page_table(&self.page),
+            page_table: Vec::new(), // streamed uses the octree node pool instead
             page_dim: self.page_dim,
             vol_dim: [side, side, side],
             apron: 0, // streaming can't see neighbors → no border, nearest filtering
             occupied: self.occupied,
             streamed: true,
+            node_pool,
+            node_pool_dim,
+            tree_depth: self.depth,
+            node_count,
+            focus_center,
+            focus_radius,
         };
         (bv, self.dropped)
     }
@@ -454,16 +596,43 @@ mod tests {
         assert!(bv.page_table.iter().step_by(4).all(|&r| r == 0), "all cells empty");
     }
 
-    /// Reconstruct a voxel's RGBA from a **streamed** `BrickVolume`: the page
-    /// table holds a 1-based brick id, and `atlas` is the flat block array
-    /// (brick `id` at `(id-1)·BRICK³·4`), exactly as the viewer addresses it.
+    /// Descend the serialized **octree** node pool exactly as the shader/JS will,
+    /// returning the 1-based brick id at brick cell `(cx,cy,cz)` (`0` = empty).
+    /// This is the authoritative check that the built tree round-trips.
+    fn descend_octree(bv: &BrickVolume, cx: u32, cy: u32, cz: u32) -> u32 {
+        let [tw, th, _] = bv.node_pool_dim;
+        let (nx, ny) = (tw / 2, th / 2);
+        let read = |node: u32, ox: u32, oy: u32, oz: u32| -> (u32, u8) {
+            let (bx, by, bz) = (node % nx, (node / nx) % ny, node / (nx * ny));
+            let (txc, tyc, tzc) = (bx * 2 + ox, by * 2 + oy, bz * 2 + oz);
+            let ti = ((txc + tyc * tw + tzc * tw * th) as usize) * 4;
+            let rgb = bv.node_pool[ti] as u32
+                | (bv.node_pool[ti + 1] as u32) << 8
+                | (bv.node_pool[ti + 2] as u32) << 16;
+            (rgb, bv.node_pool[ti + 3])
+        };
+        let mut node = 0u32;
+        for d in 0..bv.tree_depth {
+            let shift = bv.tree_depth - 1 - d;
+            let (ox, oy, oz) = ((cx >> shift) & 1, (cy >> shift) & 1, (cz >> shift) & 1);
+            let (rgb, a) = read(node, ox, oy, oz);
+            if a > 0 {
+                return rgb; // leaf: 1-based brick id
+            }
+            if rgb == 0 {
+                return 0; // empty subtree
+            }
+            node = rgb - 1; // internal: descend
+        }
+        0
+    }
+
+    /// Reconstruct a voxel's RGBA from a **streamed** `BrickVolume`: descend the
+    /// octree to the brick id, then read the flat block array (brick `id` at
+    /// `(id-1)·BRICK³·4`), exactly as the viewer addresses it.
     fn sample_streamed(bv: &BrickVolume, x: u32, y: u32, z: u32) -> [u8; 4] {
         assert!(bv.streamed);
-        let [pbx, pby, _] = bv.page_dim;
-        let pi = ((z / BRICK) * pby * pbx + (y / BRICK) * pbx + (x / BRICK)) as usize;
-        let id = bv.page_table[pi * 4] as u32
-            | (bv.page_table[pi * 4 + 1] as u32) << 8
-            | (bv.page_table[pi * 4 + 2] as u32) << 16;
+        let id = descend_octree(bv, x / BRICK, y / BRICK, z / BRICK);
         if id == 0 {
             return [0, 0, 0, 0];
         }
@@ -506,5 +675,78 @@ mod tests {
         // bounded GPU cache is resident, so MAX_BRICKS is a high disk-bound
         // safety valve — far above the old 262_144 VRAM cap.
         assert!(MAX_BRICKS > 262_144, "streamed cap is disk-bound, not the old VRAM cap");
+    }
+
+    #[test]
+    fn octree_indexes_every_occupied_brick_and_prunes_empty() {
+        // order_v=6 (64³ voxels → 8³ = 512 brick cells, depth 3). Feed a
+        // contiguous Hilbert prefix so several bricks fill; the octree must map
+        // each occupied brick to a unique 1-based id and report empties as 0.
+        let order_v = 6;
+        let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256]);
+        let n = 1u64 << (3 * 5); // 32768 voxels
+        for h in 0..n {
+            b.push(h, ((h & 0x7f) as u8) | 1);
+        }
+        let (bv, _) = b.finish_streaming();
+        assert!(bv.streamed && bv.page_table.is_empty(), "streamed → octree, no flat page");
+        assert_eq!(bv.tree_depth, order_v - BRICK.trailing_zeros());
+        assert!(bv.node_count >= 1, "at least a root node");
+        assert_eq!(bv.node_pool_dim[0] % 2, 0, "node pool is 2 texels/node/axis");
+
+        // Every fed voxel's brick descends to a valid, in-range id.
+        let mut seen = std::collections::HashSet::new();
+        for h in 0..n {
+            let v = hilbert_d2xyz(h, order_v);
+            let id = descend_octree(&bv, v[0] / BRICK, v[1] / BRICK, v[2] / BRICK);
+            assert!(id >= 1 && id <= bv.occupied, "h={h} → id {id} out of range");
+            seen.insert((v[0] / BRICK, v[1] / BRICK, v[2] / BRICK));
+        }
+        // Distinct occupied brick cells == occupied count (a bijection cell↔id).
+        assert_eq!(seen.len() as u32, bv.occupied);
+
+        // A far, unfed brick cell prunes to empty (0).
+        let far = hilbert_d2xyz((1u64 << (3 * order_v)) - 1, order_v);
+        assert_eq!(descend_octree(&bv, far[0] / BRICK, far[1] / BRICK, far[2] / BRICK), 0);
+    }
+
+    #[test]
+    fn octree_round_trips_at_high_depth() {
+        // order_v=11 (2048³ voxels, depth 8) — the deep-tree case the viewer
+        // must handle. Feed a contiguous prefix and confirm every occupied brick
+        // still descends to a valid id and a far brick prunes to empty.
+        let order_v = 11;
+        let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256]);
+        let n = 1u64 << (3 * 6); // 262144 voxels → a small corner of the cube
+        for h in 0..n {
+            b.push(h, ((h & 0x7f) as u8) | 1);
+        }
+        let (bv, _) = b.finish_streaming();
+        assert_eq!(bv.tree_depth, 8);
+        for h in 0..n {
+            let v = hilbert_d2xyz(h, order_v);
+            let id = descend_octree(&bv, v[0] / BRICK, v[1] / BRICK, v[2] / BRICK);
+            assert!(id >= 1 && id <= bv.occupied, "h={h} → id {id} out of range at depth 8");
+        }
+        let far = hilbert_d2xyz((1u64 << (3 * order_v)) - 1, order_v);
+        assert_eq!(descend_octree(&bv, far[0] / BRICK, far[1] / BRICK, far[2] / BRICK), 0);
+    }
+
+    #[test]
+    fn octree_node_pool_is_sparse_not_dense() {
+        // A single occupied brick in a large 256³-voxel volume (32³ = 32768 brick
+        // cells) must build only a path of nodes (≈ depth), not a dense table.
+        let order_v = 8; // 256³ voxels, depth 5, 32³ brick cells
+        let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256]);
+        b.push(0, 1); // one occupied voxel at Hilbert distance 0 (origin brick)
+        let (bv, _) = b.finish_streaming();
+        assert_eq!(bv.occupied, 1);
+        // Depth-5 tree, one leaf → 5 nodes on the path (root + 4 internal).
+        assert_eq!(bv.node_count, bv.tree_depth, "one leaf ⇒ one node per level");
+        assert!(
+            (bv.node_count as usize) < 32 * 32 * 32,
+            "node pool is O(path), not O(brick cells)"
+        );
+        assert_eq!(descend_octree(&bv, 0, 0, 0), 1);
     }
 }

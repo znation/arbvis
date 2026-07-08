@@ -326,13 +326,16 @@ const volFrag = `
   precision highp float;
   precision highp sampler3D;
   uniform sampler3D uBricks;      // brick-pool atlas / streamed cache (RGBA8)
-  uniform sampler3D uPageTable;   // page table (RGBA8) — see pageCell()
+  uniform sampler3D uPageTable;   // flat page table (non-streamed) — see pageCell()
+  uniform sampler3D uNodePool;    // sparse octree node pool (streamed) — see descend()
   uniform sampler3D uCoarse;      // dense low-res fallback (streamed mode only)
   uniform sampler2D uLut;
   uniform sampler2D uSceneDepth; // depth of the opaque (edges) pass — ray cutoff
   uniform vec2 uResolution;      // drawing-buffer size, for the gl_FragCoord lookup
   uniform mat4 uInvProjView, uInvModel; // reconstruct the scene hit in box space
   uniform float uOpacity, uGamma, uThreshold, uNorm, uBrick, uBrickStride, uApron;
+  uniform vec3 uNodePoolDim;     // octree node-pool dims in texels (2/node/axis)
+  uniform float uTreeDepth;      // octree depth D (bricks per side = exp2(D))
   uniform int uSource, uSteps, uDirectColor, uStreamed;
   // Box world size per axis (longest axis = 1; isotropic cube = vec3(1)).
   uniform vec3 uSize;
@@ -360,6 +363,42 @@ const volFrag = `
     vec4 c = texture(uPageTable, (cell + 0.5) / uPageDim);
     state = uint(c.a * 255.0 + 0.5);
     return uint(c.r * 255.0 + 0.5) + (uint(c.g * 255.0 + 0.5) << 8u) + (uint(c.b * 255.0 + 0.5) << 16u);
+  }
+
+  // Read child octant o (each component 0/1) of octree node "node" from the node
+  // pool. Each node is a 2x2x2 texel block; nodes are laid out near-cubically
+  // (2 texels/node/axis). Returns the 24-bit RGB payload; outputs the A-state
+  // byte and the texel it lives at (for the streaming feedback probe).
+  uint readChild(float node, vec3 o, out uint a, out vec3 texel) {
+    vec3 npa = uNodePoolDim * 0.5;                 // nodes per axis
+    vec3 nb = vec3(mod(node, npa.x), mod(floor(node / npa.x), npa.y), floor(node / (npa.x * npa.y)));
+    texel = nb * 2.0 + o;
+    vec4 c = texture(uNodePool, (texel + 0.5) / uNodePoolDim);
+    a = uint(c.a * 255.0 + 0.5);
+    return uint(c.r * 255.0 + 0.5) + (uint(c.g * 255.0 + 0.5) << 8u) + (uint(c.b * 255.0 + 0.5) << 16u);
+  }
+
+  // Descend the sparse octree to the terminal node containing brick "cell".
+  // Returns the payload (brick id when not resident, cache slot when resident;
+  // 0 when empty) and, via out params: state (0 empty / 1 occupied-not-resident
+  // / 2 resident), the terminal node's brick-space box [boxOrigin, +boxExtent)
+  // for coarse empty-space leaps, and the leaf entry's pool texel (feedback).
+  // Leaf vs internal is read straight off the entry: A>0 => leaf, else RGB>0 =>
+  // internal pointer, else empty — so the walk is depth-agnostic (bounded by D).
+  uint descend(vec3 cell, out uint state, out vec3 boxOrigin, out float boxExtent, out vec3 texel) {
+    float node = 0.0;                 // root
+    vec3 origin = vec3(0.0);
+    float extent = exp2(uTreeDepth);  // bricks per side
+    for (int d = 0; d < 24; d++) {
+      float halfE = extent * 0.5;
+      vec3 o = step(origin + halfE, cell + 0.5);   // octant per axis (0/1)
+      vec3 childOrigin = origin + o * halfE;
+      uint a; uint rgb = readChild(node, o, a, texel);
+      if (a > 0u) { state = a; boxOrigin = childOrigin; boxExtent = 1.0; return rgb; }   // leaf brick
+      if (rgb == 0u) { state = 0u; boxOrigin = childOrigin; boxExtent = halfE; return 0u; } // empty subtree
+      node = float(rgb - 1u); origin = childOrigin; extent = halfE;                       // internal → descend
+    }
+    state = 0u; boxOrigin = cell; boxExtent = 1.0; return 0u;
   }
 
   // Sample the brick atlas/cache at a volume voxel position, for a 0-based slot.
@@ -405,11 +444,22 @@ const volFrag = `
       vec3 uvw = (vOrigin + t * dir) / uSize + 0.5;
       vec3 posVox = uvw * uVolDim;
       vec3 cell = floor(posVox / uBrick);
-      uint state; uint payload = pageCell(cell, state);
+      // Streamed: descend the octree (empty leaps span the whole empty node, not
+      // just one brick). Non-streamed: one flat page-table lookup.
+      uint state; uint payload;
+      vec3 boxOrigin; float boxExtent; vec3 leafTexel;
+      if (uStreamed == 1) {
+        payload = descend(cell, state, boxOrigin, boxExtent, leafTexel);
+      } else {
+        payload = pageCell(cell, state);
+        boxOrigin = cell; boxExtent = 1.0;
+      }
       bool empty = (uStreamed == 1) ? (state == 0u) : (payload == 0u);
       if (empty) {
-        // Empty brick → jump to its exit boundary (always advancing ≥ one step).
-        vec3 nb = (cell + step(0.0, dir)) * uBrick / uVolDim;  // next brick boundary (uvw)
+        // Empty region → jump to the exit boundary of its [boxOrigin, +boxExtent)
+        // brick box (the octree's coarse leap; one brick in the flat path). Always
+        // advances ≥ one step.
+        vec3 nb = (boxOrigin + step(0.0, dir) * boxExtent) * uBrick / uVolDim;
         vec3 tb = ((nb - 0.5) * uSize - vOrigin) / dir;        // → ray t at each axis plane
         float tnext = min(tb.x, min(tb.y, tb.z));
         t = max(tnext, t + stepLen) + 1e-4;
@@ -456,19 +506,20 @@ const volFrag = `
     fragColor = acc;
   }`;
 
-// Ray-guided brick-request (feedback) shader — the GigaVoxels probe. Marches the
-// same page table as volFrag (sharing volVert), but instead of compositing color
-// it reports the FIRST occupied-but-not-resident brick along each ray: the
-// linear page-cell index (+1, so 0 means "no miss") packed little-endian across
-// RGBA8. Rendered to a small off-screen target and read back so the CPU can
-// fetch exactly the bricks the visible surface needs, front-to-back.
+// Ray-guided brick-request (feedback) shader — the GigaVoxels probe. Descends the
+// same octree as volFrag (sharing volVert) but, instead of compositing color,
+// reports the FIRST occupied-but-not-resident leaf along each ray: the leaf's
+// node-pool texel index, linearized (+1, so 0 means "no miss") and packed
+// little-endian across RGBA8. Rendered to a small off-screen target and read back
+// so the CPU can fetch exactly the bricks the visible surface needs and locate
+// the very texel to flip resident. Streamed path only.
 const fbFrag = `
   precision highp float;
   precision highp sampler3D;
-  uniform sampler3D uPageTable;
-  uniform float uBrick;
+  uniform sampler3D uNodePool;
+  uniform float uBrick, uTreeDepth;
   uniform int uSteps;
-  uniform vec3 uSize, uVolDim, uPageDim;
+  uniform vec3 uSize, uVolDim, uNodePoolDim;
   in vec3 vOrigin;
   in vec3 vDirection;
   out vec4 fragColor;
@@ -482,6 +533,33 @@ const fbFrag = `
     return vec2(max(tmin.x, max(tmin.y, tmin.z)), min(tmax.x, min(tmax.y, tmax.z)));
   }
 
+  uint readChild(float node, vec3 o, out uint a, out vec3 texel) {
+    vec3 npa = uNodePoolDim * 0.5;
+    vec3 nb = vec3(mod(node, npa.x), mod(floor(node / npa.x), npa.y), floor(node / (npa.x * npa.y)));
+    texel = nb * 2.0 + o;
+    vec4 c = texture(uNodePool, (texel + 0.5) / uNodePoolDim);
+    a = uint(c.a * 255.0 + 0.5);
+    return uint(c.r * 255.0 + 0.5) + (uint(c.g * 255.0 + 0.5) << 8u) + (uint(c.b * 255.0 + 0.5) << 16u);
+  }
+
+  // Same walk as volFrag's descend, but returns only what the probe needs:
+  // state, the terminal node box (for leaping) and the leaf's pool texel.
+  void descend(vec3 cell, out uint state, out vec3 boxOrigin, out float boxExtent, out vec3 texel) {
+    float node = 0.0;
+    vec3 origin = vec3(0.0);
+    float extent = exp2(uTreeDepth);
+    for (int d = 0; d < 24; d++) {
+      float halfE = extent * 0.5;
+      vec3 o = step(origin + halfE, cell + 0.5);
+      vec3 childOrigin = origin + o * halfE;
+      uint a; uint rgb = readChild(node, o, a, texel);
+      if (a > 0u) { state = a; boxOrigin = childOrigin; boxExtent = 1.0; return; }
+      if (rgb == 0u) { state = 0u; boxOrigin = childOrigin; boxExtent = halfE; return; }
+      node = float(rgb - 1u); origin = childOrigin; extent = halfE;
+    }
+    state = 0u; boxOrigin = cell; boxExtent = 1.0;
+  }
+
   void main() {
     vec3 dir = normalize(vDirection);
     vec2 bounds = hitBox(vOrigin, dir);
@@ -492,18 +570,21 @@ const fbFrag = `
       if (t >= bounds.y) break;
       vec3 uvw = (vOrigin + t * dir) / uSize + 0.5;
       vec3 cell = floor(uvw * uVolDim / uBrick);
-      uint state = uint(texture(uPageTable, (cell + 0.5) / uPageDim).a * 255.0 + 0.5);
+      uint state; vec3 boxOrigin; float boxExtent; vec3 texel;
+      descend(cell, state, boxOrigin, boxExtent, texel);
       if (state == 0u) {
-        vec3 nb = (cell + step(0.0, dir)) * uBrick / uVolDim;
+        vec3 nb = (boxOrigin + step(0.0, dir) * boxExtent) * uBrick / uVolDim;
         vec3 tb = ((nb - 0.5) * uSize - vOrigin) / dir;
         float tnext = min(tb.x, min(tb.y, tb.z));
         t = max(tnext, t + stepLen) + 1e-4;
         continue;
       }
       if (state == 1u) {
-        uint cl = uint(cell.x) + uint(cell.y) * uint(uPageDim.x)
-                + uint(cell.z) * uint(uPageDim.x) * uint(uPageDim.y);
-        uint v = cl + 1u;
+        // Report the leaf's node-pool texel (linearized, +1) so the CPU can read
+        // its brick id and flip exactly this texel resident.
+        uint tl = uint(texel.x) + uint(texel.y) * uint(uNodePoolDim.x)
+                + uint(texel.z) * uint(uNodePoolDim.x) * uint(uNodePoolDim.y);
+        uint v = tl + 1u;
         fragColor = vec4(float(v & 255u) / 255.0, float((v >> 8u) & 255u) / 255.0,
                          float((v >> 16u) & 255u) / 255.0, float((v >> 24u) & 255u) / 255.0);
         return;
@@ -600,8 +681,12 @@ async function load() {
   {
     const b = meta.bricks;
     loadTotal = ex * ey * ez * 4;                                   // volume.bin
-    loadTotal += b.page_dim[0] * b.page_dim[1] * b.page_dim[2] * 4; // pagetable.bin
-    if (!b.streamed) loadTotal += b.atlas_dim[0] * b.atlas_dim[1] * b.atlas_dim[2] * 4; // bricks.bin
+    if (b.streamed) {
+      loadTotal += b.tree_dim[0] * b.tree_dim[1] * b.tree_dim[2] * 4; // tree.bin (octree node pool)
+    } else {
+      loadTotal += b.page_dim[0] * b.page_dim[1] * b.page_dim[2] * 4; // pagetable.bin
+      loadTotal += b.atlas_dim[0] * b.atlas_dim[1] * b.atlas_dim[2] * 4; // bricks.bin
+    }
   }
 
   // The volume renders from a sparse brick pool indexed by a page table
@@ -645,14 +730,14 @@ async function load() {
     return t;
   };
 
-  let pageTex, brickTex, coarseTex, atlasBricks;
+  let pageTex, brickTex, coarseTex, atlasBricks, nodePoolTex;
   if (streamed) {
     // Coarse fallback LOD: the dense grid (already fetched for histograms/pick),
     // sampled linearly where a brick isn't yet resident → an instant blurry
-    // image that sharpens in place. Clamp to ≤1024³ (the --grid max) so VRAM
+    // image that sharpens in place. Clamp to ≤1024³ (the coarse cap) so VRAM
     // stays bounded; a bundle exceeding that shouldn't exist, but guard it.
     if (Math.max(ex, ey, ez) > 1024) {
-      throw new Error('streamed coarse fallback expects --grid ≤ 1024, got ' + Math.max(ex, ey, ez));
+      throw new Error('streamed coarse fallback expects coarse grid ≤ 1024, got ' + Math.max(ex, ey, ez));
     }
     coarseTex = make3d(volBuf, ex, ey, ez, true);
 
@@ -664,27 +749,23 @@ async function load() {
     brickTex = make3d(new Uint8Array(cdim * cdim * cdim * 4), cdim, cdim, cdim, false);
     atlasBricks = [BRICK_CACHE_DIM, BRICK_CACHE_DIM, BRICK_CACHE_DIM];
 
-    // Mutable page table. The shipped pagetable.bin holds each cell's 1-based
-    // brick id (0 = empty); rebuild it into the viewer's A-state encoding
-    // (0 empty / 1 occupied-not-resident / 2 resident) and keep the ids + a CPU
-    // state mirror for fetch + the LRU touch walk.
-    const idBuf = await fetchBytes(bm.page_file);
-    const nCells = bm.page_dim[0] * bm.page_dim[1] * bm.page_dim[2];
-    const pageBuf = new Uint8Array(nCells * 4);
-    const brickIds = new Uint32Array(nCells);
-    const cellState = new Uint8Array(nCells); // 0 empty, 1 not-resident, 2 resident
-    for (let i = 0; i < nCells; i++) {
-      const id = idBuf[i * 4] | (idBuf[i * 4 + 1] << 8) | (idBuf[i * 4 + 2] << 16);
-      brickIds[i] = id;
-      const s = id ? 1 : 0;
-      cellState[i] = s;
-      pageBuf[i * 4 + 3] = s; // A = state; RGB stay 0 until resident
+    // Sparse octree node pool (tree.bin). O(occupied), so this stays a few MB
+    // however high the detail resolution — the whole point of the octree. The
+    // fetched bytes are BOTH the uploaded texture and the CPU mirror the streamer
+    // mutates in place: leaf entries ship with A=1 (occupied, not resident) + RGB
+    // = 1-based brick id; the viewer flips A=2 + RGB = cache slot as bricks land.
+    const nodePool = await fetchBytes(bm.tree_file);
+    const [tw, th, tdp] = bm.tree_dim;
+    if (Math.max(tw, th, tdp) > maxSide) {
+      throw new Error('octree node pool ' + Math.max(tw, th, tdp) + ' exceeds this GPU\'s max 3D texture (' + maxSide + ')');
     }
-    pageTex = make3d(pageBuf, bm.page_dim[0], bm.page_dim[1], bm.page_dim[2], false);
+    nodePoolTex = make3d(nodePool, tw, th, tdp, false);
     // Force GPU allocation now so per-texel/per-brick texSubImage3D works.
-    renderer.initTexture(pageTex);
+    renderer.initTexture(nodePoolTex);
     renderer.initTexture(brickTex);
-    brickStream = setupBrickStream(bm, pageTex, brickTex, pageBuf, cellState, brickIds, size);
+    // uPageTable is unused in the octree path; bind a 1-voxel dummy.
+    pageTex = make3d(new Uint8Array(4), 1, 1, 1, false);
+    brickStream = setupBrickStream(bm, nodePoolTex, brickTex, nodePool, size);
   } else {
     const atlasMax = Math.max(bm.atlas_dim[0], bm.atlas_dim[1], bm.atlas_dim[2]);
     if (atlasMax > maxSide) {
@@ -698,9 +779,10 @@ async function load() {
     // The apron border lets trilinear filtering cross brick edges smoothly.
     brickTex = make3d(brickBuf, bm.atlas_dim[0], bm.atlas_dim[1], bm.atlas_dim[2], bm.apron > 0);
     atlasBricks = [bm.atlas_dim[0] / bstride, bm.atlas_dim[1] / bstride, bm.atlas_dim[2] / bstride];
-    // uCoarse is never sampled in this mode, but the sampler still needs a bound
-    // 3D texture — a 1-voxel dummy.
+    // uCoarse and uNodePool are never sampled in this mode, but the samplers
+    // still need a bound 3D texture — 1-voxel dummies.
     coarseTex = make3d(new Uint8Array(4), 1, 1, 1, false);
+    nodePoolTex = make3d(new Uint8Array(4), 1, 1, 1, false);
   }
 
   const volMat = new THREE.ShaderMaterial({
@@ -713,6 +795,9 @@ async function load() {
     blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor,
     uniforms: {
       uBricks: { value: brickTex }, uPageTable: { value: pageTex }, uLut: { value: lutTex },
+      uNodePool: { value: nodePoolTex },
+      uNodePoolDim: { value: new THREE.Vector3(bm.tree_dim[0] || 1, bm.tree_dim[1] || 1, bm.tree_dim[2] || 1) },
+      uTreeDepth: { value: bm.tree_depth || 0 },
       uCoarse: { value: coarseTex }, uStreamed: { value: streamed ? 1 : 0 },
       uOpacity: { value: 0.45 }, uGamma: { value: 1.0 },
       // Quality is fixed high (no slider) — well above the old 384 max. The 2048
@@ -794,24 +879,26 @@ const FB_EVERY = 2;                                          // probe at most ev
 const brickDebug = location.search.includes('debug');
 const _tNdc = new THREE.Vector2();
 
-// Build the brick-stream state. `pageTex`/`brickTex` are the mutable page table
-// and the (initially empty) cache atlas; `pageBuf`/`cellState` are CPU mirrors;
-// `brickIds[cell]` is the 1-based file brick id (range offset = (id-1)·stride).
-function setupBrickStream(bm, pageTex, brickTex, pageBuf, cellState, brickIds, size) {
-  const pd = bm.page_dim;
+// Build the brick-stream state. `nodeTex`/`brickTex` are the mutable octree node
+// pool and the (initially empty) cache atlas; `nodePool` is the CPU mirror of the
+// node pool (mutated in lock-step via texSub3D). Residency is keyed by a leaf's
+// linear node-pool texel index `tl`: its RGB holds the 1-based file brick id
+// while not resident (range offset = (id-1)·stride), the cache slot once resident.
+function setupBrickStream(bm, nodeTex, brickTex, nodePool, size) {
   const freeSlots = [];
   for (let s = BRICK_CACHE_CAP - 1; s >= 0; s--) freeSlots.push(s); // pop() → 0,1,2,…
-  // Feedback material: reuses volVert, shares the *mutable* page-table texture
-  // (so it never re-requests a brick that already arrived). Coarse step count —
-  // it only needs to find the first miss, not integrate color.
+  // Feedback material: reuses volVert, shares the *mutable* node-pool texture (so
+  // it never re-requests a brick that already arrived). Coarse step count — it
+  // only needs to find the first miss, not integrate color.
   const fbMat = new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3, side: THREE.BackSide,
     uniforms: {
-      uPageTable: { value: pageTex },
+      uNodePool: { value: nodeTex },
+      uNodePoolDim: { value: new THREE.Vector3(bm.tree_dim[0], bm.tree_dim[1], bm.tree_dim[2]) },
+      uTreeDepth: { value: bm.tree_depth },
       uBrick: { value: bm.brick }, uSteps: { value: 128 },
       uSize: { value: new THREE.Vector3(size[0], size[1], size[2]) },
       uVolDim: { value: new THREE.Vector3(bm.vol_dim[0], bm.vol_dim[1], bm.vol_dim[2]) },
-      uPageDim: { value: new THREE.Vector3(pd[0], pd[1], pd[2]) },
     },
     vertexShader: volVert, fragmentShader: fbFrag,
   });
@@ -822,15 +909,37 @@ function setupBrickStream(bm, pageTex, brickTex, pageBuf, cellState, brickIds, s
     minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, depthBuffer: false,
   });
   return {
-    bm, brick: bm.brick, pd, stride: bm.brick ** 3 * 4,
-    pageTex, brickTex, pageBuf, cellState, brickIds,
+    bm, brick: bm.brick, stride: bm.brick ** 3 * 4,
+    nodeTex, brickTex, nodePool,
+    treeDim: bm.tree_dim, treeDepth: bm.tree_depth,
+    vol: bm.vol_dim,
     fbScene, fbTarget, fbBuf: null,
-    resident: new Map(),        // cellLinear → { slot, lastUsed }
+    resident: new Map(),        // leaf texel tl → { slot, lastUsed, id }
     freeSlots, inflight: 0, pending: new Set(),
     frame: 0, fbFrame: -100, probeIdle: true, glDirty: false,
     stats: { requested: 0, evicted: 0 },
     size, volMat: null,
   };
+}
+
+// Descend the octree CPU-side (mirrors the shader) to the leaf texel for brick
+// cell (cx,cy,cz), or -1 for an empty subtree. Used by the LRU touch walk.
+function descendCell(bs, cx, cy, cz) {
+  const np = bs.nodePool, tw = bs.treeDim[0], twh = bs.treeDim[0] * bs.treeDim[1];
+  const npx = bs.treeDim[0] >> 1, npy = bs.treeDim[1] >> 1;
+  let node = 0, ox = 0, oy = 0, oz = 0;
+  let extent = 1 << bs.treeDepth, orx = 0, ory = 0, orz = 0;
+  for (let d = 0; d < bs.treeDepth; d++) {
+    const half = extent >> 1;
+    ox = (cx - orx) >= half ? 1 : 0; oy = (cy - ory) >= half ? 1 : 0; oz = (cz - orz) >= half ? 1 : 0;
+    const bx = node % npx, by = ((node / npx) | 0) % npy, bz = (node / (npx * npy)) | 0;
+    const tl = (bx * 2 + ox) + (by * 2 + oy) * tw + (bz * 2 + oz) * twh;
+    const o = tl * 4, a = np[o + 3], rgb = np[o] | (np[o + 1] << 8) | (np[o + 2] << 16);
+    if (a > 0) return tl;      // leaf brick
+    if (rgb === 0) return -1;  // empty subtree
+    node = rgb - 1; orx += ox * half; ory += oy * half; orz += oz * half; extent = half;
+  }
+  return -1;
 }
 
 // Raw-GL subregion upload into a three-owned Data3DTexture (page cell or brick).
@@ -848,28 +957,36 @@ function texSub3D(bs, tex, x, y, z, w, h, d, data) {
 }
 
 const _cellTexel = new Uint8Array(4);
-// Write one page-table cell (CPU mirror + GPU texel). state: 0 empty, 1 not
-// resident, 2 resident; slot is the 0-based cache slot (only used when resident).
-function writePageCell(bs, cl, state, slot) {
-  const pd = bs.pd;
-  const cx = cl % pd[0], cy = ((cl / pd[0]) | 0) % pd[1], cz = (cl / (pd[0] * pd[1])) | 0;
-  _cellTexel[0] = slot & 0xff; _cellTexel[1] = (slot >> 8) & 0xff;
-  _cellTexel[2] = (slot >> 16) & 0xff; _cellTexel[3] = state;
-  const o = cl * 4;
-  bs.pageBuf[o] = _cellTexel[0]; bs.pageBuf[o + 1] = _cellTexel[1];
-  bs.pageBuf[o + 2] = _cellTexel[2]; bs.pageBuf[o + 3] = _cellTexel[3];
-  texSub3D(bs, bs.pageTex, cx, cy, cz, 1, 1, 1, _cellTexel);
+// Leaf-entry state read off the CPU node-pool mirror at texel `tl` (A byte):
+// 0 empty, 1 occupied-not-resident, 2 resident.
+function leafState(bs, tl) { return bs.nodePool[tl * 4 + 3]; }
+// The leaf's RGB payload (brick id while not resident, cache slot when resident).
+function leafRgb(bs, tl) {
+  const o = tl * 4; return bs.nodePool[o] | (bs.nodePool[o + 1] << 8) | (bs.nodePool[o + 2] << 16);
 }
 
-// Evict a resident brick: free its cache slot, flip the page cell back to
-// not-resident. Its atlas texels are never cleared — the page state gates reads.
-function evictBrick(bs, cl) {
-  const e = bs.resident.get(cl);
+// Write one octree leaf entry (CPU mirror + GPU texel). state: 1 not resident,
+// 2 resident; rgb is the 1-based brick id (state 1) or 0-based cache slot (2).
+function writeLeaf(bs, tl, state, rgb) {
+  const tw = bs.treeDim[0], twh = bs.treeDim[0] * bs.treeDim[1];
+  const tx = tl % tw, ty = ((tl / tw) | 0) % bs.treeDim[1], tz = (tl / twh) | 0;
+  _cellTexel[0] = rgb & 0xff; _cellTexel[1] = (rgb >> 8) & 0xff;
+  _cellTexel[2] = (rgb >> 16) & 0xff; _cellTexel[3] = state;
+  const o = tl * 4;
+  bs.nodePool[o] = _cellTexel[0]; bs.nodePool[o + 1] = _cellTexel[1];
+  bs.nodePool[o + 2] = _cellTexel[2]; bs.nodePool[o + 3] = _cellTexel[3];
+  texSub3D(bs, bs.nodeTex, tx, ty, tz, 1, 1, 1, _cellTexel);
+}
+
+// Evict a resident brick: free its cache slot, flip its leaf back to
+// not-resident and restore its brick id (RGB). Atlas texels are never cleared —
+// the leaf state gates reads.
+function evictBrick(bs, tl) {
+  const e = bs.resident.get(tl);
   if (!e) return;
   bs.freeSlots.push(e.slot);
-  bs.resident.delete(cl);
-  bs.cellState[cl] = 1;
-  writePageCell(bs, cl, 1, 0);
+  bs.resident.delete(tl);
+  writeLeaf(bs, tl, 1, e.id);
   bs.stats.evicted++;
 }
 
@@ -878,34 +995,34 @@ function evictBrick(bs, cl) {
 // bricks → defer rather than evict something on screen).
 function evictLru(bs) {
   let lru = null, used = Infinity;
-  for (const [cl, e] of bs.resident) {
-    if (e.lastUsed < used) { used = e.lastUsed; lru = cl; }
+  for (const [tl, e] of bs.resident) {
+    if (e.lastUsed < used) { used = e.lastUsed; lru = tl; }
   }
   if (lru === null || used === bs.frame) return false;
   evictBrick(bs, lru);
   return true;
 }
 
-// Place an arrived brick (brick³ RGBA8, x-fastest) into a cache slot and mark
-// its page cell resident. apron 0 → the stored brick edge is exactly bm.brick.
-function uploadBrick(bs, cl, data) {
-  if (bs.cellState[cl] !== 1) return; // evicted/raced before the fetch returned
+// Place an arrived brick (brick³ RGBA8, x-fastest) into a cache slot and mark its
+// leaf resident. `id` is the 1-based brick id (kept so eviction can restore RGB).
+// apron 0 → the stored brick edge is exactly bm.brick.
+function uploadBrick(bs, tl, id, data) {
+  if (leafState(bs, tl) !== 1) return; // evicted/raced before the fetch returned
   let slot = bs.freeSlots.pop();
   if (slot === undefined) { if (!evictLru(bs)) return; slot = bs.freeSlots.pop(); }
   const D = BRICK_CACHE_DIM, b = bs.brick;
   const sx = slot % D, sy = ((slot / D) | 0) % D, sz = (slot / (D * D)) | 0;
   texSub3D(bs, bs.brickTex, sx * b, sy * b, sz * b, b, b, b, data);
-  bs.resident.set(cl, { slot, lastUsed: bs.frame });
-  bs.cellState[cl] = 2;
-  writePageCell(bs, cl, 2, slot);
+  bs.resident.set(tl, { slot, lastUsed: bs.frame, id });
+  writeLeaf(bs, tl, 2, slot);
   volumeDirty = true; // a brick landed — re-probe (more may be needed behind it)
 }
 
 // Range-fetch one brick's block from bricks.bin and upload it: 206 (partial) is
 // the fast path; a host that ignores Range (200, whole file) is sliced
 // client-side so it stays correct everywhere.
-function loadBrick(bs, cl) {
-  const id = bs.brickIds[cl];
+function loadBrick(bs, tl) {
+  const id = leafRgb(bs, tl); // not resident ⇒ RGB is the 1-based brick id
   if (!id) return;
   const off = (id - 1) * bs.stride, end = off + bs.stride - 1;
   bs.inflight++;
@@ -913,7 +1030,7 @@ function loadBrick(bs, cl) {
     .then((res) => res.arrayBuffer().then((ab) => {
       let u8 = new Uint8Array(ab);
       if (res.status !== 206 && u8.length !== bs.stride) u8 = u8.subarray(off, off + bs.stride);
-      uploadBrick(bs, cl, u8);
+      uploadBrick(bs, tl, id, u8);
     }))
     .catch((e) => console.error('brick load failed', e))
     .finally(() => { bs.inflight--; pumpBrickFetches(bs); });
@@ -924,24 +1041,24 @@ function loadBrick(bs, cl) {
 // blind here (it lacks the current visible cut).
 function pumpBrickFetches(bs) {
   if (bs.pending.size === 0) return;
-  for (const cl of [...bs.pending]) {
+  for (const tl of [...bs.pending]) {
     if (bs.inflight >= BRICK_MAX_INFLIGHT || bs.freeSlots.length === 0) break;
-    if (bs.cellState[cl] !== 1) { bs.pending.delete(cl); continue; }
-    bs.pending.delete(cl);
-    loadBrick(bs, cl);
+    if (leafState(bs, tl) !== 1) { bs.pending.delete(tl); continue; }
+    bs.pending.delete(tl);
+    loadBrick(bs, tl);
   }
 }
 
-// Decode the feedback target: each pixel is (cellLinear+1) of the first miss
+// Decode the feedback target: each pixel is (leaf texel + 1) of the first miss
 // along its ray, little-endian RGBA8 (0 = no miss). Enqueue unique misses.
 function processFeedback(bs, buf) {
   let added = 0;
   for (let i = 0; i < buf.length; i += 4) {
     const v = (buf[i] | (buf[i + 1] << 8) | (buf[i + 2] << 16) | (buf[i + 3] << 24)) >>> 0;
     if (v === 0) continue;
-    const cl = v - 1;
-    if (bs.cellState[cl] !== 1 || bs.pending.has(cl)) continue;
-    bs.pending.add(cl);
+    const tl = v - 1;
+    if (leafState(bs, tl) !== 1 || bs.pending.has(tl)) continue;
+    bs.pending.add(tl);
     bs.stats.requested++;
     added++;
   }
@@ -984,8 +1101,7 @@ function runFeedback(bs) {
 // nearest not-resident bricks just ahead. Then evict LRU non-cut bricks if the
 // cache is over its soft cap. Cheap (≈ RAYS² · steps state lookups, no GPU).
 function touchAndEvictBricks(bs) {
-  const pd = bs.pd, pdx = pd[0], pdxy = pd[0] * pd[1];
-  const sz = bs.size, vd = bs.bm.vol_dim, brick = bs.brick;
+  const sz = bs.size, vd = bs.vol, brick = bs.brick;
   const cut = new Set();
   camera.updateMatrixWorld();
   const RAYS = 28, STEPS = 96;
@@ -1012,13 +1128,14 @@ function touchAndEvictBricks(bs) {
         const uz = (ro.z + rd.z * t) / sz[2] + 0.5;
         if (ux < 0 || uy < 0 || uz < 0 || ux >= 1 || uy >= 1 || uz >= 1) continue;
         const cx = (ux * vd[0] / brick) | 0, cy = (uy * vd[1] / brick) | 0, cz = (uz * vd[2] / brick) | 0;
-        const cl = cx + cy * pdx + cz * pdxy;
-        const st = bs.cellState[cl];
+        const tl = descendCell(bs, cx, cy, cz); // octree leaf texel, or -1 empty
+        if (tl < 0) continue;
+        const st = bs.nodePool[tl * 4 + 3];
         if (st === 2) {
-          const e = bs.resident.get(cl);
-          if (e) { e.lastUsed = bs.frame; cut.add(cl); }
-        } else if (st === 1 && pre < 3 && !bs.pending.has(cl)) {
-          bs.pending.add(cl); bs.stats.requested++; pre++;
+          const e = bs.resident.get(tl);
+          if (e) { e.lastUsed = bs.frame; cut.add(tl); }
+        } else if (st === 1 && pre < 3 && !bs.pending.has(tl)) {
+          bs.pending.add(tl); bs.stats.requested++; pre++;
         }
       }
     }
@@ -1026,11 +1143,11 @@ function touchAndEvictBricks(bs) {
   pumpBrickFetches(bs);
   if (bs.resident.size > BRICK_CACHE_SOFT) {
     const ev = [];
-    for (const [cl, e] of bs.resident) if (!cut.has(cl)) ev.push([cl, e.lastUsed]);
+    for (const [tl, e] of bs.resident) if (!cut.has(tl)) ev.push([tl, e.lastUsed]);
     ev.sort((a, b) => a[1] - b[1]); // oldest first
-    for (const [cl] of ev) {
+    for (const [tl] of ev) {
       if (bs.resident.size <= BRICK_CACHE_SOFT) break;
-      evictBrick(bs, cl);
+      evictBrick(bs, tl);
     }
   }
 }

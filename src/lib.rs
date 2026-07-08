@@ -225,12 +225,12 @@ pub struct Args {
     three_d: bool,
 
     /// 3D target detail resolution: the voxel grid side (a power of two,
-    /// 2–8192, default 2048). Higher is more detailed. Above `COARSE_CAP` (128)
+    /// 2–16384, default 2048). Higher is more detailed. Above `COARSE_CAP` (128)
     /// the up-front download stays small and fixed — a coarse `COARSE_CAP`³
-    /// fallback plus a page table — while the fine detail streams on demand from
-    /// a sparse brick pool as you pan/zoom. Note the page table itself grows
-    /// with resolution (≈ `(N/8)³·4` bytes), so very high `N` (≥ 4096) produces a
-    /// large page table; see `validate_grid`. Ignored in 2D mode.
+    /// fallback plus a sparse octree — while the fine detail streams on demand
+    /// from a brick pool as you pan/zoom. The octree page structure is
+    /// O(occupied), so raising `N` costs more disk on the host but not a bigger
+    /// download, client RAM, or VRAM. Ignored in 2D mode.
     #[arg(long, default_value_t = 2048)]
     grid: u32,
 
@@ -550,28 +550,25 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
     dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await
 }
 
-/// Validate `--grid`: a power of two in `[2, 8192]`. Detail above the coarse cap
-/// streams (see `volume::derive_volume_resolution`), so the *wire* cost is
-/// bounded by the coarse grid + page table rather than side³·4. The upper bound
-/// caps the Hilbert order (8192 = order 13). Caveat at the top end: the page
-/// table is still a flat dense array (≈ `(side/8)³·4` bytes — ~64 MiB at 2048³,
-/// ~512 MiB at 4096³, ~4 GiB at 8192³) fetched and held client-side, so
-/// resolutions ≥ 4096 are only practical for the deployed (gzipped) viewer and
-/// may exceed browser memory until the page table goes sparse/octree.
+/// Validate `--grid`: a power of two in `[2, 16384]`. Detail above the coarse cap
+/// streams (see `volume::derive_volume_resolution`) from a sparse octree whose
+/// page structure is O(occupied) — so neither the download, the client RAM, nor
+/// the VRAM scales with the volume, only with the data actually present. The
+/// upper bound caps the Hilbert order (16384 = order 14).
 fn validate_grid(side: u32) -> anyhow::Result<()> {
-    if !(2..=8192).contains(&side) || !side.is_power_of_two() {
-        anyhow::bail!("--grid must be a power of two between 2 and 8192, got {side}");
+    if !(2..=16384).contains(&side) || !side.is_power_of_two() {
+        anyhow::bail!("--grid must be a power of two between 2 and 16384, got {side}");
     }
     Ok(())
 }
 
 /// Validate `--volume-res`: `0` (derive from `--grid`) or a power of two in
-/// `[8, 8192]`. The sparse brick pool stores only occupied bricks, so a high
-/// resolution is affordable for sparse data; the upper bound caps the page
-/// table + Hilbert order (8192 = order 13).
+/// `[8, 16384]`. The sparse brick pool + octree store only occupied data, so a
+/// high resolution is affordable; the upper bound caps the Hilbert order (16384
+/// = order 14).
 fn validate_volume_res(res: u32) -> anyhow::Result<()> {
-    if res != 0 && (!(8..=8192).contains(&res) || !res.is_power_of_two()) {
-        anyhow::bail!("--volume-res must be 0 or a power of two between 8 and 8192, got {res}");
+    if res != 0 && (!(8..=16384).contains(&res) || !res.is_power_of_two()) {
+        anyhow::bail!("--volume-res must be 0 or a power of two between 8 and 16384, got {res}");
     }
     Ok(())
 }
@@ -1031,10 +1028,10 @@ mod grid_validation_tests {
     use super::validate_grid;
 
     #[test]
-    fn grid_cap_raised_to_8192() {
-        assert!(validate_grid(8192).is_ok());
-        assert!(validate_grid(2048).is_ok()); // the new default
-        assert!(validate_grid(16384).is_err()); // above the cap
+    fn grid_cap_raised_to_16384() {
+        assert!(validate_grid(16384).is_ok());
+        assert!(validate_grid(2048).is_ok()); // the default
+        assert!(validate_grid(32768).is_err()); // above the cap
         assert!(validate_grid(768).is_err()); // not a power of two
     }
 }

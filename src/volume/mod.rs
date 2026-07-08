@@ -182,42 +182,39 @@ pub async fn render_volume(
         None => brick::build_brick_volume(&built.volume_rgba, actual_extent, brick::BRICK),
     };
     std::fs::write(out_dir.join("bricks.bin"), &bricks.atlas)?;
-    std::fs::write(out_dir.join("pagetable.bin"), &bricks.page_table)?;
+    // Page structure: the streamed path ships a sparse octree node pool
+    // (`tree.bin`); the non-streamed/flat path ships the dense page table
+    // (`pagetable.bin`).
+    let (page_file, tree_file) = if bricks.streamed {
+        std::fs::write(out_dir.join("tree.bin"), &bricks.node_pool)?;
+        (String::new(), "tree.bin".to_string())
+    } else {
+        std::fs::write(out_dir.join("pagetable.bin"), &bricks.page_table)?;
+        ("pagetable.bin".to_string(), String::new())
+    };
 
-    // Report the blocking up-front download: the coarse dense grid + page table
-    // (bricks.bin streams on demand and is excluded). This is what the viewer's
-    // progress bar tracks; when it streams, keeping this small is the whole
-    // point of the coarse/detail split. The page table grows with detail
-    // resolution (≈ (side/BRICK)³·4); the deployed Space gzips both assets on
-    // the wire (see space_template/app.py.tmpl).
+    // Report the blocking up-front download: the coarse dense grid + the sparse
+    // octree node pool (bricks.bin streams on demand and is excluded). The octree
+    // is O(occupied), not O((side/BRICK)³), so this stays small however high the
+    // detail resolution; the deployed Space gzips both assets on the wire (see
+    // space_template/app.py.tmpl).
     if bricks.streamed {
-        let upfront = built.volume_rgba.len() + bricks.page_table.len();
+        let upfront = built.volume_rgba.len() + bricks.node_pool.len();
         log::info!(
-            "3D up-front download ≈ {:.1} MiB (coarse {ex}³ grid {:.1} MiB + page table {:.1} MiB); \
-             {} bricks stream on demand from bricks.bin ({:.1} MiB)",
+            "3D up-front download ≈ {:.1} MiB (coarse {ex}³ grid {:.1} MiB + octree {:.1} MiB, \
+             {} nodes, depth {}); {} bricks stream on demand from bricks.bin ({:.1} MiB)",
             upfront as f64 / (1 << 20) as f64,
             built.volume_rgba.len() as f64 / (1 << 20) as f64,
-            bricks.page_table.len() as f64 / (1 << 20) as f64,
+            bricks.node_pool.len() as f64 / (1 << 20) as f64,
+            bricks.node_count,
+            bricks.tree_depth,
             bricks.occupied,
             bricks.atlas.len() as f64 / (1 << 20) as f64,
         );
-        // The page table is a flat dense array the viewer downloads and holds in
-        // RAM whole (plus parallel id/state mirrors ≈ 2.25× on the client). Past
-        // a few hundred MiB it can exceed browser memory — warn so a very high
-        // --grid doesn't silently produce a bundle that won't load.
-        const PAGE_TABLE_WARN: usize = 256 << 20; // 256 MiB (~4096³)
-        if bricks.page_table.len() >= PAGE_TABLE_WARN {
-            log::warn!(
-                "page table is {:.0} MiB (grid detail is high); the viewer loads it whole \
-                 (~2.25× that in client RAM) and may fail in a browser — lower --grid or wait \
-                 for the sparse/octree page table",
-                bricks.page_table.len() as f64 / (1 << 20) as f64,
-            );
-        }
     }
     let brick_meta = encode::BrickVolumeMeta {
         atlas_file: "bricks.bin".to_string(),
-        page_file: "pagetable.bin".to_string(),
+        page_file,
         brick: brick::BRICK,
         page_dim: bricks.page_dim,
         atlas_dim: bricks.atlas_dim,
@@ -225,6 +222,10 @@ pub async fn render_volume(
         apron: bricks.apron,
         occupied: bricks.occupied,
         streamed: bricks.streamed,
+        tree_file,
+        tree_dim: bricks.node_pool_dim,
+        tree_depth: bricks.tree_depth,
+        node_count: bricks.node_count,
     };
 
     let meta = VolumeMeta {
@@ -241,7 +242,9 @@ pub async fn render_volume(
         focus_radius: built.focus_radius,
         lut: pixel_lut.iter().map(|c| c.0).collect(),
         manifest,
-        format_version: 4,
+        // v5: the streamed path's page structure is a sparse octree node pool
+        // (`bricks.tree_*`) rather than a flat page table.
+        format_version: 5,
         bricks: Some(brick_meta),
     };
     std::fs::write(out_dir.join("meta.json"), serde_json::to_vec(&meta)?)?;
@@ -396,10 +399,6 @@ fn aggregate_bytes_hilbert(
     // Flush the trailing in-progress cell.
     flush(&mut grid, cur_cell, &acc, &mut max_count);
 
-    // Occupied bounding box (voxel coords) → world-space center + radius, so the
-    // viewer frames the data rather than a mostly-empty cube.
-    let (focus_center, focus_radius) = occupied_focus(&grid, [grid_side; 3]);
-
     let volume_rgba = encode::grid_to_rgba(&grid, max_count);
     let bricks = brick_builder.map(|bb| {
         let (bv, dropped) = bb.finish_streaming();
@@ -411,6 +410,16 @@ fn aggregate_bytes_hilbert(
         }
         bv
     });
+
+    // Camera framing. Stream the *fine* focus (the octree builder's occupied
+    // bbox): for a small file at high resolution the coarse grid fills the whole
+    // cube while the fine data is a tiny Hilbert-prefix corner, so framing from
+    // the coarse grid would aim the camera at empty space. Non-streamed frames
+    // from the dense grid as before.
+    let (focus_center, focus_radius) = match &bricks {
+        Some(bv) if bv.streamed => (bv.focus_center, bv.focus_radius),
+        _ => occupied_focus(&grid, [grid_side; 3]),
+    };
 
     Ok(BuildResult {
         volume_rgba,
@@ -513,7 +522,7 @@ fn aggregate_entities(
 /// on that axis (the viewer scales its longest axis to the unit cube and keeps
 /// voxels cubic — matching the shader's `uvw = p/uSize + 0.5`). For a cube all
 /// scales are 1, so this reduces to the old `(v + 0.5)/side - 0.5`.
-fn box_focus(
+pub(super) fn box_focus(
     bmin: [u32; 3],
     bmax: [u32; 3],
     sum: [f64; 3],
@@ -721,26 +730,33 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.path().join("meta.json")).unwrap()).unwrap();
         let bm = &meta["bricks"];
         assert_eq!(bm["streamed"], true, "--volume-res ships the streamed pool");
-        assert_eq!(bm["vol_dim"][0], 16, "page table sized to the virtual resolution");
+        assert_eq!(bm["vol_dim"][0], 16, "octree sized to the virtual resolution");
+        assert_eq!(bm["tree_depth"], 1, "depth = log2(16 / brick=8) = 1");
         let occupied = bm["occupied"].as_u64().unwrap();
         assert!(occupied > 0, "some bricks are occupied");
 
-        // bricks.bin is a flat array of occupied blocks; the page table tiles the
-        // virtual cube with one id cell per brick.
+        // bricks.bin is a flat array of occupied blocks; the sparse octree node
+        // pool (tree.bin) indexes them — no flat pagetable.bin in the streamed path.
         let bricks = std::fs::read(dir.path().join("bricks.bin")).unwrap();
         let brick = bm["brick"].as_u64().unwrap() as usize;
         assert_eq!(bricks.len() as u64, occupied * (brick.pow(3) * 4) as u64,
             "bricks.bin holds occupied flat brick blocks");
-        let page = std::fs::read(dir.path().join("pagetable.bin")).unwrap();
-        let pd = &bm["page_dim"];
-        let ncells = pd[0].as_u64().unwrap() * pd[1].as_u64().unwrap() * pd[2].as_u64().unwrap();
-        assert_eq!(page.len() as u64, ncells * 4, "page table is one RGBA cell per brick");
-        // The largest id in the page table addresses a real block in bricks.bin.
-        let mut max_id = 0u32;
-        for cell in page.chunks_exact(4) {
-            max_id = max_id.max(cell[0] as u32 | (cell[1] as u32) << 8 | (cell[2] as u32) << 16);
+        assert!(!dir.path().join("pagetable.bin").exists(), "streamed path emits no flat page table");
+        let tree = std::fs::read(dir.path().join("tree.bin")).unwrap();
+        let td = &bm["tree_dim"];
+        let texels = td[0].as_u64().unwrap() * td[1].as_u64().unwrap() * td[2].as_u64().unwrap();
+        assert_eq!(tree.len() as u64, texels * 4, "node pool is tree_dim texels of RGBA8");
+        // Exactly one leaf entry (A>0) per occupied brick; its RGB brick id runs
+        // 1..=occupied and addresses a real block in bricks.bin.
+        let (mut leaves, mut max_id) = (0u64, 0u32);
+        for e in tree.chunks_exact(4) {
+            if e[3] > 0 {
+                leaves += 1;
+                max_id = max_id.max(e[0] as u32 | (e[1] as u32) << 8 | (e[2] as u32) << 16);
+            }
         }
-        assert_eq!(max_id as u64, occupied, "page ids run 1..=occupied");
+        assert_eq!(leaves, occupied, "one octree leaf per occupied brick");
+        assert_eq!(max_id as u64, occupied, "leaf brick ids run 1..=occupied");
     }
 
     // A structured VolumeShape whose single entity paints a 4³ box; its

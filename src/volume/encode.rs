@@ -56,7 +56,9 @@ pub struct VolumeMeta {
     pub manifest: Vec<super::shape::VolumeLabel>,
     /// Bundle format version. `3` ⇒ the brick volume may be ray-guided streamed
     /// (`bricks.streamed`); earlier versions also shipped a point cloud, since
-    /// removed. `4` ⇒ volume-only (no point cloud).
+    /// removed. `4` ⇒ volume-only (no point cloud). `5` ⇒ the streamed page
+    /// structure is a sparse octree node pool (`bricks.tree_*`) instead of a flat
+    /// page table.
     pub format_version: u32,
     /// Sparse brick pool + page table the volume ray-march renders from
     /// (GigaVoxels-style indirection, replacing the dense full-cube texture and
@@ -98,6 +100,26 @@ pub struct BrickVolumeMeta {
     /// demand, so VRAM is decoupled from the data's total size.
     #[serde(default)]
     pub streamed: bool,
+
+    // --- Sparse octree page structure (streamed path; replaces the flat page
+    // table so the page structure is O(occupied), not O((vol/brick)³)). Absent
+    // (`tree_depth == 0`) in the non-streamed/flat path and in pre-v5 bundles.
+    /// Octree node-pool file (RGBA8, `tree_dim` texels). Each node is a 2×2×2
+    /// child-entry block; entry `A>0` ⇒ leaf (RGB = 1-based brick id, `A=1`),
+    /// `A==0 && RGB>0` ⇒ internal (RGB = 1-based child-node index), all-zero ⇒
+    /// empty subtree. Node 0 is the root over the whole `2^tree_depth` brick cube.
+    #[serde(default)]
+    pub tree_file: String,
+    /// Node-pool texture dims in texels `[x, y, z]` (each even).
+    #[serde(default)]
+    pub tree_dim: [u32; 3],
+    /// Octree depth `D = log2(bricks per side)`. `0` ⇒ no octree (flat page
+    /// table); `> 0` ⇒ the viewer descends the node pool instead of `page_file`.
+    #[serde(default)]
+    pub tree_depth: u32,
+    /// Octree node count (root + internal), for diagnostics.
+    #[serde(default)]
+    pub node_count: u32,
 }
 
 /// Convert the accumulated grid into the RGBA8 texel buffer.

@@ -19,7 +19,7 @@ _RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 # far too large to gzip whole. The browser transparently inflates
 # `Content-Encoding: gzip`, so the viewer still reads decompressed bytes and its
 # byte-counted progress bar stays exact.
-_GZIP_ASSETS = {"volume.bin", "pagetable.bin", "meta.json"}
+_GZIP_ASSETS = {"volume.bin", "pagetable.bin", "tree.bin", "meta.json"}
 
 app = FastAPI()
 _fs = None

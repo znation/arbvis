@@ -18,7 +18,12 @@
 //!   higher virtual resolution to *exceed* the dense grid. Because an aligned
 //!   `B³` brick is a contiguous Hilbert range, bricks finalize one at a time as
 //!   the curve advances, so the accumulator is `O(one brick)` regardless of
-//!   resolution (only the occupied-brick atlas itself grows with the data).
+//!   resolution — and each finished brick is written straight to disk, so RAM
+//!   never holds the atlas (only the `O(occupied)` octree grows with the data).
+//! - [`StreamBrickAgg`] is the dense/structured analog: it bricks brick-aligned
+//!   Z-slabs of a baked grid, likewise streaming bricks to disk as it goes.
+
+use std::io::Write;
 
 use super::encode::VoxelAcc;
 use crate::geometry::{hilbert3d_node_origin, hilbert_d2xyz};
@@ -32,14 +37,6 @@ pub const BRICK: u32 = 8;
 /// bleeding into an unrelated atlas slot). The streaming builder can't see a
 /// brick's neighbors, so it ships `apron = 0` (nearest filtering).
 pub const APRON: u32 = 1;
-
-/// Safety cap on occupied bricks the streaming builder keeps. The streamed path
-/// ([`BrickBuilder::finish_streaming`]) writes bricks to a range-addressable
-/// file and the viewer keeps only a bounded GPU *cache* resident, so the bound
-/// here is disk/build memory (≈ 4 GiB of `bricks.bin` at `2 KiB`/brick), not
-/// VRAM. Past this, [`BrickBuilder`] stops admitting new bricks and counts them
-/// as dropped (logged).
-pub const MAX_BRICKS: u32 = 2_097_152;
 
 /// Marks an octree entry as a **leaf** (a brick), as opposed to an internal
 /// child-node pointer. Set on the packed entry during building so the serializer
@@ -155,7 +152,10 @@ impl Octree {
 /// The packed sparse volume: a brick-pool atlas + a page table indexing it.
 pub struct BrickVolume {
     /// Brick-pool atlas, RGBA8, `atlas_dim` voxels (x-fastest). Occupied bricks
-    /// are packed slot-by-slot; unused atlas space is left transparent.
+    /// are packed slot-by-slot; unused atlas space is left transparent. **Empty
+    /// for the streamed builders** ([`StreamBrickAgg`], [`BrickBuilder`]): they
+    /// write each brick straight to `bricks.bin` as it finalizes, so the atlas
+    /// never accumulates in RAM and the caller does not re-write it.
     pub atlas: Vec<u8>,
     /// Atlas dimensions in voxels `[x, y, z]` (each a multiple of [`BRICK`]).
     pub atlas_dim: [u32; 3],
@@ -175,6 +175,12 @@ pub struct BrickVolume {
     pub apron: u32,
     /// Number of occupied bricks (atlas slots used).
     pub occupied: u32,
+    /// Largest raw per-voxel byte count in the streamed byte atlas (density
+    /// source). `> 0` ⇒ the atlas B channel holds RAW counts and the viewer
+    /// normalizes density by `255/max_count` when sampling a resident brick;
+    /// `0` ⇒ B is already baked/normalized (structured verbatim RGBA and the
+    /// non-streamed path), so the viewer does not rescale.
+    pub max_count: u64,
     /// `false` ⇒ `atlas` is a packed 3D atlas (`atlas_dim` voxels) the viewer
     /// uploads whole, and the page table holds resident atlas slots. `true` ⇒
     /// `atlas` is a flat, range-addressable array of `occupied` bricks
@@ -317,6 +323,7 @@ pub fn build_brick_volume(rgba: &[u8], extent: [u32; 3], brick: u32) -> BrickVol
         vol_dim: extent,
         apron: APRON,
         occupied,
+        max_count: 0, // non-streamed atlas keeps B baked; viewer never rescales
         streamed: false,
         // Non-streamed uses the flat page table above, not the octree; the
         // caller derives framing from the dense grid instead.
@@ -329,137 +336,184 @@ pub fn build_brick_volume(rgba: &[u8], extent: [u32; 3], brick: u32) -> BrickVol
     }
 }
 
-/// Build a **streamed** [`BrickVolume`] from a finished RGBA8 dense grid — the
-/// dense-grid analog of [`BrickBuilder::finish_streaming`], for the structured
-/// (`rgb`) path that bakes final color rather than streaming bytes in Hilbert
-/// order. It emits the same on-the-wire shape as the byte streamed path (a flat,
-/// range-addressable block array + a sparse octree over a `2^depth`³ **cube** of
-/// brick cells), so the viewer's streamed+`directColor` shader renders it with no
-/// changes — but stores each brick's RGBA **verbatim** (no mean/luma/density
-/// transform), and carries the full anisotropic `extent` as `vol_dim`.
+/// Streaming brick aggregator for the dense/structured (`rgb`) path — the
+/// dense-grid analog of [`BrickBuilder`], for layouts that bake final color
+/// rather than streaming bytes in Hilbert order. It bricks a sequence of
+/// **brick-aligned Z-slabs** into the same on-the-wire shape as the byte
+/// streamed path (a flat, range-addressable block array + a sparse octree over
+/// a `2^depth`³ **cube** of brick cells), writing each occupied brick straight
+/// to a [`Write`] sink (`bricks.bin`) as it finalizes — so the atlas never
+/// accumulates in RAM.
 ///
-/// `apron` is `0` (nearest filtering): the flat block layout the viewer streams
-/// on demand can't carry neighbour borders. Returns the volume plus the number
-/// of bricks dropped past [`MAX_BRICKS`] (0 in practice for real models; the cap
-/// is a disk-bound safety valve). Framing uses the occupied-brick bbox via
+/// Because slabs advance in increasing z and each slab bricks in `bz/by/bx`
+/// order, brick ids stay sequential (brick `S` at byte `(S-1)·brick³·4`) and
+/// octree insertion matches a single full-grid pass; a single full-extent slab
+/// reproduces the old one-shot builder exactly. Bricks store RGBA **verbatim**
+/// (no mean/luma/density transform), so the streamed+`directColor` shader
+/// renders them unchanged, and the full anisotropic `extent` is the `vol_dim`.
+/// `apron` is `0` (nearest filtering): the flat block layout can't carry
+/// neighbour borders. Framing uses the occupied-brick bbox via
 /// [`super::box_focus`].
-pub fn build_streamed_brick_volume(
-    rgba: &[u8],
+pub struct StreamBrickAgg {
     extent: [u32; 3],
     brick: u32,
-) -> (BrickVolume, u64) {
-    let [ex, ey, ez] = extent;
-    let (exs, eys) = (ex as usize, ey as usize);
-    // Page dims per axis (bricks), and the power-of-two brick cube the octree
-    // spans. Short axes simply never populate their high cells → empty subtrees,
-    // pruned by the octree, so anisotropy needs no special handling.
-    let pb = [ex.div_ceil(brick), ey.div_ceil(brick), ez.div_ceil(brick)];
-    let p = pb[0].max(pb[1]).max(pb[2]).next_power_of_two().max(2);
-    let depth = p.trailing_zeros();
-
-    let mut octree = Octree::new(depth);
-    let mut blocks: Vec<u8> = Vec::new();
-    let bk = brick as usize;
-    let brick_texels = bk * bk * bk;
-
-    let mut occupied = 0u32;
-    let mut dropped = 0u64;
+    octree: Octree,
+    occupied: u32,
     // Occupied-brick voxel bbox + centroid, for fine-data camera framing.
-    let mut fmin = [u32::MAX; 3];
-    let mut fmax = [0u32; 3];
-    let mut fsum = [0f64; 3];
+    fmin: [u32; 3],
+    fmax: [u32; 3],
+    fsum: [f64; 3],
+}
 
-    // One pass in x-fastest brick order: for each brick, gather its voxels; if
-    // any voxel is occupied (`a > 0`), assign it the next 1-based id, insert it
-    // into the octree, and append its RGBA verbatim (out-of-extent texels stay
-    // transparent for partial edge bricks).
-    let mut scratch = vec![0u8; brick_texels * 4];
-    for bz in 0..pb[2] {
-        for by in 0..pb[1] {
-            for bx in 0..pb[0] {
-                scratch.iter_mut().for_each(|v| *v = 0);
-                let mut any = false;
-                for dz in 0..brick {
-                    let gz = bz * brick + dz;
-                    if gz >= ez {
-                        break;
-                    }
-                    for dy in 0..brick {
-                        let gy = by * brick + dy;
-                        if gy >= ey {
-                            break;
-                        }
-                        for dx in 0..brick {
-                            let gx = bx * brick + dx;
-                            if gx >= ex {
-                                break;
-                            }
-                            let src = (gx as usize + gy as usize * exs + gz as usize * exs * eys) * 4;
-                            let dst = (dx as usize + dy as usize * bk + dz as usize * bk * bk) * 4;
-                            scratch[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
-                            any |= rgba[src + 3] > 0;
-                        }
-                    }
-                }
-                if !any {
-                    continue;
-                }
-                if occupied >= MAX_BRICKS {
-                    dropped += 1;
-                    continue;
-                }
-                occupied += 1; // 1-based brick id
-                octree.insert([bx, by, bz], occupied);
-                blocks.extend_from_slice(&scratch);
-                // Track the occupied region in voxels (brick origin → +brick-1).
-                let origin = [bx * brick, by * brick, bz * brick];
-                for a in 0..3 {
-                    fmin[a] = fmin[a].min(origin[a]);
-                    fmax[a] = fmax[a].max(origin[a] + brick - 1);
-                    fsum[a] += (origin[a] + brick / 2) as f64;
-                }
-            }
+impl StreamBrickAgg {
+    pub fn new(extent: [u32; 3], brick: u32) -> Self {
+        // Page dims per axis (bricks), and the power-of-two brick cube the octree
+        // spans. Short axes never populate their high cells → empty subtrees.
+        let pb = [
+            extent[0].div_ceil(brick),
+            extent[1].div_ceil(brick),
+            extent[2].div_ceil(brick),
+        ];
+        let p = pb[0].max(pb[1]).max(pb[2]).next_power_of_two().max(2);
+        StreamBrickAgg {
+            extent,
+            brick,
+            octree: Octree::new(p.trailing_zeros()),
+            occupied: 0,
+            fmin: [u32::MAX; 3],
+            fmax: [0; 3],
+            fsum: [0.0; 3],
         }
     }
 
-    let (node_pool, node_pool_dim, node_count) = octree.serialize();
-    let (focus_center, focus_radius) = super::box_focus(
-        if occupied > 0 { fmin } else { [0; 3] },
-        fmax,
-        fsum,
-        occupied as u64,
-        extent,
-    );
+    /// Brick one **brick-aligned** Z-slab (`z0 % brick == 0`; `z1` a multiple of
+    /// `brick`, or `== extent.z` for the final slab). `slab` is `ex·ey·(z1-z0)`
+    /// RGBA8 (x-fastest, planes z-relative to `z0`). Emits every occupied brick
+    /// in the slab (absolute `bz/by/bx` order) to `writer` and inserts it into
+    /// the octree. Slab boundaries being `brick` multiples guarantees no brick
+    /// row straddles two slabs.
+    pub fn add_slab<W: Write>(
+        &mut self,
+        slab: &[u8],
+        z0: u32,
+        z1: u32,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        debug_assert!(z0.is_multiple_of(self.brick), "slab boundary must be brick-aligned");
+        let [ex, ey, _] = self.extent;
+        let (exs, eys) = (ex as usize, ey as usize);
+        let brick = self.brick;
+        let bk = brick as usize;
+        let mut scratch = vec![0u8; bk * bk * bk * 4];
+        for bz in (z0 / brick)..z1.div_ceil(brick) {
+            for by in 0..ey.div_ceil(brick) {
+                for bx in 0..ex.div_ceil(brick) {
+                    scratch.iter_mut().for_each(|v| *v = 0);
+                    let mut any = false;
+                    for dz in 0..brick {
+                        let gz = bz * brick + dz;
+                        if gz >= z1 {
+                            break; // clip to the slab (or the final partial brick)
+                        }
+                        let zl = (gz - z0) as usize; // slab-relative plane
+                        for dy in 0..brick {
+                            let gy = by * brick + dy;
+                            if gy >= ey {
+                                break;
+                            }
+                            for dx in 0..brick {
+                                let gx = bx * brick + dx;
+                                if gx >= ex {
+                                    break;
+                                }
+                                let src = (gx as usize + gy as usize * exs + zl * exs * eys) * 4;
+                                let dst =
+                                    (dx as usize + dy as usize * bk + dz as usize * bk * bk) * 4;
+                                scratch[dst..dst + 4].copy_from_slice(&slab[src..src + 4]);
+                                any |= slab[src + 3] > 0;
+                            }
+                        }
+                    }
+                    if !any {
+                        continue;
+                    }
+                    self.occupied += 1; // 1-based brick id
+                    self.octree.insert([bx, by, bz], self.occupied);
+                    writer.write_all(&scratch)?;
+                    // Track the occupied region in voxels (brick origin → +brick-1).
+                    let origin = [bx * brick, by * brick, bz * brick];
+                    for (a, &o) in origin.iter().enumerate() {
+                        self.fmin[a] = self.fmin[a].min(o);
+                        self.fmax[a] = self.fmax[a].max(o + brick - 1);
+                        self.fsum[a] += (o + brick / 2) as f64;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
-    (
+    /// Finalize the octree + framing into a streamed [`BrickVolume`]. Its `atlas`
+    /// is empty — every brick was already written to the `Write` sink.
+    pub fn finish(self) -> BrickVolume {
+        let pb = [
+            self.extent[0].div_ceil(self.brick),
+            self.extent[1].div_ceil(self.brick),
+            self.extent[2].div_ceil(self.brick),
+        ];
+        let (node_pool, node_pool_dim, node_count) = self.octree.serialize();
+        let (focus_center, focus_radius) = super::box_focus(
+            if self.occupied > 0 { self.fmin } else { [0; 3] },
+            self.fmax,
+            self.fsum,
+            self.occupied as u64,
+            self.extent,
+        );
         BrickVolume {
-            atlas: blocks,
+            atlas: Vec::new(),
             atlas_dim: [0, 0, 0], // streamed: bricks.bin is a flat block array
             page_table: Vec::new(), // streamed uses the octree node pool instead
             page_dim: pb,
-            vol_dim: extent,
+            vol_dim: self.extent,
             apron: 0, // streaming can't see neighbors → no border, nearest filtering
-            occupied,
+            occupied: self.occupied,
+            max_count: 0, // structured RGBA is verbatim; viewer does not rescale
             streamed: true,
             node_pool,
             node_pool_dim,
-            tree_depth: depth,
+            tree_depth: self.octree.depth,
             node_count,
             focus_center,
             focus_radius,
-        },
-        dropped,
-    )
+        }
+    }
+}
+
+/// Build a **streamed** [`BrickVolume`] from a finished RGBA8 dense grid in one
+/// shot (a single full-extent slab), writing bricks to `writer`. A test/helper
+/// wrapper over [`StreamBrickAgg`]; the production structured path drives the
+/// aggregator slab-by-slab so it never materializes the full dense grid.
+#[cfg(test)]
+pub fn build_streamed_brick_volume<W: Write>(
+    rgba: &[u8],
+    extent: [u32; 3],
+    brick: u32,
+    writer: &mut W,
+) -> std::io::Result<BrickVolume> {
+    let mut agg = StreamBrickAgg::new(extent, brick);
+    agg.add_slab(rgba, 0, extent[2], writer)?;
+    Ok(agg.finish())
 }
 
 /// Streaming sparse-voxel brick builder for the byte→Hilbert pass. Points are
 /// fed in non-decreasing Hilbert order at virtual order `order_v` (cube side
 /// `2^order_v`); because an aligned `2^brick_log2` brick is a contiguous Hilbert
-/// range, only the *current* brick is open at a time. Finished bricks stream
-/// into a flat block list + a dense page table, assembled into a [`BrickVolume`]
-/// by [`finish`](BrickBuilder::finish). Memory is `O(one brick)` plus the
-/// page table and the occupied-brick output — never the full `2^order_v` cube.
-pub struct BrickBuilder {
+/// range, only the *current* brick is open at a time. Finished bricks are
+/// written straight to the [`Write`] sink (`bricks.bin`) as they finalize, and a
+/// sparse octree indexes them; [`finish_streaming`](BrickBuilder::finish_streaming)
+/// assembles the [`BrickVolume`]. Memory is `O(one brick)` plus the O(occupied)
+/// octree — never the full `2^order_v` cube, nor the atlas (it lives on disk).
+pub struct BrickBuilder<W: Write> {
     order_v: u32,
     brick: u32,
     brick_log2: u32,
@@ -468,13 +522,14 @@ pub struct BrickBuilder {
     // Sparse octree over the P³ brick grid (P = 2^depth = 2^(order_v-brick_log2)),
     // built by insertion as bricks finalize (O(occupied) memory, never the P³ cube).
     octree: Octree,
-    blocks: Vec<u8>,   // occupied bricks' RGBA8, B³ each, in slot order
+    writer: W,          // occupied bricks stream here (bricks.bin) as they finalize
+    brick_buf: Vec<u8>, // reusable B³·4-byte staging buffer for one brick
+    io_err: Option<std::io::Error>, // first write error, surfaced at finish_streaming
     open: Vec<VoxelAcc>, // accumulators for the current open brick (B³)
     cur_hidx: i128,    // Hilbert index of the open brick (-1 = none)
     cur_origin: [u32; 3],
     occupied: u32,
     max_count: u64,
-    dropped: u64,
     // Voxel-space bounding box + centroid of occupied bricks, for framing the
     // camera on the *fine* data (see BrickVolume::focus_center).
     fmin: [u32; 3],
@@ -482,10 +537,11 @@ pub struct BrickBuilder {
     fsum: [f64; 3],
 }
 
-impl BrickBuilder {
+impl<W: Write> BrickBuilder<W> {
     /// `order_v` = virtual cube exponent (side `2^order_v`); `brick` = brick
-    /// edge (power of two ≤ `2^order_v`); `luma` = per-byte luminance LUT.
-    pub fn new(order_v: u32, brick: u32, luma: [u16; 256]) -> Self {
+    /// edge (power of two ≤ `2^order_v`); `luma` = per-byte luminance LUT;
+    /// `writer` = sink for the flat brick blocks (`bricks.bin`).
+    pub fn new(order_v: u32, brick: u32, luma: [u16; 256], writer: W) -> Self {
         assert!((1..=21).contains(&order_v));
         let brick_log2 = brick.trailing_zeros();
         let side = 1u32 << order_v;
@@ -499,13 +555,14 @@ impl BrickBuilder {
             luma,
             page_dim: [pd, pd, pd],
             octree: Octree::new(depth),
-            blocks: Vec::new(),
+            writer,
+            brick_buf: vec![0u8; (brick as usize).pow(3) * 4],
+            io_err: None,
             open: vec![VoxelAcc::default(); (brick as usize).pow(3)],
             cur_hidx: -1,
             cur_origin: [0; 3],
             occupied: 0,
             max_count: 0,
-            dropped: 0,
             fmin: [u32::MAX; 3],
             fmax: [0; 3],
             fsum: [0.0; 3],
@@ -536,13 +593,10 @@ impl BrickBuilder {
         acc.sum_luma += self.luma[b as usize] as u64;
     }
 
-    /// Emit the open brick (if non-empty) into the block list + page table.
+    /// Emit the open brick (if non-empty): stage it into `brick_buf`, insert it
+    /// into the octree, and write it to the `writer` sink.
     fn finalize(&mut self) {
         if self.cur_hidx < 0 || self.open.iter().all(|a| a.count == 0) {
-            return;
-        }
-        if self.occupied >= MAX_BRICKS {
-            self.dropped += 1;
             return;
         }
         self.occupied += 1; // 1-based brick id
@@ -559,16 +613,26 @@ impl BrickBuilder {
             self.fsum[a] += (self.cur_origin[a] + bk / 2) as f64;
         }
         self.octree.insert(cell, self.occupied);
-        for acc in &self.open {
+        // Stage the brick into brick_buf. B holds the RAW per-voxel count
+        // (clamped to 255); the global density rescale is deferred to the shader
+        // (see `BrickVolume::max_count`) because bricks stream to disk before the
+        // final `max_count` is known. Empty voxels (a == 0) stay transparent.
+        for i in 0..self.open.len() {
+            let acc = self.open[i];
+            let o = i * 4;
             if acc.count == 0 {
-                self.blocks.extend_from_slice(&[0, 0, 0, 0]);
+                self.brick_buf[o..o + 4].copy_from_slice(&[0, 0, 0, 0]);
             } else {
                 let c = acc.count as u64;
                 let mean = (acc.sum_val / c).min(255) as u8;
                 let act = (acc.sum_luma / c).min(255) as u8;
-                self.blocks
-                    .extend_from_slice(&[mean, act, c.min(255) as u8, 255]);
+                self.brick_buf[o..o + 4].copy_from_slice(&[mean, act, c.min(255) as u8, 255]);
                 self.max_count = self.max_count.max(c);
+            }
+        }
+        if self.io_err.is_none() {
+            if let Err(e) = self.writer.write_all(&self.brick_buf) {
+                self.io_err = Some(e);
             }
         }
     }
@@ -583,15 +647,17 @@ impl BrickBuilder {
     /// reason the streaming path can exceed the dense grid in both VRAM *and*
     /// download/RAM without either scaling with the volume.
     ///
-    /// The only transform over the accumulated [`blocks`](Self::blocks) is the
-    /// global density (B-channel) rescale the dense atlas path also applies.
-    pub fn finish_streaming(mut self) -> (BrickVolume, u64) {
+    /// The per-voxel density (B) rescale is **not** applied here — the atlas
+    /// ships raw counts and the viewer normalizes by `255/max_count` (carried on
+    /// [`BrickVolume::max_count`]). Returns the volume plus the sink `W` (so
+    /// tests can recover an in-memory buffer); a write error stashed during
+    /// streaming surfaces here.
+    pub fn finish_streaming(mut self) -> std::io::Result<(BrickVolume, W)> {
         self.finalize();
-        let inv_max = if self.max_count > 0 {
-            255.0 / self.max_count as f32
-        } else {
-            0.0
-        };
+        if let Some(e) = self.io_err.take() {
+            return Err(e);
+        }
+        self.writer.flush()?;
         let (node_pool, node_pool_dim, node_count) = self.octree.serialize();
         let side = 1u32 << self.order_v;
         // Frame on the fine occupied region (voxel bbox → world). box_focus
@@ -603,24 +669,15 @@ impl BrickBuilder {
             self.occupied as u64,
             [side, side, side],
         );
-        // Density (B): rescale the raw per-voxel count by the global max, in
-        // place — the blocks then ship as bricks.bin verbatim (x-fastest within
-        // each brick, bricks concatenated in 1-based id order). Empty voxels
-        // (a == 0) stay transparent.
-        let mut blocks = self.blocks;
-        for v in blocks.chunks_exact_mut(4) {
-            if v[3] != 0 {
-                v[2] = (v[2] as f32 * inv_max).round().clamp(0.0, 255.0) as u8;
-            }
-        }
         let bv = BrickVolume {
-            atlas: blocks,
+            atlas: Vec::new(), // bricks were streamed to `writer` (bricks.bin)
             atlas_dim: [0, 0, 0], // streamed: bricks.bin is a flat block array
             page_table: Vec::new(), // streamed uses the octree node pool instead
             page_dim: self.page_dim,
             vol_dim: [side, side, side],
             apron: 0, // streaming can't see neighbors → no border, nearest filtering
             occupied: self.occupied,
+            max_count: self.max_count, // >0 ⇒ shader normalizes density by 255/max_count
             streamed: true,
             node_pool,
             node_pool_dim,
@@ -629,7 +686,7 @@ impl BrickBuilder {
             focus_center,
             focus_radius,
         };
-        (bv, self.dropped)
+        Ok((bv, self.writer))
     }
 }
 
@@ -767,7 +824,7 @@ mod tests {
     /// Reconstruct a voxel's RGBA from a **streamed** `BrickVolume`: descend the
     /// octree to the brick id, then read the flat block array (brick `id` at
     /// `(id-1)·BRICK³·4`), exactly as the viewer addresses it.
-    fn sample_streamed(bv: &BrickVolume, x: u32, y: u32, z: u32) -> [u8; 4] {
+    fn sample_streamed(bv: &BrickVolume, blocks: &[u8], x: u32, y: u32, z: u32) -> [u8; 4] {
         assert!(bv.streamed);
         let id = descend_octree(bv, x / BRICK, y / BRICK, z / BRICK);
         if id == 0 {
@@ -776,7 +833,7 @@ mod tests {
         let bk = BRICK;
         let local = (x % bk + (y % bk) * bk + (z % bk) * bk * bk) as usize;
         let off = ((id as usize - 1) * (bk as usize).pow(3) + local) * 4;
-        [bv.atlas[off], bv.atlas[off + 1], bv.atlas[off + 2], bv.atlas[off + 3]]
+        [blocks[off], blocks[off + 1], blocks[off + 2], blocks[off + 3]]
     }
 
     #[test]
@@ -785,33 +842,25 @@ mod tests {
         // spanning several bricks. The accumulator stays O(one brick).
         let order_v = 5;
         let n = 1u64 << (3 * 4); // 4096 voxels
-        let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256]);
+        let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256], Vec::new());
         assert_eq!(b.open.len(), (BRICK as usize).pow(3), "accumulator is one brick");
         for h in 0..n {
             b.push(h, ((h & 0x7f) as u8) | 1); // byte > 0 ⇒ voxel occupied
         }
-        let (bv, dropped) = b.finish_streaming();
-        assert_eq!(dropped, 0);
+        let (bv, blocks) = b.finish_streaming().unwrap();
         assert!(bv.occupied >= 1);
         assert!(bv.streamed, "the --volume-res path ships the streamable format");
-        // bricks.bin is exactly `occupied` flat brick blocks.
-        assert_eq!(bv.atlas.len(), bv.occupied as usize * (BRICK as usize).pow(3) * 4);
+        // bricks.bin is exactly `occupied` flat brick blocks (streamed to `blocks`).
+        assert!(bv.atlas.is_empty(), "streamed atlas lives on disk, not in the struct");
+        assert_eq!(blocks.len(), bv.occupied as usize * (BRICK as usize).pow(3) * 4);
         // Every fed voxel reconstructs through the id page table + flat blocks.
         for h in 0..n {
             let v = hilbert_d2xyz(h, order_v);
-            assert!(sample_streamed(&bv, v[0], v[1], v[2])[3] > 0, "h={h} should be occupied");
+            assert!(sample_streamed(&bv, &blocks, v[0], v[1], v[2])[3] > 0, "h={h} should be occupied");
         }
         // A voxel in an unfed (far) brick is empty.
         let far = hilbert_d2xyz((1u64 << (3 * order_v)) - 1, order_v);
-        assert_eq!(sample_streamed(&bv, far[0], far[1], far[2]), [0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn streaming_builder_keeps_bricks_past_the_old_vram_cap() {
-        // The streamed path writes bricks to a range-addressable file and only a
-        // bounded GPU cache is resident, so MAX_BRICKS is a high disk-bound
-        // safety valve — far above the old 262_144 VRAM cap.
-        assert!(MAX_BRICKS > 262_144, "streamed cap is disk-bound, not the old VRAM cap");
+        assert_eq!(sample_streamed(&bv, &blocks, far[0], far[1], far[2]), [0, 0, 0, 0]);
     }
 
     #[test]
@@ -820,12 +869,12 @@ mod tests {
         // contiguous Hilbert prefix so several bricks fill; the octree must map
         // each occupied brick to a unique 1-based id and report empties as 0.
         let order_v = 6;
-        let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256]);
+        let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256], Vec::new());
         let n = 1u64 << (3 * 5); // 32768 voxels
         for h in 0..n {
             b.push(h, ((h & 0x7f) as u8) | 1);
         }
-        let (bv, _) = b.finish_streaming();
+        let (bv, _) = b.finish_streaming().unwrap();
         assert!(bv.streamed && bv.page_table.is_empty(), "streamed → octree, no flat page");
         assert_eq!(bv.tree_depth, order_v - BRICK.trailing_zeros());
         assert!(bv.node_count >= 1, "at least a root node");
@@ -853,12 +902,12 @@ mod tests {
         // must handle. Feed a contiguous prefix and confirm every occupied brick
         // still descends to a valid id and a far brick prunes to empty.
         let order_v = 11;
-        let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256]);
+        let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256], Vec::new());
         let n = 1u64 << (3 * 6); // 262144 voxels → a small corner of the cube
         for h in 0..n {
             b.push(h, ((h & 0x7f) as u8) | 1);
         }
-        let (bv, _) = b.finish_streaming();
+        let (bv, _) = b.finish_streaming().unwrap();
         assert_eq!(bv.tree_depth, 8);
         for h in 0..n {
             let v = hilbert_d2xyz(h, order_v);
@@ -891,22 +940,22 @@ mod tests {
         for (p, c) in pts {
             put(&mut g, p.0, p.1, p.2, c);
         }
-        let (bv, dropped) = build_streamed_brick_volume(&g, extent, BRICK);
-        assert_eq!(dropped, 0);
+        let mut buf = Vec::new();
+        let bv = build_streamed_brick_volume(&g, extent, BRICK, &mut buf).unwrap();
         assert!(bv.streamed);
         assert_eq!(bv.apron, 0, "streamed bricks carry no apron border");
         assert_eq!(bv.vol_dim, extent, "vol_dim is the full anisotropic extent");
         assert_eq!(bv.tree_depth, 3, "P = next_pow2(max([3,2,5])) = 8 → depth 3");
         assert_eq!(
-            bv.atlas.len() as u32,
+            buf.len() as u32,
             bv.occupied * BRICK.pow(3) * 4,
             "bricks.bin is a flat occupied-block array"
         );
         for (p, c) in pts {
-            assert_eq!(sample_streamed(&bv, p.0, p.1, p.2), c, "voxel {p:?} round-trips verbatim");
+            assert_eq!(sample_streamed(&bv, &buf, p.0, p.1, p.2), c, "voxel {p:?} round-trips verbatim");
         }
         // An empty brick and an out-of-page-range cell both prune to empty.
-        assert_eq!(sample_streamed(&bv, 16, 8, 8), [0, 0, 0, 0], "empty brick");
+        assert_eq!(sample_streamed(&bv, &buf, 16, 8, 8), [0, 0, 0, 0], "empty brick");
         assert_eq!(descend_octree(&bv, 7, 7, 7), 0, "cell beyond any page dim prunes");
     }
 
@@ -918,10 +967,11 @@ mod tests {
         let extent = [64u32, 8, 8]; // page dims [8, 1, 1] → cube P=8, depth 3
         let mut g = vec![0u8; (64 * 8 * 8 * 4) as usize];
         for bx in 0..8u32 {
-            let i = ((bx * BRICK + 0 * 64 + 0) * 4) as usize; // one voxel per x-brick
+            let i = (bx * BRICK * 4) as usize; // one voxel (x=bx·BRICK, y=z=0) per x-brick
             g[i..i + 4].copy_from_slice(&[1, 1, 1, 255]);
         }
-        let (bv, _) = build_streamed_brick_volume(&g, extent, BRICK);
+        let mut buf = Vec::new();
+        let bv = build_streamed_brick_volume(&g, extent, BRICK, &mut buf).unwrap();
         assert_eq!(bv.occupied, 8, "8 occupied bricks along x");
         // Distinct occupied cells ↔ ids 1..=occupied (a bijection).
         let mut ids = std::collections::HashSet::new();
@@ -939,9 +989,62 @@ mod tests {
     #[test]
     fn streamed_rgba_empty_grid_has_no_bricks() {
         let extent = [40u32, 40, 40];
-        let (bv, dropped) = build_streamed_brick_volume(&vec![0u8; 40 * 40 * 40 * 4], extent, BRICK);
-        assert_eq!((bv.occupied, dropped), (0, 0));
-        assert!(bv.streamed && bv.atlas.is_empty());
+        let mut buf = Vec::new();
+        let bv = build_streamed_brick_volume(&vec![0u8; 40 * 40 * 40 * 4], extent, BRICK, &mut buf).unwrap();
+        assert_eq!(bv.occupied, 0);
+        assert!(bv.streamed && bv.atlas.is_empty() && buf.is_empty());
+    }
+
+    #[test]
+    fn stream_agg_slabs_match_single_pass() {
+        // Same anisotropic grid as the verbatim round-trip test, with occupied
+        // voxels on BOTH sides of a brick-aligned slab boundary (z=16). Bricking
+        // it in two slabs must be byte-identical to a single full-extent pass —
+        // proving id sequencing, octree order, and block offsets hold across slabs.
+        let extent = [24u32, 16, 40];
+        let (ex, ey) = (24usize, 16usize);
+        let mut g = vec![0u8; ex * ey * 40 * 4];
+        let put = |g: &mut [u8], x: u32, y: u32, z: u32, c: [u8; 4]| {
+            let i = ((x + y * 24 + z * 24 * 16) * 4) as usize;
+            g[i..i + 4].copy_from_slice(&c);
+        };
+        let pts = [
+            ((1u32, 2u32, 3u32), [10u8, 20, 30, 200]), // slab [0,16)
+            ((0, 0, 0), [255, 254, 253, 1]),           // slab [0,16)
+            ((9, 5, 33), [1, 2, 3, 255]),              // slab [16,40)
+            ((23, 15, 39), [77, 88, 99, 100]),         // slab [16,40)
+        ];
+        for (p, c) in pts {
+            put(&mut g, p.0, p.1, p.2, c);
+        }
+
+        // Reference: one full-extent slab.
+        let mut buf_full = Vec::new();
+        let bv_full = build_streamed_brick_volume(&g, extent, BRICK, &mut buf_full).unwrap();
+
+        // Two brick-aligned slabs, each fed only its own z-planes.
+        let mut agg = StreamBrickAgg::new(extent, BRICK);
+        let mut buf_slab = Vec::new();
+        for (z0, z1) in [(0u32, 16u32), (16u32, 40u32)] {
+            let depth = (z1 - z0) as usize;
+            let mut slab = vec![0u8; ex * ey * depth * 4];
+            for z in z0..z1 {
+                let (src, dst) = ((z as usize) * ex * ey * 4, (z - z0) as usize * ex * ey * 4);
+                slab[dst..dst + ex * ey * 4].copy_from_slice(&g[src..src + ex * ey * 4]);
+            }
+            agg.add_slab(&slab, z0, z1, &mut buf_slab).unwrap();
+        }
+        let bv_slab = agg.finish();
+
+        assert_eq!(bv_slab.occupied, bv_full.occupied, "same occupied-brick count");
+        assert_eq!(buf_slab, buf_full, "slab bricking is byte-identical to one pass");
+        assert_eq!(bv_slab.node_pool, bv_full.node_pool, "octree node pool identical");
+        assert_eq!(bv_slab.node_pool_dim, bv_full.node_pool_dim);
+        assert_eq!(bv_slab.focus_center, bv_full.focus_center, "framing identical");
+        assert_eq!(bv_slab.focus_radius, bv_full.focus_radius);
+        for (p, c) in pts {
+            assert_eq!(sample_streamed(&bv_slab, &buf_slab, p.0, p.1, p.2), c, "voxel {p:?}");
+        }
     }
 
     #[test]
@@ -949,9 +1052,9 @@ mod tests {
         // A single occupied brick in a large 256³-voxel volume (32³ = 32768 brick
         // cells) must build only a path of nodes (≈ depth), not a dense table.
         let order_v = 8; // 256³ voxels, depth 5, 32³ brick cells
-        let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256]);
+        let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256], Vec::new());
         b.push(0, 1); // one occupied voxel at Hilbert distance 0 (origin brick)
-        let (bv, _) = b.finish_streaming();
+        let (bv, _) = b.finish_streaming().unwrap();
         assert_eq!(bv.occupied, 1);
         // Depth-5 tree, one leaf → 5 nodes on the path (root + 4 internal).
         assert_eq!(bv.node_count, bv.tree_depth, "one leaf ⇒ one node per level");

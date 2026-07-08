@@ -339,6 +339,9 @@ const volFrag = `
   uniform vec2 uResolution;      // drawing-buffer size, for the gl_FragCoord lookup
   uniform mat4 uInvProjView, uInvModel; // reconstruct the scene hit in box space
   uniform float uOpacity, uGamma, uThreshold, uNorm, uBrick, uBrickStride, uApron;
+  // Density (B) rescale for a raw-count streamed atlas: 255/max_count, or 0 when
+  // B is already baked (structured, non-streamed, coarse fallback, old bundles).
+  uniform float uAtlasInvMax;
   uniform vec3 uNodePoolDim;     // octree node-pool dims in texels (2/node/axis)
   uniform float uTreeDepth;      // octree depth D (bricks per side = exp2(D))
   uniform int uSource, uSteps, uDirectColor, uStreamed;
@@ -489,6 +492,14 @@ const volFrag = `
         } else {
           col = texture(uLut, vec2(vox.r, 0.5)).rgb;
           d = (uSource == 0) ? vox.g : vox.b;
+          // A resident streamed brick (state==2) stores the RAW per-voxel count
+          // in B; normalize by the pool max here (deferred from build time). The
+          // coarse fallback and all non-streamed atlases keep B pre-baked, so
+          // uAtlasInvMax is 0 and this is skipped. vox.b is raw/255, so
+          // ·(255/max) recovers the old baked min(count,255)/max.
+          if (uSource == 1 && uStreamed == 1 && state == 2u && uAtlasInvMax > 0.0) {
+            d *= uAtlasInvMax;
+          }
         }
         d = max(0.0, d - uThreshold) / denom;
         // uNorm compensates for the data the threshold removed: as the field
@@ -816,6 +827,9 @@ async function load() {
       uPageDim: { value: new THREE.Vector3(bm.page_dim[0], bm.page_dim[1], bm.page_dim[2]) },
       uAtlasBricks: { value: new THREE.Vector3(atlasBricks[0], atlasBricks[1], atlasBricks[2]) },
       uBrick: { value: bm.brick }, uBrickStride: { value: bstride }, uApron: { value: bm.apron },
+      // Raw-count streamed atlas ⇒ normalize density in-shader by 255/max_count;
+      // absent/0 (structured, non-streamed, pre-v6 bundles) ⇒ B is baked, no rescale.
+      uAtlasInvMax: { value: (bm.max_count > 0) ? 255.0 / bm.max_count : 0.0 },
       // sceneTarget may not exist yet on a cold start (the ResizeObserver hasn't
       // fired — likely now that the small streamed up-front fetch lets load()
       // reach here before layout settles). renderHybrid re-points this every

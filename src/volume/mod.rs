@@ -24,6 +24,7 @@ pub use shape::{
 };
 pub use voxel::{VoxelCell, VoxelGridMut, VoxelRegistry, VoxelRenderCtx, VoxelRenderer};
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -44,6 +45,12 @@ const CHUNK: u64 = 4 * 1024 * 1024;
 /// (128³·4 ≈ 8 MiB) regardless of the requested detail resolution. Detail finer
 /// than this streams on demand from the sparse brick pool.
 pub(crate) const COARSE_CAP: u32 = 128;
+
+/// Peak slab-buffer budget for the streamed structured path. The driver picks a
+/// brick-aligned `slab_depth` so `ex·ey·slab_depth·size_of::<VoxelCell>()` stays
+/// under this — bounding peak RAM to one slab (plus the O(occupied) octree and
+/// the bounded coarse accumulator) instead of the full `extent³` dense grid.
+const SLAB_BUDGET_BYTES: usize = 128 * 1024 * 1024;
 
 /// Split the requested detail resolution (`--grid`) into the effective
 /// `(coarse dense-grid side, streamed brick resolution)` the byte volume path
@@ -163,17 +170,23 @@ pub async fn render_volume(
         );
     }
 
+    // Create the output dir up front: the streamed builders write `bricks.bin`
+    // incrementally (one brick at a time) from inside the blocking closure, so
+    // the directory must exist before they run.
+    std::fs::create_dir_all(&out_dir)?;
+
     // CPU + per-chunk fetch work on the blocking pool, like the single-image
     // path — keeps the tokio runtime free for the `Http`/`Xet`/`LazyDiff`
     // fetches the workers drive via `block_on`. The voxel registry is a cheap
     // Arc-map clone so the blocking closure owns everything it needs.
     let rt = tokio::runtime::Handle::current();
     let voxel_reg = registry.voxel.clone();
+    let out_dir_build = out_dir.clone();
     let built = tokio::task::spawn_blocking(move || {
         if is_byte {
             // Byte volumes are cubes (Hilbert needs equal sides); all three
             // axes match, so the cube side is `ex`.
-            aggregate_bytes_hilbert(sources, total, ex, volume_res, pixel_lut, rt)
+            aggregate_bytes_hilbert(sources, total, ex, volume_res, pixel_lut, rt, &out_dir_build)
         } else {
             aggregate_entities(
                 sources,
@@ -183,13 +196,13 @@ pub async fn render_volume(
                 diff_mode,
                 structured_streamed,
                 rt,
+                &out_dir_build,
             )
         }
     })
     .await
     .map_err(|e| anyhow::anyhow!("volume aggregation join failure: {e}"))??;
 
-    std::fs::create_dir_all(&out_dir)?;
     std::fs::write(out_dir.join("volume.bin"), &built.volume_rgba)?;
 
     // Sparse brick pool + page table the volume ray-march renders from
@@ -203,7 +216,12 @@ pub async fn render_volume(
         // (`grid_extent` == the bake extent here, since streaming set `bricks`).
         None => brick::build_brick_volume(&built.volume_rgba, built.grid_extent, brick::BRICK),
     };
-    std::fs::write(out_dir.join("bricks.bin"), &bricks.atlas)?;
+    // Streamed builders already wrote `bricks.bin` incrementally as bricks
+    // finalized (their `atlas` is empty); only the non-streamed dense-derived
+    // path still holds the atlas in RAM and writes it here.
+    if !bricks.streamed {
+        std::fs::write(out_dir.join("bricks.bin"), &bricks.atlas)?;
+    }
     // Page structure: the streamed path ships a sparse octree node pool
     // (`tree.bin`); the non-streamed/flat path ships the dense page table
     // (`pagetable.bin`).
@@ -223,6 +241,9 @@ pub async fn render_volume(
     if bricks.streamed {
         let upfront = built.volume_rgba.len() + bricks.node_pool.len();
         let [cx, cy, cz] = built.grid_extent;
+        // bricks.bin was streamed to disk (not held in RAM); its size is the
+        // occupied-block count × brick bytes (flat blocks, no apron).
+        let bricks_bytes = bricks.occupied as u64 * (brick::BRICK as u64).pow(3) * 4;
         log::info!(
             "3D up-front download ≈ {:.1} MiB (coarse {cx}×{cy}×{cz} grid {:.1} MiB + octree {:.1} MiB, \
              {} nodes, depth {}); {} bricks stream on demand from bricks.bin ({:.1} MiB)",
@@ -232,7 +253,7 @@ pub async fn render_volume(
             bricks.node_count,
             bricks.tree_depth,
             bricks.occupied,
-            bricks.atlas.len() as f64 / (1 << 20) as f64,
+            bricks_bytes as f64 / (1 << 20) as f64,
         );
     }
     let brick_meta = encode::BrickVolumeMeta {
@@ -249,6 +270,7 @@ pub async fn render_volume(
         tree_dim: bricks.node_pool_dim,
         tree_depth: bricks.tree_depth,
         node_count: bricks.node_count,
+        max_count: bricks.max_count,
     };
 
     let meta = VolumeMeta {
@@ -266,8 +288,10 @@ pub async fn render_volume(
         lut: pixel_lut.iter().map(|c| c.0).collect(),
         manifest,
         // v5: the streamed path's page structure is a sparse octree node pool
-        // (`bricks.tree_*`) rather than a flat page table.
-        format_version: 5,
+        // (`bricks.tree_*`) rather than a flat page table. v6: the streamed byte
+        // atlas ships RAW density counts and the viewer normalizes by
+        // `bricks.max_count` in-shader (deferred so bricks stream to disk).
+        format_version: 6,
         bricks: Some(brick_meta),
     };
     std::fs::write(out_dir.join("meta.json"), serde_json::to_vec(&meta)?)?;
@@ -332,6 +356,7 @@ fn aggregate_bytes_hilbert(
     volume_res: u32,
     pixel_lut: [Rgb<u8>; 256],
     rt: tokio::runtime::Handle,
+    out_dir: &Path,
 ) -> anyhow::Result<BuildResult> {
     let order = grid_side.trailing_zeros(); // grid_side is a power of two
     let cells: u64 = (grid_side as u64).pow(3);
@@ -350,8 +375,14 @@ fn aggregate_bytes_hilbert(
         0
     };
     let cells_v: u128 = if order_v > 0 { 1u128 << (3 * order_v) } else { 0 };
-    let mut brick_builder =
-        (order_v > 0).then(|| brick::BrickBuilder::new(order_v, brick::BRICK, luma));
+    // The streamed brick pool writes each finished brick straight to bricks.bin
+    // (append-only, O(one brick) RAM) as the Hilbert curve advances.
+    let mut brick_builder = if order_v > 0 {
+        let w = std::io::BufWriter::new(std::fs::File::create(out_dir.join("bricks.bin"))?);
+        Some(brick::BrickBuilder::new(order_v, brick::BRICK, luma, w))
+    } else {
+        None
+    };
 
     // First byte not belonging to cell `c`. Two regimes: when the cube can't
     // hold every byte (`total > cells`) each cell aggregates a contiguous byte
@@ -423,16 +454,13 @@ fn aggregate_bytes_hilbert(
     flush(&mut grid, cur_cell, &acc, &mut max_count);
 
     let volume_rgba = encode::grid_to_rgba(&grid, max_count);
-    let bricks = brick_builder.map(|bb| {
-        let (bv, dropped) = bb.finish_streaming();
-        if dropped > 0 {
-            log::warn!(
-                "--volume-res: dropped {dropped} bricks past the {} safety cap; lower --volume-res for full coverage",
-                brick::MAX_BRICKS
-            );
-        }
-        bv
-    });
+    // Finish the streamed pool: flush bricks.bin and assemble the octree. Bricks
+    // were already written to disk, so nothing is dropped — a full disk surfaces
+    // as an IO error here rather than truncating detail.
+    let bricks = match brick_builder {
+        Some(bb) => Some(bb.finish_streaming()?.0),
+        None => None,
+    };
 
     // Camera framing. Stream the *fine* focus (the octree builder's occupied
     // bbox): for a small file at high resolution the coarse grid fills the whole
@@ -462,6 +490,7 @@ fn aggregate_bytes_hilbert(
 /// span per entity and hands the bytes to the renderer, which decodes/samples
 /// within. (Peak memory is the largest single entity; a future revision can
 /// switch to a fetch-on-demand callback for very large tensors.)
+#[allow(clippy::too_many_arguments)]
 fn aggregate_entities(
     sources: Vec<Source>,
     shape: &dyn VolumeShape,
@@ -470,9 +499,8 @@ fn aggregate_entities(
     diff_mode: bool,
     stream: bool,
     rt: tokio::runtime::Handle,
+    out_dir: &Path,
 ) -> anyhow::Result<BuildResult> {
-    let cells = extent[0] as usize * extent[1] as usize * extent[2] as usize;
-    let mut grid = vec![VoxelCell::default(); cells];
     let entities = shape.entities().unwrap_or_default();
     let default_renderer_id = shape.id();
 
@@ -489,28 +517,94 @@ fn aggregate_entities(
             })
     };
 
-    // Fetch + bake the dense grid, one entity at a time.
+    if stream {
+        // Dense-grid-free streamed path: process the volume in brick-aligned
+        // Z-slabs so peak RAM is one slab (never `extent³`). Per slab, render
+        // only the entities whose bbox intersects it into a slab-sized buffer,
+        // brick that slab straight to `bricks.bin`, and fold it into the coarse
+        // downsample. Frame from the fine occupied region (the aggregator's bbox).
+        let [ex, ey, ez] = extent;
+        let brick = brick::BRICK;
+
+        // slab_depth: bound the slab buffer to ~SLAB_BUDGET_BYTES, a multiple of
+        // BRICK (so no brick row straddles a boundary), clamped to [BRICK, ez↑].
+        let layer = ex as usize * ey as usize * std::mem::size_of::<VoxelCell>();
+        let raw = (SLAB_BUDGET_BYTES / layer.max(1)) as u32;
+        let max_depth = ez.div_ceil(brick) * brick; // ez rounded up to a brick multiple
+        let slab_depth = (raw / brick * brick).clamp(brick, max_depth);
+
+        // Each entity's z-interval from its bbox (its authoritative target region,
+        // known before dispatch), for scheduling and residency eviction.
+        let ivals: Vec<(u32, u32)> = entities.iter().map(|e| (e.bbox.z0, e.bbox.z1)).collect();
+
+        // Fetch-once residency: fetch an entity's bytes on the first slab it
+        // intersects and evict once the slab front passes its bbox.z1. Live bytes
+        // = Σ spans of entities overlapping the current slab.
+        let mut cache: std::collections::HashMap<usize, std::sync::Arc<Vec<u8>>> =
+            std::collections::HashMap::new();
+
+        let mut agg = brick::StreamBrickAgg::new(extent, brick);
+        let mut w = std::io::BufWriter::new(std::fs::File::create(out_dir.join("bricks.bin"))?);
+        let ce = encode::coarse_extent(extent, COARSE_CAP);
+        let mut coarse = encode::CoarseAcc::new(extent, ce);
+
+        let mut z0 = 0u32;
+        while z0 < ez {
+            let z1 = (z0 + slab_depth).min(ez);
+            let depth = (z1 - z0) as usize;
+            let mut slab = vec![VoxelCell::default(); ex as usize * ey as usize * depth];
+
+            for (i, ent) in entities.iter().enumerate() {
+                let (ez0, ez1) = ivals[i];
+                if ez0 >= z1 || ez1 <= z0 {
+                    continue; // bbox doesn't intersect this slab
+                }
+                let renderer = resolve(ent)?;
+                let bytes = match cache.get(&i) {
+                    Some(b) => b.clone(),
+                    None => {
+                        let b = std::sync::Arc::new(fetch_entity_bytes(&sources, ent, &rt)?);
+                        cache.insert(i, b.clone());
+                        b
+                    }
+                };
+                let ctx = VoxelRenderCtx {
+                    entity: ent,
+                    bytes: &bytes[..],
+                    extent,
+                    diff_mode,
+                };
+                let mut view = VoxelGridMut::slab(&mut slab, extent, z0, z1);
+                renderer.render_window(&ctx, &mut view, z0..z1);
+            }
+
+            let slab_rgba = encode::pack_voxel_cells(&slab);
+            agg.add_slab(&slab_rgba, z0, z1, &mut w)?;
+            coarse.add_slab(&slab_rgba, z0, z1);
+
+            cache.retain(|&i, _| ivals[i].1 > z1); // evict entities behind the front
+            z0 = z1; // free `slab`/`slab_rgba`
+        }
+        w.flush()?;
+        let bricks = agg.finish();
+        return Ok(BuildResult {
+            volume_rgba: coarse.finish(),
+            grid_extent: ce,
+            max_count: 0,
+            focus_center: bricks.focus_center,
+            focus_radius: bricks.focus_radius,
+            bricks: Some(bricks),
+        });
+    }
+
+    // Below the coarse cap: simple dense (non-streamed) path — render every
+    // entity into one full grid (bounded by `extent ≤ COARSE_CAP`), then derive
+    // bricks from it in render_volume.
+    let cells = extent[0] as usize * extent[1] as usize * extent[2] as usize;
+    let mut grid = vec![VoxelCell::default(); cells];
     for ent in &entities {
         let renderer = resolve(ent)?;
-        let src = sources.get(ent.source_idx).ok_or_else(|| {
-            anyhow::anyhow!(
-                "entity source_idx {} out of range ({} sources)",
-                ent.source_idx,
-                sources.len()
-            )
-        })?;
-        let data = load_source_data(src)?;
-
-        // Fetch the entity's byte span (chunked, on the blocking pool).
-        let mut bytes = vec![0u8; ent.byte_len as usize];
-        let mut off = 0u64;
-        while off < ent.byte_len {
-            let len = (ent.byte_len - off).min(CHUNK) as usize;
-            let chunk = rt.block_on(data.fetch_range(ent.byte_start + off, len))?;
-            bytes[off as usize..off as usize + len].copy_from_slice(&chunk);
-            off += len as u64;
-        }
-
+        let bytes = fetch_entity_bytes(&sources, ent, &rt)?;
         let ctx = VoxelRenderCtx {
             entity: ent,
             bytes: &bytes,
@@ -522,36 +616,6 @@ fn aggregate_entities(
     }
 
     let full_rgba = encode::pack_voxel_cells(&grid);
-
-    if stream {
-        // Dice the full baked grid into a sparse octree + range-served brick pool
-        // (O(occupied)); ship `volume.bin` as a small aspect-preserving coarse
-        // downsample for the fallback LOD + CPU pick. Frame from the fine
-        // occupied region (the brick builder's bbox), not the coarse grid.
-        drop(grid); // free the dense VoxelCell grid; work from full_rgba below
-        let (bricks, dropped) =
-            brick::build_streamed_brick_volume(&full_rgba, extent, brick::BRICK);
-        if dropped > 0 {
-            log::warn!(
-                "structured volume dropped {dropped} bricks past the {} safety cap; \
-                 the fine detail is truncated (lower --grid for full coverage)",
-                brick::MAX_BRICKS
-            );
-        }
-        let ce = encode::coarse_extent(extent, COARSE_CAP);
-        let coarse = encode::downsample_rgba(&full_rgba, extent, ce);
-        return Ok(BuildResult {
-            volume_rgba: coarse,
-            grid_extent: ce,
-            max_count: 0,
-            focus_center: bricks.focus_center,
-            focus_radius: bricks.focus_radius,
-            bricks: Some(bricks),
-        });
-    }
-
-    // Below the coarse cap: keep the simple dense (non-streamed) path — bricks are
-    // derived from the dense grid in render_volume.
     let (focus_center, focus_radius) = shape
         .focus()
         .unwrap_or_else(|| occupied_focus_cells(&grid, extent));
@@ -564,6 +628,32 @@ fn aggregate_entities(
         focus_radius,
         bricks: None,
     })
+}
+
+/// Fetch an entity's `[byte_start, +byte_len)` span (chunked, on the blocking
+/// pool via `rt.block_on`). Peak transient RAM is the entity's own span.
+fn fetch_entity_bytes(
+    sources: &[Source],
+    ent: &VolumeEntity,
+    rt: &tokio::runtime::Handle,
+) -> anyhow::Result<Vec<u8>> {
+    let src = sources.get(ent.source_idx).ok_or_else(|| {
+        anyhow::anyhow!(
+            "entity source_idx {} out of range ({} sources)",
+            ent.source_idx,
+            sources.len()
+        )
+    })?;
+    let data = load_source_data(src)?;
+    let mut bytes = vec![0u8; ent.byte_len as usize];
+    let mut off = 0u64;
+    while off < ent.byte_len {
+        let len = (ent.byte_len - off).min(CHUNK) as usize;
+        let chunk = rt.block_on(data.fetch_range(ent.byte_start + off, len))?;
+        bytes[off as usize..off as usize + len].copy_from_slice(&chunk);
+        off += len as u64;
+    }
+    Ok(bytes)
 }
 
 /// World-space framing center + radius from an occupied bounding box (per-axis
@@ -812,6 +902,12 @@ mod tests {
         }
         assert_eq!(leaves, occupied, "one octree leaf per occupied brick");
         assert_eq!(max_id as u64, occupied, "leaf brick ids run 1..=occupied");
+        // v6: the streamed byte atlas ships RAW density counts + a positive
+        // max_count so the viewer normalizes density in-shader.
+        assert!(
+            bm["max_count"].as_u64().unwrap() > 0,
+            "streamed byte atlas carries a positive max_count for shader-side density"
+        );
     }
 
     // A structured VolumeShape whose single entity paints a 4³ box; its

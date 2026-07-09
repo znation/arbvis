@@ -81,12 +81,37 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
   #tip[hidden] { display: none; }
   #tip .tname { color: #e8e8ea; word-break: break-all; }
   #tip .tmeta { color: #9aa0ab; margin-top: 2px; }
+  /* Background brick-streaming activity HUD — bottom-left, appears only while the
+     view is still sharpening (demand-driven bricks streaming in), hidden at full res. */
+  #bg { position: fixed; left: 12px; bottom: 12px; width: 200px; z-index: 5;
+    padding: 8px 10px; pointer-events: none;
+    background: rgba(18,20,26,.82); border: 1px solid #2a2d36; border-radius: 10px;
+    backdrop-filter: blur(6px); box-shadow: 0 6px 24px rgba(0,0,0,.4);
+    transition: opacity .3s ease-out; }
+  #bg[hidden] { display: none; }
+  #bg.fading { opacity: 0; }
+  #bg .bg-row { display: flex; justify-content: space-between; align-items: baseline;
+    color: #c4c8d0; font-size: 11px; margin-bottom: 6px; }
+  #bg #bg-pct { color: #80858f; font-variant-numeric: tabular-nums; }
+  #bg .load-track { width: 100%; } /* override the fixed 220px shared track to fit the card */
+  #bg-bar { width: 0; height: 100%; background: #9aa0ab; border-radius: 2px;
+    transition: width .15s ease-out; }
+  #bg.warn #bg-bar { background: #d0a24a; }
+  #bg.warn #bg-title { color: #d0a24a; }
+  #bg .bg-sub { color: #6b7078; font-size: 10px; font-variant-numeric: tabular-nums;
+    margin-top: 5px; min-height: 12px; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
 <div id="labels"></div>
 <div id="tip" hidden></div>
+<div id="bg" hidden>
+  <div class="bg-row"><span id="bg-title">sharpening…</span><span id="bg-pct"></span></div>
+  <div class="load-track"><div id="bg-bar"></div></div>
+  <div id="bg-eta" class="bg-sub"></div>
+  <div id="bg-counts" class="bg-sub"></div>
+</div>
 <div id="status">
   <div class="load-box">
     <div class="load-label" id="load-label">loading…</div>
@@ -968,9 +993,13 @@ function setupBrickStream(bm, nodeTex, brickTex, nodePool, size) {
     fbScene, fbTarget, fbBuf: null,
     resident: new Map(),        // leaf texel tl → { slot, lastUsed, id }
     freeSlots, inflight: 0, pending: new Set(),
+    // Activity-HUD accounting. inflightBricks tracks bricks (not block requests) in
+    // flight so "outstanding" stays in brick units; sessionResolved counts bricks that
+    // landed since the current sharpening session began (reset on each idle→active edge).
+    inflightBricks: 0, sessionResolved: 0, sessionStartMs: 0,
     frame: 0, fbFrame: -100, probeIdle: true, glDirty: false,
     backoffUntil: 0, backoffMs: 0, // pause fetches after a 429/5xx (decorrelated jitter)
-    stats: { requested: 0, evicted: 0 },
+    stats: { requested: 0, evicted: 0, bytes: 0, loaded: 0 },
     size, volMat: null,
   };
 }
@@ -1068,6 +1097,8 @@ function uploadBrick(bs, tl, id, data) {
   texSub3D(bs, bs.brickTex, sx * b, sy * b, sz * b, b, b, b, data);
   bs.resident.set(tl, { slot, lastUsed: bs.frame, id });
   writeLeaf(bs, tl, 2, slot);
+  bs.sessionResolved++; // for the activity-HUD progress fraction this sharpening session
+  bs.stats.loaded++;    // cumulative "total loaded" counter (survives session resets/eviction)
   volumeDirty = true; // a brick landed — re-probe (more may be needed behind it)
 }
 
@@ -1103,6 +1134,7 @@ function loadBrickBlock(bs, blk, group) {
   const base = blk * BRICK_BLOCK * bs.stride;        // block-aligned file origin
   const end = base + BRICK_BLOCK * bs.stride - 1;    // inclusive last byte (clamped at EOF by the server)
   bs.inflight++;
+  bs.inflightBricks += group.length;
   fetch(bs.bm.atlas_file, { headers: { Range: 'bytes=' + base + '-' + end } })
     .then((res) => {
       // Rate-limit / transient signals: the HF Spaces router in front of the app
@@ -1117,6 +1149,7 @@ function loadBrickBlock(bs, blk, group) {
       if (!res.ok) { console.error('brick block failed', res.status); return null; }
       return res.arrayBuffer().then((ab) => {
         brickFetchOk(bs);
+        bs.stats.bytes += ab.byteLength; // "total downloaded" (network + browser-cache hits)
         const u8 = new Uint8Array(ab);
         const whole = res.status !== 206; // 200 ⇒ whole file; index by absolute offset
         for (const [id, tl] of group) {
@@ -1132,7 +1165,7 @@ function loadBrickBlock(bs, blk, group) {
       for (const [, tl] of group) requeueBrick(bs, tl);
       brickBackoff(bs);
     })
-    .finally(() => { bs.inflight--; pumpBrickFetches(bs); });
+    .finally(() => { bs.inflight--; bs.inflightBricks -= group.length; pumpBrickFetches(bs); });
 }
 
 // Drain queued misses into block fetches: bucket every pending brick by its
@@ -1286,6 +1319,69 @@ function streamBricks() {
       'requested', bs.stats.requested, 'evicted', bs.stats.evicted);
   }
 }
+
+// ---- background streaming activity HUD --------------------------------------
+// A small bottom-left overlay that appears only while the view is still sharpening
+// (demand-driven bricks streaming in) and hides once the current view is at full
+// resolution. Driven by a throttled interval (below), reading only brickStream state.
+function bytesFmt(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n / 1024).toFixed(0) + ' KB';
+  if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+  return (n / 1073741824).toFixed(2) + ' GB';
+}
+// When the stream falls quiet we flash "full resolution" then fade out; these two
+// timestamps gate that so the HUD doesn't flicker between back-to-back probes.
+let bgFadeAt = 0, bgHideAt = 0;
+function updateBgHud() {
+  const bs = brickStream;
+  const el = $('bg');
+  if (!bs || !el) return; // non-streamed bundles never stream → HUD stays hidden
+  const outstanding = bs.pending.size + bs.inflightBricks;
+  const backoff = bs.backoffUntil && nowMs() < bs.backoffUntil;
+  const active = outstanding > 0 || bs.inflight > 0 || backoff;
+
+  // An idle→active edge starts a fresh sharpening "session" (progress denominator).
+  if (active && bs.sessionStartMs === 0) { bs.sessionStartMs = nowMs(); bs.sessionResolved = 0; }
+
+  if (active) {
+    bgFadeAt = 0; bgHideAt = 0;
+    el.hidden = false; el.classList.remove('fading');
+    const denom = bs.sessionResolved + outstanding;
+    let pct = Math.max(0, Math.min(100, Math.round((denom > 0 ? bs.sessionResolved / denom : 0) * 100)));
+    if (outstanding > 0 && pct >= 100) pct = 99; // reserve 100% for true quiescence (below)
+    $('bg-bar').style.width = pct + '%';
+    $('bg-pct').textContent = pct + '%';
+    if (backoff) {
+      el.classList.add('warn');
+      $('bg-title').textContent = 'waiting — rate-limited';
+      $('bg-eta').textContent = 'retrying in ~' + fmtDur((bs.backoffUntil - nowMs()) / 1000);
+    } else {
+      el.classList.remove('warn');
+      $('bg-title').textContent = 'sharpening…';
+      const elapsed = (nowMs() - bs.sessionStartMs) / 1000;
+      const rate = elapsed > 0 ? bs.sessionResolved / elapsed : 0; // bricks/sec
+      $('bg-eta').textContent = (bs.sessionResolved > 2 && rate > 0)
+        ? '~' + fmtDur(outstanding / rate) + ' left' : '—';
+    }
+    $('bg-counts').textContent =
+      bs.inflight + ' active · ' + bs.pending.size + ' queued · ' +
+      bs.stats.loaded.toLocaleString() + ' loaded · ' + bytesFmt(bs.stats.bytes);
+  } else if (bs.sessionStartMs !== 0) {
+    // Just reached quiescence: end the session, show a completed state, arm the fade.
+    bs.sessionStartMs = 0;
+    el.classList.remove('warn');
+    $('bg-bar').style.width = '100%';
+    $('bg-pct').textContent = '100%';
+    $('bg-title').textContent = 'full resolution';
+    $('bg-eta').textContent = '';
+    bgFadeAt = nowMs() + 900; bgHideAt = bgFadeAt + 300; // fade window then remove
+  } else if (bgFadeAt) {
+    if (nowMs() >= bgFadeAt) el.classList.add('fading');
+    if (nowMs() >= bgHideAt) { el.hidden = true; el.classList.remove('fading'); bgFadeAt = 0; bgHideAt = 0; }
+  }
+}
+setInterval(updateBgHud, 150);
 
 // HTML-escape model-derived tensor names before injecting into the panel.
 const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));

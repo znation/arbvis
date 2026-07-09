@@ -186,9 +186,23 @@ function setStatus(msg) {
 // back to a whole-buffer read when the body isn't a readable stream. Returns a
 // Uint8Array (callers needing an ArrayBuffer use .buffer — byteOffset is 0).
 async function fetchBytes(url, opts) {
-  const res = await fetch(url, opts);
-  // Fail loud: a 5xx/OOM mid-load must surface as an error overlay (via load()'s
-  // .catch → setStatus), not silently yield empty bytes and render a blank cube.
+  // Retry rate-limit / transient responses before failing. The up-front assets
+  // are few, but a reload while the HF Spaces router is still throttling a prior
+  // brick storm can 409/429 here — without a retry the whole load would error
+  // out loud instead of just waiting out the window. Bounded attempts with
+  // decorrelated-jitter backoff (mirrors the brick streamer's backoff).
+  let res, wait = 0;
+  for (let attempt = 0; ; attempt++) {
+    if (wait) await new Promise((r) => setTimeout(r, wait));
+    res = await fetch(url, opts);
+    const throttled = res.status === 429 || res.status === 409 || res.status === 403 || res.status >= 500;
+    if (!throttled || attempt >= 6) break;
+    const base = wait || BACKOFF_MIN_MS;
+    wait = Math.min(BACKOFF_MAX_MS, Math.floor(base * (1 + Math.random() * 2)));
+  }
+  // Fail loud: a persistent 5xx/OOM mid-load must surface as an error overlay
+  // (via load()'s .catch → setStatus), not silently yield empty bytes and
+  // render a blank cube.
   if (!res.ok) throw new Error('load failed: ' + res.status + ' ' + res.statusText + ' (' + url + ')');
   if (!res.body) return new Uint8Array(await res.arrayBuffer());
   const reader = res.body.getReader();
@@ -1080,7 +1094,14 @@ function loadBrickRange(bs, group) {
   bs.inflight++;
   fetch(bs.bm.atlas_file, { headers: { Range: 'bytes=' + base + '-' + end } })
     .then((res) => {
-      if (res.status === 429 || res.status >= 500) {
+      // Rate-limit / transient signals from EITHER hop: the HF Spaces router in
+      // front of the app (browser→Space) or the app's Hub proxy (Space→bucket).
+      // The router surfaces throttling as 429/409/403; the app 500s on a Hub
+      // hiccup. All are retryable — requeue the whole group and back off so we
+      // stop hammering. Critically we must NOT drop these bricks (the old code
+      // let 409 fall through and drop them permanently → the view never
+      // sharpened and the client kept storming with no backoff).
+      if (res.status === 429 || res.status === 409 || res.status === 403 || res.status >= 500) {
         for (const [, tl] of group) requeueBrick(bs, tl);
         brickBackoff(bs);
         return null;

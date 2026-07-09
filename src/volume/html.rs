@@ -912,11 +912,19 @@ async function load() {
 const BRICK_CACHE_DIM = 32;                                  // cache atlas side in bricks → 32768 slots
 const BRICK_CACHE_CAP = BRICK_CACHE_DIM ** 3;
 const BRICK_CACHE_SOFT = Math.floor(BRICK_CACHE_CAP * 0.92); // evict above this (hysteresis vs CAP)
-const BRICK_MAX_INFLIGHT = 8;                                // concurrent range fetches (each may cover many bricks)
-const COALESCE_GAP = 64;                                     // bridge id gaps up to this to merge pending bricks into one fetch
-const COALESCE_MAX_BRICKS = 2048;                            // cap a coalesced group's span (≤ ~4 MiB at a 2 KiB stride)
+const BRICK_MAX_INFLIGHT = 8;                                // concurrent range fetches (each covers one aligned block)
+// Bricks are fetched in FIXED, aligned blocks of this many ids: any pending
+// brick in a block pulls the whole block in ONE Range request. Two payoffs vs
+// per-brick fetches, both aimed at the HF Spaces per-window request limit that
+// 429s the load: (1) request count is bounded by blocks-touched, not bricks
+// (scattered misses across a block collapse to one fetch); (2) the Range is a
+// function of the block alone, so it's byte-identical across probes, pans, and
+// reloads — the immutable browser cache then serves repeats with no network at
+// all (per-brick coalescing produced session-dependent ranges that never cache-
+// hit, which is why reloads still stormed). 1024·(8³·4) = one 2 MiB request.
+const BRICK_BLOCK = 1024;
 const BACKOFF_MIN_MS = 800;                                  // first pause after a 429/5xx before retrying fetches
-const BACKOFF_MAX_MS = 8000;                                 // ceiling for the decorrelated-jitter backoff
+const BACKOFF_MAX_MS = 20000;                                // ceiling for the decorrelated-jitter backoff
 const FB_DIV = 8;                                            // feedback target = drawing buffer / FB_DIV
 const FB_EVERY = 2;                                          // probe at most every N frames
 const brickDebug = location.search.includes('debug');
@@ -1081,16 +1089,19 @@ function brickBackoff(bs) {
 }
 function brickFetchOk(bs) { bs.backoffMs = 0; bs.backoffUntil = 0; }
 
-// Range-fetch one coalesced run of bricks from bricks.bin in a single request and
-// upload each. `group` is [[id, tl], …] sorted by id; the request spans the first
-// brick's offset to the last brick's end. 206 (partial) is the fast path; a host
-// that ignores Range (200, whole file) is sliced client-side by absolute offset
-// so it stays correct everywhere. On 429/5xx/error the whole group is re-queued
-// and a backoff window opens (no partial/garbage upload).
-function loadBrickRange(bs, group) {
-  const firstId = group[0][0], lastId = group[group.length - 1][0];
-  const base = (firstId - 1) * bs.stride;      // group's file-offset origin
-  const end = lastId * bs.stride - 1;          // inclusive last byte of the run
+// Fetch one FIXED aligned block [blk·BRICK_BLOCK, (blk+1)·BRICK_BLOCK) of bricks
+// in a single Range request and upload the needed ones. `group` is [[id, tl], …]
+// (every pending brick that fell in this block). The request offset is derived
+// from the block index alone — NOT from the group — so the Range is byte-
+// identical every time the block is touched and the immutable browser cache can
+// serve it with no network. 206 (partial) is the fast path; a host that ignores
+// Range (200, whole file) is sliced client-side by absolute offset so it stays
+// correct everywhere. On a throttle/5xx/error the whole group is re-queued and a
+// backoff window opens (no partial/garbage upload). The block's end may run past
+// EOF on the last block — the Space clamps it to the true size.
+function loadBrickBlock(bs, blk, group) {
+  const base = blk * BRICK_BLOCK * bs.stride;        // block-aligned file origin
+  const end = base + BRICK_BLOCK * bs.stride - 1;    // inclusive last byte (clamped at EOF by the server)
   bs.inflight++;
   fetch(bs.bm.atlas_file, { headers: { Range: 'bytes=' + base + '-' + end } })
     .then((res) => {
@@ -1106,7 +1117,7 @@ function loadBrickRange(bs, group) {
         brickBackoff(bs);
         return null;
       }
-      if (!res.ok) { console.error('brick range failed', res.status); return null; }
+      if (!res.ok) { console.error('brick block failed', res.status); return null; }
       return res.arrayBuffer().then((ab) => {
         brickFetchOk(bs);
         const u8 = new Uint8Array(ab);
@@ -1120,48 +1131,40 @@ function loadBrickRange(bs, group) {
       });
     })
     .catch((e) => {
-      console.error('brick load failed', e);
+      console.error('brick block load failed', e);
       for (const [, tl] of group) requeueBrick(bs, tl);
       brickBackoff(bs);
     })
     .finally(() => { bs.inflight--; pumpBrickFetches(bs); });
 }
 
-// Drain queued requests into fetches, coalescing bricks with nearby ids (i.e.
-// nearby file offsets) into single Range requests — far fewer, larger fetches
-// instead of thousands of tiny per-brick ones, which is what triggers Hub rate
-// limiting through the Space proxy. Bounded by inflight groups + free cache
-// slots; paused entirely during a backoff window. When the cache is full we wait
-// for the touch walk to evict rather than evict blind here (it lacks the current
-// visible cut).
+// Drain queued misses into block fetches: bucket every pending brick by its
+// fixed aligned block and issue at most one Range request per block. This is
+// what keeps the browser under the HF Spaces per-window request limit — a whole
+// scattered surface collapses to blocks-touched requests, not one-per-brick, and
+// each block's Range is stable so already-fetched blocks re-serve from cache.
+// Bounded by the inflight cap + free cache slots; paused during a backoff window.
+// When the cache is full we wait for the touch walk to evict rather than evict
+// blind here (it lacks the current visible cut).
 function pumpBrickFetches(bs) {
   if (bs.pending.size === 0) return;
   if (bs.backoffUntil && nowMs() < bs.backoffUntil) return; // rate-limited: hold off
-  // Snapshot fetchable leaves (still occupied-not-resident) with their brick ids.
-  const items = [];
+  // Bucket fetchable leaves (still occupied-not-resident) by aligned block.
+  const blocks = new Map(); // block index → [[id, tl], …]
   for (const tl of bs.pending) {
     if (leafState(bs, tl) !== 1) { bs.pending.delete(tl); continue; }
     const id = leafRgb(bs, tl);
     if (!id) { bs.pending.delete(tl); continue; }
-    items.push([id, tl]);
+    const blk = Math.floor((id - 1) / BRICK_BLOCK);
+    let g = blocks.get(blk);
+    if (!g) { g = []; blocks.set(blk, g); }
+    g.push([id, tl]);
   }
-  if (items.length === 0) return;
-  items.sort((a, b) => a[0] - b[0]); // ascending brick id → contiguous file order
-  let i = 0;
-  while (i < items.length) {
+  if (blocks.size === 0) return;
+  for (const [blk, group] of blocks) {
     if (bs.inflight >= BRICK_MAX_INFLIGHT || bs.freeSlots.length === 0) break;
-    const group = [items[i]];
-    let j = i + 1;
-    while (
-      j < items.length &&
-      items[j][0] - group[group.length - 1][0] <= COALESCE_GAP &&
-      items[j][0] - group[0][0] + 1 <= COALESCE_MAX_BRICKS
-    ) {
-      group.push(items[j]); j++;
-    }
     for (const [, tl] of group) bs.pending.delete(tl);
-    loadBrickRange(bs, group);
-    i = j;
+    loadBrickBlock(bs, blk, group);
   }
 }
 

@@ -899,8 +899,8 @@ const BRICK_CACHE_DIM = 32;                                  // cache atlas side
 const BRICK_CACHE_CAP = BRICK_CACHE_DIM ** 3;
 const BRICK_CACHE_SOFT = Math.floor(BRICK_CACHE_CAP * 0.92); // evict above this (hysteresis vs CAP)
 const BRICK_MAX_INFLIGHT = 8;                                // concurrent range fetches (each may cover many bricks)
-const COALESCE_GAP = 8;                                      // merge pending bricks within this many ids into one fetch
-const COALESCE_MAX_BRICKS = 512;                             // cap a coalesced group's span (≤ ~1 MiB at a 2 KiB stride)
+const COALESCE_GAP = 64;                                     // bridge id gaps up to this to merge pending bricks into one fetch
+const COALESCE_MAX_BRICKS = 2048;                            // cap a coalesced group's span (≤ ~4 MiB at a 2 KiB stride)
 const BACKOFF_MIN_MS = 800;                                  // first pause after a 429/5xx before retrying fetches
 const BACKOFF_MAX_MS = 8000;                                 // ceiling for the decorrelated-jitter backoff
 const FB_DIV = 8;                                            // feedback target = drawing buffer / FB_DIV

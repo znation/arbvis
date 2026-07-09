@@ -130,8 +130,6 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
         <button data-v="1">Density</button>
       </div>
     </div>
-    <div class="row"><label>Volume opacity <span id="opv"></span></label>
-      <input id="opacity" type="range" min="0" max="1" step="0.01" value="0.45"></div>
     <div class="row"><label>Volume contrast <span id="gav"></span></label>
       <input id="gamma" type="range" min="0.2" max="3" step="0.05" value="1"></div>
     <div class="row"><label>Threshold <span id="thv"></span></label>
@@ -378,6 +376,11 @@ const volFrag = `
   uniform vec2 uResolution;      // drawing-buffer size, for the gl_FragCoord lookup
   uniform mat4 uInvProjView, uInvModel; // reconstruct the scene hit in box space
   uniform float uOpacity, uGamma, uThreshold, uNorm, uBrick, uBrickStride, uApron;
+  // Distance-along-ray opacity envelope (all in world-space ray distance t, which
+  // equals camera distance because the box model matrix is identity — see the
+  // updateEnvelope() note). Translucent near-camera floor rising to a peak of 1
+  // around the orbit focus, then a steep fall to 0 at the hard cutoff uEnvFall1.
+  uniform float uEnvFloor, uEnvRise0, uEnvRise1, uEnvFall0, uEnvFall1;
   // Density (B) rescale for a raw-count streamed atlas: 255/max_count, or 0 when
   // B is already baked (structured, non-streamed, coarse fallback, old bundles).
   uniform float uAtlasInvMax;
@@ -460,6 +463,17 @@ const volFrag = `
     return texture(uBricks, (atlasVox + 0.5) / (uAtlasBricks * uBrickStride));
   }
 
+  // Opacity weight as a function of ray distance t. Floor near the camera, a
+  // gentle rise to a plateau of 1 straddling the focus, then a steep fall to 0 at
+  // uEnvFall1 (== tCut). Constants guarantee uEnvRise1 < uEnvFall0 (well-formed
+  // plateau). Beyond uEnvFall1 the ray is already cut (bounds.y clamp), so this
+  // returning 0 there is belt-and-suspenders.
+  float envelope(float t) {
+    float up   = mix(uEnvFloor, 1.0, smoothstep(uEnvRise0, uEnvRise1, t));
+    float down = 1.0 - smoothstep(uEnvFall0, uEnvFall1, t);
+    return up * down;
+  }
+
   void main() {
     vec3 dir = normalize(vDirection);
     vec2 bounds = hitBox(vOrigin, dir);
@@ -476,6 +490,11 @@ const volFrag = `
       bounds.y = min(bounds.y, dot(mh - vOrigin, dir)); // dir is normalized → t
       if (bounds.x > bounds.y) discard;
     }
+    // Distance-opacity cutoff: nothing past uEnvFall1 contributes (envelope is 0
+    // there), so cap the ray here. Done before stepLen so the fixed step budget
+    // concentrates on the visible span instead of the culled tail.
+    bounds.y = min(bounds.y, uEnvFall1);
+    if (bounds.x > bounds.y) discard;
     float t = max(bounds.x, 0.0);
     float stepLen = (bounds.y - t) / float(uSteps);
     float denom = max(1e-4, 1.0 - uThreshold);
@@ -545,7 +564,7 @@ const volFrag = `
         // thins, fewer voxels accumulate along each ray, so we scale per-voxel
         // alpha up to hold the cube's integrated opacity (its viewability)
         // roughly constant. Computed on the client from the channel histogram.
-        float a = clamp(pow(d, uGamma) * uOpacity * uNorm, 0.0, 1.0);
+        float a = clamp(pow(d, uGamma) * uOpacity * uNorm, 0.0, 1.0) * envelope(t);
         acc.rgb += (1.0 - acc.a) * col * a;
         acc.a   += (1.0 - acc.a) * a;
         // Early-ray termination: once the ray is near-opaque, voxels behind it
@@ -578,6 +597,9 @@ const fbFrag = `
   uniform vec3 uSize, uVolDim, uNodePoolDim;
   // Kept in sync with volFrag each probe so occlusion matches what's rendered.
   uniform float uOpacity, uGamma, uThreshold, uNorm;
+  // Distance-opacity envelope — synced from volFrag each probe (see runFeedback)
+  // so the probe's occlusion matches exactly what volFrag composites.
+  uniform float uEnvFloor, uEnvRise0, uEnvRise1, uEnvFall0, uEnvFall1;
   uniform int uSource, uDirectColor;
   // Screen-space LOD: only demand bricks nearer than this ray-t (their projected
   // footprint is ≥ LOD_MIN_FB_PX). Beyond it a brick is too small → stays coarse.
@@ -622,9 +644,20 @@ const fbFrag = `
     state = 0u; boxOrigin = cell; boxExtent = 1.0;
   }
 
+  // Same envelope as volFrag (see there) — occlusion must match the render.
+  float envelope(float t) {
+    float up   = mix(uEnvFloor, 1.0, smoothstep(uEnvRise0, uEnvRise1, t));
+    float down = 1.0 - smoothstep(uEnvFall0, uEnvFall1, t);
+    return up * down;
+  }
+
   void main() {
     vec3 dir = normalize(vDirection);
     vec2 bounds = hitBox(vOrigin, dir);
+    if (bounds.x > bounds.y) { fragColor = vec4(0.0); return; }
+    // Match volFrag's distance cutoff so no leaf past uEnvFall1 is ever reached
+    // (and thus never reported as a miss / demanded).
+    bounds.y = min(bounds.y, uEnvFall1);
     if (bounds.x > bounds.y) { fragColor = vec4(0.0); return; }
     float t = max(bounds.x, 0.0);           // vOrigin is the camera in box space → t is camera distance
     float stepLen = (bounds.y - t) / float(uSteps);
@@ -667,7 +700,7 @@ const fbFrag = `
       vec4 cs = texture(uCoarse, uvw);
       float dd = (uDirectColor == 1) ? cs.a : ((uSource == 0) ? cs.g : cs.b);
       dd = max(0.0, dd - uThreshold) / denom;
-      acc += (1.0 - acc) * clamp(pow(dd, uGamma) * uOpacity * uNorm, 0.0, 1.0);
+      acc += (1.0 - acc) * clamp(pow(dd, uGamma) * uOpacity * uNorm, 0.0, 1.0) * envelope(t);
       if (acc >= 0.9) { fragColor = vec4(1.0); return; } // opaque → resolved, no miss behind
       t += stepLen;
     }
@@ -881,7 +914,17 @@ async function load() {
       uNodePoolDim: { value: new THREE.Vector3(bm.tree_dim[0] || 1, bm.tree_dim[1] || 1, bm.tree_dim[2] || 1) },
       uTreeDepth: { value: bm.tree_depth || 0 },
       uCoarse: { value: coarseTex }, uStreamed: { value: streamed ? 1 : 0 },
-      uOpacity: { value: 0.45 }, uGamma: { value: 1.0 },
+      // Fixed peak opacity (no longer a slider — opacity is now distance-driven).
+      // The envelope scales this per-voxel by ray distance, so only the mid-distance
+      // plateau reaches this value while the front fades to the translucent floor and
+      // the back to zero. Set above the old flat 0.45 default so the focus plateau
+      // still reads solidly opaque despite the envelope thinning the integrated alpha.
+      uOpacity: { value: 0.7 }, uGamma: { value: 1.0 },
+      // Distance-opacity envelope anchors (world-space ray distance). Recomputed each
+      // frame by updateEnvelope from the camera→target distance; the 1e9 cutoff is a
+      // no-op until then (nothing gets clamped/zeroed before the first update).
+      uEnvFloor: { value: ENV_FLOOR }, uEnvRise0: { value: 0.0 }, uEnvRise1: { value: 0.0 },
+      uEnvFall0: { value: 0.0 }, uEnvFall1: { value: 1e9 },
       // Quality is fixed high (no slider) — well above the old 384 max. The 2048
       // loop cap in volFrag keeps up with the finer step in dense regions.
       uThreshold: { value: 0.0 }, uSource: { value: 0 }, uSteps: { value: 512 },
@@ -982,6 +1025,31 @@ const FB_EVERY = 2;                                          // probe at most ev
 // invisible, so streaming it only churns the bounded cache. 1 fb texel ≈ FB_DIV
 // device px, so 0.6 ≈ a ~5px brick. This bounds the *lateral* working set.
 const LOD_MIN_FB_PX = 0.6;
+// Distance-opacity envelope, as fractions of the camera→target distance (dCam),
+// so it's dataset-independent and zoom-responsive: dollying in shrinks dCam → the
+// whole envelope tightens and re-centers on the focus, culling harder.
+//
+// Geometry that sets the scale: auto-framing puts the camera at the focus + the
+// offset (dist, .85·dist, 1.1·dist) with dist = 3.2·focus_radius, so the camera→
+// focus distance is dCam = 1.7125·dist = 5.48·focus_radius. The occupied region
+// (radius focus_radius, centered on the orbit target) therefore always spans
+// t ∈ [1 - fr/dCam, 1 + fr/dCam]·dCam = [~0.82, ~1.18]·dCam (fr/dCam = 1/5.48 is
+// invariant across datasets; smaller data only tightens it). So the whole visible
+// shell lives in [0.82, 1.18]·dCam with the target dead-center at 1.0 — the
+// envelope's action must sit inside that window, not outside it.
+//
+// The band: floor below RISE0·dCam, rising to a peak of 1 over [RISE1, FALL0]·dCam
+// (plateau ending AT the target so the thing you orbit is fully opaque), then a
+// STEEP fall to 0 at the hard cutoff FALL1·dCam (== tCut), which lops off the far
+// side of the shell — the "fades quickly to zero, out of view" region that is never
+// fetched or drawn. Front of the shell stays translucent (floor→1) so you see into
+// it. Cull aggressiveness lives in FALL0/FALL1; focus sharpness in RISE1/FALL0.
+// Invariant: RISE0 < RISE1 < FALL0 < FALL1.
+const ENV_FLOOR = 0.15; // translucent near-shell floor (nonzero → front stays visible & streamed)
+const ENV_RISE0 = 0.82; // occupied front edge; below this·dCam: floor
+const ENV_RISE1 = 0.97; // reach the opaque peak just before the focus
+const ENV_FALL0 = 1.00; // plateau ends at the focus (target) — start dropping
+const ENV_FALL1 = 1.06; // hard cutoff tCut just behind the focus → back of the shell culled
 // Thrash backstop (all wall-clock, so it's independent of frame rate and of how
 // bursty brick arrivals are). The signal that the working set can't fit: the
 // cache is full AND the probe still reports visible misses AND the camera has
@@ -1018,6 +1086,9 @@ function setupBrickStream(bm, nodeTex, brickTex, nodePool, size) {
       // Synced from volMat each probe (runFeedback); placeholders until then.
       uCoarse: { value: null },
       uOpacity: { value: 1 }, uGamma: { value: 1 }, uThreshold: { value: 0 }, uNorm: { value: 1 },
+      // Distance-opacity envelope — synced from volMat each probe (runFeedback).
+      uEnvFloor: { value: ENV_FLOOR }, uEnvRise0: { value: 0.0 }, uEnvRise1: { value: 0.0 },
+      uEnvFall0: { value: 0.0 }, uEnvFall1: { value: 1e9 },
       uSource: { value: 0 }, uDirectColor: { value: 0 },
       uLodMaxT: { value: 1e9 }, // no gate until computed
     },
@@ -1305,6 +1376,12 @@ function runFeedback(bs) {
     fu.uNorm.value = vu.uNorm.value;
     fu.uSource.value = vu.uSource.value;
     fu.uDirectColor.value = vu.uDirectColor.value;
+    // Envelope must be byte-identical so the probe's occlusion matches the render.
+    fu.uEnvFloor.value = vu.uEnvFloor.value;
+    fu.uEnvRise0.value = vu.uEnvRise0.value;
+    fu.uEnvRise1.value = vu.uEnvRise1.value;
+    fu.uEnvFall0.value = vu.uEnvFall0.value;
+    fu.uEnvFall1.value = vu.uEnvFall1.value;
   }
   fu.uLodMaxT.value = bs.lodMaxT;
   const prevTarget = renderer.getRenderTarget();
@@ -1385,6 +1462,23 @@ function touchAndEvictBricks(bs) {
   }
 }
 
+// Refresh the distance-opacity envelope from the current camera→target distance.
+// This is the ONE place the zoom-responsive band is derived: anchors are dCam·ENV_*
+// so the envelope re-centers on the focus (pan/dolly) every frame. Correctness rests
+// on volMesh having an identity model matrix (added at load with no position/scale),
+// so the shaders' ray param t is world distance == dCam's units; if volMesh is ever
+// translated/scaled, measure dCam in box-local space (transform by uInvModel) instead.
+function updateEnvelope() {
+  if (!volMesh) return; // only after load() builds volMesh + auto-frames; dCam transient before
+  const d = camera.position.distanceTo(controls.target);
+  const u = volMesh.material.uniforms;
+  u.uEnvFloor.value = ENV_FLOOR;
+  u.uEnvRise0.value = ENV_RISE0 * d;
+  u.uEnvRise1.value = ENV_RISE1 * d;
+  u.uEnvFall0.value = ENV_FALL0 * d;
+  u.uEnvFall1.value = ENV_FALL1 * d;
+}
+
 // Ray-t (camera distance) beyond which a finest brick projects to fewer than
 // LOD_MIN_FB_PX feedback-buffer texels. Everything nearer is demanded at full
 // resolution; everything past it stays coarse. Recomputed each frame since it
@@ -1438,7 +1532,13 @@ function streamBricks() {
   const bs = brickStream;
   if (!bs || !volMesh) return; // volume is always part of the unified view now
   bs.frame++;
-  bs.lodMaxT = computeLodMaxT(bs);
+  // The finest LOD horizon is the tighter of the screen-space brick-size gate and
+  // the distance-opacity cutoff (tCut). Clamping to tCut is what stops far-brick
+  // downloads (the probe's uLodMaxT gate refuses misses past it) AND lets the touch
+  // walk evict far bricks (its march stops at lodMaxT). updateEnvelope ran earlier
+  // this frame, so uEnvFall1 is current.
+  const tCut = bs.volMat ? bs.volMat.uniforms.uEnvFall1.value : Infinity;
+  bs.lodMaxT = Math.min(computeLodMaxT(bs), tCut);
   if ((volumeDirty || bs.pending.size > 0) && bs.probeIdle && (bs.frame - bs.fbFrame) >= FB_EVERY) {
     runFeedback(bs);
   }
@@ -1716,7 +1816,7 @@ function slider(id, label, fmt, cb) {
 function bindControls() {
   const v = () => volMesh.material.uniforms;
   seg('src', (s) => { v().uSource.value = parseInt(s); refreshNorm(); });
-  slider('opacity', 'opv', (x) => x.toFixed(2), (x) => v().uOpacity.value = x);
+  // Opacity is distance-driven (see the envelope) — no manual opacity slider.
   slider('gamma', 'gav', (x) => x.toFixed(2), (x) => v().uGamma.value = x);
   // Threshold raises the volume floor (with the renorm compensation).
   slider('threshold', 'thv', (x) => x.toFixed(2), (x) => {
@@ -1774,6 +1874,7 @@ function renderHybrid() {
 
 function tick() {
   controls.update();
+  updateEnvelope(); // fresh dCam after damping; streamBricks (below) reads the new tCut
   if (brickStream) streamBricks();
   renderHybrid();
   labelRenderer.render(scene, camera);

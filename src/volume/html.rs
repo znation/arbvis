@@ -898,10 +898,15 @@ async function load() {
 const BRICK_CACHE_DIM = 32;                                  // cache atlas side in bricks → 32768 slots
 const BRICK_CACHE_CAP = BRICK_CACHE_DIM ** 3;
 const BRICK_CACHE_SOFT = Math.floor(BRICK_CACHE_CAP * 0.92); // evict above this (hysteresis vs CAP)
-const BRICK_MAX_INFLIGHT = 8;                                // concurrent range fetches
+const BRICK_MAX_INFLIGHT = 8;                                // concurrent range fetches (each may cover many bricks)
+const COALESCE_GAP = 8;                                      // merge pending bricks within this many ids into one fetch
+const COALESCE_MAX_BRICKS = 512;                             // cap a coalesced group's span (≤ ~1 MiB at a 2 KiB stride)
+const BACKOFF_MIN_MS = 800;                                  // first pause after a 429/5xx before retrying fetches
+const BACKOFF_MAX_MS = 8000;                                 // ceiling for the decorrelated-jitter backoff
 const FB_DIV = 8;                                            // feedback target = drawing buffer / FB_DIV
 const FB_EVERY = 2;                                          // probe at most every N frames
 const brickDebug = location.search.includes('debug');
+const nowMs = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 const _tNdc = new THREE.Vector2();
 
 // Build the brick-stream state. `nodeTex`/`brickTex` are the mutable octree node
@@ -942,6 +947,7 @@ function setupBrickStream(bm, nodeTex, brickTex, nodePool, size) {
     resident: new Map(),        // leaf texel tl → { slot, lastUsed, id }
     freeSlots, inflight: 0, pending: new Set(),
     frame: 0, fbFrame: -100, probeIdle: true, glDirty: false,
+    backoffUntil: 0, backoffMs: 0, // pause fetches after a 429/5xx (decorrelated jitter)
     stats: { requested: 0, evicted: 0 },
     size, volMat: null,
   };
@@ -1043,34 +1049,98 @@ function uploadBrick(bs, tl, id, data) {
   volumeDirty = true; // a brick landed — re-probe (more may be needed behind it)
 }
 
-// Range-fetch one brick's block from bricks.bin and upload it: 206 (partial) is
-// the fast path; a host that ignores Range (200, whole file) is sliced
-// client-side so it stays correct everywhere.
-function loadBrick(bs, tl) {
-  const id = leafRgb(bs, tl); // not resident ⇒ RGB is the 1-based brick id
-  if (!id) return;
-  const off = (id - 1) * bs.stride, end = off + bs.stride - 1;
+// Re-queue a leaf for a later fetch (only if it's still occupied-not-resident).
+function requeueBrick(bs, tl) { if (leafState(bs, tl) === 1) bs.pending.add(tl); }
+
+// Enter a backoff window after a 429/5xx/network error: pause all fetches for a
+// decorrelated-jitter interval (next ∈ [MIN, min(MAX, prev·3)]) so the streamer
+// stops hammering a rate-limited host and converges instead of stalling. Mirrors
+// the build-time throttle. `volumeDirty` keeps the tick loop revisiting so the
+// pump resumes automatically once the window passes.
+function brickBackoff(bs) {
+  const prev = bs.backoffMs || BACKOFF_MIN_MS;
+  const next = Math.min(BACKOFF_MAX_MS, BACKOFF_MIN_MS + Math.random() * (prev * 3 - BACKOFF_MIN_MS));
+  bs.backoffMs = next;
+  bs.backoffUntil = nowMs() + next;
+  volumeDirty = true;
+  if (brickDebug) console.warn('brick fetch backoff', Math.round(next), 'ms');
+}
+function brickFetchOk(bs) { bs.backoffMs = 0; bs.backoffUntil = 0; }
+
+// Range-fetch one coalesced run of bricks from bricks.bin in a single request and
+// upload each. `group` is [[id, tl], …] sorted by id; the request spans the first
+// brick's offset to the last brick's end. 206 (partial) is the fast path; a host
+// that ignores Range (200, whole file) is sliced client-side by absolute offset
+// so it stays correct everywhere. On 429/5xx/error the whole group is re-queued
+// and a backoff window opens (no partial/garbage upload).
+function loadBrickRange(bs, group) {
+  const firstId = group[0][0], lastId = group[group.length - 1][0];
+  const base = (firstId - 1) * bs.stride;      // group's file-offset origin
+  const end = lastId * bs.stride - 1;          // inclusive last byte of the run
   bs.inflight++;
-  fetch(bs.bm.atlas_file, { headers: { Range: 'bytes=' + off + '-' + end } })
-    .then((res) => res.arrayBuffer().then((ab) => {
-      let u8 = new Uint8Array(ab);
-      if (res.status !== 206 && u8.length !== bs.stride) u8 = u8.subarray(off, off + bs.stride);
-      uploadBrick(bs, tl, id, u8);
-    }))
-    .catch((e) => console.error('brick load failed', e))
+  fetch(bs.bm.atlas_file, { headers: { Range: 'bytes=' + base + '-' + end } })
+    .then((res) => {
+      if (res.status === 429 || res.status >= 500) {
+        for (const [, tl] of group) requeueBrick(bs, tl);
+        brickBackoff(bs);
+        return null;
+      }
+      if (!res.ok) { console.error('brick range failed', res.status); return null; }
+      return res.arrayBuffer().then((ab) => {
+        brickFetchOk(bs);
+        const u8 = new Uint8Array(ab);
+        const whole = res.status !== 206; // 200 ⇒ whole file; index by absolute offset
+        for (const [id, tl] of group) {
+          const start = whole ? (id - 1) * bs.stride : (id - 1) * bs.stride - base;
+          const data = u8.subarray(start, start + bs.stride);
+          if (data.length === bs.stride) uploadBrick(bs, tl, id, data);
+          else requeueBrick(bs, tl); // short/truncated slice — retry later
+        }
+      });
+    })
+    .catch((e) => {
+      console.error('brick load failed', e);
+      for (const [, tl] of group) requeueBrick(bs, tl);
+      brickBackoff(bs);
+    })
     .finally(() => { bs.inflight--; pumpBrickFetches(bs); });
 }
 
-// Drain queued requests into fetches, bounded by inflight + free cache slots.
-// When the cache is full we wait for the touch walk to evict rather than evict
-// blind here (it lacks the current visible cut).
+// Drain queued requests into fetches, coalescing bricks with nearby ids (i.e.
+// nearby file offsets) into single Range requests — far fewer, larger fetches
+// instead of thousands of tiny per-brick ones, which is what triggers Hub rate
+// limiting through the Space proxy. Bounded by inflight groups + free cache
+// slots; paused entirely during a backoff window. When the cache is full we wait
+// for the touch walk to evict rather than evict blind here (it lacks the current
+// visible cut).
 function pumpBrickFetches(bs) {
   if (bs.pending.size === 0) return;
-  for (const tl of [...bs.pending]) {
-    if (bs.inflight >= BRICK_MAX_INFLIGHT || bs.freeSlots.length === 0) break;
+  if (bs.backoffUntil && nowMs() < bs.backoffUntil) return; // rate-limited: hold off
+  // Snapshot fetchable leaves (still occupied-not-resident) with their brick ids.
+  const items = [];
+  for (const tl of bs.pending) {
     if (leafState(bs, tl) !== 1) { bs.pending.delete(tl); continue; }
-    bs.pending.delete(tl);
-    loadBrick(bs, tl);
+    const id = leafRgb(bs, tl);
+    if (!id) { bs.pending.delete(tl); continue; }
+    items.push([id, tl]);
+  }
+  if (items.length === 0) return;
+  items.sort((a, b) => a[0] - b[0]); // ascending brick id → contiguous file order
+  let i = 0;
+  while (i < items.length) {
+    if (bs.inflight >= BRICK_MAX_INFLIGHT || bs.freeSlots.length === 0) break;
+    const group = [items[i]];
+    let j = i + 1;
+    while (
+      j < items.length &&
+      items[j][0] - group[group.length - 1][0] <= COALESCE_GAP &&
+      items[j][0] - group[0][0] + 1 <= COALESCE_MAX_BRICKS
+    ) {
+      group.push(items[j]); j++;
+    }
+    for (const [, tl] of group) bs.pending.delete(tl);
+    loadBrickRange(bs, group);
+    i = j;
   }
 }
 

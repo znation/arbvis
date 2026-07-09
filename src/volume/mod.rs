@@ -42,9 +42,12 @@ const CHUNK: u64 = 4 * 1024 * 1024;
 
 /// The dense `volume.bin` (coarse fallback LOD + CPU pick/histogram buffer) is
 /// capped at this side so the mandatory up-front download stays small and fixed
-/// (128³·4 ≈ 8 MiB) regardless of the requested detail resolution. Detail finer
-/// than this streams on demand from the sparse brick pool.
-pub(crate) const COARSE_CAP: u32 = 128;
+/// (256³·4 ≈ 64 MiB for a full cube; far smaller for the thin, aspect-preserving
+/// boxes structured layouts produce) regardless of the requested detail
+/// resolution. Detail finer than this streams on demand from the sparse brick
+/// pool. Sized so the always-resident fallback is already reasonably sharp — a
+/// stall or slow stream degrades to a legible 256³ image, not an 128³ blur.
+pub(crate) const COARSE_CAP: u32 = 256;
 
 /// Peak slab-buffer budget for the streamed structured path. The driver picks a
 /// brick-aligned `slab_depth` so `ex·ey·slab_depth·size_of::<VoxelCell>()` stays
@@ -1075,9 +1078,9 @@ mod tests {
         reg.voxel.register_renderer(Arc::new(TestVox));
 
         let dir = tempfile::tempdir().unwrap();
-        // grid_side 80 → TestVolPlugin box [80, 160, 40]; max 160 > COARSE_CAP(128)
-        // ⇒ streamed. ~512k cells (2 MiB) keeps the test cheap.
-        let grid_side = 80u32;
+        // grid_side 130 → TestVolPlugin box [130, 260, 65]; max 260 > COARSE_CAP(256)
+        // ⇒ streamed. Just over the cap keeps the coarse grid + slab buffer cheap.
+        let grid_side = 130u32;
         render_volume(
             vec![buffered(vec![0u8; 16])],
             16,
@@ -1094,7 +1097,7 @@ mod tests {
         .await
         .unwrap();
 
-        let full_extent = [grid_side, grid_side * 2, grid_side / 2]; // [80,160,40]
+        let full_extent = [grid_side, grid_side * 2, grid_side / 2]; // [130,260,65]
         let meta: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.path().join("meta.json")).unwrap()).unwrap();
 
@@ -1115,7 +1118,7 @@ mod tests {
             ce[1].as_u64().unwrap() as u32,
             ce[2].as_u64().unwrap() as u32,
         ];
-        assert_eq!(ge, [64, 128, 32], "coarse grid preserves 2:4:1 aspect at cap 128");
+        assert_eq!(ge, [128, 256, 64], "coarse grid preserves 2:4:1 aspect at cap 256");
         assert!(ge.iter().max().unwrap() <= &COARSE_CAP);
         let vol = std::fs::read(dir.path().join("volume.bin")).unwrap();
         assert_eq!(

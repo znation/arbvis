@@ -225,13 +225,13 @@ pub struct Args {
     three_d: bool,
 
     /// 3D target detail resolution: the voxel grid side (a power of two,
-    /// 2–16384, default 2048). Higher is more detailed. Above `COARSE_CAP` (128)
+    /// 2–16384, default 1024). Higher is more detailed. Above `COARSE_CAP` (128)
     /// the up-front download stays small and fixed — a coarse `COARSE_CAP`³
     /// fallback plus a sparse octree — while the fine detail streams on demand
     /// from a brick pool as you pan/zoom. The octree page structure is
     /// O(occupied), so raising `N` costs more disk on the host but not a bigger
     /// download, client RAM, or VRAM. Ignored in 2D mode.
-    #[arg(long, default_value_t = 2048)]
+    #[arg(long, default_value_t = 1024)]
     grid: u32,
 
     /// Advanced 3D override (power of two, 8–8192): hand-tune the coarse/detail
@@ -1030,7 +1030,7 @@ mod grid_validation_tests {
     #[test]
     fn grid_cap_raised_to_16384() {
         assert!(validate_grid(16384).is_ok());
-        assert!(validate_grid(2048).is_ok()); // the default
+        assert!(validate_grid(1024).is_ok()); // the default
         assert!(validate_grid(32768).is_err()); // above the cap
         assert!(validate_grid(768).is_err()); // not a power of two
     }

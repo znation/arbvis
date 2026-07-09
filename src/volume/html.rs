@@ -572,9 +572,16 @@ const fbFrag = `
   precision highp float;
   precision highp sampler3D;
   uniform sampler3D uNodePool;
+  uniform sampler3D uCoarse;      // dense low-res fallback — occlusion proxy
   uniform float uBrick, uTreeDepth;
   uniform int uSteps;
   uniform vec3 uSize, uVolDim, uNodePoolDim;
+  // Kept in sync with volFrag each probe so occlusion matches what's rendered.
+  uniform float uOpacity, uGamma, uThreshold, uNorm;
+  uniform int uSource, uDirectColor;
+  // Screen-space LOD: only demand bricks nearer than this ray-t (their projected
+  // footprint is ≥ LOD_MIN_FB_PX). Beyond it a brick is too small → stays coarse.
+  uniform float uLodMaxT;
   in vec3 vOrigin;
   in vec3 vDirection;
   out vec4 fragColor;
@@ -619,8 +626,11 @@ const fbFrag = `
     vec3 dir = normalize(vDirection);
     vec2 bounds = hitBox(vOrigin, dir);
     if (bounds.x > bounds.y) { fragColor = vec4(0.0); return; }
-    float t = max(bounds.x, 0.0);
+    float t = max(bounds.x, 0.0);           // vOrigin is the camera in box space → t is camera distance
     float stepLen = (bounds.y - t) / float(uSteps);
+    float denom = max(1e-4, 1.0 - uThreshold);
+    float acc = 0.0;                        // accumulated opacity (occlusion), mirrors volFrag
+    bool sawSurface = false;                // hit visible occupied content along this ray?
     for (int i = 0; i < 1024; i++) {
       if (t >= bounds.y) break;
       vec3 uvw = (vOrigin + t * dir) / uSize + 0.5;
@@ -634,7 +644,12 @@ const fbFrag = `
         t = max(tnext, t + stepLen) + 1e-4;
         continue;
       }
-      if (state == 1u) {
+      // Occupied. Demand this leaf only if it's a *visible* miss: not resident,
+      // large enough on screen (within the LOD distance), and reached before the
+      // ray goes opaque. The front surface is always demanded (acc still 0 there);
+      // bricks behind an opaque front, or too small to see, are skipped — so the
+      // working set tracks what's on screen, not the data's full occluded depth.
+      if (state == 1u && t <= uLodMaxT) {
         // Report the leaf's node-pool texel (linearized, +1) so the CPU can read
         // its brick id and flip exactly this texel resident.
         uint tl = uint(texel.x) + uint(texel.y) * uint(uNodePoolDim.x)
@@ -644,9 +659,19 @@ const fbFrag = `
                          float((v >> 16u) & 255u) / 255.0, float((v >> 24u) & 255u) / 255.0);
         return;
       }
-      t += stepLen; // resident → keep walking to find the first miss behind it
+      // Resident, or a too-small brick left coarse: visible surface content that
+      // needs no fetch. Fold its coarse opacity into acc so we can stop once the
+      // ray is effectively opaque (the probe's analog of volFrag's early-ray
+      // termination at acc.a ≥ 0.9). All-ones = "sharp" sentinel (0 = no surface).
+      sawSurface = true;
+      vec4 cs = texture(uCoarse, uvw);
+      float dd = (uDirectColor == 1) ? cs.a : ((uSource == 0) ? cs.g : cs.b);
+      dd = max(0.0, dd - uThreshold) / denom;
+      acc += (1.0 - acc) * clamp(pow(dd, uGamma) * uOpacity * uNorm, 0.0, 1.0);
+      if (acc >= 0.9) { fragColor = vec4(1.0); return; } // opaque → resolved, no miss behind
+      t += stepLen;
     }
-    fragColor = vec4(0.0);
+    fragColor = sawSurface ? vec4(1.0) : vec4(0.0); // resolved surface vs empty/background ray
   }`;
 
 // ---- threshold re-normalization ---------------------------------------------
@@ -952,6 +977,18 @@ const BACKOFF_MIN_MS = 800;                                  // first pause afte
 const BACKOFF_MAX_MS = 20000;                                // ceiling for the decorrelated-jitter backoff
 const FB_DIV = 8;                                            // feedback target = drawing buffer / FB_DIV
 const FB_EVERY = 2;                                          // probe at most every N frames
+// Screen-space LOD gate: a finest brick that projects to fewer than this many
+// feedback-buffer texels is left coarse (never demanded). Far/tiny detail is
+// invisible, so streaming it only churns the bounded cache. 1 fb texel ≈ FB_DIV
+// device px, so 0.6 ≈ a ~5px brick. This bounds the *lateral* working set.
+const LOD_MIN_FB_PX = 0.6;
+// Thrash backstop (all wall-clock, so it's independent of frame rate and of how
+// bursty brick arrivals are). The signal that the working set can't fit: the
+// cache is full AND the probe still reports visible misses AND the camera has
+// settled — a fitting view drains its misses to zero and never pins the cache.
+const THRASH_SETTLE_MS = 700;   // camera must be still this long before we judge
+const THRASH_SUSTAIN_MS = 1200; // …and stay over-subscribed this long → cap zoom-in
+const THRASH_RELAX_MS = 2500;   // once calm this long, ease the cap back out a step
 const brickDebug = location.search.includes('debug');
 const nowMs = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 const _tNdc = new THREE.Vector2();
@@ -968,7 +1005,9 @@ function setupBrickStream(bm, nodeTex, brickTex, nodePool, size) {
   // it never re-requests a brick that already arrived). Coarse step count — it
   // only needs to find the first miss, not integrate color.
   const fbMat = new THREE.ShaderMaterial({
-    glslVersion: THREE.GLSL3, side: THREE.BackSide,
+    // NoBlending: the probe encodes leaf ids / sentinels directly in RGBA8, so the
+    // fragment must land verbatim — alpha blending would zero low-alpha misses.
+    glslVersion: THREE.GLSL3, side: THREE.BackSide, blending: THREE.NoBlending,
     uniforms: {
       uNodePool: { value: nodeTex },
       uNodePoolDim: { value: new THREE.Vector3(bm.tree_dim[0], bm.tree_dim[1], bm.tree_dim[2]) },
@@ -976,6 +1015,11 @@ function setupBrickStream(bm, nodeTex, brickTex, nodePool, size) {
       uBrick: { value: bm.brick }, uSteps: { value: 128 },
       uSize: { value: new THREE.Vector3(size[0], size[1], size[2]) },
       uVolDim: { value: new THREE.Vector3(bm.vol_dim[0], bm.vol_dim[1], bm.vol_dim[2]) },
+      // Synced from volMat each probe (runFeedback); placeholders until then.
+      uCoarse: { value: null },
+      uOpacity: { value: 1 }, uGamma: { value: 1 }, uThreshold: { value: 0 }, uNorm: { value: 1 },
+      uSource: { value: 0 }, uDirectColor: { value: 0 },
+      uLodMaxT: { value: 1e9 }, // no gate until computed
     },
     vertexShader: volVert, fragmentShader: fbFrag,
   });
@@ -990,13 +1034,24 @@ function setupBrickStream(bm, nodeTex, brickTex, nodePool, size) {
     nodeTex, brickTex, nodePool,
     treeDim: bm.tree_dim, treeDepth: bm.tree_depth,
     vol: bm.vol_dim,
-    fbScene, fbTarget, fbBuf: null,
+    fbScene, fbMat, fbTarget, fbBuf: null,
+    // Screen-space LOD distance (ray-t beyond which finest bricks are too small),
+    // recomputed each frame from the camera + feedback-buffer size.
+    lodMaxT: 1e9,
+    // Thrash backstop: wall-clock timestamps for the over-subscription streak, the
+    // calm streak, and the last camera move; plus the zoom-cap flag.
+    thrashMs: 0, calmMs: 0, lastMoveMs: 0, zoomCapped: false,
+    // Honest progress (instantaneous, distinct-leaf; smoothed): visible-resident
+    // and visible-total sampled by the touch walk within the LOD distance.
+    wsResident: 0, wsTotal: 0,
+    // Windowed upload rate for the ETA (bricks/sec), sampled in updateBgHud.
+    rate: 0, rateLoaded: 0, rateMs: 0,
     resident: new Map(),        // leaf texel tl → { slot, lastUsed, id }
     freeSlots, inflight: 0, pending: new Set(),
     // Activity-HUD accounting. inflightBricks tracks bricks (not block requests) in
-    // flight so "outstanding" stays in brick units; sessionResolved counts bricks that
-    // landed since the current sharpening session began (reset on each idle→active edge).
-    inflightBricks: 0, sessionResolved: 0, sessionStartMs: 0,
+    // flight so "outstanding" stays in brick units; sessionStartMs marks the current
+    // sharpening session (idle→active edge) for the ETA rate window.
+    inflightBricks: 0, sessionStartMs: 0,
     frame: 0, fbFrame: -100, probeIdle: true, glDirty: false,
     backoffUntil: 0, backoffMs: 0, // pause fetches after a 429/5xx (decorrelated jitter)
     stats: { requested: 0, evicted: 0, bytes: 0, loaded: 0 },
@@ -1097,7 +1152,6 @@ function uploadBrick(bs, tl, id, data) {
   texSub3D(bs, bs.brickTex, sx * b, sy * b, sz * b, b, b, b, data);
   bs.resident.set(tl, { slot, lastUsed: bs.frame, id });
   writeLeaf(bs, tl, 2, slot);
-  bs.sessionResolved++; // for the activity-HUD progress fraction this sharpening session
   bs.stats.loaded++;    // cumulative "total loaded" counter (survives session resets/eviction)
   volumeDirty = true; // a brick landed — re-probe (more may be needed behind it)
 }
@@ -1200,16 +1254,29 @@ function pumpBrickFetches(bs) {
 
 // Decode the feedback target: each pixel is (leaf texel + 1) of the first miss
 // along its ray, little-endian RGBA8 (0 = no miss). Enqueue unique misses.
+const FB_SHARP = 0xffffffff; // all-ones sentinel: ray hit visible surface, fully resolved
 function processFeedback(bs, buf) {
-  let added = 0;
+  let added = 0, sharp = 0, miss = 0;
   for (let i = 0; i < buf.length; i += 4) {
     const v = (buf[i] | (buf[i + 1] << 8) | (buf[i + 2] << 16) | (buf[i + 3] << 24)) >>> 0;
-    if (v === 0) continue;
+    if (v === 0) continue;          // empty/background ray — not part of the surface
+    if (v === FB_SHARP) { sharp++; continue; } // resolved visible surface
+    miss++;                          // blurry pixel: a visible brick still needs fetching
     const tl = v - 1;
     if (leafState(bs, tl) !== 1 || bs.pending.has(tl)) continue;
     bs.pending.add(tl);
     bs.stats.requested++;
     added++;
+  }
+  // Honest, perceptual progress: fraction of on-screen surface pixels already at
+  // full resolution. Occlusion-correct (the probe culls hidden bricks) and free
+  // of re-fetch inflation (it counts pixels, not brick loads). EMA-smoothed to
+  // steady the readout across the sparse per-probe sampling.
+  const total = sharp + miss;
+  if (total > 0) {
+    const k = 0.4;
+    bs.wsResident += (sharp - bs.wsResident) * k;
+    bs.wsTotal += (total - bs.wsTotal) * k;
   }
   pumpBrickFetches(bs);
   // Converge: keep probing while there's outstanding work; otherwise fall quiet
@@ -1226,6 +1293,20 @@ function runFeedback(bs) {
   const fw = Math.max(1, Math.ceil(renderer.domElement.width / FB_DIV));
   const fh = Math.max(1, Math.ceil(renderer.domElement.height / FB_DIV));
   if (bs.fbTarget.width !== fw || bs.fbTarget.height !== fh) bs.fbTarget.setSize(fw, fh);
+  // Mirror the render's opacity pipeline + coarse texture so the probe's
+  // occlusion matches what volFrag actually composites, and hand it the current
+  // LOD distance (screen-space brick-size gate).
+  const fu = bs.fbMat.uniforms, vu = bs.volMat && bs.volMat.uniforms;
+  if (vu) {
+    fu.uCoarse.value = vu.uCoarse.value;
+    fu.uOpacity.value = vu.uOpacity.value;
+    fu.uGamma.value = vu.uGamma.value;
+    fu.uThreshold.value = vu.uThreshold.value;
+    fu.uNorm.value = vu.uNorm.value;
+    fu.uSource.value = vu.uSource.value;
+    fu.uDirectColor.value = vu.uDirectColor.value;
+  }
+  fu.uLodMaxT.value = bs.lodMaxT;
   const prevTarget = renderer.getRenderTarget();
   renderer.setRenderTarget(bs.fbTarget);
   renderer.setClearColor(0x000000, 0); // outside-box / no-miss rays read back as 0
@@ -1246,11 +1327,13 @@ function runFeedback(bs) {
 }
 
 // Coarse CPU march over the page-state mirror along a grid of view rays: stamp
-// resident bricks seen as in-cut (lastUsed, for LRU), and lightly prefetch the
-// nearest not-resident bricks just ahead. Then evict LRU non-cut bricks if the
-// cache is over its soft cap. Cheap (≈ RAYS² · steps state lookups, no GPU).
+// the resident bricks that are actually on screen (within the LOD distance) as
+// in-cut so they survive the LRU sweep, then evict LRU non-cut bricks if the
+// cache is over its soft cap. Demand is left entirely to the GPU feedback probe
+// (which culls by occlusion + screen-space size); this walk only decides what to
+// KEEP. Cheap (≈ RAYS² · steps state lookups, no GPU).
 function touchAndEvictBricks(bs) {
-  const sz = bs.size, vd = bs.vol, brick = bs.brick;
+  const sz = bs.size, vd = bs.vol, brick = bs.brick, lodMaxT = bs.lodMaxT;
   const cut = new Set();
   camera.updateMatrixWorld();
   const RAYS = 28, STEPS = 96;
@@ -1269,8 +1352,12 @@ function touchAndEvictBricks(bs) {
       }
       let t = Math.max(tmin, 0);
       if (tmax < t) continue;
-      const dt = (tmax - t) / STEPS;
-      let pre = 0;
+      // Only walk as far as the LOD horizon: bricks beyond it render coarse, so
+      // keeping their fine copies resident just wastes cache. rd is unit-length,
+      // so t is the camera distance and directly comparable to lodMaxT.
+      const tend = Math.min(tmax, lodMaxT);
+      const dt = (tend - t) / STEPS;
+      if (dt <= 0) continue;
       for (let s = 0; s < STEPS; s++, t += dt) {
         const ux = (ro.x + rd.x * t) / sz[0] + 0.5;
         const uy = (ro.y + rd.y * t) / sz[1] + 0.5;
@@ -1279,17 +1366,14 @@ function touchAndEvictBricks(bs) {
         const cx = (ux * vd[0] / brick) | 0, cy = (uy * vd[1] / brick) | 0, cz = (uz * vd[2] / brick) | 0;
         const tl = descendCell(bs, cx, cy, cz); // octree leaf texel, or -1 empty
         if (tl < 0) continue;
-        const st = bs.nodePool[tl * 4 + 3];
-        if (st === 2) {
+        if (bs.nodePool[tl * 4 + 3] === 2) {
           const e = bs.resident.get(tl);
           if (e) { e.lastUsed = bs.frame; cut.add(tl); }
-        } else if (st === 1 && pre < 3 && !bs.pending.has(tl)) {
-          bs.pending.add(tl); bs.stats.requested++; pre++;
         }
       }
     }
   }
-  pumpBrickFetches(bs);
+  pumpBrickFetches(bs); // keep draining queued misses every frame, not just on probe/fetch completion
   if (bs.resident.size > BRICK_CACHE_SOFT) {
     const ev = [];
     for (const [tl, e] of bs.resident) if (!cut.has(tl)) ev.push([tl, e.lastUsed]);
@@ -1301,15 +1385,65 @@ function touchAndEvictBricks(bs) {
   }
 }
 
+// Ray-t (camera distance) beyond which a finest brick projects to fewer than
+// LOD_MIN_FB_PX feedback-buffer texels. Everything nearer is demanded at full
+// resolution; everything past it stays coarse. Recomputed each frame since it
+// depends on the feedback-buffer height and the camera fov.
+function computeLodMaxT(bs) {
+  const fh = Math.max(1, Math.ceil(renderer.domElement.height / FB_DIV));
+  const pxPerUnit = (fh * 0.5) / Math.tan(camera.fov * Math.PI / 360); // world unit → fb px at distance 1
+  const s = bs.size, v = bs.vol, b = bs.brick;
+  const ew = Math.max(s[0] * b / v[0], s[1] * b / v[1], s[2] * b / v[2]); // finest brick world edge
+  return (ew * pxPerUnit) / LOD_MIN_FB_PX;
+}
+
+// Detect an over-subscribed view — the visible working set exceeds the cache, so
+// we evict bricks we immediately re-demand and never converge — and, keeping the
+// always-finest intent, cap zoom-in (raise controls.minDistance to the current
+// distance) so the view can't get any deeper into the un-fittable regime. Ease
+// the cap back out once the stream stays calm (e.g. the user zoomed out again).
+// Wall-clock throughout so it doesn't depend on frame rate or arrival burstiness.
+function updateThrashCap(bs) {
+  const t = nowMs();
+  const settled = (t - bs.lastMoveMs) > THRASH_SETTLE_MS; // not mid-zoom/pan
+  // Cache full + visible misses still outstanding while settled ⇒ can't all fit.
+  const oversub = settled && bs.resident.size >= BRICK_CACHE_SOFT && bs.pending.size > 0;
+  if (oversub) {
+    bs.calmMs = 0;
+    if (bs.thrashMs === 0) bs.thrashMs = t;
+    else if (t - bs.thrashMs > THRASH_SUSTAIN_MS) {
+      const d = camera.position.distanceTo(controls.target);
+      if (!bs.zoomCapped || d > controls.minDistance) {
+        controls.minDistance = d; // can't dolly any closer than where it stopped fitting
+        bs.zoomCapped = true;
+        if (brickDebug) console.warn('zoom capped at distance', d.toFixed(3), '- working set exceeds cache');
+      }
+      bs.thrashMs = t; // re-arm so a further move deeper can tighten the cap again
+    }
+  } else {
+    bs.thrashMs = 0;
+    if (bs.zoomCapped) {
+      if (bs.calmMs === 0) bs.calmMs = t;
+      else if (t - bs.calmMs > THRASH_RELAX_MS) {
+        controls.minDistance *= 0.85; // let a sparser region sharpen fully again
+        bs.calmMs = t;
+        if (controls.minDistance < 0.02) { controls.minDistance = 0; bs.zoomCapped = false; }
+      }
+    }
+  }
+}
+
 // Per-frame brick streaming step (called from tick before the main render).
 function streamBricks() {
   const bs = brickStream;
   if (!bs || !volMesh) return; // volume is always part of the unified view now
   bs.frame++;
+  bs.lodMaxT = computeLodMaxT(bs);
   if ((volumeDirty || bs.pending.size > 0) && bs.probeIdle && (bs.frame - bs.fbFrame) >= FB_EVERY) {
     runFeedback(bs);
   }
   if (bs.pending.size > 0 || bs.resident.size > BRICK_CACHE_SOFT) touchAndEvictBricks(bs);
+  updateThrashCap(bs);
   // Raw-GL writes this frame left three's binding cache stale — clear it once
   // before the next draw (cheaper than resetting per texSubImage3D).
   if (bs.glDirty) { renderer.resetState(); bs.glDirty = false; }
@@ -1341,14 +1475,29 @@ function updateBgHud() {
   const backoff = bs.backoffUntil && nowMs() < bs.backoffUntil;
   const active = outstanding > 0 || bs.inflight > 0 || backoff;
 
-  // An idle→active edge starts a fresh sharpening "session" (progress denominator).
-  if (active && bs.sessionStartMs === 0) { bs.sessionStartMs = nowMs(); bs.sessionResolved = 0; }
+  // An idle→active edge starts a fresh sharpening "session" (for the ETA rate).
+  if (active && bs.sessionStartMs === 0) {
+    bs.sessionStartMs = nowMs(); bs.rateLoaded = bs.stats.loaded; bs.rateMs = nowMs(); bs.rate = 0;
+    bs.wsResident = 0; bs.wsTotal = 0; // repopulated by the next probe
+  }
 
   if (active) {
     bgFadeAt = 0; bgHideAt = 0;
     el.hidden = false; el.classList.remove('fading');
-    const denom = bs.sessionResolved + outstanding;
-    let pct = Math.max(0, Math.min(100, Math.round((denom > 0 ? bs.sessionResolved / denom : 0) * 100)));
+    // Windowed upload rate (bricks/sec) for the ETA — from the *distinct* load
+    // counter over the interval, EMA-smoothed, so it reflects real forward
+    // progress and decays toward 0 when the stream is only re-fetching.
+    const t = nowMs(), dt = (t - bs.rateMs) / 1000;
+    if (dt >= 0.15) {
+      const inst = Math.max(0, (bs.stats.loaded - bs.rateLoaded)) / dt;
+      bs.rate += (inst - bs.rate) * 0.3;
+      bs.rateLoaded = bs.stats.loaded; bs.rateMs = t;
+    }
+    // Progress = fraction of the visible surface already at full resolution
+    // (occlusion-correct, no re-fetch inflation). When the working set can't fit
+    // (zoom capped) it honestly plateaus below 100 instead of pinning at 99.
+    let pct = bs.wsTotal > 0.5 ? Math.round((bs.wsResident / bs.wsTotal) * 100) : (outstanding > 0 ? 0 : 100);
+    pct = Math.max(0, Math.min(100, pct));
     if (outstanding > 0 && pct >= 100) pct = 99; // reserve 100% for true quiescence (below)
     $('bg-bar').style.width = pct + '%';
     $('bg-pct').textContent = pct + '%';
@@ -1356,13 +1505,17 @@ function updateBgHud() {
       el.classList.add('warn');
       $('bg-title').textContent = 'waiting — rate-limited';
       $('bg-eta').textContent = 'retrying in ~' + fmtDur((bs.backoffUntil - nowMs()) / 1000);
+    } else if (bs.zoomCapped) {
+      // Working set exceeds the cache: this is as sharp as it gets here. No fake
+      // countdown — the queue never drains at this zoom.
+      el.classList.remove('warn');
+      $('bg-title').textContent = 'max detail — zoom out for more';
+      $('bg-eta').textContent = '';
     } else {
       el.classList.remove('warn');
       $('bg-title').textContent = 'sharpening…';
-      const elapsed = (nowMs() - bs.sessionStartMs) / 1000;
-      const rate = elapsed > 0 ? bs.sessionResolved / elapsed : 0; // bricks/sec
-      $('bg-eta').textContent = (bs.sessionResolved > 2 && rate > 0)
-        ? '~' + fmtDur(outstanding / rate) + ' left' : '—';
+      $('bg-eta').textContent = (bs.rate > 0.5)
+        ? '~' + fmtDur(outstanding / bs.rate) + ' left' : '—';
     }
     $('bg-counts').textContent =
       bs.inflight + ' active · ' + bs.pending.size + ' queued · ' +
@@ -1576,7 +1729,10 @@ function bindControls() {
 // ---- loop -------------------------------------------------------------------
 // Camera motion (incl. OrbitControls damping) re-arms the brick-streaming
 // feedback probe.
-controls.addEventListener('change', () => { volumeDirty = true; });
+controls.addEventListener('change', () => {
+  volumeDirty = true;
+  if (brickStream) brickStream.lastMoveMs = nowMs(); // gates the thrash/zoom-cap check
+});
 
 // Depth-correct compositing in three passes (see the "hybrid compositing" block):
 //   1. opaque edges (layer 0) → sceneTarget (color + depth)

@@ -357,8 +357,9 @@ impl CoarseAcc {
                 out[dst] = (self.sr[ci] / w).round().clamp(0.0, 255.0) as u8;
                 out[dst + 1] = (self.sg[ci] / w).round().clamp(0.0, 255.0) as u8;
                 out[dst + 2] = (self.sb[ci] / w).round().clamp(0.0, 255.0) as u8;
-                out[dst + 3] =
-                    (self.asum[ci] / self.n[ci] as f64).round().clamp(0.0, 255.0) as u8;
+                out[dst + 3] = (self.asum[ci] / self.n[ci] as f64)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
             }
         }
         out
@@ -430,7 +431,11 @@ mod tests {
             px[0] = (next() % 256) as u8;
             px[1] = (next() % 256) as u8;
             px[2] = (next() % 256) as u8;
-            px[3] = if next() % 3 == 0 { 0 } else { (next() % 255 + 1) as u8 };
+            px[3] = if next() % 3 == 0 {
+                0
+            } else {
+                (next() % 255 + 1) as u8
+            };
         }
         let reference = downsample_rgba(&g, full, coarse);
 
@@ -444,7 +449,11 @@ mod tests {
             }
             acc.add_slab(&slab, z0, z1);
         }
-        assert_eq!(acc.finish(), reference, "slab accumulation == full downsample");
+        assert_eq!(
+            acc.finish(),
+            reference,
+            "slab accumulation == full downsample"
+        );
     }
 
     #[test]
@@ -458,4 +467,3 @@ mod tests {
         assert_eq!(out, vec![100, 0, 0, 100, /*|*/ 50, 0, 0, 50]);
     }
 }
-

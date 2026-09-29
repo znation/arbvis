@@ -81,7 +81,10 @@ struct Octree {
 
 impl Octree {
     fn new(depth: u32) -> Self {
-        Octree { nodes: vec![[0u32; 8]], depth }
+        Octree {
+            nodes: vec![[0u32; 8]],
+            depth,
+        }
     }
 
     /// Insert an occupied brick at cell `(cx, cy, cz)` (in brick coords) with the
@@ -131,7 +134,11 @@ impl Octree {
                 if e == 0 {
                     continue;
                 }
-                let (ox, oy, oz) = (octant as u32 & 1, (octant as u32 >> 1) & 1, (octant as u32 >> 2) & 1);
+                let (ox, oy, oz) = (
+                    octant as u32 & 1,
+                    (octant as u32 >> 1) & 1,
+                    (octant as u32 >> 2) & 1,
+                );
                 let (tx, ty, tz) = (bx * 2 + ox, by * 2 + oy, bz * 2 + oz);
                 let ti = ((tx + ty * tw + tz * tw * th) as usize) * 4;
                 let (payload, state) = if e & LEAF_BIT != 0 {
@@ -223,7 +230,11 @@ impl BrickVolume {
     #[cfg(test)]
     pub fn atlas_bricks(&self) -> [u32; 3] {
         let bs = BRICK + 2 * self.apron;
-        [self.atlas_dim[0] / bs, self.atlas_dim[1] / bs, self.atlas_dim[2] / bs]
+        [
+            self.atlas_dim[0] / bs,
+            self.atlas_dim[1] / bs,
+            self.atlas_dim[2] / bs,
+        ]
     }
 }
 
@@ -271,7 +282,8 @@ pub fn build_brick_volume(rgba: &[u8], extent: [u32; 3], brick: u32) -> BrickVol
     let [ax, ay, az] = atlas_dims_bricks(occupied);
     let atlas_dim = [ax * bs, ay * bs, az * bs];
     let (adx, ady) = (atlas_dim[0] as usize, atlas_dim[1] as usize);
-    let mut atlas = vec![0u8; (atlas_dim[0] as usize) * (atlas_dim[1] as usize) * (atlas_dim[2] as usize) * 4];
+    let mut atlas =
+        vec![0u8; (atlas_dim[0] as usize) * (atlas_dim[1] as usize) * (atlas_dim[2] as usize) * 4];
 
     // Pass 2: fill each occupied brick's slot from the dense grid, including the
     // apron border (neighbor voxels, or transparent past the grid edge / into
@@ -399,7 +411,10 @@ impl StreamBrickAgg {
         z1: u32,
         writer: &mut W,
     ) -> std::io::Result<()> {
-        debug_assert!(z0.is_multiple_of(self.brick), "slab boundary must be brick-aligned");
+        debug_assert!(
+            z0.is_multiple_of(self.brick),
+            "slab boundary must be brick-aligned"
+        );
         let [ex, ey, _] = self.extent;
         let (exs, eys) = (ex as usize, ey as usize);
         let brick = self.brick;
@@ -471,7 +486,7 @@ impl StreamBrickAgg {
         );
         BrickVolume {
             atlas: Vec::new(),
-            atlas_dim: [0, 0, 0], // streamed: bricks.bin is a flat block array
+            atlas_dim: [0, 0, 0],   // streamed: bricks.bin is a flat block array
             page_table: Vec::new(), // streamed uses the octree node pool instead
             page_dim: pb,
             vol_dim: self.extent,
@@ -526,7 +541,7 @@ pub struct BrickBuilder<W: Write> {
     brick_buf: Vec<u8>, // reusable B³·4-byte staging buffer for one brick
     io_err: Option<std::io::Error>, // first write error, surfaced at finish_streaming
     open: Vec<VoxelAcc>, // accumulators for the current open brick (B³)
-    cur_hidx: i128,    // Hilbert index of the open brick (-1 = none)
+    cur_hidx: i128,     // Hilbert index of the open brick (-1 = none)
     cur_origin: [u32; 3],
     occupied: u32,
     max_count: u64,
@@ -670,8 +685,8 @@ impl<W: Write> BrickBuilder<W> {
             [side, side, side],
         );
         let bv = BrickVolume {
-            atlas: Vec::new(), // bricks were streamed to `writer` (bricks.bin)
-            atlas_dim: [0, 0, 0], // streamed: bricks.bin is a flat block array
+            atlas: Vec::new(),      // bricks were streamed to `writer` (bricks.bin)
+            atlas_dim: [0, 0, 0],   // streamed: bricks.bin is a flat block array
             page_table: Vec::new(), // streamed uses the octree node pool instead
             page_dim: self.page_dim,
             vol_dim: [side, side, side],
@@ -728,7 +743,12 @@ mod tests {
         );
         let di = ((axx + ayy * adx + azz * adx * ady) * 4) as usize;
         let _ = extent;
-        [bv.atlas[di], bv.atlas[di + 1], bv.atlas[di + 2], bv.atlas[di + 3]]
+        [
+            bv.atlas[di],
+            bv.atlas[di + 1],
+            bv.atlas[di + 2],
+            bv.atlas[di + 3],
+        ]
     }
 
     #[test]
@@ -743,7 +763,10 @@ mod tests {
         // A voxel in a different (empty) brick is empty.
         assert_eq!(sample(&bv, extent, 31, 31, 31), [0, 0, 0, 0]);
         // A different voxel in the SAME brick is transparent (only the one set).
-        assert_eq!(sample(&bv, extent, 0, 0, 8 /* brick (0,0,1) */), [0, 0, 0, 0]);
+        assert_eq!(
+            sample(&bv, extent, 0, 0, 8 /* brick (0,0,1) */),
+            [0, 0, 0, 0]
+        );
     }
 
     #[test]
@@ -777,7 +800,11 @@ mod tests {
             // recompute expected from grid (a later write to the same voxel wins)
             let i = ((pos.0 + pos.1 * 16 + pos.2 * 16 * 16) * 4) as usize;
             let exp = [g[i], g[i + 1], g[i + 2], g[i + 3]];
-            assert_eq!(sample(&bv, extent, pos.0, pos.1, pos.2), exp, "voxel {pos:?}");
+            assert_eq!(
+                sample(&bv, extent, pos.0, pos.1, pos.2),
+                exp,
+                "voxel {pos:?}"
+            );
             let _ = c;
         }
     }
@@ -787,7 +814,10 @@ mod tests {
         let extent = [16, 16, 16];
         let bv = build_brick_volume(&vec![0u8; 16 * 16 * 16 * 4], extent, BRICK);
         assert_eq!(bv.occupied, 0);
-        assert!(bv.page_table.iter().step_by(4).all(|&r| r == 0), "all cells empty");
+        assert!(
+            bv.page_table.iter().step_by(4).all(|&r| r == 0),
+            "all cells empty"
+        );
     }
 
     /// Descend the serialized **octree** node pool exactly as the shader/JS will,
@@ -833,7 +863,12 @@ mod tests {
         let bk = BRICK;
         let local = (x % bk + (y % bk) * bk + (z % bk) * bk * bk) as usize;
         let off = ((id as usize - 1) * (bk as usize).pow(3) + local) * 4;
-        [blocks[off], blocks[off + 1], blocks[off + 2], blocks[off + 3]]
+        [
+            blocks[off],
+            blocks[off + 1],
+            blocks[off + 2],
+            blocks[off + 3],
+        ]
     }
 
     #[test]
@@ -843,24 +878,43 @@ mod tests {
         let order_v = 5;
         let n = 1u64 << (3 * 4); // 4096 voxels
         let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256], Vec::new());
-        assert_eq!(b.open.len(), (BRICK as usize).pow(3), "accumulator is one brick");
+        assert_eq!(
+            b.open.len(),
+            (BRICK as usize).pow(3),
+            "accumulator is one brick"
+        );
         for h in 0..n {
             b.push(h, ((h & 0x7f) as u8) | 1); // byte > 0 ⇒ voxel occupied
         }
         let (bv, blocks) = b.finish_streaming().unwrap();
         assert!(bv.occupied >= 1);
-        assert!(bv.streamed, "the --volume-res path ships the streamable format");
+        assert!(
+            bv.streamed,
+            "the --volume-res path ships the streamable format"
+        );
         // bricks.bin is exactly `occupied` flat brick blocks (streamed to `blocks`).
-        assert!(bv.atlas.is_empty(), "streamed atlas lives on disk, not in the struct");
-        assert_eq!(blocks.len(), bv.occupied as usize * (BRICK as usize).pow(3) * 4);
+        assert!(
+            bv.atlas.is_empty(),
+            "streamed atlas lives on disk, not in the struct"
+        );
+        assert_eq!(
+            blocks.len(),
+            bv.occupied as usize * (BRICK as usize).pow(3) * 4
+        );
         // Every fed voxel reconstructs through the id page table + flat blocks.
         for h in 0..n {
             let v = hilbert_d2xyz(h, order_v);
-            assert!(sample_streamed(&bv, &blocks, v[0], v[1], v[2])[3] > 0, "h={h} should be occupied");
+            assert!(
+                sample_streamed(&bv, &blocks, v[0], v[1], v[2])[3] > 0,
+                "h={h} should be occupied"
+            );
         }
         // A voxel in an unfed (far) brick is empty.
         let far = hilbert_d2xyz((1u64 << (3 * order_v)) - 1, order_v);
-        assert_eq!(sample_streamed(&bv, &blocks, far[0], far[1], far[2]), [0, 0, 0, 0]);
+        assert_eq!(
+            sample_streamed(&bv, &blocks, far[0], far[1], far[2]),
+            [0, 0, 0, 0]
+        );
     }
 
     #[test]
@@ -875,10 +929,17 @@ mod tests {
             b.push(h, ((h & 0x7f) as u8) | 1);
         }
         let (bv, _) = b.finish_streaming().unwrap();
-        assert!(bv.streamed && bv.page_table.is_empty(), "streamed → octree, no flat page");
+        assert!(
+            bv.streamed && bv.page_table.is_empty(),
+            "streamed → octree, no flat page"
+        );
         assert_eq!(bv.tree_depth, order_v - BRICK.trailing_zeros());
         assert!(bv.node_count >= 1, "at least a root node");
-        assert_eq!(bv.node_pool_dim[0] % 2, 0, "node pool is 2 texels/node/axis");
+        assert_eq!(
+            bv.node_pool_dim[0] % 2,
+            0,
+            "node pool is 2 texels/node/axis"
+        );
 
         // Every fed voxel's brick descends to a valid, in-range id.
         let mut seen = std::collections::HashSet::new();
@@ -893,7 +954,10 @@ mod tests {
 
         // A far, unfed brick cell prunes to empty (0).
         let far = hilbert_d2xyz((1u64 << (3 * order_v)) - 1, order_v);
-        assert_eq!(descend_octree(&bv, far[0] / BRICK, far[1] / BRICK, far[2] / BRICK), 0);
+        assert_eq!(
+            descend_octree(&bv, far[0] / BRICK, far[1] / BRICK, far[2] / BRICK),
+            0
+        );
     }
 
     #[test]
@@ -912,10 +976,16 @@ mod tests {
         for h in 0..n {
             let v = hilbert_d2xyz(h, order_v);
             let id = descend_octree(&bv, v[0] / BRICK, v[1] / BRICK, v[2] / BRICK);
-            assert!(id >= 1 && id <= bv.occupied, "h={h} → id {id} out of range at depth 8");
+            assert!(
+                id >= 1 && id <= bv.occupied,
+                "h={h} → id {id} out of range at depth 8"
+            );
         }
         let far = hilbert_d2xyz((1u64 << (3 * order_v)) - 1, order_v);
-        assert_eq!(descend_octree(&bv, far[0] / BRICK, far[1] / BRICK, far[2] / BRICK), 0);
+        assert_eq!(
+            descend_octree(&bv, far[0] / BRICK, far[1] / BRICK, far[2] / BRICK),
+            0
+        );
     }
 
     #[test]
@@ -945,18 +1015,33 @@ mod tests {
         assert!(bv.streamed);
         assert_eq!(bv.apron, 0, "streamed bricks carry no apron border");
         assert_eq!(bv.vol_dim, extent, "vol_dim is the full anisotropic extent");
-        assert_eq!(bv.tree_depth, 3, "P = next_pow2(max([3,2,5])) = 8 → depth 3");
+        assert_eq!(
+            bv.tree_depth, 3,
+            "P = next_pow2(max([3,2,5])) = 8 → depth 3"
+        );
         assert_eq!(
             buf.len() as u32,
             bv.occupied * BRICK.pow(3) * 4,
             "bricks.bin is a flat occupied-block array"
         );
         for (p, c) in pts {
-            assert_eq!(sample_streamed(&bv, &buf, p.0, p.1, p.2), c, "voxel {p:?} round-trips verbatim");
+            assert_eq!(
+                sample_streamed(&bv, &buf, p.0, p.1, p.2),
+                c,
+                "voxel {p:?} round-trips verbatim"
+            );
         }
         // An empty brick and an out-of-page-range cell both prune to empty.
-        assert_eq!(sample_streamed(&bv, &buf, 16, 8, 8), [0, 0, 0, 0], "empty brick");
-        assert_eq!(descend_octree(&bv, 7, 7, 7), 0, "cell beyond any page dim prunes");
+        assert_eq!(
+            sample_streamed(&bv, &buf, 16, 8, 8),
+            [0, 0, 0, 0],
+            "empty brick"
+        );
+        assert_eq!(
+            descend_octree(&bv, 7, 7, 7),
+            0,
+            "cell beyond any page dim prunes"
+        );
     }
 
     #[test]
@@ -990,7 +1075,8 @@ mod tests {
     fn streamed_rgba_empty_grid_has_no_bricks() {
         let extent = [40u32, 40, 40];
         let mut buf = Vec::new();
-        let bv = build_streamed_brick_volume(&vec![0u8; 40 * 40 * 40 * 4], extent, BRICK, &mut buf).unwrap();
+        let bv = build_streamed_brick_volume(&vec![0u8; 40 * 40 * 40 * 4], extent, BRICK, &mut buf)
+            .unwrap();
         assert_eq!(bv.occupied, 0);
         assert!(bv.streamed && bv.atlas.is_empty() && buf.is_empty());
     }
@@ -1036,14 +1122,30 @@ mod tests {
         }
         let bv_slab = agg.finish();
 
-        assert_eq!(bv_slab.occupied, bv_full.occupied, "same occupied-brick count");
-        assert_eq!(buf_slab, buf_full, "slab bricking is byte-identical to one pass");
-        assert_eq!(bv_slab.node_pool, bv_full.node_pool, "octree node pool identical");
+        assert_eq!(
+            bv_slab.occupied, bv_full.occupied,
+            "same occupied-brick count"
+        );
+        assert_eq!(
+            buf_slab, buf_full,
+            "slab bricking is byte-identical to one pass"
+        );
+        assert_eq!(
+            bv_slab.node_pool, bv_full.node_pool,
+            "octree node pool identical"
+        );
         assert_eq!(bv_slab.node_pool_dim, bv_full.node_pool_dim);
-        assert_eq!(bv_slab.focus_center, bv_full.focus_center, "framing identical");
+        assert_eq!(
+            bv_slab.focus_center, bv_full.focus_center,
+            "framing identical"
+        );
         assert_eq!(bv_slab.focus_radius, bv_full.focus_radius);
         for (p, c) in pts {
-            assert_eq!(sample_streamed(&bv_slab, &buf_slab, p.0, p.1, p.2), c, "voxel {p:?}");
+            assert_eq!(
+                sample_streamed(&bv_slab, &buf_slab, p.0, p.1, p.2),
+                c,
+                "voxel {p:?}"
+            );
         }
     }
 
@@ -1057,7 +1159,10 @@ mod tests {
         let (bv, _) = b.finish_streaming().unwrap();
         assert_eq!(bv.occupied, 1);
         // Depth-5 tree, one leaf → 5 nodes on the path (root + 4 internal).
-        assert_eq!(bv.node_count, bv.tree_depth, "one leaf ⇒ one node per level");
+        assert_eq!(
+            bv.node_count, bv.tree_depth,
+            "one leaf ⇒ one node per level"
+        );
         assert!(
             (bv.node_count as usize) < 32 * 32 * 32,
             "node pool is O(path), not O(brick cells)"

@@ -150,7 +150,11 @@ pub async fn render_volume(
     };
     // The byte floor is a cube; override its extent to the (possibly capped)
     // coarse side so `volume.bin` stays small while detail streams.
-    let actual_extent = if is_byte { [dense_side; 3] } else { shape.grid_extent() };
+    let actual_extent = if is_byte {
+        [dense_side; 3]
+    } else {
+        shape.grid_extent()
+    };
     let [ex, ey, ez] = actual_extent;
     let color_mode = if is_byte { "lut" } else { "rgb" };
     // Structured layouts above the coarse cap now stream too (like the byte path):
@@ -169,7 +173,11 @@ pub async fn render_volume(
         log::info!(
             "Rendering structured `{}` 3D volume into a {ex}×{ey}×{ez} voxel box{}...",
             shape.id(),
-            if structured_streamed { " (streamed)" } else { "" }
+            if structured_streamed {
+                " (streamed)"
+            } else {
+                ""
+            }
         );
     }
 
@@ -189,7 +197,15 @@ pub async fn render_volume(
         if is_byte {
             // Byte volumes are cubes (Hilbert needs equal sides); all three
             // axes match, so the cube side is `ex`.
-            aggregate_bytes_hilbert(sources, total, ex, volume_res, pixel_lut, rt, &out_dir_build)
+            aggregate_bytes_hilbert(
+                sources,
+                total,
+                ex,
+                volume_res,
+                pixel_lut,
+                rt,
+                &out_dir_build,
+            )
         } else {
             aggregate_entities(
                 sources,
@@ -377,7 +393,11 @@ fn aggregate_bytes_hilbert(
     } else {
         0
     };
-    let cells_v: u128 = if order_v > 0 { 1u128 << (3 * order_v) } else { 0 };
+    let cells_v: u128 = if order_v > 0 {
+        1u128 << (3 * order_v)
+    } else {
+        0
+    };
     // The streamed brick pool writes each finished brick straight to bricks.bin
     // (append-only, O(one brick) RAM) as the Hilbert curve advances.
     let mut brick_builder = if order_v > 0 {
@@ -878,7 +898,10 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.path().join("meta.json")).unwrap()).unwrap();
         let bm = &meta["bricks"];
         assert_eq!(bm["streamed"], true, "--volume-res ships the streamed pool");
-        assert_eq!(bm["vol_dim"][0], 16, "octree sized to the virtual resolution");
+        assert_eq!(
+            bm["vol_dim"][0], 16,
+            "octree sized to the virtual resolution"
+        );
         assert_eq!(bm["tree_depth"], 1, "depth = log2(16 / brick=8) = 1");
         let occupied = bm["occupied"].as_u64().unwrap();
         assert!(occupied > 0, "some bricks are occupied");
@@ -887,13 +910,23 @@ mod tests {
         // pool (tree.bin) indexes them — no flat pagetable.bin in the streamed path.
         let bricks = std::fs::read(dir.path().join("bricks.bin")).unwrap();
         let brick = bm["brick"].as_u64().unwrap() as usize;
-        assert_eq!(bricks.len() as u64, occupied * (brick.pow(3) * 4) as u64,
-            "bricks.bin holds occupied flat brick blocks");
-        assert!(!dir.path().join("pagetable.bin").exists(), "streamed path emits no flat page table");
+        assert_eq!(
+            bricks.len() as u64,
+            occupied * (brick.pow(3) * 4) as u64,
+            "bricks.bin holds occupied flat brick blocks"
+        );
+        assert!(
+            !dir.path().join("pagetable.bin").exists(),
+            "streamed path emits no flat page table"
+        );
         let tree = std::fs::read(dir.path().join("tree.bin")).unwrap();
         let td = &bm["tree_dim"];
         let texels = td[0].as_u64().unwrap() * td[1].as_u64().unwrap() * td[2].as_u64().unwrap();
-        assert_eq!(tree.len() as u64, texels * 4, "node pool is tree_dim texels of RGBA8");
+        assert_eq!(
+            tree.len() as u64,
+            texels * 4,
+            "node pool is tree_dim texels of RGBA8"
+        );
         // Exactly one leaf entry (A>0) per occupied brick; its RGB brick id runs
         // 1..=occupied and addresses a real block in bricks.bin.
         let (mut leaves, mut max_id) = (0u64, 0u32);
@@ -953,7 +986,14 @@ mod tests {
             vec![VolumeLabel {
                 name: "test-tensor".to_string(),
                 group: "layer 0".to_string(),
-                bbox: VoxelBox { x0: 0, y0: 0, z0: 0, x1: ex, y1: ey, z1: ez },
+                bbox: VoxelBox {
+                    x0: 0,
+                    y0: 0,
+                    z0: 0,
+                    x1: ex,
+                    y1: ey,
+                    z1: ez,
+                },
             }]
         }
         fn as_any(&self) -> &dyn std::any::Any {
@@ -1118,7 +1158,11 @@ mod tests {
             ce[1].as_u64().unwrap() as u32,
             ce[2].as_u64().unwrap() as u32,
         ];
-        assert_eq!(ge, [128, 256, 64], "coarse grid preserves 2:4:1 aspect at cap 256");
+        assert_eq!(
+            ge,
+            [128, 256, 64],
+            "coarse grid preserves 2:4:1 aspect at cap 256"
+        );
         assert!(ge.iter().max().unwrap() <= &COARSE_CAP);
         let vol = std::fs::read(dir.path().join("volume.bin")).unwrap();
         assert_eq!(
@@ -1128,8 +1172,14 @@ mod tests {
         );
 
         // Octree page structure, no flat page table; flat brick blocks.
-        assert!(dir.path().join("tree.bin").exists(), "streamed ships tree.bin");
-        assert!(!dir.path().join("pagetable.bin").exists(), "no flat page table");
+        assert!(
+            dir.path().join("tree.bin").exists(),
+            "streamed ships tree.bin"
+        );
+        assert!(
+            !dir.path().join("pagetable.bin").exists(),
+            "no flat page table"
+        );
         let occupied = bm["occupied"].as_u64().unwrap();
         assert_eq!(occupied, 1, "the 4³ entity sits in a single brick");
         let brick = bm["brick"].as_u64().unwrap() as usize;
@@ -1140,13 +1190,25 @@ mod tests {
             "bricks.bin is a flat occupied-block array"
         );
         // The baked RGBA survives verbatim in the streamed block (no LUT channels).
-        assert_eq!(&bricks[0..4], &[10, 20, 30, 200], "brick RGBA is baked color, verbatim");
+        assert_eq!(
+            &bricks[0..4],
+            &[10, 20, 30, 200],
+            "brick RGBA is baked color, verbatim"
+        );
 
         // Manifest bbox stays in full vol_dim coords (client maps it, not the build).
         let mb = &meta["manifest"][0]["bbox"];
         assert_eq!(
-            [mb["x1"].as_u64().unwrap(), mb["y1"].as_u64().unwrap(), mb["z1"].as_u64().unwrap()],
-            [full_extent[0] as u64, full_extent[1] as u64, full_extent[2] as u64],
+            [
+                mb["x1"].as_u64().unwrap(),
+                mb["y1"].as_u64().unwrap(),
+                mb["z1"].as_u64().unwrap()
+            ],
+            [
+                full_extent[0] as u64,
+                full_extent[1] as u64,
+                full_extent[2] as u64
+            ],
             "manifest bbox is NOT rescaled to the coarse grid"
         );
     }

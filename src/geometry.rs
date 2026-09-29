@@ -486,7 +486,10 @@ mod tests {
             assert_eq!(hilbert3d_node_origin(0, 0, order), [0, 0, 0]);
             // A depth==order node is a single voxel == its Hilbert distance.
             let last = (1u64 << (3 * order)) - 1;
-            assert_eq!(hilbert3d_node_origin(last, order, order), hilbert_d2xyz(last, order));
+            assert_eq!(
+                hilbert3d_node_origin(last, order, order),
+                hilbert_d2xyz(last, order)
+            );
         }
     }
 }

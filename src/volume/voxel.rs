@@ -53,14 +53,24 @@ pub struct VoxelGridMut<'a> {
 impl<'a> VoxelGridMut<'a> {
     /// Full-grid view: `cells` covers the whole `extent` (`z0 = 0, z1 = ez`).
     pub fn new(cells: &'a mut [VoxelCell], extent: [u32; 3]) -> Self {
-        Self { cells, extent, z0: 0, z1: extent[2] }
+        Self {
+            cells,
+            extent,
+            z0: 0,
+            z1: extent[2],
+        }
     }
 
     /// Slab view: `cells` is `extent.x * extent.y * (z1 - z0)` long; an absolute
     /// z in `[z0, z1)` maps to plane `z - z0` in the buffer. `extent()` still
     /// reports the FULL box so a renderer's absolute-coordinate math is unchanged.
     pub fn slab(cells: &'a mut [VoxelCell], extent: [u32; 3], z0: u32, z1: u32) -> Self {
-        Self { cells, extent, z0, z1 }
+        Self {
+            cells,
+            extent,
+            z0,
+            z1,
+        }
     }
 
     /// The full box dimensions `[x, y, z]` in voxels (not the slab depth).

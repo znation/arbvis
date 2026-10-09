@@ -463,53 +463,50 @@ pub fn render_leaf_tile_xet_from_buf(
 ) -> TileResult {
     let tile_pixel_start = tile_pixel_start(tx, ty, kh, height_tiles, square_pixels);
 
-    let frame = tile_curve_frame(tx % height_tiles, ty, kh);
+    let (swap, cx, cy) = tile_curve_frame(tx % height_tiles, ty, kh);
+    let xy_lut = local_curve_to_xy();
     let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
-    for py in 0..TILE {
-        for px in 0..TILE {
-            let local_idx = tile_local_curve_idx(frame, px, py);
-            let pixel_idx = tile_pixel_start + local_idx;
-            let color = if pixel_idx < total {
-                let byte = tile_buf[local_idx as usize];
-                match xorb_color_idx(xorb_ranges, pixel_idx) {
-                    Some(idx) => {
-                        let t = tableau[idx as usize];
-                        let scale = byte as u16;
-                        Rgb([
-                            ((t[0] as u16 * scale + 127) / 255) as u8,
-                            ((t[1] as u16 * scale + 127) / 255) as u8,
-                            ((t[2] as u16 * scale + 127) / 255) as u8,
-                        ])
-                    }
-                    None => pixel_lut[byte as usize],
-                }
+    // Visit pixels in curve order: `pixel_idx` then increases strictly
+    // monotonically, and since `xorb_ranges` is sorted by start and
+    // non-overlapping, a forward-advancing cursor finds each pixel's range in
+    // O(1) amortized instead of a log-n binary search per pixel. Seed it past
+    // every range that ends at or before the tile start (ends are sorted too,
+    // since the ranges are sorted by start and non-overlapping).
+    let mut cur = xorb_ranges.partition_point(|r| r.1 <= tile_pixel_start);
+    for curve in 0..TILE_AREA {
+        let pixel_idx = tile_pixel_start + curve;
+        // Scatter target: unpack the identity-frame pixel at this curve
+        // position, then undo this tile's frame (XOR-with-constant plus an
+        // optional coordinate swap — each its own inverse) to raster coords.
+        let packed = xy_lut[curve as usize];
+        let (a, b) = (packed & (TILE - 1), packed >> TILE_LOG2);
+        let (px, py) = if swap {
+            (b ^ cx, a ^ cy)
+        } else {
+            (a ^ cx, b ^ cy)
+        };
+        let color = if pixel_idx >= total {
+            Rgb([0u8, 0, 0])
+        } else {
+            while cur < xorb_ranges.len() && xorb_ranges[cur].1 <= pixel_idx {
+                cur += 1;
+            }
+            let byte = tile_buf[curve as usize];
+            if cur < xorb_ranges.len() && xorb_ranges[cur].0 <= pixel_idx {
+                let t = tableau[xorb_ranges[cur].2 as usize];
+                let scale = byte as u16;
+                Rgb([
+                    ((t[0] as u16 * scale + 127) / 255) as u8,
+                    ((t[1] as u16 * scale + 127) / 255) as u8,
+                    ((t[2] as u16 * scale + 127) / 255) as u8,
+                ])
             } else {
-                Rgb([0u8, 0, 0])
-            };
-            img.put_pixel(px, py, color);
-        }
+                pixel_lut[byte as usize]
+            }
+        };
+        img.put_pixel(px, py, color);
     }
     encode_tile(img, fmt)
-}
-
-fn xorb_color_idx(ranges: &[(u64, u64, u8)], pixel_idx: u64) -> Option<u8> {
-    if ranges.is_empty() {
-        return None;
-    }
-    let mut lo = 0usize;
-    let mut hi = ranges.len();
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        let (s, e, c) = ranges[mid];
-        if pixel_idx < s {
-            hi = mid;
-        } else if pixel_idx >= e {
-            lo = mid + 1;
-        } else {
-            return Some(c);
-        }
-    }
-    None
 }
 
 /// x,y → Hilbert index using u64 intermediate arithmetic.
@@ -576,6 +573,87 @@ mod tests {
                         pixel_lut[tile_buf[(local_idx - base) as usize] as usize]
                     } else {
                         Rgb([0u8, 0, 0])
+                    };
+                    assert_eq!(
+                        img.get_pixel(px, py),
+                        &expected,
+                        "tile ({tx},{ty}) pixel ({px},{py})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `render_leaf_tile_xet_from_buf` must reproduce the per-pixel
+    /// binary-search coloring it replaced: tableau-scaled colors inside xorb
+    /// ranges, the plain LUT in the gaps between ranges, and black past
+    /// `total`. The reference here is an independent per-pixel linear find,
+    /// not the forward cursor under test.
+    #[test]
+    fn render_leaf_tile_xet_matches_binary_search_reference() {
+        let kh = 13u8;
+        let height_tiles = 1u32 << (kh - TILE_LOG2);
+        let square_pixels = 1u64 << (2 * kh as u32);
+        let total = square_pixels * 3;
+        let mut tile_buf = Box::new([0u8; TILE_PIXELS]);
+        for (i, b) in tile_buf.iter_mut().enumerate() {
+            *b = (i * 2654435761 % 256) as u8;
+        }
+        let pixel_lut: [Rgb<u8>; 256] =
+            std::array::from_fn(|i| Rgb([(i * 7) as u8, (i * 13) as u8, (i * 29) as u8]));
+        let tableau: [Rgb<u8>; 20] = std::array::from_fn(|i| {
+            Rgb([(i * 11 + 3) as u8, (i * 5 + 90) as u8, (i * 31 + 40) as u8])
+        });
+        // Sorted by start, non-overlapping, with gaps between the ranges so
+        // both the Some and None branches get exercised inside each tile.
+        let xorb_ranges: Vec<(u64, u64, u8)> = (0..20u64)
+            .map(|k| (k * 700_000 + 100, k * 700_000 + 700_000, k as u8 % 20))
+            .collect();
+        for &(tx, ty) in &[(0u32, 0u32), (1, 2), (3, 3), (7, 5)] {
+            let (img, _) = render_leaf_tile_xet_from_buf(
+                tx,
+                ty,
+                kh,
+                height_tiles,
+                square_pixels,
+                total,
+                &tile_buf,
+                &pixel_lut,
+                &xorb_ranges,
+                &tableau,
+                TileFormat::Png,
+            )
+            .unwrap();
+            let sq = (tx / height_tiles) as u64;
+            let sq_off = sq * square_pixels;
+            let local_tx = tx % height_tiles;
+            let base = xy2h_u64(local_tx as u64, ty as u64, kh - TILE_LOG2) * TILE_AREA;
+            for py in 0..TILE {
+                for px in 0..TILE {
+                    let lx = ((local_tx as u64) << TILE_LOG2) | px as u64;
+                    let ly = ((ty as u64) << TILE_LOG2) | py as u64;
+                    let local_idx = xy2h_u64(lx, ly, kh);
+                    let pixel_idx = sq_off + local_idx;
+                    let byte = tile_buf[(local_idx - base) as usize];
+                    let expected = if pixel_idx >= total {
+                        Rgb([0u8, 0, 0])
+                    } else {
+                        let idx = xorb_ranges
+                            .iter()
+                            .find(|&&(s, e, _)| s <= pixel_idx && pixel_idx < e)
+                            .map(|&(_, _, c)| c);
+                        match idx {
+                            Some(c) => {
+                                let t = tableau[c as usize];
+                                let scale = byte as u16;
+                                Rgb([
+                                    ((t[0] as u16 * scale + 127) / 255) as u8,
+                                    ((t[1] as u16 * scale + 127) / 255) as u8,
+                                    ((t[2] as u16 * scale + 127) / 255) as u8,
+                                ])
+                            }
+                            None => pixel_lut[byte as usize],
+                        }
                     };
                     assert_eq!(
                         img.get_pixel(px, py),

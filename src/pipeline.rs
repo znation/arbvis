@@ -142,10 +142,7 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
     let ctx = SourceCtx {
         inputs: &files,
         diff,
-        dest_kind: dest
-            .as_ref()
-            .map(|d| d.kind())
-            .unwrap_or(DestKind::Bundle),
+        dest_kind: dest.as_ref().map(|d| d.kind()).unwrap_or(DestKind::Bundle),
         three_d: args.three_d,
         stream,
         show_xet_xorbs,
@@ -194,9 +191,7 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
     }
 
     match dest {
-        Some(dest) => {
-            dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await
-        }
+        Some(dest) => dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await,
         // PNG mode returned earlier; nothing else runs without a destination.
         None => Ok(()),
     }

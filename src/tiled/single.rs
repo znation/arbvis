@@ -72,11 +72,7 @@ pub fn single_geometry(total: u64) -> SingleGeom {
 /// indexed PNG whose palette is the full 256-entry `build_pixel_lut()` in LUT
 /// order — so index *i* renders the same color the tile pyramid gives byte
 /// value *i*.
-fn encode_indexed_single_png(
-    width: u32,
-    height: u32,
-    pixels: &[u8],
-) -> anyhow::Result<Vec<u8>> {
+fn encode_indexed_single_png(width: u32, height: u32, pixels: &[u8]) -> anyhow::Result<Vec<u8>> {
     let lut = build_pixel_lut();
     let palette: Vec<u8> = lut.iter().flat_map(|c| c.0).collect();
     debug_assert_eq!(palette.len(), 256 * 3);
@@ -91,7 +87,9 @@ fn encode_indexed_single_png(
         // stream is Hilbert-local and compresses to within ~0.4% of zlib
         // level 6 while encoding far faster.
         encoder.set_compression(png::Compression::Fast);
-        let mut writer = encoder.write_header().map_err(|e: png::EncodingError| anyhow::anyhow!(e.to_string()))?;
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e: png::EncodingError| anyhow::anyhow!(e.to_string()))?;
         writer
             .write_image_data(pixels)
             .map_err(|e: png::EncodingError| anyhow::anyhow!(e.to_string()))?;
@@ -116,11 +114,7 @@ fn pixel_offset(i: u64, geom: &SingleGeom) -> usize {
 /// Render all `sources` (concatenated, `total` bytes) into one indexed PNG
 /// written to `out`. Reads through the mmap / range-fetch `Data` path in
 /// `CHUNK_BYTES` chunks; writes to a `.tmp` sibling and renames on success.
-pub async fn render_single_png(
-    sources: &[Source],
-    total: u64,
-    out: &Path,
-) -> anyhow::Result<()> {
+pub async fn render_single_png(sources: &[Source], total: u64, out: &Path) -> anyhow::Result<()> {
     let geom = single_geometry(total);
     let mut pixels = vec![0u8; geom.width as usize * geom.height as usize];
 
@@ -164,8 +158,7 @@ pub async fn render_single_png(
     // Write to a temp sibling, then rename, so a crash never leaves a
     // half-written PNG at the requested path.
     let tmp = out.with_extension("png.tmp");
-    fs::write(&tmp, &png)
-        .with_context(|| format!("writing {}", tmp.display()))?;
+    fs::write(&tmp, &png).with_context(|| format!("writing {}", tmp.display()))?;
     fs::rename(&tmp, out).with_context(|| format!("renaming into {}", out.display()))?;
     log::info!(
         "wrote {} ({}x{}, {} bytes of input)",
@@ -191,9 +184,10 @@ pub fn png_output_path(png: &Path, out: Option<&Path>) -> anyhow::Result<PathBuf
             "--png writes a single local file; --out must be a local directory, got {out:?}"
         );
     }
-    Ok(out.join(png.file_name().ok_or_else(|| {
-        anyhow::anyhow!("--png path has no file name: {}", png.display())
-    })?))
+    Ok(out.join(
+        png.file_name()
+            .ok_or_else(|| anyhow::anyhow!("--png path has no file name: {}", png.display()))?,
+    ))
 }
 
 #[cfg(test)]
@@ -269,7 +263,10 @@ mod tests {
         // hilbert_to_xy lookup.
         for i in [0u64, 1, 2, 3, 42, 255] {
             let (lx, ly) = hilbert_to_xy_u64(i, g.kh);
-            assert_eq!(pixel_offset(i, &g), ly as usize * g.width as usize + lx as usize);
+            assert_eq!(
+                pixel_offset(i, &g),
+                ly as usize * g.width as usize + lx as usize
+            );
         }
     }
 

@@ -427,6 +427,20 @@ pub fn prepare_sources(
             extensions,
         });
     }
+    if sources.is_empty() {
+        // Every explicitly named input failed to stat (typically a typo'd
+        // path, each already logged as a warning above). Fail fast instead of
+        // rendering a silent empty viewer. An empty *input list* is stdin and
+        // handled above; an empty *result* from a non-empty list is an error.
+        anyhow::bail!(
+            "no readable input files: {} (see the skip warnings above)",
+            files
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     Ok((sources, total))
 }
 
@@ -1204,4 +1218,43 @@ pub fn byte_directory_diff(
     }
 
     Ok((sources, total))
+}
+
+#[cfg(test)]
+mod prepare_sources_tests {
+    use super::prepare_sources;
+    use crate::registry::Registry;
+    use std::path::PathBuf;
+
+    #[test]
+    fn missing_paths_fail_instead_of_rendering_empty() {
+        let registry = Registry::with_defaults();
+        let err = match prepare_sources(
+            &[
+                PathBuf::from("no-such-file-1.bin"),
+                PathBuf::from("no-such-file-2.bin"),
+            ],
+            &registry,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("all-missing input list should fail"),
+        };
+        assert!(
+            err.to_string().contains("no readable input files"),
+            "unexpected error: {err:#}"
+        );
+        assert!(err.to_string().contains("no-such-file-1.bin"));
+    }
+
+    #[test]
+    fn one_readable_path_among_missing_still_renders() {
+        let registry = Registry::with_defaults();
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.bin");
+        std::fs::write(&good, b"hello").unwrap();
+        let (sources, total) =
+            prepare_sources(&[good, PathBuf::from("no-such-file.bin")], &registry).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(total, 5);
+    }
 }

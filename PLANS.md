@@ -5,7 +5,19 @@ Each plan: goal, approach, files touched, acceptance criteria. Move finished pla
 
 ## Planned
 
-### Diff-mode single-image PNG export (`--png FILE` with `--diff`) — found by plan loop 2026-10-09
+_None yet._
+
+## Done
+
+### Diff-mode single-image PNG export (`--png FILE` with `--diff`) — Done 2026-10-09
+
+**Implemented 2026-10-09 by feature.** As planned. One clarification: the factored helper is
+`pub(super) fn diff_leaf_mode(sources: &[Source]) -> LeafMode` (no `total` parameter — it reads
+`byte_size` off each source). The diff PNG is rendered per TILE×TILE tile through the pyramid's
+`load_tile_bytes` + `render_leaf_tile_diff` (TileFormat::Png), blitted at `(tx*TILE, ty*TILE)`,
+and encoded truecolor RGB via a new `encode_rgb_png`. Manual check: `arbvis --diff orig.bin
+mod.bin --png out.png` on 5000-byte random pairs wrote a valid 512×512 8-bit RGB PNG, and plain
+`--png` still writes the indexed (colormap) PNG.
 
 **Verified 2026-10-09:** the single-image PNG path shipped (`src/tiled/single.rs`, routed in `src/pipeline.rs` ~line 184) deliberately excludes diff: `src/cli.rs` `--png` has `conflicts_with_all = ["three_d", "diff", "space", "regen_html", "show_xet_xorbs"]` (~line 159), and no diff-rendering code exists in `single.rs`. `render_single_png` uses only the plain byte LUT.
 
@@ -31,8 +43,6 @@ Each plan: goal, approach, files touched, acceptance criteria. Move finished pla
 **Sizing:** ~150–200 lines across four existing files plus tests — one run. `--png` for `--show-xet-xorbs` remains a separate possible follow-up; do not attempt it here.
 
 _Plan written 2026-10-09._
-
-## Done
 
 ### Single-image PNG export (`--png FILE`) — Done 2026-10-09
 

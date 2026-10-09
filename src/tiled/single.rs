@@ -97,6 +97,29 @@ fn encode_indexed_single_png(width: u32, height: u32, pixels: &[u8]) -> anyhow::
     Ok(out)
 }
 
+/// Encode an RGB image as a truecolor 8-bit PNG. Diff output mixes
+/// signed-delta LUT colors, one-sided-source tints, and crosshatch fills, so
+/// its palette is not bounded at 256 entries — indexed PNG won't do.
+fn encode_rgb_png(
+    img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+) -> anyhow::Result<Vec<u8>> {
+    let (width, height) = img.dimensions();
+    let mut out: Vec<u8> = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e: png::EncodingError| anyhow::anyhow!(e.to_string()))?;
+        writer
+            .write_image_data(img.as_raw())
+            .map_err(|e: png::EncodingError| anyhow::anyhow!(e.to_string()))?;
+    }
+    Ok(out)
+}
+
 /// Scatter state for one leaf-size tile (TILE×TILE pixels) of the canvas.
 ///
 /// Bytes arrive in Hilbert order, and each leaf tile covers one contiguous
@@ -216,6 +239,121 @@ pub async fn render_single_png(sources: &[Source], total: u64, out: &Path) -> an
         total
     );
     Ok(())
+}
+
+/// Render all `sources` (concatenated, `total` bytes) in diff mode into one
+/// truecolor RGB PNG written to `out`.
+///
+/// The tile grid is identical to plain mode (`single_geometry`), but each
+/// TILE×TILE tile is loaded with the pyramid's `load_tile_bytes` (Hilbert
+/// order, per-source ranges) and rendered with the pyramid's
+/// `render_leaf_tile_diff` — signed-delta LUT plus crosshatch fills and
+/// one-sided-source tints from [`crate::tiled::diff_leaf_mode`] — then blitted
+/// at raster `(tx*TILE, ty*TILE)`. Output is truecolor (see
+/// [`encode_rgb_png`]); write goes to a `.tmp` sibling, then rename.
+pub async fn render_single_diff_png(
+    sources: &[Source],
+    total: u64,
+    out: &Path,
+) -> anyhow::Result<()> {
+    use crate::tiled::leaf::{load_tile_bytes, render_leaf_tile_diff, TileFormat};
+    use crate::tiled::{diff_leaf_mode, LeafMode};
+
+    let geom = single_geometry(total);
+    let LeafMode::Diff {
+        pixel_lut,
+        plain_lut,
+        fills,
+        tints,
+    } = diff_leaf_mode(sources)
+    else {
+        unreachable!("diff_leaf_mode always returns LeafMode::Diff")
+    };
+
+    // Open every source up front — mirrors `build_tile_plan`'s
+    // `load_source_data` loop and `render_single_png`'s.
+    let source_data: Vec<Data> = sources
+        .iter()
+        .map(load_source_data)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let cumulative: Vec<u64> = {
+        let mut v = Vec::with_capacity(sources.len());
+        let mut off = 0u64;
+        for s in sources {
+            v.push(off);
+            off += s.byte_size;
+        }
+        v
+    };
+
+    let height_tiles = geom.height / TILE;
+    let width_tiles = geom.width / TILE;
+    let mut img = image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::new(geom.width, geom.height);
+    for ty in 0..height_tiles {
+        for tx in 0..width_tiles {
+            let tile_buf = load_tile_bytes(
+                tx,
+                ty,
+                geom.kh,
+                height_tiles,
+                geom.square_pixels,
+                total,
+                &source_data,
+                &cumulative,
+            )
+            .await?;
+            let (tile_img, _) = render_leaf_tile_diff(
+                tx,
+                ty,
+                geom.kh,
+                height_tiles,
+                geom.square_pixels,
+                total,
+                &tile_buf,
+                &pixel_lut,
+                &plain_lut,
+                &fills,
+                &tints,
+                TileFormat::Png,
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
+            blit_tile(&mut img, &tile_img, tx, ty, geom.width);
+        }
+    }
+
+    let png = encode_rgb_png(&img)?;
+    let tmp = out.with_extension("png.tmp");
+    fs::write(&tmp, &png).with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, out).with_context(|| format!("renaming into {}", out.display()))?;
+    log::info!(
+        "wrote {} ({}x{}, diff mode, {} bytes of input)",
+        out.display(),
+        geom.width,
+        geom.height,
+        total
+    );
+    Ok(())
+}
+
+/// Copy a TILE×TILE tile image into the full canvas at raster
+/// `(tx*TILE, ty*TILE)`.
+fn blit_tile(
+    img: &mut image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+    tile_img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+    tx: u32,
+    ty: u32,
+    canvas_width: u32,
+) {
+    let raw = tile_img.as_raw();
+    let dst: &mut [u8] = img.as_mut();
+    for py in 0..TILE as usize {
+        let y = ty as usize * TILE as usize + py;
+        let x = tx as usize * TILE as usize;
+        let dst_start = (y * canvas_width as usize + x) * 3;
+        let src_start = py * TILE as usize * 3;
+        dst[dst_start..dst_start + TILE as usize * 3]
+            .copy_from_slice(&raw[src_start..src_start + TILE as usize * 3]);
+    }
 }
 
 /// Resolve the output path for `--png FILE`.
@@ -477,5 +615,187 @@ mod tests {
             png_output_path(Path::new("a.png"), Some(Path::new("/tmp/o"))).unwrap(),
             PathBuf::from("/tmp/o/a.png")
         );
+    }
+
+    /// Fabricated diff-mode source list: a 300-byte whole-file diff pair
+    /// (identical first 200 bytes, diverging tail), a 100-byte
+    /// `UnmatchedRegion` (crosshatch fill), and a 50-byte `OneSidedRange`
+    /// (tinted plain bytes). Total canvas: 450 bytes → 512×512, one tile.
+    fn diff_sources() -> anyhow::Result<(Vec<Source>, u64)> {
+        let mut orig = vec![0x00u8; 200];
+        orig.extend(std::iter::repeat_n(0x07u8, 100));
+        let mut mod_ = vec![0x00u8; 200];
+        mod_.extend(std::iter::repeat_n(0xFFu8, 100));
+        let (o_path, m_path) = temp_input_pair(&orig, &mod_)?;
+        use crate::data::{DiffFill, SourceKind};
+        let mk = |kind: SourceKind, byte_size: u64, name: &str| Source {
+            file_idx: 0,
+            kind,
+            byte_size,
+            name_override: Some(name.to_string()),
+            xet_terms: None,
+            extensions: Default::default(),
+        };
+        let sources = vec![
+            mk(
+                SourceKind::Diff {
+                    original: o_path,
+                    modified: m_path,
+                },
+                300,
+                "pair",
+            ),
+            mk(SourceKind::UnmatchedRegion { fill: DiffFill::Red }, 100, "unmatched"),
+            mk(
+                SourceKind::OneSidedRange {
+                    data: std::sync::Arc::new(Data::Owned(vec![0x41; 50])),
+                    start: 0,
+                    fill: DiffFill::Green,
+                },
+                50,
+                "inserted",
+            ),
+        ];
+        let total: u64 = sources.iter().map(|s| s.byte_size).sum();
+        Ok((sources, total))
+    }
+
+    fn temp_input_pair(orig: &[u8], mod_: &[u8]) -> anyhow::Result<(PathBuf, PathBuf)> {
+        let o = tempfile::NamedTempFile::new()?;
+        o.as_file().write_all(orig)?;
+        let m = tempfile::NamedTempFile::new()?;
+        m.as_file().write_all(mod_)?;
+        Ok((
+            o.into_temp_path().keep()?,
+            m.into_temp_path().keep()?,
+        ))
+    }
+
+    #[tokio::test]
+    async fn diff_png_matches_reference_tiles() {
+        let (sources, total) = diff_sources().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let out = out_dir.path().join("diff.png");
+        render_single_diff_png(&sources, total, &out).await.unwrap();
+
+        // Decode with the `png` crate: must be truecolor RGB (diff output
+        // mixes signed-delta LUT colors, tints, and crosshatch fills, so the
+        // palette is not 256 entries).
+        let file = std::io::BufReader::new(std::fs::File::open(&out).unwrap());
+        let mut decoder = png::Decoder::new(file);
+        decoder.set_transformations(png::Transformations::empty());
+        let mut reader = decoder.read_info().unwrap();
+        assert_eq!(reader.info().width, 512);
+        assert_eq!(reader.info().height, 512);
+        assert_eq!(reader.info().color_type, png::ColorType::Rgb);
+        let mut buf = vec![0u8; reader.output_buffer_size().expect("buffer size known")];
+        let frame = reader.next_frame(&mut buf).unwrap();
+        assert_eq!(frame.width, 512);
+        assert_eq!(frame.height, 512);
+
+        // Reference: render the same sources tile-by-tile through the
+        // pyramid's loader + diff renderer and blit each TILE×TILE result at
+        // (tx*TILE, ty*TILE) with an independent put_pixel loop.
+        use crate::tiled::leaf::{load_tile_bytes, render_leaf_tile_diff, TileFormat};
+        use crate::tiled::{diff_leaf_mode, LeafMode};
+        let LeafMode::Diff {
+            pixel_lut,
+            plain_lut,
+            fills,
+            tints,
+        } = diff_leaf_mode(&sources)
+        else {
+            unreachable!()
+        };
+        let source_data: Vec<Data> = sources
+            .iter()
+            .map(crate::data::load_source_data)
+            .collect::<anyhow::Result<Vec<_>>>()
+            .unwrap();
+        let mut cumulative = Vec::new();
+        let mut off = 0u64;
+        for s in &sources {
+            cumulative.push(off);
+            off += s.byte_size;
+        }
+        let geom = single_geometry(total);
+        let (ht, wt) = (geom.height / TILE, geom.width / TILE);
+        let mut reference = image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::new(geom.width, geom.height);
+        for ty in 0..ht {
+            for tx in 0..wt {
+                let tile_buf = load_tile_bytes(
+                    tx, ty, geom.kh, ht, geom.square_pixels, total,
+                    &source_data, &cumulative,
+                )
+                .await
+                .unwrap();
+                let (tile_img, _) = render_leaf_tile_diff(
+                    tx, ty, geom.kh, ht, geom.square_pixels, total,
+                    &tile_buf, &pixel_lut, &plain_lut, &fills, &tints,
+                    TileFormat::Png,
+                )
+                .map_err(|e| anyhow::anyhow!(e))
+                .unwrap();
+                for py in 0..TILE {
+                    for px in 0..TILE {
+                        reference.put_pixel(tx * TILE + px, ty * TILE + py, tile_img[(px, py)]);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(frame.color_type, png::ColorType::Rgb);
+        let decoded: &[[u8; 3]] =
+            unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const [u8; 3], 512 * 512) };
+        for (i, px) in decoded.iter().enumerate() {
+            let (x, y) = ((i % 512) as u32, (i / 512) as u32);
+            let ref_px = reference[(x, y)].0;
+            assert_eq!(px, &ref_px, "pixel ({x},{y})");
+        }
+    }
+
+    #[tokio::test]
+    async fn diff_leaf_mode_matches_build_tile_plan() {
+        let (sources, total) = diff_sources().unwrap();
+        // Source isn't Clone; build the same fabricated list twice so the
+        // plan path and the helper get independent instances.
+        let (helper_sources, _helper_total) = diff_sources().unwrap();
+        let plan = crate::tiled::build_tile_plan(
+            sources,
+            total,
+            true,
+            false,
+            crate::layout::LayoutMode::Hilbert,
+            &crate::registry::Registry::with_defaults(),
+        )
+        .await
+        .unwrap();
+        use crate::tiled::{diff_leaf_mode, LeafMode};
+        let LeafMode::Diff {
+            pixel_lut,
+            plain_lut,
+            fills,
+            tints,
+        } = diff_leaf_mode(&helper_sources)
+        else {
+            unreachable!()
+        };
+        let LeafMode::Diff {
+            pixel_lut: plan_lut,
+            plain_lut: plan_plain,
+            fills: plan_fills,
+            tints: plan_tints,
+        } = plan.mode
+        else {
+            panic!("expected diff mode plan")
+        };
+        assert_eq!(&*pixel_lut, &*plan_lut);
+        assert_eq!(&*plain_lut, &*plan_plain);
+        assert_eq!(&*fills, &*plan_fills);
+        assert_eq!(&*tints, &*plan_tints);
+        // And the fabricated lists are what the diff renderer expects:
+        // sorted by start, covering the fabricated sources only.
+        assert_eq!(fills.as_ref(), &[(300u64, 400u64, crate::data::DiffFill::Red)]);
+        assert_eq!(tints.as_ref(), &[(400u64, 450u64, crate::data::DiffFill::Green)]);
     }
 }

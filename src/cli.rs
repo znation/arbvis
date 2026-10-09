@@ -148,15 +148,16 @@ pub struct Args {
     #[arg(long)]
     pub(crate) show_xet_xorbs: bool,
 
-    /// Write the entire 2D render as one indexed PNG file (one pixel per
-    /// byte, same byte-color scheme as the tile pyramid) instead of a viewer
-    /// bundle — for embedding arbvis output in docs and PRs without serving
-    /// a web bundle. With `--out DIR`, FILE is placed inside DIR; otherwise
-    /// FILE is used as given.
+    /// Write the entire 2D render as one PNG file (plain mode: indexed, one
+    /// pixel per byte, same byte-color scheme as the tile pyramid; diff mode:
+    /// truecolor with the signed-delta LUT, crosshatch fills, and tints)
+    /// instead of a viewer bundle — for embedding arbvis output in docs and
+    /// PRs without serving a web bundle. With `--out DIR`, FILE is placed
+    /// inside DIR; otherwise FILE is used as given.
     #[arg(
         long = "png",
         value_name = "FILE",
-        conflicts_with_all = ["three_d", "diff", "space", "regen_html", "show_xet_xorbs"]
+        conflicts_with_all = ["three_d", "space", "regen_html", "show_xet_xorbs"]
     )]
     pub(crate) png: Option<PathBuf>,
 
@@ -565,12 +566,11 @@ mod png_flag_tests {
     use clap::Parser;
 
     #[test]
-    fn png_conflicts_with_3d_diff_space_regen_and_xorbs() {
+    fn png_conflicts_with_3d_space_regen_and_xorbs() {
         let png = ["arbvis", "--png", "out.png"];
         assert!(Args::try_parse_from(png).is_ok());
         for flag in [
             vec!["--3d"],
-            vec!["--diff", "a", "b"],
             vec!["--space", "me/vis"],
             vec!["--regen-html", "dir"],
             vec!["--show-xet-xorbs"],
@@ -583,6 +583,16 @@ mod png_flag_tests {
                 flag.join(" ")
             );
         }
+        // `--png` composes with `--diff` (diff PNG export is supported).
+        let with_diff = [
+            "arbvis",
+            "--diff",
+            "a",
+            "b",
+            "--png",
+            "out.png",
+        ];
+        assert!(Args::try_parse_from(with_diff).is_ok());
     }
 
     #[test]

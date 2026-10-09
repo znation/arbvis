@@ -192,7 +192,7 @@ modelweightvis layers a dtype-aware element coloring on top of the same xorb hue
 
 ## Other useful flags
 
-- `--png FILE` — write the entire 2D render as a single indexed PNG (one pixel per byte, same byte-color scheme as the tile pyramid) instead of a viewer bundle. With `--out DIR`, FILE is placed inside DIR. Not combinable with `--3d`, `--diff`, `--space`, `--show-xet-xorbs`, or `--regen-html`.
+- `--png FILE` — write the entire 2D render as a single PNG instead of a viewer bundle. Plain mode writes an indexed PNG (one pixel per byte, same byte-color scheme as the tile pyramid); with `--diff`, writes a truecolor PNG of the diff render (signed-delta colors, crosshatch fills, and one-sided-source tints). With `--out DIR`, FILE is placed inside DIR. Not combinable with `--3d`, `--space`, `--show-xet-xorbs`, or `--regen-html`.
 - `--title TEXT` — title shown in the viewer info panel (defaults to `"arbvis"` or `"arbvis diff"`).
 - `-l, --file-list FILE` — read input paths from `FILE`, one per line; `-` reads from stdin.
 - `--regen-html DIR` — rebuild `index.html` for an existing bundle directory without re-rendering (2D or, with `--3d`, the volume bundle). Useful after editing the viewer template.

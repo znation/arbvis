@@ -279,6 +279,37 @@ pub(super) struct TilePlan {
     leaf_tile: LeafTile,
 }
 
+/// Build the diff-mode leaf mode for `sources` (in canvas order): the
+/// signed-delta LUT as `pixel_lut`, the plain byte LUT as `plain_lut`, plus
+/// crosshatch `fills` from `UnmatchedRegion` sources and `tints` from
+/// `OneSidedRange` sources. Their byte_size already accounts for their canvas
+/// footprint; each source's cumulative offset + size becomes a range. Sources
+/// are listed in canvas order, so each list is already sorted by start.
+/// Shared by `build_tile_plan` and the single-image diff PNG renderer.
+pub(super) fn diff_leaf_mode(sources: &[Source]) -> LeafMode {
+    let mut fills = Vec::new();
+    let mut tints = Vec::new();
+    let mut cumulative = 0u64;
+    for source in sources {
+        match &source.kind {
+            SourceKind::UnmatchedRegion { fill } if source.byte_size > 0 => {
+                fills.push((cumulative, cumulative + source.byte_size, *fill));
+            }
+            SourceKind::OneSidedRange { fill, .. } if source.byte_size > 0 => {
+                tints.push((cumulative, cumulative + source.byte_size, *fill));
+            }
+            _ => {}
+        }
+        cumulative += source.byte_size;
+    }
+    LeafMode::Diff {
+        pixel_lut: Arc::new(build_diff_signed_lut()),
+        plain_lut: Arc::new(build_pixel_lut()),
+        fills: Arc::new(fills),
+        tints: Arc::new(tints),
+    }
+}
+
 pub(super) async fn build_tile_plan(
     sources: Vec<Source>,
     total: u64,
@@ -409,33 +440,6 @@ pub(super) async fn build_tile_plan(
         }
     }
 
-    // For diff mode: collect crosshatch fills from any UnmatchedRegion
-    // sources and tinted ranges from OneSidedRange sources. Their byte_size
-    // already accounts for their canvas footprint; we just translate each
-    // source's cumulative offset + size into a range. Sources are listed in
-    // canvas order, so each resulting list is already sorted by start.
-    let (diff_fills, diff_tints): (Vec<(u64, u64, DiffFill)>, Vec<(u64, u64, DiffFill)>) =
-        if diff_mode {
-            let mut fills = Vec::new();
-            let mut tints = Vec::new();
-            let mut cumulative = 0u64;
-            for source in &sources {
-                match &source.kind {
-                    SourceKind::UnmatchedRegion { fill } if source.byte_size > 0 => {
-                        fills.push((cumulative, cumulative + source.byte_size, *fill));
-                    }
-                    SourceKind::OneSidedRange { fill, .. } if source.byte_size > 0 => {
-                        tints.push((cumulative, cumulative + source.byte_size, *fill));
-                    }
-                    _ => {}
-                }
-                cumulative += source.byte_size;
-            }
-            (fills, tints)
-        } else {
-            (Vec::new(), Vec::new())
-        };
-
     // arbvis byte-Hilbert renders one of three modes: xet (xorb-colored),
     // diff (signed-delta LUT + crosshatch), or plain byte-LUT. Structure-aware
     // specializations don't reach this path — they ship their own layout plugin
@@ -447,11 +451,20 @@ pub(super) async fn build_tile_plan(
             tableau: Arc::new(tableau),
         }
     } else if diff_mode {
+        let LeafMode::Diff {
+            pixel_lut,
+            plain_lut,
+            fills,
+            tints,
+        } = diff_leaf_mode(&sources)
+        else {
+            unreachable!("diff_leaf_mode always returns LeafMode::Diff")
+        };
         LeafMode::Diff {
-            pixel_lut: pixel_lut.clone(),
-            plain_lut: Arc::new(build_pixel_lut()),
-            fills: Arc::new(diff_fills),
-            tints: Arc::new(diff_tints),
+            pixel_lut,
+            plain_lut,
+            fills,
+            tints,
         }
     } else {
         LeafMode::Plain {

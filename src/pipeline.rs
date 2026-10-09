@@ -184,8 +184,9 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
         volume_res: args.volume_res,
     };
 
-    // Single-image PNG export: render the whole 2D canvas as one indexed PNG
-    // and stop — no bundle, no upload, no deploy.
+    // Single-image PNG export: render the whole 2D canvas as one PNG and
+    // stop — no bundle, no upload, no deploy. Diff mode renders through the
+    // signed-delta LUT + crosshatch (truecolor); plain mode is indexed.
     if let Some(ref png) = args.png {
         if total == 0 {
             anyhow::bail!("--png requires non-empty input");
@@ -195,7 +196,11 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        return tiled::single::render_single_png(&sources, total, &out_path).await;
+        return if hints.diff_mode {
+            tiled::single::render_single_diff_png(&sources, total, &out_path).await
+        } else {
+            tiled::single::render_single_png(&sources, total, &out_path).await
+        };
     }
 
     match dest {

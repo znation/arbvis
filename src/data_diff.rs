@@ -538,6 +538,64 @@ mod tests {
         ));
     }
 
+    /// A file pair whose sizes differ is rejected with a message naming both
+    /// sizes and paths, instead of silently zero-padding.
+    #[tokio::test]
+    async fn file_pair_size_mismatch_is_rejected_with_sizes_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = dir.path().join("o.bin");
+        let m = dir.path().join("m.bin");
+        fs::write(&o, b"123").unwrap();
+        fs::write(&m, b"56789").unwrap();
+        let registry = Registry::with_defaults();
+        let err = match prepare_diff_sources(&o, &m, false, &registry).await {
+            Err(e) => e,
+            Ok(_) => panic!("size-mismatched file pair should fail"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("file sizes differ"), "message was: {msg}");
+        assert!(msg.contains("3 bytes vs 5 bytes"), "message was: {msg}");
+        assert!(msg.contains(&o.display().to_string()), "message was: {msg}");
+    }
+
+    /// Two directories with no files in common produce a clear error rather
+    /// than an empty diff.
+    #[tokio::test]
+    async fn directories_without_file_pairs_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let registry = Registry::with_defaults();
+        let err = match prepare_diff_sources(&a, &b, false, &registry).await {
+            Err(e) => e,
+            Ok(_) => panic!("empty directory pair should fail"),
+        };
+        assert!(err
+            .to_string()
+            .contains("no matching file pairs found"));
+    }
+
+    /// In finetune mode, modified-only files render green crosshatch, unlike
+    /// the red used in plain directory mode.
+    #[test]
+    fn finetune_diff_renders_modified_only_files_green() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("orig");
+        let mod_ = tmp.path().join("mod");
+        fs::create_dir_all(&orig).unwrap();
+        mkfile(&mod_, "added.bin", 4);
+        let (sources, total) = byte_directory_diff(&orig, &mod_, true, &|_| false).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert!(matches!(
+            sources[0].kind,
+            SourceKind::UnmatchedRegion {
+                fill: DiffFill::Green
+            }
+        ));
+        assert_eq!(total, 4);
+    }
+
     /// Builder ids and priority ordering are part of the registry contract.
     #[test]
     fn builder_ids_and_priority_order_are_stable() {

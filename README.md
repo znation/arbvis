@@ -198,7 +198,7 @@ modelweightvis layers a dtype-aware element coloring on top of the same xorb hue
 
 ## Other useful flags
 
-- `--png FILE` — write the entire 2D render as a single PNG instead of a viewer bundle. Plain mode writes an indexed PNG (one pixel per byte, same byte-color scheme as the tile pyramid); with `--diff`, writes a truecolor PNG of the diff render (signed-delta colors, crosshatch fills, and one-sided-source tints). With `--out DIR`, FILE is placed inside DIR. Not combinable with `--3d`, `--space`, `--show-xet-xorbs`, or `--regen-html`.
+- `--png FILE` — write the entire 2D render as a single PNG instead of a viewer bundle. Plain mode writes an indexed PNG (one pixel per byte, same byte-color scheme as the tile pyramid); with `--diff`, writes a truecolor PNG of the diff render (signed-delta colors, crosshatch fills, and one-sided-source tints); with `--show-xet-xorbs`, writes a truecolor xorb-colored PNG (Tableau hue per xorb, scaled by byte intensity). With `--out DIR`, FILE is placed inside DIR. Not combinable with `--3d`, `--space`, or `--regen-html`.
 - `--title TEXT` — title shown in the viewer info panel (defaults to `"arbvis"` or `"arbvis diff"`).
 - `-l, --file-list FILE` — read input paths from `FILE`, one per line; `-` reads from stdin (erroring if stdin is an interactive terminal — pipe the list in instead); an empty list file is an error.
 - `--regen-html DIR` — rebuild `index.html` for an existing bundle directory without re-rendering (2D or, with `--3d`, the volume bundle). Useful after editing the viewer template. An explicit `--title` overrides the bundle's title (3D bundles re-read the title persisted in `meta.json` unless overridden; 2D bundles fall back to the brand name).

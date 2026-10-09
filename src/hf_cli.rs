@@ -233,15 +233,24 @@ where
 /// AIMD throttle treats it like any other stall).
 fn hf_timeout_secs() -> Option<u64> {
     match std::env::var("ARBVIS_HF_TIMEOUT_SECS") {
-        Ok(s) => match s.trim().parse::<u64>() {
-            Ok(secs) if secs > 0 => Some(secs),
-            Ok(_) => None,
-            Err(_) => {
-                log::warn!("ARBVIS_HF_TIMEOUT_SECS={s:?} is not a positive integer; ignoring");
-                None
-            }
-        },
+        Ok(s) => parse_hf_timeout(&s),
         Err(_) => None,
+    }
+}
+
+/// Parse one `ARBVIS_HF_TIMEOUT_SECS` value. Anything that is not a positive
+/// integer (including `0`, which would make the timeout fire instantly) means
+/// no timeout; a warning is logged for every ignored value so a typo'd or
+/// zero setting never silently disables the opt-in budget.
+fn parse_hf_timeout(s: &str) -> Option<u64> {
+    match s.trim().parse::<u64>() {
+        Ok(secs) if secs > 0 => Some(secs),
+        _ => {
+            log::warn!(
+                "ARBVIS_HF_TIMEOUT_SECS={s:?} is not a positive integer; ignoring (no timeout)"
+            );
+            None
+        }
     }
 }
 
@@ -453,6 +462,18 @@ pub async fn check_hf_available() -> Result<String, HfCliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_hf_timeout_values() {
+        assert_eq!(parse_hf_timeout("30"), Some(30));
+        assert_eq!(parse_hf_timeout(" 30 "), Some(30));
+        // 0 would make the opt-in budget fire instantly; treat it like any
+        // other non-positive value: warn and run without a timeout.
+        assert_eq!(parse_hf_timeout("0"), None);
+        assert_eq!(parse_hf_timeout("abc"), None);
+        assert_eq!(parse_hf_timeout(""), None);
+        assert_eq!(parse_hf_timeout("-1"), None);
+    }
 
     #[test]
     fn classify_rate_limit() {

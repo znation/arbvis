@@ -15,10 +15,16 @@ use super::{http_client, XetTerm};
 use crate::hf_url;
 use crate::throttle::with_throttle;
 
+/// JSON response from the Hub's `xet-read-token` endpoint: a short-lived CAS
+/// bearer token plus the base URL of the CAS service it authenticates against.
 #[derive(Deserialize)]
 pub(super) struct XetReadTokenResponse {
+    /// Bearer token for the CAS API; sent as `Authorization` on the
+    /// reconstruction request.
     #[serde(rename = "accessToken")]
     pub(super) access_token: String,
+    /// Base URL of the CAS service (e.g. `https://cas-bridge.xethub.hf.co`);
+    /// trailing slashes are stripped before caching.
     #[serde(rename = "casUrl")]
     pub(super) cas_url: String,
 }
@@ -28,13 +34,22 @@ pub(super) struct XetReadTokenResponse {
 /// so only `start`/`end` go on the wire.
 #[derive(Deserialize, Clone, Copy)]
 pub(super) struct WireRange<T> {
+    /// First index or byte of the range; inclusive.
     pub(super) start: T,
+    /// Last index or byte of the range; inclusivity depends on the context —
+    /// chunk-index ranges are half-open `[start, end)`, packed-byte ranges
+    /// are closed `[start, end]` (see `WireXorbRangeDescriptor`).
     pub(super) end: T,
 }
 
+/// One contiguous run of bytes in the reconstructed file, backed by a chunk
+/// sequence from a single xorb. The reconstruction is the terms list in order.
 #[derive(Deserialize)]
 pub(super) struct ReconstructionTerm {
+    /// Hash of the xorb holding this term's chunks (e.g. `"abc/123"`); keys
+    /// the `xorbs` map on a V2 response.
     pub(super) hash: String,
+    /// Number of bytes this term contributes to the file once unpacked.
     #[serde(rename = "unpacked_length")]
     pub(super) unpacked_length: u64,
     /// Chunk index `[start, end)` within the xorb. Captured so the reader can
@@ -52,14 +67,22 @@ pub(super) struct WireXorbRangeDescriptor {
     pub(super) bytes: WireRange<u64>,
 }
 
+/// One entry of a V2 response's `xorbs` map: a signed URL that serves the
+/// requested byte ranges of a single xorb, plus which ranges to fetch from it.
 #[derive(Deserialize)]
 pub(super) struct WireXorbMultiRangeFetch {
+    /// Pre-signed GET URL for the xorb's chunk endpoint; valid without
+    /// additional auth headers for its lifetime.
     pub(super) url: String,
+    /// The disjoint byte ranges this URL covers, each as chunk indices plus
+    /// packed-byte offsets.
     pub(super) ranges: Vec<WireXorbRangeDescriptor>,
 }
 
 #[derive(Deserialize)]
 pub(super) struct ReconstructionResponse {
+    /// The file's chunk terms in file order; concatenating their unpacked
+    /// bytes (skipping zero-length terms) reproduces the file.
     pub(super) terms: Vec<ReconstructionTerm>,
     /// V2-only: per-xorb signed-URL fetch info. Absent on V1 responses; we
     /// require V2 for the direct-CAS reader path, so callers that need it
@@ -68,9 +91,13 @@ pub(super) struct ReconstructionResponse {
     pub(super) xorbs: HashMap<String, Vec<WireXorbMultiRangeFetch>>,
 }
 
+/// A cached CAS credential: the service base URL and its bearer token, in
+/// the normalized form used to build reconstruction URLs.
 #[derive(Clone)]
 pub(super) struct CasToken {
+    /// CAS service base URL with trailing slashes stripped.
     pub(super) cas_url: String,
+    /// Bearer token for CAS API requests.
     pub(super) access_token: String,
 }
 
@@ -80,6 +107,9 @@ pub(super) struct CasToken {
 static CAS_TOKEN_CACHE: Mutex<Option<HashMap<(String, String, String), CasToken>>> =
     Mutex::new(None);
 
+/// Drops the cached CAS token for `(api_segment, repo_id, revision)`, if any.
+/// A no-op when the key is absent or the cache was never initialized; safe to
+/// call before any token has been fetched.
 pub(super) fn invalidate_cas_token_cache(api_segment: &str, repo_id: &str, revision: &str) {
     let key = (
         api_segment.to_string(),
@@ -120,6 +150,10 @@ async fn authed_get_json<T: DeserializeOwned>(
         .with_context(|| format!("parsing {label} response from {url}"))
 }
 
+/// Fetches (or returns from `CAS_TOKEN_CACHE`) a CAS token for reading
+/// `repo_id` at `revision`. Requires an HF token (`HF_TOKEN` or `hf auth
+/// login`) to call the Hub's xet-read-token endpoint. The returned token's
+/// `cas_url` is trimmed of trailing slashes so URL joins are safe.
 pub(super) async fn fetch_cas_token(
     api_segment: &str,
     repo_id: &str,
@@ -174,6 +208,8 @@ pub(super) async fn fetch_cas_token(
     Ok(token)
 }
 
+/// GETs the V2 reconstruction for `xet_hash_hex` from `cas`'s CAS service,
+/// authenticated with the CAS token's bearer token.
 pub(super) async fn fetch_reconstruction_response(
     cas: &CasToken,
     xet_hash_hex: &str,
@@ -188,6 +224,10 @@ pub(super) async fn fetch_reconstruction_response(
     .await
 }
 
+/// Fetches the reconstruction for `xet_hash_hex` and flattens it into
+/// `XetTerm`s: one per non-empty term, with `file_offset` accumulated from
+/// the `unpacked_length`s. Zero-length terms are skipped and contribute no
+/// offset.
 pub(super) async fn fetch_reconstruction_terms(
     cas: &CasToken,
     xet_hash_hex: &str,

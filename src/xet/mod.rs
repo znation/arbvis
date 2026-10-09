@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
+use futures::{StreamExt, TryStreamExt};
 use lru::LruCache;
 
 use crate::hf_url::{self, RemoteFileSpec};
@@ -280,6 +281,22 @@ impl ReaderDescriptor {
     }
 }
 
+// Manual Clone: `std::sync::Mutex` isn't Clone, but the url is an
+// `Arc<String>` we can snapshot under the lock — descriptors are content-
+// addressed, so a cloned descriptor sees the same refreshed URL updates via
+// the reader's in-place refresh of its own table.
+impl Clone for ReaderDescriptor {
+    fn clone(&self) -> Self {
+        Self {
+            chunk_start: self.chunk_start,
+            chunk_end: self.chunk_end,
+            byte_start: self.byte_start,
+            byte_end: self.byte_end,
+            url: Mutex::new(self.current_url()),
+        }
+    }
+}
+
 /// All descriptors for one xorb, sorted by `chunk_start` for binary search.
 struct XorbInfo {
     descriptors: Vec<ReaderDescriptor>,
@@ -434,6 +451,12 @@ fn compute_expires_at(earliest_parsed: u64, any_missing: bool) -> u64 {
 /// many concurrent readers don't blow up RAM.
 const DEFAULT_CACHE_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 
+/// How many descriptors one `fetch_range` prefetches concurrently before
+/// its append loop consumes them from the cache. Mirrors the per-entity
+/// chunk-fetch concurrency in `volume::aggregate::fetch_entity_bytes`; each
+/// in-flight descriptor is one compressed CAS segment (typically a few MiB).
+const DESCRIPTOR_PREFETCH_CONCURRENCY: usize = 8;
+
 impl XetReader {
     /// Build a reader for a xet-backed remote file. Errors if the file has
     /// no xet hash (i.e. plain LFS / regular Hub file).
@@ -563,6 +586,19 @@ impl XetReader {
                 self.file_size,
             );
         }
+        // Warm the descriptor cache for every descriptor overlapping
+        // [start, end) with bounded concurrency — the HTTP round-trip plus
+        // decompress of the i+1-th descriptor overlaps the i-th instead of
+        // serializing one round-trip per descriptor on a cold cache. The
+        // append loop below then resolves each `load_descriptor` from the
+        // LRU (or from the in-flight dedup cell) with no network wait.
+        let prefetch = self.descriptors_for_range(start, end);
+        futures::stream::iter(prefetch)
+            .map(|(hash, desc)| async move { self.load_descriptor(&hash, &desc).await })
+            .buffered(DESCRIPTOR_PREFETCH_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
+
         let mut out = Vec::with_capacity(len);
 
         // Binary search for the first term overlapping `start`.
@@ -590,6 +626,46 @@ impl XetReader {
             );
         }
         Ok(out)
+    }
+
+    /// Every `(xorb_hash, descriptor)` overlapping the file-byte range
+    /// `[start, end)`, deduplicated by descriptor key, in ascending term
+    /// order. Mirrors the descriptor walk in [`XetReader::append_term_range`]
+    /// (without its byte-slicing math) so a prefetch of this list guarantees
+    /// the append loop finds every descriptor it touches already in the LRU.
+    /// A xorb hash missing from the fetch map is skipped here — the append
+    /// loop surfaces that error when it reaches the term, as before. Items
+    /// are fully owned (cloned hash + descriptor) so the buffered `map`
+    /// closure carries no borrows.
+    fn descriptors_for_range(&self, start: u64, end: u64) -> Vec<(String, ReaderDescriptor)> {
+        let mut seen: std::collections::HashSet<(&str, u64)> = std::collections::HashSet::new();
+        let mut out: Vec<(String, ReaderDescriptor)> = Vec::new();
+        // Same term-partition as `fetch_range`'s append loop.
+        let mut term_idx = self
+            .terms
+            .partition_point(|t| t.file_offset + t.byte_len <= start);
+        while term_idx < self.terms.len() {
+            let term = &self.terms[term_idx];
+            if term.file_offset >= end {
+                break;
+            }
+            if let Some(xorb) = self.xorbs.get(&term.xorb_hash) {
+                // Same descriptor partition as `append_term_range`.
+                let first_desc = xorb
+                    .descriptors
+                    .partition_point(|d| d.chunk_end <= term.chunk_start);
+                for desc in &xorb.descriptors[first_desc..] {
+                    if desc.chunk_start >= term.chunk_end {
+                        break;
+                    }
+                    if seen.insert((term.xorb_hash.as_str(), desc.byte_start)) {
+                        out.push((term.xorb_hash.clone(), desc.clone()));
+                    }
+                }
+            }
+            term_idx += 1;
+        }
+        out
     }
 
     /// Append the slice of `term`'s data that overlaps `[req_start, req_end)`
@@ -1178,5 +1254,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, b"abcd");
+    }
+
+    #[tokio::test]
+    async fn descriptors_for_range_lists_overlapping_descriptors_deduped() {
+        // Two terms sharing one descriptor plus a term with its own
+        // descriptor; the range covers term 0 fully and term 1 partially.
+        // Term 2 and its descriptor sit past `end` and must be excluded.
+        let xorbs = HashMap::from([(
+            "xorb".to_string(),
+            XorbInfo {
+                descriptors: vec![desc(0, 4, 0, 8), desc(8, 16, 8, 16), desc(16, 24, 16, 24)],
+            },
+        )]);
+        let r = reader_with(
+            vec![term(0, 4, 0, 4), term(4, 8, 4, 12), term(16, 4, 16, 20)],
+            xorbs,
+        );
+        let got = r.descriptors_for_range(0, 10);
+        // Term 0 → descriptor(0..8); term 1 overlaps descriptors 0..8 and
+        // 8..16 (deduped for the first). The 16..24 descriptor belongs only
+        // to term 2, outside the range.
+        assert_eq!(
+            got.iter()
+                .map(|(h, d)| (h.as_str(), d.byte_start))
+                .collect::<Vec<_>>(),
+            vec![("xorb", 0), ("xorb", 8)]
+        );
+        // A range past every term yields nothing.
+        assert!(r.descriptors_for_range(20, 24).is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_range_resolves_through_prefetch_from_seeded_cache() {
+        // Three terms of two 2-byte chunks, one descriptor each. With the
+        // cache seeded by `reader_with`, the prefetch (and the append loop)
+        // resolve without any network call, and the concatenated bytes match
+        // the terms' spans — the same result as the pre-prefetch path.
+        let xorbs = HashMap::from([(
+            "xorb".to_string(),
+            XorbInfo {
+                descriptors: vec![desc(0, 2, 0, 2), desc(2, 4, 2, 4), desc(4, 6, 4, 6)],
+            },
+        )]);
+        let r = reader_with(
+            vec![term(0, 2, 0, 2), term(2, 2, 2, 4), term(4, 2, 4, 6)],
+            xorbs,
+        );
+        // `reader_with` seeds every descriptor with the same "abcd" payload, so
+        // each 2-byte term resolves to "ab"; the point is that a multi-term,
+        // multi-descriptor fetch round-trips through the prefetch unchanged.
+        assert_eq!(r.fetch_range(0, 6).await.unwrap(), b"ababab");
+        // A sub-range skipping the leading bytes resolves identically.
+        assert_eq!(r.fetch_range(3, 3).await.unwrap(), b"bab");
     }
 }

@@ -19,7 +19,9 @@
 //! with the input size; only remote sources read incrementally.
 
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use anyhow::Context;
 
@@ -27,7 +29,7 @@ use crate::color::build_pixel_lut;
 use crate::data::{load_source_data, Data, Source};
 use crate::geometry::hilbert_to_xy_u64;
 use crate::layout::hilbert::hilbert_canvas;
-use crate::tiled::leaf::{local_curve_to_xy, tile_curve_frame, TILE, TILE_LOG2};
+use crate::tiled::leaf::{local_curve_to_xy, tile_curve_frame, TILE, TILE_LOG2, TILE_PIXELS};
 
 /// Bytes fetched from a source per `fetch_range` call. Large enough to keep
 /// per-chunk fetch overhead negligible, small enough to bound peak RAM.
@@ -161,13 +163,21 @@ fn open_sources(sources: &[Source]) -> anyhow::Result<(Vec<Data>, Vec<u64>)> {
         .iter()
         .map(load_source_data)
         .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((source_data, cumulative_offsets(sources)))
+}
+
+/// Prefix-sum of source byte sizes: `out[i]` is the concatenated offset at
+/// which `sources[i]` begins. Pure byte arithmetic — never touches the source
+/// contents, so callers that only need the offset table (the xet/xorb range
+/// builder) can skip [`open_sources`]' full reads entirely.
+fn cumulative_offsets(sources: &[Source]) -> Vec<u64> {
     let mut cumulative = Vec::with_capacity(sources.len());
     let mut off = 0u64;
     for s in sources {
         cumulative.push(off);
         off += s.byte_size;
     }
-    Ok((source_data, cumulative))
+    cumulative
 }
 
 /// Source index, source-local offset, and length of the byte range this
@@ -277,7 +287,7 @@ pub async fn render_single_xet_png(
     use crate::tiled::leaf::{load_tile_bytes, render_leaf_tile_xet_from_buf, TileFormat};
     use crate::tiled::{tableau_palette, xet_xorb_ranges};
 
-    let xorb_ranges = xet_xorb_ranges(sources, &open_sources(sources)?.1);
+    let xorb_ranges = xet_xorb_ranges(sources, &cumulative_offsets(sources));
     if xorb_ranges.is_empty() {
         return Ok(false);
     }
@@ -290,35 +300,60 @@ pub async fn render_single_xet_png(
 
     let height_tiles = geom.height / TILE;
     let width_tiles = geom.width / TILE;
+    let n_tiles = height_tiles as usize * width_tiles as usize;
     let mut img = image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::new(geom.width, geom.height);
-    for ty in 0..height_tiles {
-        for tx in 0..width_tiles {
-            let tile_buf = load_tile_bytes(
-                tx,
-                ty,
+    // One-tile-ahead pipelining (same pattern as `render_single_png`'s chunk
+    // loop): kick off the next tile's `load_tile_bytes` before rendering and
+    // blitting this one, so a remote fetch's round-trip overlaps the CPU work
+    // instead of serializing per tile. Tile issue order (row-major tx) is
+    // unchanged; fetch order stays ascending within a tile run.
+    let mut tile_buf = load_tile_bytes(
+        0,
+        0,
+        geom.kh,
+        height_tiles,
+        geom.square_pixels,
+        total,
+        &source_data,
+        &cumulative,
+    )
+    .await?;
+    for i in 0..n_tiles {
+        let tx = (i % width_tiles as usize) as u32;
+        let ty = (i / width_tiles as usize) as u32;
+        let next: Option<Pin<Box<dyn Future<Output = _> + '_>>> = if i + 1 < n_tiles {
+            let ntx = ((i + 1) % width_tiles as usize) as u32;
+            let nty = ((i + 1) / width_tiles as usize) as u32;
+            Some(Box::pin(load_tile_bytes(
+                ntx,
+                nty,
                 geom.kh,
                 height_tiles,
                 geom.square_pixels,
                 total,
                 &source_data,
                 &cumulative,
-            )
-            .await?;
-            let (tile_img, _) = render_leaf_tile_xet_from_buf(
-                tx,
-                ty,
-                geom.kh,
-                height_tiles,
-                geom.square_pixels,
-                total,
-                &tile_buf,
-                &pixel_lut,
-                &xorb_ranges.global_ranges,
-                &tableau,
-                TileFormat::Png,
-            )
-            .map_err(|e| anyhow::anyhow!(e))?;
-            blit_tile(&mut img, &tile_img, tx, ty, geom.width);
+            )))
+        } else {
+            None
+        };
+        let (tile_img, _) = render_leaf_tile_xet_from_buf(
+            tx,
+            ty,
+            geom.kh,
+            height_tiles,
+            geom.square_pixels,
+            total,
+            &tile_buf,
+            &pixel_lut,
+            &xorb_ranges.global_ranges,
+            &tableau,
+            TileFormat::Png,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        blit_tile(&mut img, &tile_img, tx, ty, geom.width);
+        if let Some(f) = next {
+            tile_buf = f.await?;
         }
     }
 
@@ -367,36 +402,59 @@ pub async fn render_single_diff_png(
 
     let height_tiles = geom.height / TILE;
     let width_tiles = geom.width / TILE;
+    let n_tiles = height_tiles as usize * width_tiles as usize;
     let mut img = image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::new(geom.width, geom.height);
-    for ty in 0..height_tiles {
-        for tx in 0..width_tiles {
-            let tile_buf = load_tile_bytes(
-                tx,
-                ty,
+    // One-tile-ahead pipelining, identical to the xet loop above.
+    let mut tile_buf = load_tile_bytes(
+        0,
+        0,
+        geom.kh,
+        height_tiles,
+        geom.square_pixels,
+        total,
+        &source_data,
+        &cumulative,
+    )
+    .await?;
+    for i in 0..n_tiles {
+        let tx = (i % width_tiles as usize) as u32;
+        let ty = (i / width_tiles as usize) as u32;
+        let next: Option<
+            Pin<Box<dyn Future<Output = anyhow::Result<Box<[u8; TILE_PIXELS]>>> + '_>>,
+        > = if i + 1 < n_tiles {
+            let ntx = ((i + 1) % width_tiles as usize) as u32;
+            let nty = ((i + 1) / width_tiles as usize) as u32;
+            Some(Box::pin(load_tile_bytes(
+                ntx,
+                nty,
                 geom.kh,
                 height_tiles,
                 geom.square_pixels,
                 total,
                 &source_data,
                 &cumulative,
-            )
-            .await?;
-            let (tile_img, _) = render_leaf_tile_diff(
-                tx,
-                ty,
-                geom.kh,
-                height_tiles,
-                geom.square_pixels,
-                total,
-                &tile_buf,
-                &pixel_lut,
-                &plain_lut,
-                &fills,
-                &tints,
-                TileFormat::Png,
-            )
-            .map_err(|e| anyhow::anyhow!(e))?;
-            blit_tile(&mut img, &tile_img, tx, ty, geom.width);
+            )))
+        } else {
+            None
+        };
+        let (tile_img, _) = render_leaf_tile_diff(
+            tx,
+            ty,
+            geom.kh,
+            height_tiles,
+            geom.square_pixels,
+            total,
+            &tile_buf,
+            &pixel_lut,
+            &plain_lut,
+            &fills,
+            &tints,
+            TileFormat::Png,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        blit_tile(&mut img, &tile_img, tx, ty, geom.width);
+        if let Some(f) = next {
+            tile_buf = f.await?;
         }
     }
 

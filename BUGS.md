@@ -8,7 +8,11 @@ unclear-invariant).
 
 ## Open
 
-### `src/volume/html.rs` (1889 lines) exceeds the one-sitting readability budget
+_None yet._
+
+## Fixed
+
+### `src/volume/html/mod.rs` (1889 lines before the split) exceeds the one-sitting readability budget — fixed 2026-10-09 by bugfix
 
 **Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
 "several modules" entry; siblings: tiled/mod.rs, volume/mod.rs, volume/brick.rs, xet/mod.rs, data/mod.rs).
@@ -17,9 +21,22 @@ Three.js template string, so a Rust-module split has poor ROI — treat as oppor
 feature loop already touches the viewer, e.g. extracting the JS shader/uniform blocks behind named
 const segments. Do not refactor for refactoring's sake.
 
-**Reproduce:** `wc -l src/volume/html.rs`.
+**Fixed 2026-10-09 by bugfix:** the embedded template moved verbatim to new
+`src/volume/html/template.rs` (1868 lines, one doc comment plus the `pub(super) const TEMPLATE`
+string); the module split into `src/volume/html/mod.rs` (43 lines) holding the module doc,
+`build_volume_html`, the `mod template` wiring, and a new `template_tests` module asserting the
+placeholder (`__CONFIG_JSON__`), the doctype, and the closing `</html>` survived the split. The
+raw string body was compared byte-for-byte against the pre-split extraction (`cmp`: identical,
+96,562 bytes), so the served viewer HTML is unchanged. No external callers changed: the only
+callers of `build_volume_html` are in `src/volume/mod.rs`, and `volume::html` keeps the same path.
 
-### `src/data/mod.rs` (853 lines) exceeds the one-sitting readability budget
+**Validation gap:** no-observability — nothing in the suite pinned the template's shape, so a
+split that silently mangled the embedded HTML would have left no failing trace; added the
+`template_survived_the_module_split_intact` test and the byte-identity comparison.
+
+**Reproduce:** `wc -l src/volume/html/mod.rs src/volume/html/template.rs`.
+
+### `src/data/mod.rs` (853 lines) exceeds the one-sitting readability budget — found already fixed 2026-10-09 by bugfix
 
 **Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
 "several modules" entry; siblings: volume/html.rs, tiled/mod.rs, volume/mod.rs, volume/brick.rs,
@@ -27,12 +44,17 @@ xet/mod.rs). Already reduced by the diff-subsystem extraction (see Fixed 2026-10
 source/IO half (Data, SourceKind, Source, prepare_sources). Suggested direction: opportunistic
 splits only. Do not refactor for refactoring's sake.
 
+**Found already fixed 2026-10-09 by bugfix:** this Open entry was stale — it duplicated the
+diff-subsystem-extraction record already under Fixed (2026-10-09), and the extraction had brought
+the file within budget: `src/data/mod.rs` measured 514 lines at this tick (`wc -l`), under the
+one-sitting threshold, with the same Open copy still quoting the old 853-line count. No further
+code change was made; the entry is closed as a duplicate. (The original combined entry's `lib.rs`
+at 1131 lines was also stale — `lib.rs` is 134 lines and in budget.)
+
+**Validation gap:** no-observability — the only symptom was a line count nobody re-measured, so
+the entry stayed open after the fix had already landed beneath it.
+
 **Reproduce:** `wc -l src/data/mod.rs`.
-
-Note: the original combined entry also listed `lib.rs` at 1131 lines, which was stale —
-`lib.rs` is 134 lines and in budget.
-
-## Fixed
 
 ### `src/tiled/mod.rs` (1575 lines at find time; 1047 after revision 1) exceeds the one-sitting readability budget — fixed 2026-10-09 by bugfix
 

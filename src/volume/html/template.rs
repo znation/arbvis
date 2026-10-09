@@ -1,30 +1,9 @@
-//! Standalone Three.js viewer for the 3D (`--3d`) bundle.
+//! The embedded Three.js viewer template.
 //!
-//! The 3D analog of [`crate::tiled::html`]. Like the Leaflet viewer it is a
-//! self-contained `index.html` built as a string and loads its rendering
-//! library (here Three.js) from a CDN via an ES-module import map, so it
-//! deploys to an HF Space with no build step. At runtime it fetches
-//! `meta.json` and `volume.bin` (written alongside it by
-//! [`crate::volume::render_volume`]).
+//! Kept in its own module so [`crate::volume::html`] stays readable: the
+//! template is a single ~1860-line string with no Rust logic in it.
 
-use crate::registry::Branding;
-
-/// Build the 3D viewer HTML. Branding/title/inputs are injected as a JSON
-/// config blob; everything else (grid extent, LUT) is read from `meta.json`
-/// at runtime.
-pub fn build_volume_html(title: &str, inputs: &[String], branding: &Branding) -> String {
-    let config = serde_json::json!({
-        "title": title,
-        "brandName": branding.name,
-        "repoUrl": branding.repo_url,
-        "inputs": inputs,
-    });
-    // `</` would prematurely close the inline <script>; neutralize it.
-    let config = config.to_string().replace("</", "<\\/");
-    TEMPLATE.replace("__CONFIG_JSON__", &config)
-}
-
-const TEMPLATE: &str = r##"<!DOCTYPE html>
+pub(super) const TEMPLATE: &str = r##"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">

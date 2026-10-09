@@ -1348,7 +1348,7 @@ mod scene_tests {
     #[test]
     fn regen_html_missing_labels_json_says_the_dir_must_be_a_viewer_bundle() {
         let dir = tempfile::tempdir().unwrap();
-        let err = crate::tiled::regen_html(dir.path(), &crate::registry::Branding::default())
+        let err = crate::tiled::regen_html(dir.path(), &crate::registry::Branding::default(), None)
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("labels.json"), "unexpected message: {msg}");

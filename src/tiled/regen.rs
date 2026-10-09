@@ -86,6 +86,7 @@ fn regen_html_multi(
     tile_dir: &Path,
     parsed: &serde_json::Value,
     branding: &Branding,
+    title: Option<&str>,
 ) -> anyhow::Result<bool> {
     let Some(scenes_json) = parsed.get("scenes").and_then(|v| v.as_array()) else {
         return Ok(false);
@@ -123,7 +124,13 @@ fn regen_html_multi(
             }
         })
         .collect();
-    html::write_leaflet_html_multi(tile_dir, &scenes, &branding.name, &[], branding)?;
+    html::write_leaflet_html_multi(
+        tile_dir,
+        &scenes,
+        title.unwrap_or(branding.name.as_ref()),
+        &[],
+        branding,
+    )?;
     log::info!(
         "Regenerated index.html ({} scenes) in {}",
         scenes.len(),
@@ -133,7 +140,11 @@ fn regen_html_multi(
 }
 
 /// Regenerate `index.html` for an existing tiles directory without re-rendering tiles.
-pub fn regen_html(tile_dir: &Path, branding: &Branding) -> anyhow::Result<()> {
+pub fn regen_html(tile_dir: &Path, branding: &Branding, title: Option<&str>) -> anyhow::Result<()> {
+    // An explicit `--title` overrides the branding default; without it the
+    // regen keeps the tool name (the original render's title is not persisted
+    // in a 2D bundle's labels.json, so there is nothing to restore here).
+    let title = title.unwrap_or(branding.name.as_ref());
     let tiles_dir = tile_dir.join("tiles");
 
     // Read labels.json first. Newer outputs persist `max_zoom`/`detail_depth` so
@@ -151,7 +162,7 @@ pub fn regen_html(tile_dir: &Path, branding: &Branding) -> anyhow::Result<()> {
     let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
     // Multi-scene outputs carry per-scene geometry in labels.json and live
     // under `tiles/<key>/…`, so they regenerate without any dir scan.
-    if regen_html_multi(tile_dir, &parsed, branding)? {
+    if regen_html_multi(tile_dir, &parsed, branding, Some(title))? {
         return Ok(());
     }
     let detail_depth = parsed
@@ -237,7 +248,7 @@ pub fn regen_html(tile_dir: &Path, branding: &Branding) -> anyhow::Result<()> {
         width,
         TILE,
         &entities,
-        &branding.name,
+        title,
         &[],
         &leaf_ext,
         &pyramid_ext,
@@ -268,7 +279,7 @@ mod tests {
         )
         .unwrap();
         let branding = crate::registry::Branding::default();
-        let err = regen_html(dir.path(), &branding).unwrap_err();
+        let err = regen_html(dir.path(), &branding, None).unwrap_err();
         assert!(
             err.to_string().contains("max_zoom 34 is out of range"),
             "unexpected error: {err:#}"
@@ -279,7 +290,7 @@ mod tests {
     fn regen_html_errors_when_labels_json_missing() {
         let dir = tempfile::tempdir().unwrap();
         let branding = crate::registry::Branding::default();
-        let err = regen_html(dir.path(), &branding).unwrap_err();
+        let err = regen_html(dir.path(), &branding, None).unwrap_err();
         assert!(
             err.to_string()
                 .contains("--regen-html expects a viewer bundle"),
@@ -343,11 +354,40 @@ mod tests {
         )
         .unwrap();
         let branding = crate::registry::Branding::default();
-        regen_html(dir.path(), &branding).unwrap();
+        regen_html(dir.path(), &branding, None).unwrap();
         let index = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
         assert!(
             index.contains("base scene"),
             "scene label must reach the HTML"
+        );
+    }
+
+    /// An explicit `--title` must reach the regenerated multi-scene HTML;
+    /// without it the branding name is used (a 2D bundle's labels.json does
+    /// not persist the original title).
+    #[test]
+    fn regen_html_honors_title_override() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("labels.json"),
+            serde_json::json!({
+                "scenes": [{
+                    "key": "base", "label": "base scene", "order": 1,
+                    "world_w": 256, "world_h": 256, "max_zoom": 2,
+                    "detail_depth": 0, "height": 256, "width": 256,
+                    "leaf_ext": "png", "pyramid_ext": "png",
+                    "files": []
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let branding = crate::registry::Branding::default();
+        regen_html(dir.path(), &branding, Some("custom title")).unwrap();
+        let index = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
+        assert!(
+            index.contains("custom title"),
+            "--title override must reach the regenerated HTML"
         );
     }
 
@@ -366,7 +406,7 @@ mod tests {
         ]);
         std::fs::write(dir.path().join("labels.json"), labels.to_string()).unwrap();
         let branding = crate::registry::Branding::default();
-        regen_html(dir.path(), &branding).unwrap();
+        regen_html(dir.path(), &branding, None).unwrap();
         let index = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
         assert!(
             !index.contains("alert(1)"),
@@ -392,7 +432,7 @@ mod tests {
         ]);
         std::fs::write(dir.path().join("labels.json"), labels.to_string()).unwrap();
         let branding = crate::registry::Branding::default();
-        regen_html(dir.path(), &branding).unwrap();
+        regen_html(dir.path(), &branding, None).unwrap();
         let index = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
         // The sniffed leaf extension must reach the generated viewer config.
         assert!(index.contains("png"), "leaf extension must reach the HTML");

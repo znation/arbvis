@@ -364,17 +364,21 @@ fn cumulative_offsets(sources: &[Source]) -> Vec<u64> {
 }
 
 /// Rebuild `index.html` for an existing 3D bundle from its `meta.json`,
-/// without re-aggregating. Mirrors [`crate::tiled::regen_html`].
-pub fn regen_html(dir: &Path, branding: &Branding) -> anyhow::Result<()> {
+/// Regenerate `index.html` for an existing 3D bundle directory without
+/// re-aggregating. Mirrors [`crate::tiled::regen_html`]. An explicit
+/// `--title` overrides the title persisted in `meta.json`, which otherwise
+/// wins over the branding default.
+pub fn regen_html(dir: &Path, branding: &Branding, title: Option<&str>) -> anyhow::Result<()> {
     let meta_path = dir.join("meta.json");
     let bytes = std::fs::read(&meta_path)
         .with_context(|| format!("reading {} (is this a --3d bundle?)", meta_path.display()))?;
     let v: serde_json::Value = serde_json::from_slice(&bytes)?;
-    let title = v
-        .get("title")
-        .and_then(|t| t.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| branding.name.to_string());
+    let title = title.map(String::from).unwrap_or_else(|| {
+        v.get("title")
+            .and_then(|t| t.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| branding.name.to_string())
+    });
     let inputs: Vec<String> = v
         .get("inputs")
         .and_then(|i| i.as_array())
@@ -530,7 +534,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("meta.json"), b"{}").unwrap();
         std::fs::create_dir(dir.path().join("index.html")).unwrap();
-        let res = regen_html(dir.path(), &Branding::default());
+        let res = regen_html(dir.path(), &Branding::default(), None);
         assert!(res.is_err(), "write into a directory path must fail loudly");
         assert!(!dir.path().join("index.html.part").exists());
         // The existing directory is untouched by the failed regeneration.
@@ -547,10 +551,40 @@ mod tests {
             serde_json::json!({"title": "T", "inputs": ["a.bin"]}).to_string(),
         )
         .unwrap();
-        regen_html(dir.path(), &Branding::default()).unwrap();
+        regen_html(dir.path(), &Branding::default(), None).unwrap();
         let html = std::fs::read(dir.path().join("index.html")).unwrap();
         assert!(!html.is_empty());
         assert!(!dir.path().join("index.html.part").exists());
+    }
+
+    /// `--title` must reach the regenerated HTML, overriding both the title
+    /// persisted in `meta.json` and the branding default.
+    #[test]
+    fn regen_html_title_override_reaches_index_html() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("meta.json"),
+            serde_json::json!({"title": "persisted", "inputs": []}).to_string(),
+        )
+        .unwrap();
+        regen_html(dir.path(), &Branding::default(), Some("override")).unwrap();
+        let html = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
+        assert!(
+            html.contains("override"),
+            "--title override must reach the HTML"
+        );
+        assert!(
+            !html.contains("persisted"),
+            "persisted title must be replaced"
+        );
+
+        // Without an override the persisted title still wins over branding.
+        regen_html(dir.path(), &Branding::default(), None).unwrap();
+        let html = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
+        assert!(
+            html.contains("persisted"),
+            "meta.json title must survive a bare regen"
+        );
     }
 
     /// write_atomic must leave the previous file intact when the staged write

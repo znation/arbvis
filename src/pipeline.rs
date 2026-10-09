@@ -61,9 +61,9 @@ struct RenderConfig {
 pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()> {
     if let Some(ref dir) = args.regen_html {
         return if args.three_d {
-            volume::regen_html(dir, &registry.branding)
+            volume::regen_html(dir, &registry.branding, args.title.as_deref())
         } else {
-            tiled::regen_html(dir, &registry.branding)
+            tiled::regen_html(dir, &registry.branding, args.title.as_deref())
         };
     }
 

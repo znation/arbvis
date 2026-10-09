@@ -140,7 +140,10 @@ pub struct Args {
     pub(crate) regen_html: Option<PathBuf>,
 
     /// Title shown in the HTML info panel (default: the brand name, optionally
-    /// suffixed " diff" / " moe" — e.g. "arbvis" / "arbvis moe")
+    /// suffixed " diff" / " moe" — e.g. "arbvis" / "arbvis moe"). With
+    /// `--regen-html`, an explicit title overrides the one in the bundle
+    /// (2D bundles fall back to the brand name; 3D bundles re-read the title
+    /// persisted in `meta.json`).
     #[arg(long, value_name = "TITLE")]
     pub(crate) title: Option<String>,
 

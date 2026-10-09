@@ -866,13 +866,38 @@ where
     let _ = coord_task.await;
     let mut first_err: Option<anyhow::Error> = writer_err;
     for h in load_handles {
-        if let Ok(Err(e)) = h.await {
-            first_err.get_or_insert(e);
+        match h.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                first_err.get_or_insert(e);
+            }
+            // A tokio JoinError means the worker task panicked or was
+            // cancelled. That must not be swallowed: a panicking loader
+            // silently drops every tile it was responsible for, and treating
+            // the run as successful would leave a truncated pyramid behind
+            // with exit code 0.
+            Err(join) => {
+                let e = anyhow::anyhow!("load worker task failed: {join}");
+                log::error!("{e:?}");
+                first_err.get_or_insert(e);
+            }
         }
     }
     for h in process_handles {
-        if let Ok(Err(e)) = h.await {
-            first_err.get_or_insert(e);
+        match h.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                first_err.get_or_insert(e);
+            }
+            // Same reasoning as the load stage: render workers run most of
+            // their work inside `spawn_blocking` (whose panics are already
+            // surfaced above), but a panic outside that call would otherwise
+            // vanish here.
+            Err(join) => {
+                let e = anyhow::anyhow!("render worker task failed: {join}");
+                log::error!("{e:?}");
+                first_err.get_or_insert(e);
+            }
         }
     }
 
@@ -1044,6 +1069,100 @@ pub(super) fn derive_leaf_format(user_choice: TileFormat, mode: &LeafMode) -> Ti
 // [`streaming`](crate::tiled::streaming) submodule. It uses the same plan and
 // pipeline helpers above; keeping it in its own file makes the "off-by-default"
 // path easy to find and easy to delete if it's ever superseded.
+
+#[cfg(test)]
+mod pipeline_join_tests {
+    use super::*;
+    use crate::tiled::leaf_renderer::{LeafLoader, LeafRenderer};
+    use futures::future::BoxFuture;
+
+    // A loader that panics, standing in for any bug deep inside a plugin's
+    // load path (slice index, unwraps on malformed data, ...). tokio catches
+    // the unwind as a JoinError; the pipeline must surface it, not drop it.
+    struct PanickingLoader;
+
+    impl LeafLoader for PanickingLoader {
+        fn id(&self) -> &'static str {
+            "panic-test"
+        }
+        fn needs_io(&self, _ctx: &LoadCtx<'_>) -> bool {
+            false
+        }
+        fn load<'a>(&'a self, _ctx: &LoadCtx<'a>) -> BoxFuture<'a, anyhow::Result<LoadedTile>> {
+            Box::pin(async {
+                panic!("loader panic injected by test");
+            })
+        }
+    }
+
+    // Never reached (the loader panics first) but required to register the
+    // pair under the id the plan's leaf_tile names.
+    struct NeverRenderer;
+
+    impl LeafRenderer for NeverRenderer {
+        fn id(&self) -> &'static str {
+            "panic-test"
+        }
+        fn render(&self, _tile: LoadedTile, _ctx: &RenderCtx<'_>) -> Result<EncodedTile, String> {
+            Err("never renderer must not be reached".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_load_worker_fails_the_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.bin");
+        std::fs::write(&input, vec![0u8; 64]).unwrap();
+        let total = 64;
+
+        let plan = build_tile_plan(
+            vec![Source {
+                file_idx: 0,
+                kind: SourceKind::File(input),
+                byte_size: total,
+                name_override: None,
+                xet_terms: None,
+                extensions: Default::default(),
+            }],
+            total,
+            false,
+            false,
+            crate::layout::LayoutMode::Auto,
+            &crate::registry::Registry::with_defaults(),
+        )
+        .await
+        .unwrap();
+
+        let mut reg = LeafRegistry::new();
+        reg.register_loader(Arc::new(PanickingLoader));
+        reg.register_renderer(Arc::new(NeverRenderer));
+        let plan = TilePlan {
+            leaf: Arc::new(reg),
+            leaf_tile: LeafTile::Bytes {
+                renderer_id: "panic-test",
+            },
+            ..plan
+        };
+
+        let err = drive_pipeline(
+            &plan,
+            TileFormat::IndexedPng,
+            0,
+            TileCoords::Dense {
+                width_tiles: 1,
+                height_tiles: 1,
+            },
+            |_tile| Ok(()),
+        )
+        .await
+        .expect_err("a panicking load worker must fail the pipeline");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("load worker task failed"),
+            "unexpected message: {msg}"
+        );
+    }
+}
 
 #[cfg(test)]
 mod scene_tests {

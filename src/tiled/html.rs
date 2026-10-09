@@ -1,4 +1,4 @@
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use std::path::{Path, PathBuf};
 
 use crate::registry::Branding;
@@ -98,7 +98,8 @@ pub fn write_leaflet_html(
 /// replaced (it exists as a directory), the write fails before anything is
 /// staged or sealed, leaving the previous pair untouched.
 fn write_viewer_pair(dir: &Path, html: &[u8], labels: &[u8]) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dir).with_context(|| format!("creating viewer dir {}", dir.display()))?;
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating viewer dir {}", dir.display()))?;
     let index = dir.join("index.html");
     let labels_path = dir.join("labels.json");
     for target in [&index, &labels_path] {

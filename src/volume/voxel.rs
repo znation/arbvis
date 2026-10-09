@@ -190,7 +190,12 @@ mod tests {
     use std::sync::Mutex;
 
     fn cell(v: u8) -> VoxelCell {
-        VoxelCell { r: v, g: v, b: v, a: v }
+        VoxelCell {
+            r: v,
+            g: v,
+            b: v,
+            a: v,
+        }
     }
 
     fn entity() -> VolumeEntity {
@@ -198,7 +203,14 @@ mod tests {
             source_idx: 0,
             byte_start: 0,
             byte_len: 4,
-            bbox: VoxelBox { x0: 0, y0: 0, z0: 0, x1: 2, y1: 2, z1: 2 },
+            bbox: VoxelBox {
+                x0: 0,
+                y0: 0,
+                z0: 0,
+                x1: 2,
+                y1: 2,
+                z1: 2,
+            },
             renderer_id: "test",
             extra: Box::new(()),
         }
@@ -233,10 +245,8 @@ mod tests {
     #[test]
     fn slab_view_drops_puts_outside_its_z_window() {
         let mut cells = vec![VoxelCell::default(); 2 * 2];
-        VoxelGridMut::slab(&mut cells, [2, 2, 3], 1, 2)
-            .put(0, 0, 0, cell(1)); // below window
-        VoxelGridMut::slab(&mut cells, [2, 2, 3], 1, 2)
-            .put(0, 0, 2, cell(2)); // above window
+        VoxelGridMut::slab(&mut cells, [2, 2, 3], 1, 2).put(0, 0, 0, cell(1)); // below window
+        VoxelGridMut::slab(&mut cells, [2, 2, 3], 1, 2).put(0, 0, 2, cell(2)); // above window
         assert!(cells.iter().all(|c| *c == VoxelCell::default()));
     }
 
@@ -292,4 +302,3 @@ mod tests {
         assert!(reg.renderer("other").is_none());
     }
 }
-

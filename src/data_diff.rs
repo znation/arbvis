@@ -11,8 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::data::{DiffFill, Extensions, Source, SourceKind, collect_files_recursive};
-
+use crate::data::{collect_files_recursive, DiffFill, Extensions, Source, SourceKind};
 
 fn is_json_path(p: &Path) -> bool {
     matches!(
@@ -342,7 +341,6 @@ pub fn byte_directory_diff(
     Ok((sources, total))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{byte_directory_diff, prepare_diff_sources};
@@ -364,11 +362,10 @@ mod tests {
         fs::write(a.join("skip_me.bin"), b"zz").unwrap();
         fs::write(b.join("skip_me.bin"), b"zz").unwrap();
 
-        let (sources, total) =
-            byte_directory_diff(&a, &b, false, &|p: &Path| {
-                p.file_name().is_some_and(|n| n == "skip_me.bin")
-            })
-            .unwrap();
+        let (sources, total) = byte_directory_diff(&a, &b, false, &|p: &Path| {
+            p.file_name().is_some_and(|n| n == "skip_me.bin")
+        })
+        .unwrap();
         let names: Vec<String> = sources.iter().map(|s| s.name()).collect();
         assert!(names.iter().any(|n| n == "same.bin"), "names: {names:?}");
         assert!(
@@ -391,10 +388,15 @@ mod tests {
         fs::write(&o, b"1234").unwrap();
         fs::write(&m, b"5678").unwrap();
         let registry = Registry::with_defaults();
-        let (sources, total) = prepare_diff_sources(&o, &m, false, &registry).await.unwrap();
+        let (sources, total) = prepare_diff_sources(&o, &m, false, &registry)
+            .await
+            .unwrap();
         assert_eq!(sources.len(), 1);
         assert_eq!(total, 4);
-        assert!(matches!(sources[0].kind, crate::data::SourceKind::Diff { .. }));
+        assert!(matches!(
+            sources[0].kind,
+            crate::data::SourceKind::Diff { .. }
+        ));
     }
 
     /// Mixed file/directory inputs are rejected with a clear message.
@@ -408,6 +410,8 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("mixed file/directory input should fail"),
         };
-        assert!(err.to_string().contains("files or both must be directories"));
+        assert!(err
+            .to_string()
+            .contains("files or both must be directories"));
     }
 }

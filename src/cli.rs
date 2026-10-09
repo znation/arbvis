@@ -389,10 +389,7 @@ mod file_list_tests {
         let list = dir.path().join("list.txt");
         std::fs::write(&list, "a.bin\n\n  \nb.bin\n").unwrap();
         let files = collect_input_files(vec![], Some(list)).unwrap();
-        assert_eq!(
-            files,
-            vec![PathBuf::from("a.bin"), PathBuf::from("b.bin")]
-        );
+        assert_eq!(files, vec![PathBuf::from("a.bin"), PathBuf::from("b.bin")]);
     }
 
     #[test]

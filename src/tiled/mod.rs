@@ -1051,7 +1051,13 @@ pub(super) struct SceneGroup {
 pub(super) fn sanitize_scene_key(key: &str) -> String {
     let slug: String = key
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let slug = slug.trim_matches('_');
     if slug.is_empty() {
@@ -1378,7 +1384,6 @@ mod scene_tests {
         assert_eq!(groups[1].sources.len(), 2);
     }
 
-
     #[test]
     fn hostile_scene_keys_are_reduced_to_path_safe_slugs() {
         // The key is interpolated into `tiles/{key}/` for on-disk joins and Hub
@@ -1403,18 +1408,24 @@ mod scene_tests {
         // Grouping happens on the sanitized key so a run cannot end up with
         // two scenes writing into the same `tiles/<slug>/` directory.
         let groups = partition_scenes(
-            vec![src(1, Some(("a/b", 0))), src(2, Some(("a_b", 0))), src(4, Some(("cka", 1)))],
+            vec![
+                src(1, Some(("a/b", 0))),
+                src(2, Some(("a_b", 0))),
+                src(4, Some(("cka", 1))),
+            ],
             0,
         );
         assert_eq!(groups.len(), 2);
-        let merged: Option<&super::SceneGroup> = groups.iter().find(|g| g.key.as_deref() == Some("a_b"));
+        let merged: Option<&super::SceneGroup> =
+            groups.iter().find(|g| g.key.as_deref() == Some("a_b"));
         assert_eq!(merged.unwrap().sources.len(), 2);
     }
 
     #[test]
     fn regen_html_missing_labels_json_says_the_dir_must_be_a_viewer_bundle() {
         let dir = tempfile::tempdir().unwrap();
-        let err = crate::tiled::regen_html(dir.path(), &crate::registry::Branding::default()).unwrap_err();
+        let err = crate::tiled::regen_html(dir.path(), &crate::registry::Branding::default())
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("labels.json"), "unexpected message: {msg}");
         assert!(msg.contains("viewer bundle"), "unexpected message: {msg}");

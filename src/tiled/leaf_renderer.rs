@@ -262,10 +262,7 @@ mod tests {
         fn needs_io(&self, _ctx: &LoadCtx<'_>) -> bool {
             false
         }
-        fn load<'a>(
-            &'a self,
-            _ctx: &'a LoadCtx<'a>,
-        ) -> BoxFuture<'a, anyhow::Result<LoadedTile>> {
+        fn load<'a>(&'a self, _ctx: &'a LoadCtx<'a>) -> BoxFuture<'a, anyhow::Result<LoadedTile>> {
             unimplemented!()
         }
     }

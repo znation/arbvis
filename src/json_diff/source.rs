@@ -234,7 +234,11 @@ mod tests {
         assert_eq!(start, 2); // orig.start + common
         assert_eq!(fill, DiffFill::Red);
         assert_eq!(sources[1].byte_size, 3);
-        assert!(sources[1].name_override.as_deref().unwrap().contains("[only in original] orig.json @ [2, 5)"));
+        assert!(sources[1]
+            .name_override
+            .as_deref()
+            .unwrap()
+            .contains("[only in original] orig.json @ [2, 5)"));
     }
 
     #[test]
@@ -293,11 +297,19 @@ mod tests {
         let (start, fill) = one_sided(&sources[0]);
         assert_eq!((start, fill), (0, DiffFill::Red));
         assert_eq!(sources[0].byte_size, 3);
-        assert!(sources[0].name_override.as_deref().unwrap().contains("[only in original] orig.json @ [0, 3)"));
+        assert!(sources[0]
+            .name_override
+            .as_deref()
+            .unwrap()
+            .contains("[only in original] orig.json @ [0, 3)"));
         let (start, fill) = one_sided(&sources[1]);
         assert_eq!((start, fill), (4, DiffFill::Green));
         assert_eq!(sources[1].byte_size, 5);
-        assert!(sources[1].name_override.as_deref().unwrap().contains("[only in modified] mod.json @ [4, 9)"));
+        assert!(sources[1]
+            .name_override
+            .as_deref()
+            .unwrap()
+            .contains("[only in modified] mod.json @ [4, 9)"));
     }
 
     #[test]
@@ -322,4 +334,3 @@ mod tests {
         assert_eq!(sources.len(), 3);
     }
 }
-

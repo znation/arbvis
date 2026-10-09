@@ -317,4 +317,73 @@ mod tests {
             "strict select_layout must error when a forced layout falls back"
         );
     }
+
+    /// A plugin that claims applicability but returns `None` from `build`, so
+    /// `select_layout`'s forced-fallback diagnostic can distinguish
+    /// "applicable-but-couldn't-build" from "never applicable".
+    struct ApplicableButEmptyPlugin;
+
+    impl crate::registry::LayoutPlugin for ApplicableButEmptyPlugin {
+        fn id(&self) -> &'static str {
+            "applicable-but-empty"
+        }
+        fn priority(&self) -> i32 {
+            0
+        }
+        fn applicable(&self, _ctx: &crate::registry::LayoutBuildCtx<'_>) -> bool {
+            true
+        }
+        fn build(&self, _ctx: &crate::registry::LayoutBuildCtx<'_>) -> Option<Box<dyn LayoutShape>> {
+            None
+        }
+    }
+
+    /// Forcing a plugin that is applicable but fails to build falls back to the
+    /// floor (non-strict) and worded the "could not build" way under strict.
+    #[test]
+    fn forced_applicable_but_couldnt_build_words_the_reason() {
+        let mut registry = Registry::with_defaults();
+        registry
+            .layouts
+            .push(std::sync::Arc::new(ApplicableButEmptyPlugin));
+        registry.layout_mode = LayoutMode::Forced("applicable-but-empty");
+
+        let relaxed = select_layout(&[], &[], 0, registry.layout_mode, false, &registry);
+        let layout = relaxed.expect("non-strict must fall back past an empty build");
+        assert_eq!(layout.id(), "hilbert-bytes");
+
+        registry.strict_layout = true;
+        let err = select_layout(&[], &[], 0, registry.layout_mode, false, &registry)
+            .map(|_| ())
+            .expect_err("strict must error when the forced plugin can't build");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("could not build for these inputs"),
+            "expected the applicable-but-couldn't-build wording, got: {msg}"
+        );
+        assert!(
+            !msg.contains("no registered layout matched"),
+            "must not use the never-applicable wording, got: {msg}"
+        );
+    }
+
+    /// Forcing an id no plugin claims words the reason the "never applicable"
+    /// way, even when other non-floor plugins are registered.
+    #[test]
+    fn forced_never_applicable_words_the_reason() {
+        let mut registry = Registry::with_defaults();
+        registry
+            .layouts
+            .push(std::sync::Arc::new(ApplicableButEmptyPlugin));
+        registry.layout_mode = LayoutMode::Forced("nonexistent");
+        registry.strict_layout = true;
+        let err = select_layout(&[], &[], 0, registry.layout_mode, false, &registry)
+            .map(|_| ())
+            .expect_err("strict must error when no plugin claims the forced id");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no registered layout matched"),
+            "expected the never-applicable wording, got: {msg}"
+        );
+    }
 }

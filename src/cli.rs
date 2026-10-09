@@ -80,7 +80,8 @@ pub struct Args {
     /// Write the viewer bundle to this directory. In the default 2D mode this is
     /// a Leaflet tile pyramid (`tiles/`, `index.html`, `labels.json`); under
     /// `--3d` it is the Three.js volume bundle (`index.html`, `volume.bin`,
-    /// `points.bin`, `meta.json`). Open `index.html` over HTTP in a browser.
+    /// `bricks.bin`, `pagetable.bin`, `meta.json`). Open `index.html` over
+    /// HTTP in a browser.
     ///
     /// Accepts a local directory or an `hf://` URL to upload the bundle to a Hub
     /// repo. Note: `hf://` upload does NOT stand up a Space; the `index.html`

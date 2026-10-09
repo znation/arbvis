@@ -535,6 +535,7 @@ fn occupied_focus(grid: &[VoxelAcc], extent: [u32; 3]) -> ([f32; 3], f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color::build_pixel_lut;
 
     #[test]
     fn voxel_coord_is_x_fastest() {
@@ -712,7 +713,7 @@ mod tests {
         };
         let buffered = Source {
             file_idx: 0,
-            kind: SourceKind::Buffered(bytes),
+            kind: crate::data::SourceKind::Buffered(bytes),
             byte_size: len as u64,
             name_override: None,
             xet_terms: None,
@@ -811,5 +812,87 @@ mod tests {
         assert!(bytes.iter().all(|&b| b == 0));
         // All three chunk windows were in flight at once.
         assert_eq!(peak.load(Ordering::SeqCst), 3);
+    }
+
+    fn plain_source(bytes: Vec<u8>) -> Source {
+        Source {
+            file_idx: 0,
+            kind: crate::data::SourceKind::Buffered(bytes),
+            byte_size: 0, // filled by callers below
+            name_override: None,
+            xet_terms: None,
+            extensions: Default::default(),
+        }
+    }
+
+    /// With `--volume-res` above the grid side, the byte floor must build the
+    /// streamed sparse brick pool: each finished brick is written to
+    /// `bricks.bin` on disk (so `atlas` stays empty) and camera framing comes
+    /// from the octree's fine occupied region, not the coarse grid.
+    #[test]
+    fn volume_res_above_grid_streams_sparse_bricks() {
+        // 100 bytes into a 16³ fine cube (cells_v = 4096 > 100): the sparse
+        // regime, one byte per voxel along the Hilbert prefix.
+        let mut src = plain_source(vec![0x41u8; 100]);
+        src.byte_size = 100;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let built = aggregate_bytes_hilbert(
+            vec![src],
+            100,
+            8,
+            16,
+            build_pixel_lut(),
+            rt.handle().clone(),
+            dir.path(),
+        )
+        .unwrap();
+        let bv = built.bricks.expect("streamed brick pool present");
+        assert!(bv.streamed);
+        assert!(bv.atlas.is_empty(), "streamed bricks live on disk, not RAM");
+        assert_eq!(bv.vol_dim, [16, 16, 16]);
+        assert_eq!(bv.max_count, 1, "one byte per voxel in the sparse regime");
+        assert!(bv.occupied >= 1);
+        assert!(bv.focus_radius > 0.0);
+        // Every brick written to bricks.bin carries BRICK³ RGBA voxels, and
+        // the B channel holds raw per-voxel counts: summing B over the file
+        // must recover the exact input byte count (nothing dropped, none
+        // double-counted as the Hilbert cursor advances).
+        let raw = std::fs::read(dir.path().join("bricks.bin")).unwrap();
+        assert_eq!(raw.len(), bv.occupied as usize * (brick::BRICK * brick::BRICK * brick::BRICK) as usize * 4);
+        let pushed: u64 = raw.iter().skip(2).step_by(4).map(|&b| b as u64).sum();
+        assert_eq!(pushed, 100);
+        // A `.part` staging file must not survive the seal.
+        assert!(!dir.path().join("bricks.bin.part").exists());
+    }
+
+    /// When the input exceeds the fine cube (`total > cells_v`) several bytes
+    /// share each voxel: the bulk-regime cursor advances `cp_v` once per
+    /// voxel step (not per byte), so per-voxel counts must still sum to the
+    /// exact total and never exceed `ceil(total / cells_v)`.
+    #[test]
+    fn volume_res_bulk_regime_bins_bytes_without_loss() {
+        // 10 000 bytes into a 16³ cube: bulk regime, 2–3 bytes per voxel.
+        let mut src = plain_source(vec![0u8; 10_000]);
+        src.byte_size = 10_000;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let built = aggregate_bytes_hilbert(
+            vec![src],
+            10_000,
+            8,
+            16,
+            build_pixel_lut(),
+            rt.handle().clone(),
+            dir.path(),
+        )
+        .unwrap();
+        let bv = built.bricks.expect("streamed brick pool present");
+        assert!(bv.streamed);
+        assert_eq!(bv.max_count, 3, "div_ceil(10_000 / 4_096) per voxel");
+        let raw = std::fs::read(dir.path().join("bricks.bin")).unwrap();
+        assert_eq!(raw.len(), bv.occupied as usize * (brick::BRICK * brick::BRICK * brick::BRICK) as usize * 4);
+        let pushed: u64 = raw.iter().skip(2).step_by(4).map(|&b| b as u64).sum();
+        assert_eq!(pushed, 10_000, "every input byte binned exactly once");
     }
 }

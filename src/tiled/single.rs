@@ -167,33 +167,78 @@ fn open_sources(sources: &[Source]) -> anyhow::Result<(Vec<Data>, Vec<u64>)> {
     Ok((source_data, cumulative))
 }
 
+/// Source index, source-local offset, and length of the byte range this
+/// pipeline reads for the file position `pos`, capped at [`CHUNK_BYTES`] and
+/// at the owning source's end. Pure helper so tests can pin boundary
+/// behavior (source switches, final partial chunk) without I/O.
+fn chunk_span(cumulative: &[u64], total: u64, pos: u64) -> ChunkSpan {
+    let src = cumulative.partition_point(|&c| c <= pos) - 1;
+    let src_end = if src + 1 < cumulative.len() {
+        cumulative[src + 1]
+    } else {
+        total
+    };
+    ChunkSpan {
+        src,
+        offset: pos - cumulative[src],
+        len: (src_end - pos).min(CHUNK_BYTES) as usize,
+    }
+}
+
+/// See [`chunk_span`].
+struct ChunkSpan {
+    src: usize,
+    offset: u64,
+    len: usize,
+}
+
 pub async fn render_single_png(sources: &[Source], total: u64, out: &Path) -> anyhow::Result<()> {
     let geom = single_geometry(total);
     let mut pixels = vec![0u8; geom.width as usize * geom.height as usize];
 
     let (source_data, cumulative) = open_sources(sources)?;
 
-    // Walk byte indices sequentially across source boundaries so mmap pages
-    // stay warm and each source sees one ascending range-fetch sequence.
+    // Walk byte positions sequentially across source boundaries, pipelined one
+    // chunk ahead: while the Hilbert scatter of the current chunk runs (pure
+    // CPU), the next chunk's fetch is already in flight. On remote sources this
+    // overlaps the HTTP round-trip with the scatter instead of serializing
+    // them; on local sources the fetch is an mmap memcpy, so a one-chunk
+    // read-ahead only warms pages slightly early. Fetch order stays ascending,
+    // so each source still sees one ascending range-fetch sequence.
 
     let mut pos = 0u64;
+    let first = chunk_span(&cumulative, total, pos);
+    let mut buf = source_data[first.src]
+        .fetch_range(first.offset, first.len)
+        .await
+        .with_context(|| format!("reading byte range at {} of source {}", pos, first.src))?;
     while pos < total {
-        let src_idx = cumulative.partition_point(|&c| c <= pos) - 1;
-        let src_end = if src_idx + 1 < cumulative.len() {
-            cumulative[src_idx + 1]
-        } else {
-            total
-        };
-        let chunk_len = (src_end - pos).min(CHUNK_BYTES) as usize;
-        let buf = source_data[src_idx]
-            .fetch_range(pos - cumulative[src_idx], chunk_len)
-            .await
-            .with_context(|| format!("reading byte range at {} of source {src_idx}", pos))?;
+        let next_pos = pos + buf.len() as u64;
+        // Kick off the next chunk's fetch before scattering this one, so the
+        // round-trip overlaps the CPU work.
+        let mut next = None;
+        let mut next_fut: Option<
+            std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + '_>>,
+        > = None;
+        if next_pos < total {
+            let c = chunk_span(&cumulative, total, next_pos);
+            let data = &source_data[c.src];
+            next_fut = Some(Box::pin(async move {
+                data.fetch_range(c.offset, c.len).await.with_context(|| {
+                    format!("reading byte range at {} of source {}", next_pos, c.src)
+                })
+            }));
+            next = Some(c);
+        }
         let mut tile = tile_scatter(pos, &geom);
         for (k, &b) in buf.iter().enumerate() {
             pixels[scatter_offset(&mut tile, pos + k as u64, &geom)] = b;
         }
-        pos += chunk_len as u64;
+        if let Some(f) = next_fut {
+            buf = f.await?;
+        }
+        debug_assert!(next.is_none_or(|c| buf.len() == c.len));
+        pos = next_pos;
     }
 
     let png = encode_indexed_single_png(geom.width, geom.height, &pixels)?;
@@ -351,6 +396,36 @@ mod tests {
     use super::*;
     use crate::data::Source;
     use std::io::Write;
+
+    /// chunk_span reproduces the original inline chunk selection: chunks cap
+    /// at CHUNK_BYTES and at the owning source's end, and the source switch
+    /// resolves via the cumulative-offset partition point.
+    #[test]
+    fn chunk_span_matches_source_boundaries() {
+        // Sources: 5, 3, 0-length-free rest (total 10).
+        let cumulative = [0u64, 5, 8];
+        let total = 12u64;
+        assert_eq!(chunk_span(&cumulative, total, 0).len, 5); // capped by source end
+        assert_eq!(chunk_span(&cumulative, total, 0).src, 0);
+        assert_eq!(chunk_span(&cumulative, total, 4).offset, 4);
+        let c = chunk_span(&cumulative, total, 5);
+        assert_eq!((c.src, c.offset, c.len), (1, 0, 3));
+        let c = chunk_span(&cumulative, total, 8);
+        assert_eq!((c.src, c.offset, c.len), (2, 0, 4)); // final source runs to total
+        let c = chunk_span(&cumulative, total, 12 - 1);
+        assert_eq!((c.src, c.offset, c.len), (2, 3, 1));
+    }
+
+    /// A single large source chunks at CHUNK_BYTES and the last chunk is
+    /// partial.
+    #[test]
+    fn chunk_span_caps_at_chunk_bytes() {
+        let cumulative = [0u64];
+        let total = CHUNK_BYTES + 7;
+        assert_eq!(chunk_span(&cumulative, total, 0).len, CHUNK_BYTES as usize);
+        let last = chunk_span(&cumulative, total, CHUNK_BYTES);
+        assert_eq!((last.src, last.offset, last.len), (0, CHUNK_BYTES, 7));
+    }
 
     /// Reference implementation (full O(kh) Hilbert decode plus div/mod per
     /// byte); the equivalence oracle for [`TileScatter`], which the render

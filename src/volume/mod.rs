@@ -58,8 +58,16 @@ fn part_path(path: &Path) -> PathBuf {
 /// if complete.
 fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let part = part_path(path);
-    std::fs::write(&part, bytes).with_context(|| format!("writing {}", part.display()))?;
-    std::fs::rename(&part, path).with_context(|| format!("sealing {}", path.display()))
+    let res = std::fs::write(&part, bytes)
+        .and_then(|()| std::fs::rename(&part, path))
+        .with_context(|| format!("writing {}", path.display()));
+    if res.is_err() {
+        // Best effort: don't leave a stale partial staging file behind — a
+        // later `hf upload` of the bundle directory would push it to the Hub,
+        // and it is indistinguishable from an in-progress staging file.
+        let _ = std::fs::remove_file(&part);
+    }
+    res
 }
 /// The dense `volume.bin` (coarse fallback LOD + CPU pick/histogram buffer) is
 /// capped at this side so the mandatory up-front download stays small and fixed
@@ -612,10 +620,20 @@ mod tests {
         std::fs::set_permissions(&ro_dir, dp).unwrap();
         assert!(write_atomic(&keep_path, b"new").is_err());
         assert_eq!(std::fs::read(&keep_path).unwrap(), b"original");
+        assert!(!ro_dir.join("keep.bin.part").exists());
         let mut restore = std::fs::metadata(&ro_dir).unwrap().permissions();
         restore.set_mode(0o755);
         std::fs::set_permissions(&ro_dir, restore).unwrap();
         drop(ro);
+
+        // Make the rename fail (target path exists as a directory) and check
+        // the staged `.part` is cleaned up instead of lingering in the bundle
+        // directory with the full artifact's bytes.
+        let dir2 = tempfile::tempdir().unwrap();
+        let clash = dir2.path().join("clash.bin");
+        std::fs::create_dir(&clash).unwrap();
+        assert!(write_atomic(&clash, b"payload").is_err());
+        assert!(!dir2.path().join("clash.bin.part").exists());
     }
 
     /// A streamed brick-pool build must seal `bricks.bin` via rename, leaving

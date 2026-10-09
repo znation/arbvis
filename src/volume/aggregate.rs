@@ -30,8 +30,13 @@ pub(super) fn seal_streamed_bricks<W: Write>(
     let part = part_path(&final_path);
     match bb.finish_streaming() {
         Ok((bv, _writer)) => {
-            std::fs::rename(&part, &final_path)
-                .with_context(|| format!("sealing {}", final_path.display()))?;
+            if let Err(e) = std::fs::rename(&part, &final_path) {
+                // The rename can fail (target path is a directory,
+                // cross-device move, permissions) — the staged file must
+                // not outlive the failure.
+                let _ = std::fs::remove_file(&part);
+                return Err(e).context(format!("sealing {}", final_path.display()));
+            }
             Ok(bv)
         }
         Err(e) => {
@@ -540,6 +545,20 @@ mod tests {
         assert_eq!(voxel_coord(7, extent), [3, 1, 0]);
         assert_eq!(voxel_coord(8, extent), [0, 0, 1]);
         assert_eq!(voxel_coord(15, extent), [3, 1, 1]);
+    }
+
+    #[test]
+    fn seal_streamed_bricks_rename_failure_leaves_no_part() {
+        // Make the seal rename fail (target path is a directory): the staged
+        // file must not be left behind in the bundle directory.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("bricks.bin")).unwrap();
+        let bb = brick::BrickBuilder::new(1, 1, [0u16; 256], Vec::new(), false);
+        assert!(seal_streamed_bricks(bb, dir.path()).is_err());
+        assert!(
+            !dir.path().join("bricks.bin.part").exists(),
+            "failed seal rename must not leave a stale .part staging file"
+        );
     }
 
     #[test]

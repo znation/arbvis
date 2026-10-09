@@ -71,12 +71,17 @@ pub fn write_tile_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     part_name.push(".part");
     let part = path.with_file_name(part_name);
     let res = std::fs::write(&part, bytes);
-    if res.is_err() {
+    if let Err(e) = res {
         // Best effort: don't leave a stale partial staging file behind.
         let _ = std::fs::remove_file(&part);
+        return Err(e).with_context(|| format!("writing tile {}", part.display()));
     }
-    res.with_context(|| format!("writing tile {}", part.display()))?;
-    std::fs::rename(&part, path).with_context(|| format!("sealing tile {}", path.display()))?;
+    if let Err(e) = std::fs::rename(&part, path) {
+        // The rename can fail too (target path is a directory, cross-device
+        // move, permissions) — the staged file must not outlive the failure.
+        let _ = std::fs::remove_file(&part);
+        return Err(e).with_context(|| format!("sealing tile {}", path.display()));
+    }
     Ok(())
 }
 
@@ -319,6 +324,20 @@ mod tests {
             std::fs::read(&path).expect("read back"),
             b"original",
             "failed write must not clobber the existing tile"
+        );
+    }
+
+    #[test]
+    fn write_tile_file_rename_failure_leaves_no_part() {
+        // Simulate a rename failure (target path is a directory): the staged
+        // file must not be left behind next to the failed destination.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tile.png");
+        std::fs::create_dir(&path).expect("mkdir");
+        assert!(write_tile_file(&path, b"bytes").is_err());
+        assert!(
+            !path.with_file_name("tile.png.part").exists(),
+            "failed rename must not leave a stale .part staging file"
         );
     }
 

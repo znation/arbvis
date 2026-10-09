@@ -137,8 +137,15 @@ impl<'a> Parser<'a> {
     }
 
     fn err(&self, msg: impl Into<String>) -> ParseError {
+        self.err_at(self.pos, msg)
+    }
+
+    /// A [`ParseError`] anchored at an explicit byte offset, for callers
+    /// whose failure position differs from the current cursor (e.g. after
+    /// `advance()` has already moved past the offending byte).
+    fn err_at(&self, byte_offset: usize, msg: impl Into<String>) -> ParseError {
         ParseError {
-            byte_offset: self.pos as u64,
+            byte_offset: byte_offset as u64,
             msg: msg.into(),
         }
     }
@@ -404,19 +411,13 @@ impl<'a> Parser<'a> {
         loop {
             match self.advance() {
                 None => {
-                    return Err(ParseError {
-                        byte_offset: self.pos as u64,
-                        msg: "unterminated string".into(),
-                    })
+                    return Err(self.err_at(self.pos, "unterminated string"));
                 }
                 Some(b'"') => return Ok((out, self.pos)),
                 Some(b'\\') => {
                     match self.advance() {
                         None => {
-                            return Err(ParseError {
-                                byte_offset: self.pos as u64,
-                                msg: "EOF in escape".into(),
-                            })
+                            return Err(self.err_at(self.pos, "EOF in escape"));
                         }
                         Some(b'"') => out.push('"'),
                         Some(b'\\') => out.push('\\'),
@@ -507,10 +508,9 @@ impl<'a> Parser<'a> {
     fn parse_hex4(&mut self) -> Result<u16, ParseError> {
         let mut acc: u16 = 0;
         for _ in 0..4 {
-            let b = self.advance().ok_or_else(|| ParseError {
-                byte_offset: self.pos as u64,
-                msg: "EOF in \\uXXXX".into(),
-            })?;
+            let b = self
+                .advance()
+                .ok_or_else(|| self.err_at(self.pos, "EOF in \\uXXXX"))?;
             let d: u16 = match b {
                 b'0'..=b'9' => (b - b'0') as u16,
                 b'a'..=b'f' => (b - b'a' + 10) as u16,
@@ -633,10 +633,7 @@ pub fn parse(src: &[u8]) -> Result<Document, ParseError> {
     let root = p.parse_value()?;
     let trailing = p.skip_ws();
     if p.pos != src.len() {
-        return Err(ParseError {
-            byte_offset: p.pos as u64,
-            msg: "trailing data after root value".into(),
-        });
+        return Err(p.err_at(p.pos, "trailing data after root value"));
     }
     Ok(Document {
         leading_ws: leading,

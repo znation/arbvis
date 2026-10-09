@@ -11,6 +11,12 @@ arbvis /tmp/foo.bin --out ./out
 # then serve ./out over HTTP and open index.html in a browser
 ```
 
+For a single static image instead of a viewer bundle, export one PNG:
+
+```sh
+arbvis /tmp/foo.bin --png foo.png
+```
+
 The output is a [Leaflet.js](https://leafletjs.com/) tile pyramid you can zoom across; at maximum zoom, one pixel is one byte. Add `--3d` for the volume viewer:
 
 ```sh
@@ -184,6 +190,7 @@ modelweightvis layers a dtype-aware element coloring on top of the same xorb hue
 
 ## Other useful flags
 
+- `--png FILE` — write the entire 2D render as a single indexed PNG (one pixel per byte, same byte-color scheme as the tile pyramid) instead of a viewer bundle. With `--out DIR`, FILE is placed inside DIR. Not combinable with `--3d`, `--diff`, `--space`, `--show-xet-xorbs`, or `--regen-html`.
 - `--title TEXT` — title shown in the viewer info panel (defaults to `"arbvis"` or `"arbvis diff"`).
 - `-l, --file-list FILE` — read input paths from `FILE`, one per line; `-` reads from stdin.
 - `--regen-html DIR` — rebuild `index.html` for an existing bundle directory without re-rendering (2D or, with `--3d`, the volume bundle). Useful after editing the viewer template.

@@ -2,6 +2,7 @@ pub mod html;
 pub mod leaf;
 pub mod leaf_renderer;
 pub mod pyramid_accum;
+pub mod single;
 pub mod streaming;
 
 use std::collections::HashMap;

@@ -147,6 +147,18 @@ pub struct Args {
     #[arg(long)]
     pub(crate) show_xet_xorbs: bool,
 
+    /// Write the entire 2D render as one indexed PNG file (one pixel per
+    /// byte, same byte-color scheme as the tile pyramid) instead of a viewer
+    /// bundle — for embedding arbvis output in docs and PRs without serving
+    /// a web bundle. With `--out DIR`, FILE is placed inside DIR; otherwise
+    /// FILE is used as given.
+    #[arg(
+        long = "png",
+        value_name = "FILE",
+        conflicts_with_all = ["three_d", "diff", "space", "regen_html", "show_xet_xorbs"]
+    )]
+    pub(crate) png: Option<PathBuf>,
+
     /// Tile output format. AVIF (default) is ~30-50% smaller than PNG over
     /// the wire; PNG is the universal fallback.
     #[arg(long, value_enum, default_value_t = TileFormatArg::Avif)]
@@ -373,5 +385,46 @@ mod grid_validation_tests {
         assert!(validate_grid(1024).is_ok()); // the default
         assert!(validate_grid(32768).is_err()); // above the cap
         assert!(validate_grid(768).is_err()); // not a power of two
+    }
+}
+
+#[cfg(test)]
+mod png_flag_tests {
+    use super::Args;
+    use clap::Parser;
+
+    #[test]
+    fn png_conflicts_with_3d_diff_space_regen_and_xorbs() {
+        let png = ["arbvis", "--png", "out.png"];
+        assert!(Args::try_parse_from(png).is_ok());
+        for flag in [
+            vec!["--3d"],
+            vec!["--diff", "a", "b"],
+            vec!["--space", "me/vis"],
+            vec!["--regen-html", "dir"],
+            vec!["--show-xet-xorbs"],
+        ] {
+            let mut argv = png.clone().to_vec();
+            argv.extend_from_slice(&flag);
+            assert!(
+                Args::try_parse_from(&argv).is_err(),
+                "--png should conflict with {}",
+                flag.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn png_coexists_with_out_and_tile_format() {
+        assert!(Args::try_parse_from([
+            "arbvis",
+            "--png",
+            "out.png",
+            "--out",
+            "dir",
+            "--tile-format",
+            "png"
+        ])
+        .is_ok());
     }
 }

@@ -14,7 +14,7 @@ use crate::data::Source;
 use crate::deploy;
 use crate::hf_url::{self, HfOutputSpec};
 use crate::providers::select_provider;
-use crate::registry::{self, DiffPair, SourceCtx};
+use crate::registry::{self, DestKind, DiffPair, SourceCtx};
 use crate::tiled;
 use crate::tiled::streaming::run_tiles_hf_streaming;
 use crate::volume;
@@ -76,7 +76,14 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
         }
     }
 
-    let dest = OutputDest::from_args(&args)?;
+    let dest = if args.png.is_some() {
+        // Single-PNG mode writes one file, not a bundle: skip --out/--space
+        // destination resolution entirely (`--out DIR` is re-read directly as
+        // the PNG's parent directory by `png_output_path`).
+        None
+    } else {
+        Some(OutputDest::from_args(&args)?)
+    };
 
     let (leaf_format, pyramid_format) = args.tile_format.split();
     let stream = args.stream;
@@ -93,12 +100,12 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
     // `--space` allocates a tempdir, this shortcut silently stops firing and
     // we re-render from empty stdin.
     if args.files.is_empty() && args.file_list.is_none() {
-        if let OutputDest::Bundle {
+        if let Some(OutputDest::Bundle {
             local: Some(local),
             upload_hf: None,
             space: Some(space_id),
             _tempdir: None,
-        } = &dest
+        }) = &dest
         {
             return if args.three_d {
                 deploy::run_deploy_bundle(local, space_id).await
@@ -126,7 +133,10 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
     let ctx = SourceCtx {
         inputs: &files,
         diff,
-        dest_kind: dest.kind(),
+        dest_kind: dest
+            .as_ref()
+            .map(|d| d.kind())
+            .unwrap_or(DestKind::Bundle),
         three_d: args.three_d,
         stream,
         show_xet_xorbs,
@@ -159,7 +169,28 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
         grid_side: args.grid,
         volume_res: args.volume_res,
     };
-    dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await
+
+    // Single-image PNG export: render the whole 2D canvas as one indexed PNG
+    // and stop — no bundle, no upload, no deploy.
+    if let Some(ref png) = args.png {
+        if total == 0 {
+            anyhow::bail!("--png requires non-empty input");
+        }
+        let out_path = tiled::single::png_output_path(png, args.out.as_deref())?;
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        return tiled::single::render_single_png(&sources, total, &out_path).await;
+    }
+
+    match dest {
+        Some(dest) => {
+            dispatch_render(sources, total, &labels, &cfg, dest, stream, &registry).await
+        }
+        // PNG mode returned earlier; nothing else runs without a destination.
+        None => Ok(()),
+    }
 }
 
 /// Drive the renderer for one of the four output destinations, optionally

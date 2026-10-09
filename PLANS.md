@@ -5,7 +5,13 @@ Each plan: goal, approach, files touched, acceptance criteria. Move finished pla
 
 ## Planned
 
-### Single-image PNG export (`--png FILE`)
+_None yet._
+
+## Done
+
+### Single-image PNG export (`--png FILE`) — Done 2026-10-09
+
+**Implemented 2026-10-09 by feature.** As planned, with two clarifications: in PNG mode `OutputDest::from_args` is skipped entirely (so `--png` needs no `--out`; a given `--out DIR` is the PNG's parent, created if missing, and `hf://` outs are rejected); and the indexed PNG uses the full 256-entry `build_pixel_lut()` as its palette, so pixel index = byte value.
 
 **Found by plan loop 2026-10-09.** Verified 2026-10-09: no single-image export exists — `src/lib.rs` `Args` has only `--tile-format` (tiles), and `grep -rni 'single.image\|snapshot' src README.md` shows no PNG-export path.
 
@@ -27,7 +33,5 @@ Each plan: goal, approach, files touched, acceptance criteria. Move finished pla
 - `arbvis <file> --png out.png` produces a valid PNG for a small real file (manual check documented in the run summary, not a committed fixture).
 
 **Sizing:** one file of new code (~150–200 lines) plus flag wiring and tests — one run. Diff-mode PNG is a possible follow-up plan; do not attempt it here.
-
-## Done
 
 _None yet._

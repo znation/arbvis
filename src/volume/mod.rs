@@ -403,12 +403,38 @@ pub fn regen_html(dir: &Path, branding: &Branding) -> anyhow::Result<()> {
                 .collect()
         })
         .unwrap_or_default();
-    std::fs::write(
-        dir.join("index.html"),
-        html::build_volume_html(&title, &inputs, branding),
-    )?;
+    let html = html::build_volume_html(&title, &inputs, branding);
+    write_index_html_atomic(dir, html.as_bytes())?;
     log::info!("Regenerated 3D viewer index.html in {}", dir.display());
     Ok(())
+}
+
+/// Write the 3D viewer's `index.html` into `dir`, staged to a `.part` sibling
+/// and then renamed into place, so a process killed mid-write (or an ENOSPC
+/// partway through) leaves the previous complete file instead of a truncated
+/// one that the deployed viewer serves as if complete. If the target path
+/// cannot be replaced (it exists as a directory), the write fails before
+/// anything is staged, leaving the previous file untouched. Mirrors the 2D
+/// viewer pair write in `crate::tiled::html::write_viewer_pair`.
+fn write_index_html_atomic(dir: &Path, html: &[u8]) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating viewer dir {}", dir.display()))?;
+    let index = dir.join("index.html");
+    if index.is_dir() {
+        anyhow::bail!(
+            "cannot write viewer artifact {}: path exists as a directory",
+            index.display()
+        );
+    }
+    let part = dir.join("index.html.part");
+    let res = std::fs::write(&part, html)
+        .and_then(|()| std::fs::rename(&part, &index))
+        .with_context(|| format!("writing {}", index.display()));
+    if res.is_err() {
+        // Best effort: don't leave stale staging files behind.
+        let _ = std::fs::remove_file(&part);
+    }
+    res
 }
 
 /// Byte-Hilbert floor: a single streaming pass over the concatenated source
@@ -939,6 +965,37 @@ mod tests {
                 "no staged {name}.part should remain"
             );
         }
+    }
+
+    /// A failure while regenerating the 3D viewer's index.html (here: the
+    /// target exists as a directory, so it cannot be replaced) must fail
+    /// loudly without leaving staging residue.
+    #[test]
+    fn regen_html_failure_leaves_no_part_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("meta.json"), b"{}").unwrap();
+        std::fs::create_dir(dir.path().join("index.html")).unwrap();
+        let res = regen_html(dir.path(), &Branding::default());
+        assert!(res.is_err(), "write into a directory path must fail loudly");
+        assert!(!dir.path().join("index.html.part").exists());
+        // The existing directory is untouched by the failed regeneration.
+        assert!(dir.path().join("index.html").is_dir());
+    }
+
+    /// A successful regen_html writes a complete index.html atomically: the
+    /// .part sibling is gone and the file renders from meta.json inputs.
+    #[test]
+    fn regen_html_writes_index_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("meta.json"),
+            serde_json::json!({"title": "T", "inputs": ["a.bin"]}).to_string(),
+        )
+        .unwrap();
+        regen_html(dir.path(), &Branding::default()).unwrap();
+        let html = std::fs::read(dir.path().join("index.html")).unwrap();
+        assert!(!html.is_empty());
+        assert!(!dir.path().join("index.html.part").exists());
     }
 
     /// write_atomic must leave the previous file intact when the staged write

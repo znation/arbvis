@@ -145,22 +145,23 @@ pub async fn prepare_diff_sources(
     }
 
     anyhow::bail!(
-        "--diff: both arguments must be files or both must be directories (got {} and {})",
-        if orig_is_file {
-            "file"
-        } else if orig_is_dir {
-            "directory"
-        } else {
-            "missing path"
-        },
-        if mod_is_file {
-            "file"
-        } else if mod_is_dir {
-            "directory"
-        } else {
-            "missing path"
-        }
+        "--diff: both arguments must be files or both must be directories \
+         (got {} and {})",
+        side_kind(original, orig_is_file, orig_is_dir),
+        side_kind(modified, mod_is_file, mod_is_dir)
     );
+}
+
+/// Describes one `--diff` side for the mixed/missing-path error, naming the
+/// path itself so a typo'd argument is identifiable at a glance.
+fn side_kind(path: &Path, is_file: bool, is_dir: bool) -> String {
+    if is_file {
+        format!("file {}", path.display())
+    } else if is_dir {
+        format!("directory {}", path.display())
+    } else {
+        format!("missing path {}", path.display())
+    }
 }
 
 /// Byte-diff two directory trees, matching files by relative path. Same-size
@@ -417,6 +418,33 @@ mod tests {
         assert!(err
             .to_string()
             .contains("files or both must be directories"));
+        assert!(err
+            .to_string()
+            .contains(&format!("file {}", file.display())));
+        assert!(err
+            .to_string()
+            .contains(&format!("directory {}", dir.path().display())));
+    }
+
+    /// A `--diff` side that exists as neither file nor directory is named in
+    /// the error, so a typo'd path is identifiable without re-running.
+    #[tokio::test]
+    async fn missing_diff_side_is_named_in_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.bin");
+        fs::write(&file, b"x").unwrap();
+        let ghost = dir.path().join("nope.bin");
+        let registry = Registry::with_defaults();
+        let err = match prepare_diff_sources(&file, &ghost, false, &registry).await {
+            Err(e) => e,
+            Ok(_) => panic!("missing diff side should fail"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("missing path"), "message was: {msg}");
+        assert!(
+            msg.contains(&ghost.display().to_string()),
+            "message was: {msg}"
+        );
     }
 
     /// A directory pair is classified into matched/mismatched byte diffs and

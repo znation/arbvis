@@ -42,9 +42,11 @@ jobs:
   # The deployed Space app (src/space_template/app.py.tmpl) is Python, outside
   # the cargo suite. Its HTTP Range tests (src/space_template/test_app.py) skip
   # themselves when their deps are missing, so without this job they never run
-  # anywhere and can rot silently. fastapi + huggingface_hub come from
-  # src/space_template/requirements.txt; httpx is the additional test-only dep
-  # of starlette's TestClient.
+  # anywhere and can rot silently. Install the app's runtime deps straight from
+  # its own requirements.txt — the same list the deployed Space installs — so CI
+  # can't drift from deploy: a dep added there is picked up here without a
+  # hand-synced edit to this file. httpx is the additional test-only dep of
+  # starlette's TestClient.
   space-app:
     runs-on: ubuntu-latest
     steps:
@@ -52,5 +54,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install fastapi httpx huggingface_hub
+      - run: pip install -r src/space_template/requirements.txt httpx
       - run: python3 src/space_template/test_app.py

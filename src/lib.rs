@@ -24,6 +24,8 @@ mod pipeline;
 mod progress;
 mod providers;
 pub mod registry;
+#[cfg(test)]
+pub(crate) mod test_plugin;
 mod throttle;
 mod tiled;
 mod volume;

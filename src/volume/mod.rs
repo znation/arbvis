@@ -37,6 +37,52 @@ use crate::layout::LayoutMode;
 use crate::registry::{Branding, Registry};
 use encode::{VolumeMeta, VoxelAcc};
 
+/// Stage path for an artifact being written atomically: `bricks.bin` is
+/// staged at `bricks.bin.part` and renamed into place when complete.
+fn part_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new(""))
+        .to_os_string();
+    name.push(".part");
+    path.with_file_name(name)
+}
+
+/// Write `bytes` to `path` atomically: stage to `<file>.part` in the same
+/// directory, then rename over `path`. A process killed mid-write leaves the
+/// previous file — or none — instead of a truncated artifact: the viewer
+/// bundle is read back by `regen_html` and served verbatim by the deployed
+/// Space, so a half-written `meta.json` or `bricks.bin` would be served as
+/// if complete.
+fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let part = part_path(path);
+    std::fs::write(&part, bytes).with_context(|| format!("writing {}", part.display()))?;
+    std::fs::rename(&part, path).with_context(|| format!("sealing {}", path.display()))
+}
+
+/// Seal a streamed `bricks.bin`: flush the builder into the staged
+/// `<file>.part`, then rename it into place. On failure the partial file is
+/// removed, so a killed or failed run never leaves a truncated `bricks.bin`
+/// for the viewer (or a later rerun) to read as if complete.
+fn seal_streamed_bricks<W: Write>(
+    bb: brick::BrickBuilder<W>,
+    out_dir: &Path,
+) -> anyhow::Result<brick::BrickVolume> {
+    let final_path = out_dir.join("bricks.bin");
+    let part = part_path(&final_path);
+    match bb.finish_streaming() {
+        Ok((bv, _writer)) => {
+            std::fs::rename(&part, &final_path)
+                .with_context(|| format!("sealing {}", final_path.display()))?;
+            Ok(bv)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            Err(anyhow::Error::new(e).context(format!("streaming bricks to {}", part.display())))
+        }
+    }
+}
+
 /// Bytes read per `fetch_range` window during aggregation.
 const CHUNK: u64 = 4 * 1024 * 1024;
 
@@ -222,7 +268,7 @@ pub async fn render_volume(
     .await
     .map_err(|e| anyhow::anyhow!("volume aggregation join failure: {e}"))??;
 
-    std::fs::write(out_dir.join("volume.bin"), &built.volume_rgba)?;
+    write_atomic(&out_dir.join("volume.bin"), &built.volume_rgba)?;
 
     // Sparse brick pool + page table the volume ray-march renders from
     // (GigaVoxels-style indirection — only occupied bricks, empty ones leapt).
@@ -239,16 +285,16 @@ pub async fn render_volume(
     // finalized (their `atlas` is empty); only the non-streamed dense-derived
     // path still holds the atlas in RAM and writes it here.
     if !bricks.streamed {
-        std::fs::write(out_dir.join("bricks.bin"), &bricks.atlas)?;
+        write_atomic(&out_dir.join("bricks.bin"), &bricks.atlas)?;
     }
     // Page structure: the streamed path ships a sparse octree node pool
     // (`tree.bin`); the non-streamed/flat path ships the dense page table
     // (`pagetable.bin`).
     let (page_file, tree_file) = if bricks.streamed {
-        std::fs::write(out_dir.join("tree.bin"), &bricks.node_pool)?;
+        write_atomic(&out_dir.join("tree.bin"), &bricks.node_pool)?;
         (String::new(), "tree.bin".to_string())
     } else {
-        std::fs::write(out_dir.join("pagetable.bin"), &bricks.page_table)?;
+        write_atomic(&out_dir.join("pagetable.bin"), &bricks.page_table)?;
         ("pagetable.bin".to_string(), String::new())
     };
 
@@ -313,10 +359,10 @@ pub async fn render_volume(
         format_version: 6,
         bricks: Some(brick_meta),
     };
-    std::fs::write(out_dir.join("meta.json"), serde_json::to_vec(&meta)?)?;
-    std::fs::write(
-        out_dir.join("index.html"),
-        html::build_volume_html(title, inputs, branding),
+    write_atomic(&out_dir.join("meta.json"), &serde_json::to_vec(&meta)?)?;
+    write_atomic(
+        &out_dir.join("index.html"),
+        html::build_volume_html(title, inputs, branding).as_bytes(),
     )?;
 
     log::info!("3D viewer bundle written to {}", out_dir.display());
@@ -401,7 +447,9 @@ fn aggregate_bytes_hilbert(
     // The streamed brick pool writes each finished brick straight to bricks.bin
     // (append-only, O(one brick) RAM) as the Hilbert curve advances.
     let mut brick_builder = if order_v > 0 {
-        let w = std::io::BufWriter::new(std::fs::File::create(out_dir.join("bricks.bin"))?);
+        let w = std::io::BufWriter::new(std::fs::File::create(part_path(
+            &out_dir.join("bricks.bin"),
+        ))?);
         Some(brick::BrickBuilder::new(order_v, brick::BRICK, luma, w))
     } else {
         None
@@ -481,7 +529,7 @@ fn aggregate_bytes_hilbert(
     // were already written to disk, so nothing is dropped — a full disk surfaces
     // as an IO error here rather than truncating detail.
     let bricks = match brick_builder {
-        Some(bb) => Some(bb.finish_streaming()?.0),
+        Some(bb) => Some(seal_streamed_bricks(bb, out_dir)?),
         None => None,
     };
 
@@ -566,58 +614,75 @@ fn aggregate_entities(
         let mut cache: std::collections::HashMap<usize, std::sync::Arc<Vec<u8>>> =
             std::collections::HashMap::new();
 
-        let mut agg = brick::StreamBrickAgg::new(extent, brick);
-        let mut w = std::io::BufWriter::new(std::fs::File::create(out_dir.join("bricks.bin"))?);
-        let ce = encode::coarse_extent(extent, COARSE_CAP);
-        let mut coarse = encode::CoarseAcc::new(extent, ce);
+        let part = part_path(&out_dir.join("bricks.bin"));
+        let built = (|| -> anyhow::Result<BuildResult> {
+            let mut agg = brick::StreamBrickAgg::new(extent, brick);
+            let mut w = std::io::BufWriter::new(std::fs::File::create(&part)?);
+            let ce = encode::coarse_extent(extent, COARSE_CAP);
+            let mut coarse = encode::CoarseAcc::new(extent, ce);
 
-        let mut z0 = 0u32;
-        while z0 < ez {
-            let z1 = (z0 + slab_depth).min(ez);
-            let depth = (z1 - z0) as usize;
-            let mut slab = vec![VoxelCell::default(); ex as usize * ey as usize * depth];
+            let mut z0 = 0u32;
+            while z0 < ez {
+                let z1 = (z0 + slab_depth).min(ez);
+                let depth = (z1 - z0) as usize;
+                let mut slab = vec![VoxelCell::default(); ex as usize * ey as usize * depth];
 
-            for (i, ent) in entities.iter().enumerate() {
-                let (ez0, ez1) = ivals[i];
-                if ez0 >= z1 || ez1 <= z0 {
-                    continue; // bbox doesn't intersect this slab
-                }
-                let renderer = resolve(ent)?;
-                let bytes = match cache.get(&i) {
-                    Some(b) => b.clone(),
-                    None => {
-                        let b = std::sync::Arc::new(fetch_entity_bytes(&sources, ent, &rt)?);
-                        cache.insert(i, b.clone());
-                        b
+                for (i, ent) in entities.iter().enumerate() {
+                    let (ez0, ez1) = ivals[i];
+                    if ez0 >= z1 || ez1 <= z0 {
+                        continue; // bbox doesn't intersect this slab
                     }
-                };
-                let ctx = VoxelRenderCtx {
-                    entity: ent,
-                    bytes: &bytes[..],
-                    extent,
-                    diff_mode,
-                };
-                let mut view = VoxelGridMut::slab(&mut slab, extent, z0, z1);
-                renderer.render_window(&ctx, &mut view, z0..z1);
+                    let renderer = resolve(ent)?;
+                    let bytes = match cache.get(&i) {
+                        Some(b) => b.clone(),
+                        None => {
+                            let b = std::sync::Arc::new(fetch_entity_bytes(&sources, ent, &rt)?);
+                            cache.insert(i, b.clone());
+                            b
+                        }
+                    };
+                    let ctx = VoxelRenderCtx {
+                        entity: ent,
+                        bytes: &bytes[..],
+                        extent,
+                        diff_mode,
+                    };
+                    let mut view = VoxelGridMut::slab(&mut slab, extent, z0, z1);
+                    renderer.render_window(&ctx, &mut view, z0..z1);
+                }
+
+                let slab_rgba = encode::pack_voxel_cells(&slab);
+                agg.add_slab(&slab_rgba, z0, z1, &mut w)?;
+                coarse.add_slab(&slab_rgba, z0, z1);
+
+                cache.retain(|&i, _| ivals[i].1 > z1); // evict entities behind the front
+                z0 = z1; // free `slab`/`slab_rgba`
             }
-
-            let slab_rgba = encode::pack_voxel_cells(&slab);
-            agg.add_slab(&slab_rgba, z0, z1, &mut w)?;
-            coarse.add_slab(&slab_rgba, z0, z1);
-
-            cache.retain(|&i, _| ivals[i].1 > z1); // evict entities behind the front
-            z0 = z1; // free `slab`/`slab_rgba`
+            w.flush()?;
+            let bricks = agg.finish();
+            Ok(BuildResult {
+                volume_rgba: coarse.finish(),
+                grid_extent: ce,
+                max_count: 0,
+                focus_center: bricks.focus_center,
+                focus_radius: bricks.focus_radius,
+                bricks: Some(bricks),
+            })
+        })();
+        match built {
+            Ok(res) => {
+                let final_path = out_dir.join("bricks.bin");
+                std::fs::rename(&part, &final_path)
+                    .with_context(|| format!("sealing {}", final_path.display()))?;
+                return Ok(res);
+            }
+            Err(e) => {
+                // Drop the staged partial so no truncated bricks.bin is left
+                // for the viewer or a rerun to read as if complete.
+                let _ = std::fs::remove_file(&part);
+                return Err(e);
+            }
         }
-        w.flush()?;
-        let bricks = agg.finish();
-        return Ok(BuildResult {
-            volume_rgba: coarse.finish(),
-            grid_extent: ce,
-            max_count: 0,
-            focus_center: bricks.focus_center,
-            focus_radius: bricks.focus_radius,
-            bricks: Some(bricks),
-        });
     }
 
     // Below the coarse cap: simple dense (non-streamed) path — render every
@@ -867,6 +932,72 @@ mod tests {
             "byte floor must stay LUT-colored"
         );
         assert!(dir.path().join("index.html").exists());
+        // Atomic writes leave no staged .part files behind.
+        for name in ["volume.bin", "bricks.bin", "meta.json", "index.html"] {
+            assert!(
+                !dir.path().join(format!("{name}.part")).exists(),
+                "no staged {name}.part should remain"
+            );
+        }
+    }
+
+    /// write_atomic must leave the previous file intact when the staged write
+    /// fails, and leave no `.part` behind when it succeeds.
+    #[test]
+    fn write_atomic_replaces_and_fails_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact.bin");
+        write_atomic(&path, b"first").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        write_atomic(&path, b"second- longer").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second- longer");
+        assert!(!dir.path().join("artifact.bin.part").exists());
+
+        // Make the staged write fail (read-only dir) and check the previous
+        // file survives untouched.
+        use std::os::unix::fs::PermissionsExt;
+        let ro = tempfile::tempdir().unwrap();
+        let ro_dir = ro.path().join("ro");
+        std::fs::create_dir(&ro_dir).unwrap();
+        let keep_path = ro_dir.join("keep.bin");
+        std::fs::write(&keep_path, b"original").unwrap();
+        let mut dp = std::fs::metadata(&ro_dir).unwrap().permissions();
+        dp.set_mode(0o500);
+        std::fs::set_permissions(&ro_dir, dp).unwrap();
+        assert!(write_atomic(&keep_path, b"new").is_err());
+        assert_eq!(std::fs::read(&keep_path).unwrap(), b"original");
+        let mut restore = std::fs::metadata(&ro_dir).unwrap().permissions();
+        restore.set_mode(0o755);
+        std::fs::set_permissions(&ro_dir, restore).unwrap();
+        drop(ro);
+    }
+
+    /// A streamed brick-pool build must seal `bricks.bin` via rename, leaving
+    /// no `.part` staged file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streamed_bricks_bin_leaves_no_part_file() {
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i * 17 + 3) as u8).collect();
+        let dir = tempfile::tempdir().unwrap();
+        render_volume(
+            vec![buffered(bytes)],
+            200_000,
+            dir.path().to_path_buf(),
+            "test",
+            &[],
+            false,
+            8,
+            16, // --volume-res > --grid ⇒ the streamed brick builder runs
+            LayoutMode::Auto,
+            &Registry::with_defaults(),
+            &Branding::default(),
+        )
+        .await
+        .unwrap();
+        assert!(dir.path().join("bricks.bin").exists());
+        assert!(
+            !dir.path().join("bricks.bin.part").exists(),
+            "sealed bricks.bin must not leave a .part staged file"
+        );
     }
 
     /// `--volume-res` above `--grid` must emit the ray-guided **streamed** brick

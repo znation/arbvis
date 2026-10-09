@@ -330,12 +330,11 @@ mod tests {
         use crate::data::SceneTag;
 
         let mut src = tiny_source();
-        src.extensions
-            .insert(SceneTag {
-                key: "alpha".to_string(),
-                label: "Alpha layer".to_string(),
-                order: 3,
-            });
+        src.extensions.insert(SceneTag {
+            key: "alpha".to_string(),
+            label: "Alpha layer".to_string(),
+            order: 3,
+        });
         let group = SceneGroup {
             key: Some("alpha".to_string()),
             label: "Alpha layer".to_string(),
@@ -364,10 +363,12 @@ mod tests {
         assert_eq!(view.label, "Alpha layer");
         assert_eq!(view.order, 3);
         let uploads = sink.uploads.lock().unwrap();
-        assert!(uploads
-            .iter()
-            .all(|(p, _)| p.starts_with("viz/tiles/alpha/")),
-            "all paths under the scene key: {uploads:?}");
+        assert!(
+            uploads
+                .iter()
+                .all(|(p, _)| p.starts_with("viz/tiles/alpha/")),
+            "all paths under the scene key: {uploads:?}"
+        );
         assert!(uploads
             .iter()
             .any(|(p, _)| *p == "viz/tiles/alpha/0/0/0.png"));

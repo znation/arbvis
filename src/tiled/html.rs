@@ -615,8 +615,7 @@ fn json_str(s: &str) -> String {
 /// labels.json invalid and the viewer's inline script a SyntaxError.
 fn json_escape_body(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
+    for c in s.chars() {
         match c {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),

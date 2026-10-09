@@ -364,6 +364,14 @@ fn indexed_palette_from_lut(lut: &[Rgb<u8>; 256]) -> Option<(Vec<[u8; 3]>, [u8; 
     Some((palette, remap, black_idx))
 }
 
+/// Render a plain byte-mode leaf tile from a pre-filled tile buffer.
+///
+/// Each pixel's byte is read from `tile_buf` and colored via `pixel_lut`
+/// (the caller's 256-entry value-range LUT, e.g. [`build_pixel_lut`]). For
+/// `TileFormat::IndexedPng`, the palette is derived from `pixel_lut` and the
+/// stream is one array remap per pixel; other formats encode truecolor.
+///
+/// [`build_pixel_lut`]: crate::color::build_pixel_lut
 pub fn render_leaf_tile_from_buf(
     tx: u32,
     ty: u32,

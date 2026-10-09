@@ -344,6 +344,64 @@ impl Registry {
             branding: Branding::default(),
         }
     }
+
+    /// Ask each registered [`FormatPlugin`] whether it recognizes `path`; the
+    /// first match wins and fills a fresh extensions map via
+    /// [`FormatPlugin::populate_local`]. A plugin failure is logged (non-fatal
+    /// — the source falls back to plain binary) and its partial extensions
+    /// kept. `log_label` prefixes the warning, e.g. the file's display path.
+    pub(crate) fn populate_local_extensions(
+        &self,
+        path: &Path,
+        file_size: u64,
+        log_label: &str,
+    ) -> Extensions {
+        let mut extensions = Extensions::default();
+        for plugin in &self.formats {
+            if plugin.detects_path(path) {
+                if let Err(e) = plugin.populate_local(path, file_size, &mut extensions) {
+                    log::warn!(
+                        "{}: format plugin `{}` failed: {e} — treating as plain binary",
+                        log_label,
+                        plugin.id()
+                    );
+                }
+                break;
+            }
+        }
+        extensions
+    }
+
+    /// Async counterpart of [`Registry::populate_local_extensions`] for an
+    /// already-open [`Data`] source (HTTP / local snapshot): dispatches to
+    /// [`FormatPlugin::populate_remote`] instead. `detect_path` is the path
+    /// the plugin's [`FormatPlugin::detects_path`] matches on (for remotes,
+    /// the Hub filename).
+    pub(crate) async fn populate_remote_extensions(
+        &self,
+        detect_path: &Path,
+        data: &Data,
+        byte_size: u64,
+        log_label: &str,
+    ) -> Extensions {
+        let mut extensions = Extensions::default();
+        for plugin in &self.formats {
+            if plugin.detects_path(detect_path) {
+                if let Err(e) = plugin
+                    .populate_remote(data, byte_size, &mut extensions)
+                    .await
+                {
+                    log::warn!(
+                        "{}: format plugin `{}` (remote) failed: {e} — treating as plain binary",
+                        log_label,
+                        plugin.id()
+                    );
+                }
+                break;
+            }
+        }
+        extensions
+    }
 }
 
 #[cfg(test)]
@@ -371,6 +429,95 @@ mod tests {
         );
         assert!(reg.formats.is_empty());
         assert!(reg.prepare_sources_extension.is_none());
+    }
+
+    struct TagPlugin {
+        id: &'static str,
+        detect: &'static str,
+        fail: bool,
+    }
+    impl FormatPlugin for TagPlugin {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn detects_path(&self, path: &Path) -> bool {
+            path.extension().is_some_and(|e| e == self.detect)
+        }
+        fn populate_local(
+            &self,
+            _path: &Path,
+            _file_size: u64,
+            exts: &mut Extensions,
+        ) -> anyhow::Result<()> {
+            if self.fail {
+                anyhow::bail!("boom");
+            }
+            exts.insert("local".to_string());
+            Ok(())
+        }
+        fn populate_remote<'a>(
+            &'a self,
+            _data: &'a Data,
+            _byte_size: u64,
+            exts: &'a mut Extensions,
+        ) -> BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async move {
+                if self.fail {
+                    anyhow::bail!("boom");
+                }
+                exts.insert("remote".to_string());
+                Ok(())
+            })
+        }
+    }
+
+    #[test]
+    fn populate_local_extensions_first_match_wins_and_skips_rest() {
+        let reg = Registry {
+            formats: vec![
+                Arc::new(TagPlugin {
+                    id: "a",
+                    detect: "bin",
+                    fail: false,
+                }),
+                Arc::new(TagPlugin {
+                    id: "b",
+                    detect: "bin",
+                    fail: false,
+                }),
+            ],
+            ..Registry::with_defaults()
+        };
+        let exts = reg.populate_local_extensions(Path::new("x.bin"), 10, "x.bin");
+        // First match wins: only `a` populated, and its marker proves the
+        // loop broke instead of letting `b` run too.
+        assert_eq!(exts.get::<String>(), Some(&"local".to_string()));
+        // A path no plugin detects yields empty extensions.
+        let none = reg.populate_local_extensions(Path::new("x.txt"), 10, "x.txt");
+        assert!(none.get::<String>().is_none());
+    }
+
+    #[test]
+    fn populate_extensions_failures_are_nonfatal() {
+        let reg = Registry {
+            formats: vec![Arc::new(TagPlugin {
+                id: "a",
+                detect: "bin",
+                fail: true,
+            })],
+            ..Registry::with_defaults()
+        };
+        // A failed populate leaves the (empty) extensions map rather than
+        // erroring or panicking — the source falls back to plain binary.
+        let local = reg.populate_local_extensions(Path::new("x.bin"), 10, "x.bin");
+        assert!(local.get::<String>().is_none());
+        let remote = futures::executor::block_on(reg.populate_remote_extensions(
+            Path::new("x.bin"),
+            &Data::Owned(Vec::new()),
+            10,
+            "x.bin",
+        ));
+        assert!(remote.get::<String>().is_none());
     }
 
     #[test]

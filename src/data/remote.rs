@@ -99,27 +99,14 @@ pub async fn prepare_sources_from_specs(
                     filename: Arc::clone(&spec.filename),
                     revision: Arc::clone(&spec.revision),
                 };
-                let mut extensions = Extensions::default();
-                let filename_path = Path::new(spec.filename.as_str());
-                for plugin in &registry.formats {
-                    if plugin.detects_path(filename_path) {
-                        if let Err(e) = plugin
-                            .populate_remote(&data, spec.size, &mut extensions)
-                            .await
-                        {
-                            // Non-fatal: arch layout falls back to byte-Hilbert,
-                            // the same way it would for any source whose format
-                            // plugin couldn't parse its header.
-                            log::warn!(
-                                "{}: format plugin `{}` (remote) failed: {e} — \
-                             treating as plain binary",
-                                crate::hf_url::sanitize_log_text(spec.filename.as_str()),
-                                plugin.id()
-                            );
-                        }
-                        break;
-                    }
-                }
+                let extensions = registry
+                    .populate_remote_extensions(
+                        Path::new(spec.filename.as_str()),
+                        &data,
+                        spec.size,
+                        &crate::hf_url::sanitize_log_text(spec.filename.as_str()),
+                    )
+                    .await;
                 extensions
             }
         })
@@ -144,20 +131,11 @@ pub async fn prepare_sources_from_specs(
                         continue;
                     }
                 };
-                let mut extensions = Extensions::default();
-                for plugin in &registry.formats {
-                    if plugin.detects_path(path.as_path()) {
-                        if let Err(e) = plugin.populate_local(path.as_path(), size, &mut extensions)
-                        {
-                            log::warn!(
-                                "{}: format plugin `{}` failed: {e} — treating as plain binary",
-                                path.display(),
-                                plugin.id()
-                            );
-                        }
-                        break;
-                    }
-                }
+                let extensions = registry.populate_local_extensions(
+                    path.as_path(),
+                    size,
+                    &path.display().to_string(),
+                );
                 total += size;
                 sources.push(Source {
                     file_idx: sources.len(),

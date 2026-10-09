@@ -144,19 +144,8 @@ pub fn prepare_sources(
         // path; the first that does gets to populate the source's
         // typed-extensions map (e.g. with `ModelInfo`). arbvis itself
         // knows nothing format-specific.
-        let mut extensions = Extensions::default();
-        for plugin in &registry.formats {
-            if plugin.detects_path(path) {
-                if let Err(e) = plugin.populate_local(path, size, &mut extensions) {
-                    log::warn!(
-                        "{}: format plugin `{}` failed: {e} — treating as plain binary",
-                        path.display(),
-                        plugin.id()
-                    );
-                }
-                break;
-            }
-        }
+        let extensions =
+            registry.populate_local_extensions(path, size, &path.display().to_string());
 
         total += size;
         sources.push(Source {

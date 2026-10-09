@@ -1,6 +1,6 @@
 //! Diff-source construction: the built-in `DiffSourceBuilder` impls for the
 //! file-pair diff cases, plus the directory-tree byte diff. Split out of
-//! `data.rs` so the core `Data`/`Source` plumbing stays readable in one
+//! `data/mod.rs` so the core `Data`/`Source` plumbing stays readable in one
 //! sitting.
 //!
 //! Directory-pair diffs stay inline in `prepare_diff_sources` for now —

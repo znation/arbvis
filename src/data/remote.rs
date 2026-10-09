@@ -70,9 +70,70 @@ pub async fn prepare_sources_from_specs(
         })
         .collect();
 
+    // Remote header population is an independent network round-trip per source
+    // (each plugin's `populate_remote` issues a head-prefix range fetch). Run
+    // those fetches concurrently instead of one-at-a-time: a repo-level
+    // `hf://` URL expands to one spec per Hub tree entry, so serializing here
+    // puts a whole round-trip on the critical path per file. Results are
+    // reattached by position so source order (and thus labels and byte
+    // offsets) stays deterministic.
+    let mut remote_exts: Vec<Extensions> =
+        (0..expanded.len()).map(|_| Extensions::default()).collect();
+    let remote_slots: Vec<usize> = expanded
+        .iter()
+        .enumerate()
+        .filter_map(|(i, spec)| match spec {
+            InputSpec::Remote(_) => Some(i),
+            _ => None,
+        })
+        .collect();
+    let fetched: Vec<Extensions> = stream::iter(remote_slots.iter().copied())
+        .map(|i| {
+            let spec = match &expanded[i] {
+                InputSpec::Remote(s) => s.clone(),
+                _ => unreachable!("remote_slots holds only Remote indices"),
+            };
+            async move {
+                let data = Data::Http {
+                    repo: spec.repo.clone(),
+                    filename: Arc::clone(&spec.filename),
+                    revision: Arc::clone(&spec.revision),
+                };
+                let mut extensions = Extensions::default();
+                let filename_path = Path::new(spec.filename.as_str());
+                for plugin in &registry.formats {
+                    if plugin.detects_path(filename_path) {
+                        if let Err(e) = plugin
+                            .populate_remote(&data, spec.size, &mut extensions)
+                            .await
+                        {
+                            // Non-fatal: arch layout falls back to byte-Hilbert,
+                            // the same way it would for any source whose format
+                            // plugin couldn't parse its header.
+                            log::warn!(
+                                "{}: format plugin `{}` (remote) failed: {e} — \
+                             treating as plain binary",
+                                crate::hf_url::sanitize_log_text(spec.filename.as_str()),
+                                plugin.id()
+                            );
+                        }
+                        break;
+                    }
+                }
+                extensions
+            }
+        })
+        .buffered(SETUP_FETCH_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    for (slot, extensions) in remote_slots.iter().copied().zip(fetched) {
+        remote_exts[slot] = extensions;
+    }
+
     let mut sources = Vec::new();
     let mut total = 0u64;
 
+    let mut next_remote = 0usize;
     for spec in &expanded {
         match spec {
             InputSpec::Local(path) => {
@@ -110,42 +171,17 @@ pub async fn prepare_sources_from_specs(
             InputSpec::Remote(spec) => {
                 let size = spec.size;
                 total += size;
-                // Open a `Data::Http` handle pointing at the same remote file
-                // the downstream loader/renderer will use. This costs nothing
-                // up front — `Data::Http` is just (repo, filename, revision);
-                // `populate_remote` is what issues the actual head-prefix
-                // range fetch needed to parse the format header.
-                let data = Data::Http {
-                    repo: spec.repo.clone(),
-                    filename: Arc::clone(&spec.filename),
-                    revision: Arc::clone(&spec.revision),
-                };
-                let mut extensions = Extensions::default();
-                let filename_path = Path::new(spec.filename.as_str());
-                for plugin in &registry.formats {
-                    if plugin.detects_path(filename_path) {
-                        if let Err(e) = plugin.populate_remote(&data, size, &mut extensions).await {
-                            // Non-fatal: arch layout falls back to byte-Hilbert,
-                            // the same way it would for any source whose format
-                            // plugin couldn't parse its header.
-                            log::warn!(
-                                "{}: format plugin `{}` (remote) failed: {e} — \
-                                 treating as plain binary",
-                                crate::hf_url::sanitize_log_text(spec.filename.as_str()),
-                                plugin.id()
-                            );
-                        }
-                        break;
-                    }
-                }
                 sources.push(Source {
                     file_idx: sources.len(),
                     kind: SourceKind::Http(spec.clone()),
                     byte_size: size,
                     name_override: None,
                     xet_terms: None,
-                    extensions,
+                    // Populated by the concurrent pass above; take it so the
+                    // Extensions map moves instead of cloning.
+                    extensions: std::mem::take(&mut remote_exts[remote_slots[next_remote]]),
                 });
+                next_remote += 1;
             }
         }
     }
@@ -417,6 +453,89 @@ mod tests {
         InputSpec::Local(p.to_path_buf())
     }
 
+    fn remote_spec(repo: &crate::hf_url::RemoteRepo, filename: &str, size: u64) -> InputSpec {
+        InputSpec::Remote(crate::hf_url::RemoteFileSpec {
+            repo: repo.clone(),
+            filename: Arc::new(filename.to_string()),
+            revision: Arc::new("main".to_string()),
+            size,
+            xet_hash: None,
+        })
+    }
+
+    /// Format plugin whose `populate_remote` tags the extensions map and —
+    /// while running — tracks the maximum number of concurrently in-flight
+    /// `populate_remote` calls across all specs, so tests can prove the
+    /// remote header pass actually overlaps instead of serializing.
+    struct ProbePlugin {
+        ext: &'static str,
+        state: Arc<ProbeState>,
+    }
+
+    struct ProbeState {
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ProbePlugin {
+        fn new(ext: &'static str) -> (Self, Arc<ProbeState>) {
+            let state = Arc::new(ProbeState {
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            });
+            (
+                Self {
+                    ext,
+                    state: Arc::clone(&state),
+                },
+                state,
+            )
+        }
+    }
+
+    impl FormatPlugin for ProbePlugin {
+        fn id(&self) -> &'static str {
+            "probe"
+        }
+        fn detects_path(&self, path: &Path) -> bool {
+            path.extension().and_then(|e| e.to_str()) == Some(self.ext)
+        }
+        fn populate_local(
+            &self,
+            _path: &Path,
+            _file_size: u64,
+            exts: &mut Extensions,
+        ) -> anyhow::Result<()> {
+            exts.insert(Tag("local".to_string()));
+            Ok(())
+        }
+        fn populate_remote<'a>(
+            &'a self,
+            _data: &'a Data,
+            _byte_size: u64,
+            exts: &'a mut Extensions,
+        ) -> BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async move {
+                let now = self
+                    .state
+                    .in_flight
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                self.state
+                    .max_in_flight
+                    .fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                // Hold the slot long enough that a serial pass could not
+                // overlap consecutive calls.
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                self.state
+                    .in_flight
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                exts.insert(Tag("remote".to_string()));
+                Ok(())
+            })
+        }
+    }
+
     #[tokio::test]
     async fn dir_spec_expands_to_one_source_per_file_recursively() {
         let tmp = TempDir::new().unwrap();
@@ -537,6 +656,70 @@ mod tests {
         assert_eq!(sources.len(), 1);
         assert!(sources[0].extensions.get::<Tag>().is_none());
         assert_eq!(total, 3);
+    }
+
+    /// The remote header pass must run concurrently: with several remote
+    /// specs, `populate_remote` calls overlap (max in-flight > 1), instead of
+    /// serializing one network round-trip per file. 4 specs × 30 ms hold ≈
+    /// 120 ms overlapped vs ≈ 120 ms serialized — the probe sees the
+    /// difference deterministically.
+    #[tokio::test]
+    async fn remote_header_population_overlaps_across_specs() {
+        let repo = crate::hf_url::remote_repo_for_tests(RepoKind::Model, "overlap/repo");
+        let specs: Vec<InputSpec> = (0..4)
+            .map(|i| remote_spec(&repo, &format!("f{i}.foo"), 1))
+            .collect();
+        let (plugin, state) = ProbePlugin::new("foo");
+        let registry = Registry {
+            formats: vec![Arc::new(plugin)],
+            ..Registry::default()
+        };
+
+        let (sources, total) = prepare_sources_from_specs(&specs, &registry).await.unwrap();
+
+        assert_eq!(sources.len(), 4);
+        assert_eq!(total, 4);
+        assert_eq!(
+            state
+                .max_in_flight
+                .load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "all populate_remote calls should be in flight simultaneously"
+        );
+    }
+
+    /// Mixed local/remote specs keep input order and attach the remote tag
+    /// only to the remote sources (populated by the concurrent pass).
+    #[tokio::test]
+    async fn remote_extensions_populated_in_input_order_mixed_specs() {
+        let tmp = TempDir::new().unwrap();
+        let local = tmp.path().join("b.foo");
+        fs::write(&local, b"xy").unwrap();
+        let repo = crate::hf_url::remote_repo_for_tests(RepoKind::Model, "order/repo");
+        let specs = vec![
+            remote_spec(&repo, "a.foo", 1),
+            local_spec(&local),
+            remote_spec(&repo, "c.foo", 3),
+        ];
+        let (plugin, _state) = ProbePlugin::new("foo");
+        let registry = Registry {
+            formats: vec![Arc::new(plugin)],
+            ..Registry::default()
+        };
+
+        let (sources, total) = prepare_sources_from_specs(&specs, &registry).await.unwrap();
+
+        assert_eq!(sources.len(), 3);
+        assert_eq!(total, 6);
+        assert!(matches!(sources[0].kind, SourceKind::Http(_)));
+        assert_eq!(sources[0].extensions.get::<Tag>().unwrap().0, "remote");
+        assert!(matches!(sources[1].kind, SourceKind::File(_)));
+        assert_eq!(sources[1].extensions.get::<Tag>().unwrap().0, "local");
+        assert!(matches!(sources[2].kind, SourceKind::Http(_)));
+        assert_eq!(sources[2].extensions.get::<Tag>().unwrap().0, "remote");
+        for (i, s) in sources.iter().enumerate() {
+            assert_eq!(s.file_idx, i);
+        }
     }
 
     /// `download_specs_to_paths` passes `filename` to the `hf` CLI as a

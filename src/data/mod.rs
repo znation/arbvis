@@ -456,6 +456,25 @@ pub fn prepare_sources(
     Ok((sources, total))
 }
 
+/// Map a byte-wise diff to the viewer's signed-delta color encoding: the
+/// neutral 127 gray shifts brighter when `b > a` and darker when `b < a`,
+/// scaled by the magnitude of the delta. Both sides must be the same length
+/// (callers zero-pad shorter sides first).
+fn diff_bytes_to_color(a: &[u8], b: &[u8]) -> Vec<u8> {
+    a.iter()
+        .zip(b.iter())
+        .map(|(&a, &b)| {
+            let delta = b as i16 - a as i16;
+            let brightness = (delta.unsigned_abs() as f32 / 255.0 * 127.0).round() as u8;
+            if delta >= 0 {
+                127u8 + brightness
+            } else {
+                127u8 - brightness
+            }
+        })
+        .collect()
+}
+
 /// Load a source's bytes for random access: mmaps file sources, clones buffered sources.
 /// For diff sources, returns a LazyDiff that computes bytes on demand per tile.
 /// For Http sources, returns a `Data::Http` handle that fetches byte ranges on demand.
@@ -490,19 +509,7 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
                     };
                     let a = read_padded(&m_o);
                     let b = read_padded(&m_m);
-                    Ok(a.iter()
-                        .zip(b.iter())
-                        .map(|(&a, &b)| {
-                            let delta = b as i16 - a as i16;
-                            let brightness =
-                                (delta.unsigned_abs() as f32 / 255.0 * 127.0).round() as u8;
-                            if delta >= 0 {
-                                127u8 + brightness
-                            } else {
-                                127u8 - brightness
-                            }
-                        })
-                        .collect())
+                    Ok(diff_bytes_to_color(&a, &b))
                 })
             })))
         }
@@ -528,19 +535,7 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
                 Box::pin(async move {
                     let a = orig.fetch_range(orig_start + start, len).await?;
                     let b = mod_.fetch_range(mod_start + start, len).await?;
-                    Ok(a.iter()
-                        .zip(b.iter())
-                        .map(|(&a, &b)| {
-                            let delta = b as i16 - a as i16;
-                            let brightness =
-                                (delta.unsigned_abs() as f32 / 255.0 * 127.0).round() as u8;
-                            if delta >= 0 {
-                                127u8 + brightness
-                            } else {
-                                127u8 - brightness
-                            }
-                        })
-                        .collect())
+                    Ok(diff_bytes_to_color(&a, &b))
                 })
             })))
         }
@@ -868,6 +863,24 @@ pub async fn populate_xet_terms(sources: &mut [Source]) -> anyhow::Result<()> {
         sources[i].xet_terms = Some(r?);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod diff_bytes_to_color_tests {
+    use super::diff_bytes_to_color;
+
+    #[test]
+    fn equal_bytes_stay_neutral_and_deltas_shift_signed() {
+        // Identical bytes map to the neutral 127 gray.
+        assert_eq!(diff_bytes_to_color(&[5, 200], &[5, 200]), [127, 127]);
+        // Positive delta brightens, negative delta darkens, scaled by
+        // magnitude: a full ±255 swing lands exactly 127±127.
+        assert_eq!(diff_bytes_to_color(&[0], &[255]), [254]);
+        assert_eq!(diff_bytes_to_color(&[255], &[0]), [0]);
+        // Mid-magnitude delta: 128/255 of the way from 127 toward the pole.
+        assert_eq!(diff_bytes_to_color(&[0], &[128]), [191]);
+        assert_eq!(diff_bytes_to_color(&[128], &[0]), [63]);
+    }
 }
 
 #[cfg(test)]

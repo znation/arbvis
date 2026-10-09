@@ -758,7 +758,11 @@ let brickStream = null;
 
 async function load() {
   startLoadClock();
-  const meta = await (await fetch('meta.json')).json();
+  // Routed through fetchBytes so meta.json gets the same contract as every
+  // other asset: a 404/HTML error page fails as "load failed: <status>" instead
+  // of a confusing JSON.parse SyntaxError, and a 429/5xx from the Space router
+  // is retried with bounded backoff rather than aborting the whole load.
+  const meta = JSON.parse(new TextDecoder().decode(await fetchBytes('meta.json')));
   // Grid box in voxels. `grid_extent` is [x,y,z]; older bundles carried a
   // single cube side as `grid_side`.
   const ext = meta.grid_extent || [meta.grid_side, meta.grid_side, meta.grid_side];

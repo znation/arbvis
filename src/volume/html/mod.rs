@@ -102,6 +102,17 @@ mod build_tests {
 mod template_tests {
     use super::TEMPLATE;
 
+    /// meta.json must be fetched through fetchBytes so it shares every other
+    /// asset's contract: a non-2xx reply (404 page, Space router 429/5xx)
+    /// throws "load failed: <status>" and gets the bounded backoff retry, and
+    /// load()'s .catch → setStatus surfaces it. A bare fetch would turn a 404
+    /// HTML page into a confusing JSON.parse SyntaxError with no retry.
+    #[test]
+    fn meta_json_is_fetched_through_fetch_bytes() {
+        assert!(TEMPLATE.contains("fetchBytes('meta.json')"));
+        assert!(!TEMPLATE.contains("fetch('meta.json')"));
+    }
+
     #[test]
     fn template_survived_the_module_split_intact() {
         assert!(TEMPLATE.starts_with("<!DOCTYPE html>\n<html lang=\"en\">"));

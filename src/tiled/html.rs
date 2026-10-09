@@ -233,6 +233,114 @@ fn build_info_html(title: &str, inputs: &[String], branding: &Branding) -> Strin
     )
 }
 
+/// JS statement body shared by the `updateLabels` function in both viewer
+/// templates (the `format!`-built single-scene template in [`build_html`] and
+/// [`TEMPLATE_MULTI`]). Injected verbatim by token replacement so the brace
+/// style stays right for each template. The statements reference `map`,
+/// `activeOverlays`, `escHtml`, and the canvas variables — globals in the
+/// single-scene viewer, locals declared by the multi-scene wrapper before the
+/// body runs.
+const UPDATE_LABELS_BODY: &str = r#"      var bounds = map.getBounds();
+      var sw = bounds.getSouthWest();
+      var ne = bounds.getNorthEast();
+      // Geo↔pixel conversion factors. WORLD_W geo units span WIDTH canvas px
+      // (and likewise for height), so canvas_x = lng * WIDTH / WORLD_W and
+      // canvas_y = -lat * HEIGHT / WORLD_H. Hilbert canvases have
+      // WORLD_W/WIDTH == WORLD_H/HEIGHT (uniform scaling) but arch canvases
+      // can be non-square, so the two axes need separate ratios.
+      var minX = sw.lng * WIDTH / WORLD_W;
+      var minY = -ne.lat * HEIGHT / WORLD_H;
+      var maxX = ne.lng * WIDTH / WORLD_W;
+      var maxY = -sw.lat * HEIGHT / WORLD_H;
+
+      var visible = [];
+      for (var i = 0; i < labels.length; i++) {
+        var l = labels[i];
+        var b = l.bbox;
+        if (b[0] < maxX && b[2] > minX && b[1] < maxY && b[3] > minY) {
+          visible.push(l);
+        }
+      }
+
+      visible.sort(function(a, b) { return b.size - a.size; });
+      if (visible.length > 1000) {
+        visible.length = 1000;
+      }
+
+      activeOverlays.clearLayers();
+
+      var placed = [];
+
+      for (var i = 0; i < visible.length; i++) {
+        var l = visible[i];
+        if (l.segs && l.segs.length > 0) {
+          // Viewport pixels per canvas pixel at the current zoom. At the leaf
+          // zoom (MAX_ZOOM) a tile is rendered 1:1, so scale = 1; each level
+          // out halves it. Independent of canvas aspect.
+          var scale = Math.pow(2, map.getZoom() - MAX_ZOOM);
+          var minWorld = 2 / scale;
+          var ll = l.segs
+            .filter(function(s) {
+              var len = Math.max(Math.abs(s[2] - s[0]), Math.abs(s[3] - s[1]));
+              return len >= minWorld;
+            })
+            .map(function(s) {
+              return [
+                [-(s[1] / HEIGHT) * WORLD_H, (s[0] / WIDTH) * WORLD_W],
+                [-(s[3] / HEIGHT) * WORLD_H, (s[2] / WIDTH) * WORLD_W],
+              ];
+            });
+          activeOverlays.addLayer(L.polyline(ll, {
+            color: 'hsl(' + l.hue + ',70%,60%)',
+            weight: i < 3 ? 2 : 1,
+            opacity: 0.9,
+            fill: false,
+            interactive: false,
+          }));
+        }
+        var lat = -(l.y / HEIGHT) * WORLD_H;
+        var lng =  (l.x / WIDTH) * WORLD_W;
+        var pt = map.latLngToContainerPoint([lat, lng]);
+        var tw = l.name.length * 7 + 12;
+        var th = 22;
+        var vw = map.getSize().x;
+        var vh = map.getSize().y;
+        var lx = Math.max(0, Math.min(pt.x - tw/2, vw - tw));
+        var ly = Math.max(0, Math.min(pt.y - th/2, vh - th));
+        var lb = { x: lx, y: ly, w: tw, h: th };
+        var overlaps = false;
+        for (var j = 0; j < placed.length; j++) {
+          var p = placed[j];
+          if (lb.x < p.x + p.w && lb.x + lb.w > p.x &&
+              lb.y < p.y + p.h && lb.y + lb.h > p.y) {
+            overlaps = true;
+            break;
+          }
+        }
+        if (!overlaps) {
+          placed.push(lb);
+          // Small dot at the true centroid anchors the label visually when
+          // the label is clamped away from the centroid to stay on-screen.
+          activeOverlays.addLayer(L.circleMarker([lat, lng], {
+            radius: 3,
+            color: 'hsl(' + l.hue + ',70%,60%)',
+            fillColor: 'hsl(' + l.hue + ',70%,60%)',
+            fillOpacity: 1,
+            weight: 0,
+            interactive: false,
+          }));
+          activeOverlays.addLayer(L.marker([lat, lng], {
+            icon: L.divIcon({
+              className: 'file-label',
+              html: escHtml(l.name),
+              iconSize: [tw, th],
+              iconAnchor: [pt.x - lx, pt.y - ly]
+            }),
+            interactive: false
+          }));
+        }
+      }"#;
+
 fn build_html(
     world_w: u32,
     world_h: u32,
@@ -400,106 +508,7 @@ fn build_html(
     var activeOverlays = L.layerGroup().addTo(map);
 
     function updateLabels(labels) {{
-      var bounds = map.getBounds();
-      var sw = bounds.getSouthWest();
-      var ne = bounds.getNorthEast();
-      // Geo↔pixel conversion factors. WORLD_W geo units span WIDTH canvas px
-      // (and likewise for height), so canvas_x = lng * WIDTH / WORLD_W and
-      // canvas_y = -lat * HEIGHT / WORLD_H. Hilbert canvases have
-      // WORLD_W/WIDTH == WORLD_H/HEIGHT (uniform scaling) but arch canvases
-      // can be non-square, so the two axes need separate ratios.
-      var minX = sw.lng * WIDTH / WORLD_W;
-      var minY = -ne.lat * HEIGHT / WORLD_H;
-      var maxX = ne.lng * WIDTH / WORLD_W;
-      var maxY = -sw.lat * HEIGHT / WORLD_H;
-
-      var visible = [];
-      for (var i = 0; i < labels.length; i++) {{
-        var l = labels[i];
-        var b = l.bbox;
-        if (b[0] < maxX && b[2] > minX && b[1] < maxY && b[3] > minY) {{
-          visible.push(l);
-        }}
-      }}
-
-      visible.sort(function(a, b) {{ return b.size - a.size; }});
-      if (visible.length > 1000) {{
-        visible.length = 1000;
-      }}
-
-      activeOverlays.clearLayers();
-
-      var placed = [];
-
-      for (var i = 0; i < visible.length; i++) {{
-        var l = visible[i];
-        if (l.segs && l.segs.length > 0) {{
-          // Viewport pixels per canvas pixel at the current zoom. At the leaf
-          // zoom (MAX_ZOOM) a tile is rendered 1:1, so scale = 1; each level
-          // out halves it. Independent of canvas aspect.
-          var scale = Math.pow(2, map.getZoom() - MAX_ZOOM);
-          var minWorld = 2 / scale;
-          var ll = l.segs
-            .filter(function(s) {{
-              var len = Math.max(Math.abs(s[2] - s[0]), Math.abs(s[3] - s[1]));
-              return len >= minWorld;
-            }})
-            .map(function(s) {{
-              return [
-                [-(s[1] / HEIGHT) * WORLD_H, (s[0] / WIDTH) * WORLD_W],
-                [-(s[3] / HEIGHT) * WORLD_H, (s[2] / WIDTH) * WORLD_W],
-              ];
-            }});
-          activeOverlays.addLayer(L.polyline(ll, {{
-            color: 'hsl(' + l.hue + ',70%,60%)',
-            weight: i < 3 ? 2 : 1,
-            opacity: 0.9,
-            fill: false,
-            interactive: false,
-          }}));
-        }}
-        var lat = -(l.y / HEIGHT) * WORLD_H;
-        var lng =  (l.x / WIDTH) * WORLD_W;
-        var pt = map.latLngToContainerPoint([lat, lng]);
-        var tw = l.name.length * 7 + 12;
-        var th = 22;
-        var vw = map.getSize().x;
-        var vh = map.getSize().y;
-        var lx = Math.max(0, Math.min(pt.x - tw/2, vw - tw));
-        var ly = Math.max(0, Math.min(pt.y - th/2, vh - th));
-        var lb = {{ x: lx, y: ly, w: tw, h: th }};
-        var overlaps = false;
-        for (var j = 0; j < placed.length; j++) {{
-          var p = placed[j];
-          if (lb.x < p.x + p.w && lb.x + lb.w > p.x &&
-              lb.y < p.y + p.h && lb.y + lb.h > p.y) {{
-            overlaps = true;
-            break;
-          }}
-        }}
-        if (!overlaps) {{
-          placed.push(lb);
-          // Small dot at the true centroid anchors the label visually when
-          // the label is clamped away from the centroid to stay on-screen.
-          activeOverlays.addLayer(L.circleMarker([lat, lng], {{
-            radius: 3,
-            color: 'hsl(' + l.hue + ',70%,60%)',
-            fillColor: 'hsl(' + l.hue + ',70%,60%)',
-            fillOpacity: 1,
-            weight: 0,
-            interactive: false,
-          }}));
-          activeOverlays.addLayer(L.marker([lat, lng], {{
-            icon: L.divIcon({{
-              className: 'file-label',
-              html: escHtml(l.name),
-              iconSize: [tw, th],
-              iconAnchor: [pt.x - lx, pt.y - ly]
-            }}),
-            interactive: false
-          }}));
-        }}
-      }}
+__UPDATE_LABELS_BODY__
     }}
 
     // Entity names come from the visualized files (e.g. filenames listed in a
@@ -556,6 +565,7 @@ fn build_html(
         leaf_ext = leaf_ext,
         pyramid_ext = pyramid_ext,
     )
+    .replace("__UPDATE_LABELS_BODY__", UPDATE_LABELS_BODY)
 }
 
 // ===========================================================================
@@ -733,6 +743,7 @@ fn build_html_multi(
         .replace("/*__VMAX__*/", &viewer_max_zoom.to_string())
         .replace("__ATTRIBUTION__", &attribution_html(branding))
         .replace("__TITLE_ESCAPED__", &escape_html(title))
+        .replace("__UPDATE_LABELS_BODY__", UPDATE_LABELS_BODY)
 }
 
 /// Tile edge length used by the viewer; matches [`crate::tiled::leaf::TILE`].
@@ -884,92 +895,7 @@ const TEMPLATE_MULTI: &str = r#"<!DOCTYPE html>
       var WIDTH = s.width, HEIGHT = s.height, WORLD_W = s.world_w, WORLD_H = s.world_h, MAX_ZOOM = s.max_zoom;
       var labels = filesByKey[s.key] || [];
 
-      var bounds = map.getBounds();
-      var sw = bounds.getSouthWest();
-      var ne = bounds.getNorthEast();
-      var minX = sw.lng * WIDTH / WORLD_W;
-      var minY = -ne.lat * HEIGHT / WORLD_H;
-      var maxX = ne.lng * WIDTH / WORLD_W;
-      var maxY = -sw.lat * HEIGHT / WORLD_H;
-
-      var visible = [];
-      for (var i = 0; i < labels.length; i++) {
-        var l = labels[i];
-        var b = l.bbox;
-        if (b[0] < maxX && b[2] > minX && b[1] < maxY && b[3] > minY) {
-          visible.push(l);
-        }
-      }
-      visible.sort(function(a, b) { return b.size - a.size; });
-      if (visible.length > 1000) { visible.length = 1000; }
-
-      activeOverlays.clearLayers();
-      var placed = [];
-
-      for (var i = 0; i < visible.length; i++) {
-        var l = visible[i];
-        if (l.segs && l.segs.length > 0) {
-          var scale = Math.pow(2, map.getZoom() - MAX_ZOOM);
-          var minWorld = 2 / scale;
-          var ll = l.segs
-            .filter(function(seg) {
-              var len = Math.max(Math.abs(seg[2] - seg[0]), Math.abs(seg[3] - seg[1]));
-              return len >= minWorld;
-            })
-            .map(function(seg) {
-              return [
-                [-(seg[1] / HEIGHT) * WORLD_H, (seg[0] / WIDTH) * WORLD_W],
-                [-(seg[3] / HEIGHT) * WORLD_H, (seg[2] / WIDTH) * WORLD_W],
-              ];
-            });
-          activeOverlays.addLayer(L.polyline(ll, {
-            color: 'hsl(' + l.hue + ',70%,60%)',
-            weight: i < 3 ? 2 : 1,
-            opacity: 0.9,
-            fill: false,
-            interactive: false,
-          }));
-        }
-        var lat = -(l.y / HEIGHT) * WORLD_H;
-        var lng = (l.x / WIDTH) * WORLD_W;
-        var pt = map.latLngToContainerPoint([lat, lng]);
-        var tw = l.name.length * 7 + 12;
-        var th = 22;
-        var vw = map.getSize().x;
-        var vh = map.getSize().y;
-        var lx = Math.max(0, Math.min(pt.x - tw / 2, vw - tw));
-        var ly = Math.max(0, Math.min(pt.y - th / 2, vh - th));
-        var lb = { x: lx, y: ly, w: tw, h: th };
-        var overlaps = false;
-        for (var j = 0; j < placed.length; j++) {
-          var p = placed[j];
-          if (lb.x < p.x + p.w && lb.x + lb.w > p.x &&
-              lb.y < p.y + p.h && lb.y + lb.h > p.y) {
-            overlaps = true;
-            break;
-          }
-        }
-        if (!overlaps) {
-          placed.push(lb);
-          activeOverlays.addLayer(L.circleMarker([lat, lng], {
-            radius: 3,
-            color: 'hsl(' + l.hue + ',70%,60%)',
-            fillColor: 'hsl(' + l.hue + ',70%,60%)',
-            fillOpacity: 1,
-            weight: 0,
-            interactive: false,
-          }));
-          activeOverlays.addLayer(L.marker([lat, lng], {
-            icon: L.divIcon({
-              className: 'file-label',
-              html: escHtml(l.name),
-              iconSize: [tw, th],
-              iconAnchor: [pt.x - lx, pt.y - ly]
-            }),
-            interactive: false
-          }));
-        }
-      }
+__UPDATE_LABELS_BODY__
     }
 
     map.on('baselayerchange', function(e) {
@@ -1049,6 +975,7 @@ mod tests {
     use super::{
         build_html, build_html_multi, build_info_html, build_labels_json, build_labels_json_scenes,
         json_str, scene_fields, scenes_js_literal, Branding, FileEntity, SceneView,
+        UPDATE_LABELS_BODY,
     };
     fn scene(key: &str, world_w: u32, world_h: u32) -> SceneView {
         SceneView {
@@ -1064,6 +991,45 @@ mod tests {
             leaf_ext: "png".to_string(),
             pyramid_ext: "avif".to_string(),
             entities: Vec::new(),
+        }
+    }
+
+    /// The `updateLabels` body is shared between the single-scene and
+    /// multi-scene templates via token injection: both emitted viewers must
+    /// contain the exact shared body (byte-for-byte, no doubled braces, no
+    /// leftover token, and no injected whitespace-only lines around it).
+    #[test]
+    fn update_labels_body_is_injected_into_both_viewers_unchanged() {
+        let single = build_html(
+            256,
+            256,
+            2,
+            0,
+            256,
+            256,
+            256,
+            "t",
+            &[],
+            "png",
+            "avif",
+            &Branding::default(),
+        );
+        let multi = build_html_multi(&[scene("s", 256, 256)], "t", &[], &Branding::default());
+        for (name, html) in [("single", single), ("multi", multi)] {
+            assert!(
+                html.contains(UPDATE_LABELS_BODY),
+                "{name} viewer must contain the exact shared updateLabels body"
+            );
+            assert!(
+                !html.contains("__UPDATE_LABELS_BODY__"),
+                "{name} viewer must have the token fully replaced"
+            );
+            for line in html.lines() {
+                assert!(
+                    !line.trim().is_empty() || line.is_empty(),
+                    "{name} viewer must not gain whitespace-only lines: {line:?}"
+                );
+            }
         }
     }
 

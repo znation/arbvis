@@ -259,6 +259,24 @@ fn tile_curve_frame(tx: u32, ty: u32, kh: u8) -> (bool, u32, u32) {
     ((m & 1) == 1, (x & mask) as u32, (y & mask) as u32)
 }
 
+/// Inverse of the row-major `LOCAL_CURVE_LUT`: for curve position `v` within
+/// a tile (identity frame), the packed raster index `(py << TILE_LOG2) | px`
+/// of the pixel sitting at that curve position. Built once per process so
+/// curve-order render loops can scatter colors to their raster coordinates
+/// with one lookup.
+static LOCAL_CURVE_TO_XY: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+
+fn local_curve_to_xy() -> &'static [u32] {
+    LOCAL_CURVE_TO_XY.get_or_init(|| {
+        let lut = local_curve_lut();
+        let mut inv = vec![0u32; TILE_AREA as usize];
+        for (i, &v) in lut.iter().enumerate() {
+            inv[v as usize] = i as u32;
+        }
+        inv
+    })
+}
+
 /// Curve offset of tile-local pixel `(px, py)` within its tile's byte range
 /// (i.e. the `tile_buf` index), via the tile's precomputed Hilbert frame.
 #[inline]
@@ -354,64 +372,59 @@ pub fn render_leaf_tile_diff(
     let tile_order = kh - TILE_LOG2;
     let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
     let tile_pixel_start = sq_off + base;
-    let tile_pixel_end = (tile_pixel_start + TILE_AREA).min(total);
 
     // Local view of the fills overlapping this tile. Avoids scanning the full
     // (potentially thousands of) fills list per pixel.
     let first_range = fills.partition_point(|r| r.1 <= tile_pixel_start);
-    let local_fills: Vec<(u64, u64, DiffFill)> = fills[first_range..]
-        .iter()
-        .take_while(|r| r.0 < tile_pixel_end)
-        .copied()
-        .collect();
-
     let first_tint = tints.partition_point(|r| r.1 <= tile_pixel_start);
-    let local_tints: Vec<(u64, u64, DiffFill)> = tints[first_tint..]
-        .iter()
-        .take_while(|r| r.0 < tile_pixel_end)
-        .copied()
-        .collect();
 
-    let frame = tile_curve_frame(local_tx, ty, kh);
+    let (swap, cx, cy) = tile_curve_frame(local_tx, ty, kh);
+    let xy_lut = local_curve_to_xy();
     let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
-    for py in 0..TILE {
-        for px in 0..TILE {
-            let local_idx = tile_local_curve_idx(frame, px, py);
-            let pixel_idx = sq_off + base + local_idx;
-            let color = if pixel_idx >= total {
-                Rgb([0u8, 0, 0])
-            } else {
-                let byte = tile_buf[local_idx as usize];
-                let mut fill: Option<DiffFill> = None;
-                for &(start, end, f) in &local_fills {
-                    if pixel_idx >= start && pixel_idx < end {
-                        fill = Some(f);
-                        break;
-                    }
-                }
-                if let Some(f) = fill {
-                    let (stripe, base_c) = f.colors();
-                    if is_crosshatch_stripe(px, py) {
-                        stripe
-                    } else {
-                        base_c
-                    }
+    // Visit pixels in curve order: `pixel_idx` then increases strictly
+    // monotonically, and since `fills`/`tints` are sorted by start and
+    // non-overlapping, a forward-advancing cursor per list finds each pixel's
+    // range in O(1) amortized instead of rescanning the local list per pixel.
+    let mut fill_cur = first_range;
+    let mut tint_cur = first_tint;
+    for curve in 0..TILE_AREA {
+        let pixel_idx = sq_off + base + curve;
+        // Scatter target: unpack the identity-frame pixel at this curve
+        // position, then undo this tile's frame (XOR-with-constant plus an
+        // optional coordinate swap — each its own inverse) to raster coords.
+        let packed = xy_lut[curve as usize];
+        let (a, b) = (packed & (TILE - 1), packed >> TILE_LOG2);
+        let (px, py) = if swap {
+            (b ^ cx, a ^ cy)
+        } else {
+            (a ^ cx, b ^ cy)
+        };
+        let color = if pixel_idx >= total {
+            Rgb([0u8, 0, 0])
+        } else {
+            while fill_cur < fills.len() && fills[fill_cur].1 <= pixel_idx {
+                fill_cur += 1;
+            }
+            let byte = tile_buf[curve as usize];
+            if fill_cur < fills.len() && fills[fill_cur].0 <= pixel_idx {
+                let (stripe, base_c) = fills[fill_cur].2.colors();
+                if is_crosshatch_stripe(px, py) {
+                    stripe
                 } else {
-                    let mut tint: Option<DiffFill> = None;
-                    for &(start, end, f) in &local_tints {
-                        if pixel_idx >= start && pixel_idx < end {
-                            tint = Some(f);
-                            break;
-                        }
-                    }
-                    match tint {
-                        Some(t) => blend_with_tint(plain_lut[byte as usize], t),
-                        None => pixel_lut[byte as usize],
-                    }
+                    base_c
                 }
-            };
-            img.put_pixel(px, py, color);
-        }
+            } else {
+                while tint_cur < tints.len() && tints[tint_cur].1 <= pixel_idx {
+                    tint_cur += 1;
+                }
+                if tint_cur < tints.len() && tints[tint_cur].0 <= pixel_idx {
+                    blend_with_tint(plain_lut[byte as usize], tints[tint_cur].2)
+                } else {
+                    pixel_lut[byte as usize]
+                }
+            }
+        };
+        img.put_pixel(px, py, color);
     }
     encode_tile(img, fmt)
 }
@@ -632,6 +645,122 @@ mod tests {
                 let tx = (tile_i % (1 << t)) as u32;
                 let ty = (tile_i / (1 << t)) as u32;
                 check_tile(tx, ty, kh, &samples);
+            }
+        }
+    }
+
+    /// The diff renderer must match a naive per-pixel reference exactly —
+    /// only the image matters, not the pixel visit order. The fills and tints
+    /// below span tile boundaries, sit before the first tile, cover whole
+    /// tiles, and end past `total`.
+    #[test]
+    fn render_leaf_tile_diff_matches_reference() {
+        let kh = 11u8; // 4×4 tile grid, covers several frame orientations
+        let square_pixels = 1u64 << (2 * kh);
+        let total = square_pixels * 3 / 4;
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let tile_buf: [u8; TILE_PIXELS] = core::array::from_fn(|_| next() as u8);
+        let pixel_lut: [Rgb<u8>; 256] =
+            core::array::from_fn(|i| Rgb([i as u8, (i * 3) as u8, (i * 7) as u8]));
+        let plain_lut: [Rgb<u8>; 256] =
+            core::array::from_fn(|i| Rgb([(i * 5) as u8, i as u8, (i * 11) as u8]));
+        let fills: Vec<(u64, u64, DiffFill)> = [
+            (0, 100_000, DiffFill::Grey),
+            (total / 2, total / 2 + 7, DiffFill::Green),
+            (
+                square_pixels / 2,
+                square_pixels / 2 + 300_000,
+                DiffFill::Red,
+            ),
+            (total - 5, total + 50, DiffFill::Red),
+            (square_pixels + 1, square_pixels + 2, DiffFill::Green),
+        ]
+        .into_iter()
+        .collect();
+        let tints: Vec<(u64, u64, DiffFill)> = [
+            (50_000, 150_000, DiffFill::Green),
+            (2 * square_pixels, 3 * square_pixels, DiffFill::Grey),
+        ]
+        .into_iter()
+        .collect();
+        let check_tile = |tx: u32, ty: u32, kh: u8| {
+            let height_tiles = 1u32 << (kh - TILE_LOG2);
+            let square_pixels = 1u64 << (2 * kh);
+            let img = render_leaf_tile_diff(
+                tx,
+                ty,
+                kh,
+                height_tiles,
+                square_pixels,
+                total,
+                &tile_buf,
+                &pixel_lut,
+                &plain_lut,
+                &fills,
+                &tints,
+                TileFormat::Png,
+            )
+            .unwrap()
+            .0;
+            let tile_order = kh - TILE_LOG2;
+            for py in 0..TILE {
+                for px in 0..TILE {
+                    let local_idx =
+                        tile_local_curve_idx(tile_curve_frame(tx % height_tiles, ty, kh), px, py);
+                    let pixel_idx = (tx as u64 / height_tiles as u64) * square_pixels
+                        + xy2h_u64(tx as u64 % height_tiles as u64, ty as u64, tile_order)
+                            * TILE_AREA
+                        + local_idx;
+                    let expected = if pixel_idx >= total {
+                        Rgb([0u8, 0, 0])
+                    } else {
+                        let byte = tile_buf[local_idx as usize];
+                        if let Some(&(_, _, f)) =
+                            fills.iter().find(|r| pixel_idx >= r.0 && pixel_idx < r.1)
+                        {
+                            let (stripe, base_c) = f.colors();
+                            if is_crosshatch_stripe(px, py) {
+                                stripe
+                            } else {
+                                base_c
+                            }
+                        } else if let Some(&(_, _, t)) =
+                            tints.iter().find(|r| pixel_idx >= r.0 && pixel_idx < r.1)
+                        {
+                            blend_with_tint(plain_lut[byte as usize], t)
+                        } else {
+                            pixel_lut[byte as usize]
+                        }
+                    };
+                    assert_eq!(
+                        img.get_pixel(px, py),
+                        &expected,
+                        "diff tile ({tx},{ty}) pixel ({px},{py})"
+                    );
+                }
+            }
+        };
+        // All tiles of the kh=11 grid, then sampled tiles of higher orders —
+        // spans all eight dihedral frame states.
+        for ty in 0..4u32 {
+            for tx in 0..4u32 {
+                check_tile(tx, ty, 11);
+            }
+        }
+        for kh in [12u8, 13, 16, 21] {
+            let t = kh - TILE_LOG2;
+            let tiles = 1u64 << (2 * t);
+            let step = (tiles / 64).max(1);
+            for tile_i in (0..tiles).step_by(step as usize) {
+                let tx = (tile_i % (1 << t)) as u32;
+                let ty = (tile_i / (1 << t)) as u32;
+                check_tile(tx, ty, kh);
             }
         }
     }

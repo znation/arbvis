@@ -84,6 +84,27 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// A zero-length `Null` node anchored at `pos`, used as the value of
+/// synthetic whitespace-sentinel children. The aligner treats it as zero-info;
+/// its only job is to carry whitespace so the round-trip stays whole.
+fn zero_len_null_node(pos: u64) -> Node {
+    Node {
+        kind: NodeKind::Null,
+        byte_start: pos,
+        byte_end: pos,
+        children: vec![],
+    }
+}
+
+/// A synthetic array element whose `trailing` range carries interior
+/// whitespace that has no real element to attach to.
+fn ws_sentinel_element(ws: Range<u64>) -> Child {
+    Child::Element {
+        value: Box::new(zero_len_null_node(ws.start)),
+        trailing: ws,
+    }
+}
+
 struct Parser<'a> {
     src: &'a [u8],
     pos: usize,
@@ -138,6 +159,23 @@ impl<'a> Parser<'a> {
         start..self.pos as u64
     }
 
+    /// After a value or member, consume trailing whitespace and an optional
+    /// comma (plus any whitespace after the comma). Returns the trailing byte
+    /// range, from just after the parsed value through the current position,
+    /// and whether a comma was consumed.
+    fn trailing_and_comma(&mut self) -> (Range<u64>, bool) {
+        let trailing_start = self.pos;
+        self.skip_ws();
+        let saw_comma = if self.peek() == Some(b',') {
+            self.pos += 1;
+            self.skip_ws();
+            true
+        } else {
+            false
+        };
+        (trailing_start as u64..self.pos as u64, saw_comma)
+    }
+
     fn parse_value(&mut self) -> Result<Node, ParseError> {
         let start = self.pos;
         match self.peek() {
@@ -180,16 +218,12 @@ impl<'a> Parser<'a> {
                 // Emit a sentinel Member with empty key_range / value spanning the
                 // whitespace via the `trailing` field. This is a zero-info entry
                 // for the aligner but keeps the round-trip whole.
+                let p = ws_after_open.start;
                 children.push(Child::Member {
-                    key_range: ws_after_open.start..ws_after_open.start,
+                    key_range: p..p,
                     key_decoded: String::new(),
-                    between_key_value: ws_after_open.start..ws_after_open.start,
-                    value: Box::new(Node {
-                        kind: NodeKind::Null,
-                        byte_start: ws_after_open.start,
-                        byte_end: ws_after_open.start,
-                        children: vec![],
-                    }),
+                    between_key_value: p..p,
+                    value: Box::new(zero_len_null_node(p)),
                     trailing: ws_after_open.clone(),
                 });
             }
@@ -229,17 +263,7 @@ impl<'a> Parser<'a> {
             let between_key_value = between_start as u64..between_end;
 
             let value = self.parse_value()?;
-            let trailing_start = self.pos;
-            self.skip_ws();
-            // Optional comma.
-            let saw_comma = if self.peek() == Some(b',') {
-                self.pos += 1;
-                self.skip_ws();
-                true
-            } else {
-                false
-            };
-            let trailing = trailing_start as u64..self.pos as u64;
+            let (trailing, saw_comma) = self.trailing_and_comma();
 
             children.push(Child::Member {
                 key_range,
@@ -278,15 +302,7 @@ impl<'a> Parser<'a> {
             if !ws_after_open.is_empty() {
                 // Same trick as empty object: encode interior whitespace as a
                 // sentinel zero-length element with trailing = ws.
-                children.push(Child::Element {
-                    value: Box::new(Node {
-                        kind: NodeKind::Null,
-                        byte_start: ws_after_open.start,
-                        byte_end: ws_after_open.start,
-                        children: vec![],
-                    }),
-                    trailing: ws_after_open.clone(),
-                });
+                children.push(ws_sentinel_element(ws_after_open));
             }
             return Ok(Node {
                 kind: NodeKind::Array,
@@ -312,28 +328,11 @@ impl<'a> Parser<'a> {
         // value, but with `trailing` covering the ws. This keeps the
         // round-trip whole while leaving real elements untouched.
         if !ws_after_open.is_empty() {
-            children.push(Child::Element {
-                value: Box::new(Node {
-                    kind: NodeKind::Null,
-                    byte_start: ws_after_open.start,
-                    byte_end: ws_after_open.start,
-                    children: vec![],
-                }),
-                trailing: ws_after_open.clone(),
-            });
+            children.push(ws_sentinel_element(ws_after_open));
         }
         loop {
             let value = self.parse_value()?;
-            let trailing_start = self.pos;
-            self.skip_ws();
-            let saw_comma = if self.peek() == Some(b',') {
-                self.pos += 1;
-                self.skip_ws();
-                true
-            } else {
-                false
-            };
-            let trailing = trailing_start as u64..self.pos as u64;
+            let (trailing, saw_comma) = self.trailing_and_comma();
             children.push(Child::Element {
                 value: Box::new(value),
                 trailing,

@@ -144,10 +144,12 @@ impl Data {
     ///
     /// Semantics match [`Data::fetch_range`] (including the bounds-checked
     /// error for a shrunken file), but local variants copy straight into the
-    /// caller's buffer instead of allocating an intermediate `Vec`, and
-    /// `ZeroFill` just memsets. Remote variants fall back to `fetch_range`
-    /// plus one copy, so callers on the hot tile-load path can use this
-    /// uniformly and only local sources skip the double copy.
+    /// caller's buffer instead of allocating an intermediate `Vec`, `Http`
+    /// streams the response body directly into `dst` with no intermediate
+    /// buffer, and `ZeroFill` just memsets. `Xet` and `LazyDiff` still fall
+    /// back to `fetch_range` plus one copy, so callers on the hot tile-load
+    /// path can use this uniformly and only those variants pay the double
+    /// copy.
     pub async fn fetch_range_into(&self, start: u64, dst: &mut [u8]) -> anyhow::Result<()> {
         match self {
             Data::Mapped(m) => copy_local(m, start, dst),
@@ -161,7 +163,15 @@ impl Data {
                 let base = *base;
                 Box::pin(async move { inner.fetch_range_into(base + start, dst).await }).await
             }
-            Data::Http { .. } | Data::Xet(_) | Data::LazyDiff(_) => {
+            Data::Http {
+                repo,
+                filename,
+                revision,
+            } => {
+                repo.fetch_range_into(filename, revision, start..start + dst.len() as u64, dst)
+                    .await
+            }
+            Data::Xet(_) | Data::LazyDiff(_) => {
                 let fetched = self.fetch_range(start, dst.len()).await?;
                 dst.copy_from_slice(&fetched);
                 Ok(())

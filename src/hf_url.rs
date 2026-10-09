@@ -103,21 +103,7 @@ impl RemoteRepo {
         revision: &str,
         range: std::ops::Range<u64>,
     ) -> anyhow::Result<Vec<u8>> {
-        let label = format!("fetch_range {}", sanitize_log_text(filename));
-        // The Hub `/resolve/` URL prefix per kind lives in
-        // `web_path_prefix` (see there for why `api_segment` is wrong).
-        let kind_prefix = self.kind.web_path_prefix();
-        let url = format!(
-            "{}/{}{}/resolve/{}/{}",
-            endpoint(),
-            kind_prefix,
-            encode_url_path(&self.repo_id),
-            encode_url_path(revision),
-            encode_url_path(filename),
-        );
-        // `Range: bytes=START-END` is inclusive on both sides; our `range.end`
-        // is the exclusive Rust convention, so subtract 1 for the header.
-        let header = format!("bytes={}-{}", range.start, range.end.saturating_sub(1));
+        let (label, url, header) = self.range_request_parts(filename, revision, &range);
         let bytes = with_throttle(&label, || async {
             let mut req = authed_request(
                 reqwest::Method::GET,
@@ -135,6 +121,136 @@ impl RemoteRepo {
         validate_range_body(&label, &range, &bytes)?;
         Ok(bytes.to_vec())
     }
+
+    /// Range-fetch `[range.start, range.end)` bytes from `filename` at
+    /// `revision`, writing them into `dst` (which must be exactly
+    /// `range.len()` bytes). Streams the response body chunk-by-chunk into
+    /// `dst` instead of buffering a `Bytes` body and copying it out, so the
+    /// per-chunk tile reads on remote sources skip two whole-buffer copies
+    /// (and an over-long body aborts as soon as it overflows `dst`).
+    /// Semantics and error wording mirror [`Self::fetch_range`] /
+    /// [`validate_range_body`].
+    pub async fn fetch_range_into(
+        &self,
+        filename: &str,
+        revision: &str,
+        range: std::ops::Range<u64>,
+        dst: &mut [u8],
+    ) -> anyhow::Result<()> {
+        fetch_range_into_at(
+            &endpoint(),
+            self.kind,
+            &self.repo_id,
+            filename,
+            revision,
+            range,
+            dst,
+        )
+        .await
+    }
+
+    /// Shared request construction for `fetch_range` / `fetch_range_into`:
+    /// throttled-operation label, the `/resolve/` URL, and the inclusive
+    /// `Range: bytes=START-END` header (our `range.end` is exclusive, so the
+    /// header subtracts 1). The URL prefix per kind is `web_path_prefix` (see
+    /// there for why `api_segment` is wrong).
+    fn range_request_parts(
+        &self,
+        filename: &str,
+        revision: &str,
+        range: &std::ops::Range<u64>,
+    ) -> (String, String, String) {
+        let label = format!("fetch_range {}", sanitize_log_text(filename));
+        let kind_prefix = self.kind.web_path_prefix();
+        let url = format!(
+            "{}/{}{}/resolve/{}/{}",
+            endpoint(),
+            kind_prefix,
+            encode_url_path(&self.repo_id),
+            encode_url_path(revision),
+            encode_url_path(filename),
+        );
+        let header = format!("bytes={}-{}", range.start, range.end.saturating_sub(1));
+        (label, url, header)
+    }
+}
+
+/// Streaming worker behind [`RemoteRepo::fetch_range_into`], split out with an
+/// explicit endpoint so tests can point it at a stub HTTP server the same way
+/// [`fetch_tree_via_http_at`] does.
+async fn fetch_range_into_at(
+    endpoint: &str,
+    kind: RepoKind,
+    repo_id: &str,
+    filename: &str,
+    revision: &str,
+    range: std::ops::Range<u64>,
+    dst: &mut [u8],
+) -> anyhow::Result<()> {
+    let want = (range.end - range.start) as usize;
+    anyhow::ensure!(
+        dst.len() == want,
+        "fetch_range_into: dst is {} bytes, range needs {want}",
+        dst.len()
+    );
+    let label = format!("fetch_range {}", sanitize_log_text(filename));
+    let kind_prefix = kind.web_path_prefix();
+    let url = format!(
+        "{}/{}{}/resolve/{}/{}",
+        endpoint,
+        kind_prefix,
+        encode_url_path(repo_id),
+        encode_url_path(revision),
+        encode_url_path(filename),
+    );
+    let header = format!("bytes={}-{}", range.start, range.end.saturating_sub(1));
+    // Throttle only the request itself (same shape as `xet::fetch`'s
+    // `authed_get_json`): the streaming body work runs outside the throttled
+    // closure, so nothing borrowed escapes into a retryable future.
+    let mut resp = with_throttle(&label, || async {
+        let mut req = authed_request(
+            reqwest::Method::GET,
+            &url,
+            std::time::Duration::from_secs(60),
+        )?;
+        req = req.header(reqwest::header::RANGE, &header);
+        let resp = req.send().await?;
+        resp.error_for_status()
+    })
+    .await
+    .with_context(|| format!("range GET {} {header}", sanitize_log_text(&url)))?;
+    let mut overflow = false;
+    let mut filled = 0usize;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .with_context(|| format!("reading body of range GET {}", sanitize_log_text(&url)))?
+    {
+        let end = filled + chunk.len();
+        if end > dst.len() {
+            // Abort the body mid-stream instead of buffering it; reported
+            // below as the same "ignored the Range header" fault
+            // `validate_range_body` names for the buffered `fetch_range`.
+            overflow = true;
+            break;
+        }
+        dst[filled..end].copy_from_slice(&chunk);
+        filled = end;
+    }
+    if overflow {
+        anyhow::bail!(
+            "{}: server ignored the Range header (full-file body) at {}",
+            label,
+            sanitize_log_text(&url)
+        );
+    }
+    if filled != want {
+        anyhow::bail!(
+            "{}: truncated response: got {filled} bytes, want {want}",
+            label
+        );
+    }
+    Ok(())
 }
 
 /// Reject a range-GET response whose body does not exactly cover the requested
@@ -1352,6 +1468,84 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("returned 10 bytes (expected 4)"), "{}", msg);
         assert!(msg.contains("ignored the Range header"), "{}", msg);
+    }
+
+    #[tokio::test]
+    async fn fetch_range_into_streams_body_into_dst() {
+        // Stub server: a 206 body for `bytes=0-7` written to the socket in
+        // two separate writes, so the streaming loop fills `dst` from
+        // successive `chunk()` deliveries. The request must carry the
+        // inclusive-end `Range` header.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+            let req = String::from_utf8_lossy(&buf).to_string();
+            assert!(req.contains("range: bytes=0-7\r\n"), "request: {req}");
+            let head =
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: 8\r\nConnection: close\r\n\r\n";
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, head.as_bytes()).await;
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, b"abcde").await;
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, b"fgh").await;
+        });
+        let mut dst = [0u8; 8];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            fetch_range_into_at(
+                &format!("http://{addr}"),
+                RepoKind::Model,
+                "stub/repo",
+                "f.bin",
+                "main",
+                0..8,
+                &mut dst,
+            ),
+        )
+        .await
+        .expect("streaming range fetch must terminate")
+        .expect("streaming range fetch must succeed");
+        assert_eq!(&dst, b"abcdefgh");
+    }
+
+    #[tokio::test]
+    async fn fetch_range_into_rejects_overlong_body() {
+        // Server ignores the Range header and sends a full-file body: the
+        // streaming loop must abort as soon as it overflows `dst`.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+            let resp = "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nabcdefgh";
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, resp.as_bytes()).await;
+        });
+        let mut dst = [0u8; 4];
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            fetch_range_into_at(
+                &format!("http://{addr}"),
+                RepoKind::Model,
+                "stub/repo",
+                "f.bin",
+                "main",
+                0..4,
+                &mut dst,
+            ),
+        )
+        .await
+        .expect("overlong-body fetch must terminate, not hang")
+        .expect_err("a full-file body must be an error, not a partial fill");
+        assert!(
+            err.to_string().contains("ignored the Range header"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]

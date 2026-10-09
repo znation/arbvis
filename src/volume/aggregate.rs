@@ -859,7 +859,10 @@ mod tests {
         // must recover the exact input byte count (nothing dropped, none
         // double-counted as the Hilbert cursor advances).
         let raw = std::fs::read(dir.path().join("bricks.bin")).unwrap();
-        assert_eq!(raw.len(), bv.occupied as usize * (brick::BRICK * brick::BRICK * brick::BRICK) as usize * 4);
+        assert_eq!(
+            raw.len(),
+            bv.occupied as usize * (brick::BRICK * brick::BRICK * brick::BRICK) as usize * 4
+        );
         let pushed: u64 = raw.iter().skip(2).step_by(4).map(|&b| b as u64).sum();
         assert_eq!(pushed, 100);
         // A `.part` staging file must not survive the seal.
@@ -891,7 +894,10 @@ mod tests {
         assert!(bv.streamed);
         assert_eq!(bv.max_count, 3, "div_ceil(10_000 / 4_096) per voxel");
         let raw = std::fs::read(dir.path().join("bricks.bin")).unwrap();
-        assert_eq!(raw.len(), bv.occupied as usize * (brick::BRICK * brick::BRICK * brick::BRICK) as usize * 4);
+        assert_eq!(
+            raw.len(),
+            bv.occupied as usize * (brick::BRICK * brick::BRICK * brick::BRICK) as usize * 4
+        );
         let pushed: u64 = raw.iter().skip(2).step_by(4).map(|&b| b as u64).sum();
         assert_eq!(pushed, 10_000, "every input byte binned exactly once");
     }

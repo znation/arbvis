@@ -121,6 +121,43 @@ fn push_node_side(n: &Node, base: u64, side: Side, out: &mut Vec<AlignmentSpan>)
     push_side(n.range(), base, side, out);
 }
 
+/// Push a member's key, key-value separator, value, and trailing bytes as
+/// one-sided spans on `side` at `base`.
+fn push_member_side(
+    key_range: &Range<u64>,
+    between_key_value: &Range<u64>,
+    value: &Node,
+    trailing: &Range<u64>,
+    base: u64,
+    side: Side,
+    out: &mut Vec<AlignmentSpan>,
+) {
+    push_side(key_range.clone(), base, side, out);
+    push_side(between_key_value.clone(), base, side, out);
+    push_node_side(value, base, side, out);
+    push_side(trailing.clone(), base, side, out);
+}
+
+/// Push a container's one-byte opening/closing delimiter as an aligned span.
+fn push_delimiter_aligned(
+    o: &Node,
+    m: &Node,
+    orig_base: u64,
+    mod_base: u64,
+    at_end: bool,
+    out: &mut Vec<AlignmentSpan>,
+) {
+    let (oo, mo) = if at_end {
+        (o.byte_end - 1, m.byte_end - 1)
+    } else {
+        (o.byte_start, m.byte_start)
+    };
+    out.push(AlignmentSpan::Aligned {
+        orig: orig_base + oo..orig_base + oo + 1,
+        mod_: mod_base + mo..mod_base + mo + 1,
+    });
+}
+
 fn align_node(o: &Node, m: &Node, orig_base: u64, mod_base: u64, out: &mut Vec<AlignmentSpan>) {
     if o.kind != m.kind {
         push_node_side(o, orig_base, Side::Orig, out);
@@ -146,10 +183,7 @@ fn align_primitive(
 
 fn align_object(o: &Node, m: &Node, orig_base: u64, mod_base: u64, out: &mut Vec<AlignmentSpan>) {
     // Opening brace.
-    out.push(AlignmentSpan::Aligned {
-        orig: orig_base + o.byte_start..orig_base + o.byte_start + 1,
-        mod_: mod_base + m.byte_start..mod_base + m.byte_start + 1,
-    });
+    push_delimiter_aligned(o, m, orig_base, mod_base, false, out);
 
     // Build mod-side key map (first occurrence wins on duplicates).
     let mut mod_by_key: HashMap<&str, usize> = HashMap::new();
@@ -207,10 +241,15 @@ fn align_object(o: &Node, m: &Node, orig_base: u64, mod_base: u64, out: &mut Vec
                     }
                 } else {
                     // Orig-only member: dump the whole member span.
-                    push_side(key_range.clone(), orig_base, Side::Orig, out);
-                    push_side(between_key_value.clone(), orig_base, Side::Orig, out);
-                    push_node_side(value, orig_base, Side::Orig, out);
-                    push_side(trailing.clone(), orig_base, Side::Orig, out);
+                    push_member_side(
+                        key_range,
+                        between_key_value,
+                        value,
+                        trailing,
+                        orig_base,
+                        Side::Orig,
+                        out,
+                    );
                 }
             }
             Child::Element { .. } => unreachable!("object should not contain Element"),
@@ -234,28 +273,27 @@ fn align_object(o: &Node, m: &Node, orig_base: u64, mod_base: u64, out: &mut Vec
                     push_side(trailing.clone(), mod_base, Side::Mod, out);
                     continue;
                 }
-                push_side(key_range.clone(), mod_base, Side::Mod, out);
-                push_side(between_key_value.clone(), mod_base, Side::Mod, out);
-                push_node_side(value, mod_base, Side::Mod, out);
-                push_side(trailing.clone(), mod_base, Side::Mod, out);
+                push_member_side(
+                    key_range,
+                    between_key_value,
+                    value,
+                    trailing,
+                    mod_base,
+                    Side::Mod,
+                    out,
+                );
             }
             Child::Element { .. } => unreachable!(),
         }
     }
 
     // Closing brace.
-    out.push(AlignmentSpan::Aligned {
-        orig: orig_base + o.byte_end - 1..orig_base + o.byte_end,
-        mod_: mod_base + m.byte_end - 1..mod_base + m.byte_end,
-    });
+    push_delimiter_aligned(o, m, orig_base, mod_base, true, out);
 }
 
 fn align_array(o: &Node, m: &Node, orig_base: u64, mod_base: u64, out: &mut Vec<AlignmentSpan>) {
     // Opening bracket.
-    out.push(AlignmentSpan::Aligned {
-        orig: orig_base + o.byte_start..orig_base + o.byte_start + 1,
-        mod_: mod_base + m.byte_start..mod_base + m.byte_start + 1,
-    });
+    push_delimiter_aligned(o, m, orig_base, mod_base, false, out);
 
     let o_elems: Vec<&Child> = o.children.iter().collect();
     let m_elems: Vec<&Child> = m.children.iter().collect();
@@ -279,10 +317,7 @@ fn align_array(o: &Node, m: &Node, orig_base: u64, mod_base: u64, out: &mut Vec<
     }
 
     // Closing bracket.
-    out.push(AlignmentSpan::Aligned {
-        orig: orig_base + o.byte_end - 1..orig_base + o.byte_end,
-        mod_: mod_base + m.byte_end - 1..mod_base + m.byte_end,
-    });
+    push_delimiter_aligned(o, m, orig_base, mod_base, true, out);
 }
 
 /// Walk paired indices in order, emitting one-sided spans for unmatched

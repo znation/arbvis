@@ -174,6 +174,8 @@ hf://buckets/owner/bucket[/path]                 # no revision concept
 
 Whole-repo URLs (no `/path`) expand to every file in the repo. Single-file URLs fetch just that file.
 
+Set `ARBVIS_HF_TIMEOUT_SECS` to a positive integer of seconds to kill hung `hf` subprocess calls after that wall-clock limit (unset means no timeout; upload/download is left to finish naturally).
+
 ### Streaming (`--stream`)
 
 By default, `hf://` inputs are downloaded to the local HF cache (via the [`hf` CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli)) before rendering, and tile output is staged on local disk before upload. `--stream` flips both: input bytes are range-fetched per tile, and tiles are pushed to the Hub as they are produced. The disk-backed default is faster and more recoverable; use `--stream` only when input or output data won't fit on local disk.

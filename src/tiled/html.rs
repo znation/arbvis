@@ -179,52 +179,6 @@ fn build_labels_json(entities: &[FileEntity], max_zoom: u32, detail_depth: u32) 
     )
 }
 
-/// Convert an `hf://` path to its huggingface.co web URL, or return `None` for
-/// non-hf paths.
-///
-/// hf://[type/]owner/repo[@rev]/path → https://huggingface.co/[type/]owner/repo/blob/rev/path
-/// Trailing `/` in path → use `tree` instead of `blob`.
-fn hf_url_to_web(s: &str) -> Option<String> {
-    let rest = s.strip_prefix("hf://")?;
-    let segs: Vec<&str> = rest.split('/').collect();
-    if segs.len() < 2 {
-        return None;
-    }
-
-    let (type_prefix, segs) = match segs[0] {
-        "datasets" | "spaces" => (Some(segs[0]), &segs[1..]),
-        "models" => (None, &segs[1..]),
-        // Xet buckets and bare owner/repo/... (model default)
-        _ => (None, &segs[..]),
-    };
-
-    if segs.len() < 2 {
-        return None;
-    }
-
-    let owner = segs[0];
-    let (repo, rev) = if let Some(at) = segs[1].find('@') {
-        (&segs[1][..at], &segs[1][at + 1..])
-    } else {
-        (segs[1], "main")
-    };
-
-    let path_parts = &segs[2..];
-    let base = if let Some(tp) = type_prefix {
-        format!("https://huggingface.co/{tp}/{owner}/{repo}")
-    } else {
-        format!("https://huggingface.co/{owner}/{repo}")
-    };
-
-    if path_parts.is_empty() {
-        return Some(base);
-    }
-
-    let path = path_parts.join("/");
-    let verb = if rest.ends_with('/') { "tree" } else { "blob" };
-    Some(format!("{base}/{verb}/{rev}/{path}"))
-}
-
 fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -252,7 +206,7 @@ fn build_info_html(title: &str, inputs: &[String], branding: &Branding) -> Strin
             .iter()
             .map(|s| {
                 let display = escape_html(s);
-                if let Some(url) = hf_url_to_web(s) {
+                if let Some(url) = crate::hf_url::web_url(s) {
                     // The URL is built from the raw input string, so it can
                     // contain `"` or `>` — escape it too, or it breaks out of
                     // the href attribute and injects HTML into the viewer.
@@ -983,7 +937,7 @@ pub fn generate_leaflet_content_multi(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_html, build_html_multi, build_info_html, hf_url_to_web, Branding, SceneView,
+        build_html, build_html_multi, build_info_html, Branding, SceneView,
     };
     fn scene(key: &str, world_w: u32, world_h: u32) -> SceneView {
         SceneView {
@@ -1158,46 +1112,6 @@ mod tests {
             html.contains("<\\/script>"),
             "`</` must be neutralized to `<\\/`: {html}"
         );
-    }
-
-    #[test]
-    fn bare_model_repo() {
-        assert_eq!(
-            hf_url_to_web("hf://owner/repo"),
-            Some("https://huggingface.co/owner/repo".to_string())
-        );
-    }
-
-    #[test]
-    fn bare_dataset_repo() {
-        assert_eq!(
-            hf_url_to_web("hf://datasets/owner/repo"),
-            Some("https://huggingface.co/datasets/owner/repo".to_string())
-        );
-    }
-
-    #[test]
-    fn file_in_model_repo() {
-        assert_eq!(
-            hf_url_to_web("hf://owner/repo/model.safetensors"),
-            Some("https://huggingface.co/owner/repo/blob/main/model.safetensors".to_string())
-        );
-    }
-
-    #[test]
-    fn file_in_dataset_repo() {
-        assert_eq!(
-            hf_url_to_web("hf://datasets/owner/repo/data.safetensors"),
-            Some(
-                "https://huggingface.co/datasets/owner/repo/blob/main/data.safetensors".to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn non_hf_url_returns_none() {
-        assert_eq!(hf_url_to_web("/local/path/file.safetensors"), None);
-        assert_eq!(hf_url_to_web("hf://owner"), None);
     }
 
     /// An hf:// input string containing `"` must not break out of the href

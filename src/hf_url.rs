@@ -754,6 +754,38 @@ pub fn bucket_url(repo_id: &str, path: &str) -> String {
 
 /// True iff `s` is an `hf://` URL. Centralises the prefix check so call sites
 /// don't sprinkle `starts_with("hf://")` everywhere.
+/// Convert an `hf://` URL to its Hub web URL, or `None` for non-hf paths and
+/// bucket URLs (which have no web viewer page).
+///
+/// `hf://[type/]owner/repo[@rev][/path]` →
+/// `{endpoint}/[type/]owner/repo/{blob|tree}/{rev}/{path}`, with `tree` when the
+/// raw path ends in `/`. Parsing is delegated to [`parse`] so owner/repo/rev
+/// splitting lives in one place; models intentionally omit the `models/`
+/// segment, matching the Hub's web URLs. The host comes from [`endpoint`], so
+/// `HF_ENDPOINT` applies here too.
+pub fn web_url(raw: &str) -> Option<String> {
+    let hf = parse(raw).ok()?;
+    if hf.kind == RepoKind::Bucket {
+        return None;
+    }
+    let kind_prefix = match hf.kind {
+        RepoKind::Model => String::new(),
+        RepoKind::Dataset => "datasets/".to_string(),
+        RepoKind::Space => "spaces/".to_string(),
+        RepoKind::Bucket => unreachable!("bucket returned above"),
+    };
+    let base = format!("{}/{kind_prefix}{}", endpoint(), hf.repo_id);
+    if hf.path_in_repo.is_empty() {
+        return Some(base);
+    }
+    let tree = raw
+        .strip_prefix("hf://")
+        .map(|rest| rest.ends_with('/'))
+        .unwrap_or(false);
+    let verb = if tree { "tree" } else { "blob" };
+    Some(format!("{base}/{verb}/{}/{path}", hf.revision, path = hf.path_in_repo))
+}
+
 pub fn is_hf_url(s: &str) -> bool {
     s.starts_with("hf://")
 }
@@ -1013,6 +1045,56 @@ mod tests {
         // Valid repo-level / file-level URLs return the expected bool.
         assert!(is_repo_level("hf://a/b").unwrap());
         assert!(!is_repo_level("hf://a/b/file").unwrap());
+    }
+
+    #[test]
+    fn web_url_bare_model_repo() {
+        assert_eq!(web_url("hf://owner/repo"), Some("https://huggingface.co/owner/repo".to_string()));
+    }
+
+    #[test]
+    fn web_url_bare_dataset_repo() {
+        assert_eq!(
+            web_url("hf://datasets/owner/repo"),
+            Some("https://huggingface.co/datasets/owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn web_url_file_in_model_repo() {
+        assert_eq!(
+            web_url("hf://owner/repo/model.safetensors"),
+            Some("https://huggingface.co/owner/repo/blob/main/model.safetensors".to_string())
+        );
+    }
+
+    #[test]
+    fn web_url_file_in_dataset_repo() {
+        assert_eq!(
+            web_url("hf://datasets/owner/repo/data.safetensors"),
+            Some(
+                "https://huggingface.co/datasets/owner/repo/blob/main/data.safetensors".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn web_url_directory_uses_tree_verb() {
+        assert_eq!(
+            web_url("hf://owner/repo/data/"),
+            Some("https://huggingface.co/owner/repo/tree/main/data".to_string())
+        );
+    }
+
+    #[test]
+    fn web_url_non_hf_or_partial_returns_none() {
+        assert_eq!(web_url("/local/path/file.safetensors"), None);
+        assert_eq!(web_url("hf://owner"), None);
+    }
+
+    #[test]
+    fn web_url_bucket_returns_none() {
+        assert_eq!(web_url("hf://buckets/alice/foo/data/x"), None);
     }
 
     #[test]

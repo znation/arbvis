@@ -425,3 +425,99 @@ async fn render_tiles_streaming(
     .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use crate::tiled::leaf::TileFormat;
+
+    fn cfg(three_d: bool) -> RenderConfig {
+        RenderConfig {
+            title: Cow::Borrowed("t"),
+            inputs: Vec::new(),
+            diff_mode: false,
+            show_xet_xorbs: false,
+            layout_mode: crate::layout::LayoutMode::Auto,
+            leaf_format: TileFormat::Png,
+            pyramid_format: TileFormat::Png,
+            three_d,
+            grid_side: 16,
+            volume_res: 0,
+        }
+    }
+
+    fn dest(local: Option<PathBuf>, space: Option<String>) -> OutputDest {
+        OutputDest::Bundle {
+            local,
+            upload_hf: None,
+            space,
+            _tempdir: None,
+        }
+    }
+
+    /// 3D dispatch without a local staging dir must fail with the internal
+    /// invariant error (OutputDest::from_args is supposed to allocate one).
+    #[tokio::test]
+    async fn dispatch_3d_without_local_staging_is_an_error() {
+        let registry = registry::Registry::default();
+        let err = dispatch_render(
+            Vec::new(),
+            0,
+            &[],
+            &cfg(true),
+            dest(None, None),
+            false,
+            &registry,
+        )
+        .await
+        .expect_err("3D render without a local dir must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("without a local staging dir"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// Disk-backed 2D render without a local path must fail with the
+    /// internal invariant error.
+    #[tokio::test]
+    async fn dispatch_2d_disk_backed_without_local_path_is_an_error() {
+        let registry = registry::Registry::default();
+        let err = dispatch_render(
+            Vec::new(),
+            0,
+            &[],
+            &cfg(false),
+            dest(None, None),
+            false,
+            &registry,
+        )
+        .await
+        .expect_err("disk-backed render without a local path must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("without a local path"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// Streaming dispatch with no HF destination is an internal error.
+    #[tokio::test]
+    async fn streaming_dispatch_without_hf_destination_is_an_error() {
+        let err = render_tiles_streaming(
+            Vec::new(),
+            0,
+            None,
+            None,
+            &cfg(false),
+            &registry::Registry::default(),
+        )
+        .await
+        .expect_err("stream dispatch with no HF destination must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("stream dispatch with no HF destination"),
+            "unexpected error: {msg}"
+        );
+    }
+}

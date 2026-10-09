@@ -1670,3 +1670,123 @@ mod render_one_tests {
     }
 }
 
+#[cfg(test)]
+mod plan_pipeline_tests {
+    use super::*;
+    use crate::data::SourceKind;
+    use crate::tiled::leaf::TileFormat;
+    use crate::xet::XetTerm;
+
+    fn source(name: &str, byte_size: u64) -> Source {
+        Source {
+            file_idx: 0,
+            kind: SourceKind::Buffered(vec![0u8; byte_size as usize]),
+            byte_size,
+            name_override: Some(name.to_string()),
+            xet_terms: None,
+            extensions: Default::default(),
+        }
+    }
+
+    async fn plain_plan(sizes: &[u64]) -> TilePlan {
+        let sources: Vec<Source> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| source(&format!("f{i}.bin"), n))
+            .collect();
+        let total: u64 = sizes.iter().sum();
+        build_tile_plan(
+            sources,
+            total,
+            false,
+            false,
+            crate::layout::LayoutMode::Hilbert,
+            &crate::registry::Registry::with_defaults(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Plain mode: byte sources must produce Plain leaf mode, cumulative
+    /// offsets stacked in source order, and one entity per source with its
+    /// own name and byte_size.
+    #[tokio::test]
+    async fn plain_plan_multi_source_offsets_and_entities() {
+        let plan = plain_plan(&[8, 5]).await;
+        assert!(matches!(plan.mode, LeafMode::Plain { .. }));
+        assert_eq!(&*plan.cumulative_offsets, &[0, 8]);
+        assert_eq!(plan.entities.len(), 2);
+        assert_eq!(plan.entities[0].name, "f0.bin");
+        assert_eq!(plan.entities[1].name, "f1.bin");
+        assert_eq!(plan.entities[0].byte_size, 8);
+        assert_eq!(plan.entities[1].byte_size, 5);
+        assert_eq!(plan.total, 13);
+        assert_eq!(plan.square_pixels, plan.width as u64 * plan.height as u64);
+    }
+
+    /// With `show_xet_xorbs` and per-source xet terms the plan must select
+    /// Xet mode carrying exactly the global ranges xet_xorb_ranges computes
+    /// (offset-shifted across sources in canvas order).
+    #[tokio::test]
+    async fn xet_plan_carries_shifted_xorb_ranges() {
+        let terms_a = vec![XetTerm {
+            file_offset: 0,
+            byte_len: 10,
+            xorb_hash: "aa".into(),
+        }];
+        let terms_b = vec![XetTerm {
+            file_offset: 5,
+            byte_len: 3,
+            xorb_hash: "bb".into(),
+        }];
+        let sources: Vec<Source> = [(10, terms_a), (8, terms_b)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (n, terms))| {
+                let mut s = source(&format!("f{i}.bin"), n);
+                s.xet_terms = Some(terms);
+                s
+            })
+            .collect();
+        let plan = build_tile_plan(
+            sources,
+            18,
+            false,
+            true,
+            crate::layout::LayoutMode::Hilbert,
+            &crate::registry::Registry::with_defaults(),
+        )
+        .await
+        .unwrap();
+        let LeafMode::Xet { xorb_ranges, .. } = &plan.mode else {
+            panic!("expected LeafMode::Xet, got {:?}",
+                std::mem::discriminant(&plan.mode));
+        };
+        assert_eq!(&**xorb_ranges, &[(0, 10, 0), (15, 18, 1)]);
+        assert_eq!(&*plan.cumulative_offsets, &[0, 10]);
+    }
+
+    /// drive_pipeline must invoke the sink exactly once per tile coordinate,
+    /// with the coordinate attached to each encoded tile.
+    #[tokio::test]
+    async fn drive_pipeline_delivers_every_tile_once() {
+        let plan = plain_plan(&[64, 64]).await;
+        let coords = TileCoords::Dense {
+            width_tiles: plan.width_tiles,
+            height_tiles: plan.height_tiles,
+        };
+        let expected = plan.width_tiles * plan.height_tiles;
+        let mut seen: Vec<(u32, u32)> = Vec::new();
+        drive_pipeline(&plan, TileFormat::IndexedPng, plan.max_zoom, coords, |t| {
+            seen.push((t.tx, t.ty));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(seen.len() as u32, expected, "one tile per coordinate");
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len() as u32, expected, "coordinates are unique");
+    }
+}
+

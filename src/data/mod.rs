@@ -923,4 +923,162 @@ mod prepare_sources_tests {
         assert_eq!(sources.len(), 1);
         assert_eq!(total, 5);
     }
+
+    #[test]
+    fn directory_input_expands_to_all_files_recursively() {
+        let registry = Registry::with_defaults();
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(dir.path().join("a.bin"), [0u8; 3]).unwrap();
+        std::fs::write(nested.join("b.bin"), [0u8; 4]).unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), [0u8; 100]).unwrap();
+        let (sources, total) =
+            prepare_sources(&[dir.path().to_path_buf()], &registry).unwrap();
+        // Every file under the directory becomes its own source, regardless
+        // of extension or nesting depth.
+        assert_eq!(sources.len(), 3);
+        assert_eq!(total, 107);
+        // Sources preserve the recursive traversal order and get fresh
+        // consecutive file_idx values.
+        // sort() orders by full path, so "a.bin" < "ignored.txt" <
+        // "nested/b.bin" (the nested directory's prefix sorts as "n").
+        let sizes: Vec<u64> = sources.iter().map(|s| s.byte_size).collect();
+        assert_eq!(sizes, [3, 100, 4]);
+        assert_eq!(
+            sources.iter().map(|s| s.file_idx).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+    }
+}
+
+#[cfg(test)]
+mod data_fetch_tests {
+    use super::Data;
+    use futures::FutureExt;
+    use std::sync::Arc;
+
+    fn owned(bytes: &[u8]) -> Data {
+        Data::Owned(bytes.to_vec())
+    }
+
+    #[tokio::test]
+    async fn fetch_range_slices_local_variants() {
+        let data = owned(b"hello world");
+        assert_eq!(data.fetch_range(0, 5).await.unwrap(), b"hello");
+        assert_eq!(data.fetch_range(6, 5).await.unwrap(), b"world");
+        assert_eq!(data.fetch_range(11, 0).await.unwrap(), b"");
+    }
+
+    #[tokio::test]
+    async fn fetch_range_panics_on_out_of_bounds() {
+        let data = owned(b"abc");
+        let result = std::panic::AssertUnwindSafe(data.fetch_range(2, 5))
+            .catch_unwind()
+            .await;        assert!(result.is_err(), "start+len past the end should panic");
+    }
+
+    #[tokio::test]
+    async fn zero_fill_returns_requested_length_of_zeros() {
+        let data = Data::ZeroFill;
+        assert_eq!(data.fetch_range(0, 4).await.unwrap(), [0u8; 4]);
+        assert_eq!(data.fetch_range(1_000_000, 2).await.unwrap(), [0u8; 2]);
+    }
+
+    #[tokio::test]
+    async fn offset_slice_shifts_fetch_and_deref_into_inner() {
+        let inner = Arc::new(owned(b"0123456789"));
+        let view = Data::OffsetSlice {
+            inner: Arc::clone(&inner),
+            base: 3,
+        };
+        // fetch_range(s, n) resolves to inner.fetch_range(base + s, n).
+        assert_eq!(view.fetch_range(0, 2).await.unwrap(), b"34");
+        assert_eq!(view.fetch_range(4, 3).await.unwrap(), b"789");
+        // Deref exposes the inner tail starting at base.
+        assert_eq!(&*view, b"3456789");
+    }
+
+    #[tokio::test]
+    async fn offset_slice_delegates_is_local_to_inner() {
+        let inner = Arc::new(owned(b"abc"));
+        let view = Data::OffsetSlice {
+            inner: Arc::clone(&inner),
+            base: 0,
+        };
+        assert!(view.is_local());
+        assert!(view.is_local());
+    }
+
+    #[tokio::test]
+    async fn lazy_diff_fetches_through_the_closure() {
+        let data = Data::LazyDiff(Arc::new(move |start: u64, len: usize| {
+            Box::pin(async move { Ok((start as u8..).take(len).collect::<Vec<u8>>()) })
+                as futures::future::BoxFuture<'static, anyhow::Result<Vec<u8>>>
+        }));
+        assert!(!data.is_local(), "LazyDiff may hit the network");
+        assert_eq!(data.fetch_range(10, 3).await.unwrap(), [10, 11, 12]);
+    }
+
+    #[test]
+    fn is_local_matches_each_variant() {
+        assert!(owned(b"").is_local());
+        assert!(Data::ZeroFill.is_local());
+    }
+}
+
+#[cfg(test)]
+mod source_name_tests {
+    use super::{Extensions, Source, SourceKind};
+    use std::path::PathBuf;
+
+    fn source(kind: SourceKind) -> Source {
+        Source {
+            file_idx: 0,
+            kind,
+            byte_size: 0,
+            name_override: None,
+            xet_terms: None,
+            extensions: Extensions::default(),
+        }
+    }
+
+    #[test]
+    fn name_varies_by_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.bin");
+        std::fs::write(&path, b"x").unwrap();
+        assert_eq!(source(SourceKind::File(path.clone())).name(), "model.bin");
+        assert_eq!(source(SourceKind::Buffered(vec![])).name(), "stdin");
+        assert_eq!(
+            source(SourceKind::Diff {
+                original: path.clone(),
+                modified: dir.path().join("other.bin"),
+            })
+            .name(),
+            "model.bin"
+        );
+    }
+
+    #[test]
+    fn name_override_wins_over_every_kind() {
+        let mut s = source(SourceKind::Buffered(vec![1]));
+        s.name_override = Some("real-name.bin".to_string());
+        assert_eq!(s.name(), "real-name.bin");
+    }
+
+    #[test]
+    fn extensions_store_one_typed_value_and_replace() {
+        let mut ext = Extensions::default();
+        ext.insert(7u32);
+        ext.insert("tag".to_string());
+        assert_eq!(*ext.get::<u32>().unwrap(), 7);
+        assert_eq!(ext.get::<u64>(), None);
+        // Same-type insert replaces the prior value.
+        ext.insert(9u32);
+        assert_eq!(*ext.get::<u32>().unwrap(), 9);
+        // Debug only reports the count, never the payloads.
+        let debug = format!("{ext:?}");
+        assert!(debug.contains("type_count: 2"), "unexpected: {debug}");
+    }
 }

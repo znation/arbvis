@@ -177,6 +177,14 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
         .await
         .with_context(|| format!("source provider `{}`", chosen.id()))?;
 
+    // Guard every render path (bundle, --3d, --space, --png) against empty
+    // input: with no bytes there is nothing to color, and rendering an empty
+    // viewer silently hides the usual cause — a typo'd path or a piped
+    // command that produced no output.
+    if total == 0 {
+        anyhow::bail!("{}", empty_input_error(&sources));
+    }
+
     let labels: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(s.name())).collect();
     let cfg = RenderConfig {
         title: default_title(args.title, &registry.branding.name, &hints.title_suffix),
@@ -197,9 +205,6 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
     // stop — no bundle, no upload, no deploy. Diff mode renders through the
     // signed-delta LUT + crosshatch (truecolor); plain mode is indexed.
     if let Some(ref png) = args.png {
-        if total == 0 {
-            anyhow::bail!("{}", empty_png_input_error(&sources));
-        }
         let out_path = tiled::single::png_output_path(png, args.out.as_deref())?;
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)
@@ -245,27 +250,28 @@ mod tests {
     }
 
     #[test]
-    fn empty_png_error_names_every_source_and_suggests_the_fallback() {
+    fn empty_input_error_names_every_source_and_suggests_the_fix() {
         let mut a = buffered_source();
         a.name_override = Some("a.bin".to_string());
         let b = buffered_source();
-        let msg = empty_png_input_error(&[a, b]);
-        assert!(msg.starts_with("--png requires non-empty input"), "{msg}");
+        let msg = empty_input_error(&[a, b]);
+        assert!(msg.starts_with("arbvis requires non-empty input"), "{msg}");
         assert!(msg.contains("2 source(s)"), "{msg}");
         assert!(msg.contains("a.bin") && msg.contains("stdin"), "{msg}");
-        assert!(msg.contains("viewer bundle"), "{msg}");
+        assert!(msg.contains("no bytes to color"), "{msg}");
     }
 }
 
-/// The error reported when every source is empty and `--png` was requested.
-/// Names the sources so a typo'd path (the usual cause of an empty input)
-/// is obvious from the message alone.
-fn empty_png_input_error(sources: &[Source]) -> String {
+/// The error reported when every source is empty, for every render path
+/// (2D bundle, 3D, Space deploy, and `--png`). Names the sources so a typo'd
+/// path (the usual cause of an empty input) is obvious from the message
+/// alone.
+fn empty_input_error(sources: &[Source]) -> String {
     let names: Vec<String> = sources.iter().map(|s| s.name()).collect();
     format!(
-        "--png requires non-empty input: all {} source(s) have 0 bytes ({}). \
-         An empty file has no bytes to color — pass a non-empty file, or drop \
-         --png to render a viewer bundle instead.",
+        "arbvis requires non-empty input: all {} source(s) have 0 bytes ({}). \
+         An empty file has no bytes to color — pass non-empty file(s), or \
+         check that the command piping into stdin actually produced output.",
         sources.len(),
         names.join(", ")
     )

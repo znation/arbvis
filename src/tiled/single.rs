@@ -176,18 +176,30 @@ pub async fn render_single_png(sources: &[Source], total: u64, out: &Path) -> an
 /// otherwise `FILE` is used as given. `hf://` destinations are rejected:
 /// a single PNG is a local file, not a bundle to upload.
 pub fn png_output_path(png: &Path, out: Option<&Path>) -> anyhow::Result<PathBuf> {
-    let Some(out) = out else {
-        return Ok(png.to_path_buf());
+    // Fail before the render if the target exists and is a directory —
+    // otherwise the PNG write fails late, at rename time, with a bare
+    // "renaming into <path>" and no hint about what is wrong.
+    let resolved = if let Some(out) = out {
+        if out.to_string_lossy().starts_with("hf://") {
+            anyhow::bail!(
+                "--png writes a single local file; --out must be a local directory, got {out:?}"
+            );
+        }
+        out.join(
+            png.file_name()
+                .ok_or_else(|| anyhow::anyhow!("--png path has no file name: {}", png.display()))?,
+        )
+    } else {
+        png.to_path_buf()
     };
-    if out.to_string_lossy().starts_with("hf://") {
+    if resolved.is_dir() {
         anyhow::bail!(
-            "--png writes a single local file; --out must be a local directory, got {out:?}"
+            "--png {} is a directory; pass the PNG file path to write (e.g. {})",
+            resolved.display(),
+            resolved.join("out.png").display()
         );
     }
-    Ok(out.join(
-        png.file_name()
-            .ok_or_else(|| anyhow::anyhow!("--png path has no file name: {}", png.display()))?,
-    ))
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -324,6 +336,21 @@ mod tests {
             pos += 12 + len;
         }
         None
+    }
+
+    #[test]
+    fn output_path_rejects_directory_target() {
+        let dir = tempfile::tempdir().unwrap();
+        // --png <existing directory> (no --out): the path itself is the target.
+        let err = png_output_path(Path::new(dir.path()), None).unwrap_err();
+        assert!(err.to_string().contains("is a directory"), "{err}");
+        // --png a.png --out <dir containing a directory named a.png>.
+        let clash = dir.path().join("a.png");
+        std::fs::create_dir(&clash).unwrap();
+        let err = png_output_path(Path::new("a.png"), Some(dir.path())).unwrap_err();
+        assert!(err.to_string().contains("is a directory"), "{err}");
+        // A non-existing resolved path is still accepted.
+        assert!(png_output_path(Path::new("a.png"), Some(&dir.path().join("o"))).is_ok());
     }
 
     #[test]

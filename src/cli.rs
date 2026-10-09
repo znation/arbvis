@@ -258,7 +258,17 @@ impl OutputDest {
                         (None, Some(url), None)
                     }
                 } else {
-                    // Local --out <dir>: always disk-backed.
+                    // Local --out <dir>: always disk-backed. Fail before the
+                    // (possibly long) render if the path exists but is not a
+                    // directory — otherwise the failure surfaces only at
+                    // final tile write, as an opaque os error with no path.
+                    if p.exists() && !p.is_dir() {
+                        anyhow::bail!(
+                            "--out {} is a file, not a directory; pass a directory \
+                             path to write the viewer bundle into",
+                            p.display()
+                        );
+                    }
                     (Some(p.clone()), None, None)
                 }
             }
@@ -380,7 +390,8 @@ pub(crate) fn collect_input_files(
 
 #[cfg(test)]
 mod file_list_tests {
-    use super::collect_input_files;
+    use super::{collect_input_files, Args, OutputDest};
+    use clap::Parser;
     use std::path::PathBuf;
 
     #[test]
@@ -399,6 +410,37 @@ mod file_list_tests {
         std::fs::write(&list, "\n   \n").unwrap();
         let err = collect_input_files(vec![], Some(list)).unwrap_err();
         assert!(err.to_string().contains("contains no paths"), "{err}");
+    }
+
+    #[test]
+    fn out_pointing_at_a_regular_file_fails_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("afile");
+        std::fs::write(&file, b"x").unwrap();
+        let args = Args::try_parse_from([
+            "arbvis",
+            file.to_str().unwrap(),
+            "--out",
+            file.to_str().unwrap(),
+        ])
+        .unwrap();
+        let err = match OutputDest::from_args(&args) {
+            Err(e) => e,
+            Ok(_) => panic!("--out pointing at a regular file should fail"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("is a file, not a directory"), "{msg}");
+        assert!(msg.contains("afile"), "{msg}");
+        // A path that does not exist yet (the common case) must still be
+        // accepted — creation happens later, at render time.
+        let args = Args::try_parse_from([
+            "arbvis",
+            file.to_str().unwrap(),
+            "--out",
+            dir.path().join("newdir").to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(OutputDest::from_args(&args).is_ok());
     }
 
     #[test]

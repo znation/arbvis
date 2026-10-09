@@ -203,24 +203,21 @@ mod tests {
             0,
         );
         assert_eq!(groups.len(), 3);
-        let keys: Vec<&str> = groups
-            .iter()
-            .map(|g| g.key.as_deref().unwrap())
-            .collect();
+        let keys: Vec<&str> = groups.iter().map(|g| g.key.as_deref().unwrap()).collect();
         assert_eq!(keys, ["summary", "cka", "main"]);
         let main = groups.last().unwrap();
         assert_eq!(main.label, "Main");
-        assert_eq!(main.total, 9, "untagged sources' sizes sum into the scene total");
+        assert_eq!(
+            main.total, 9,
+            "untagged sources' sizes sum into the scene total"
+        );
         assert_eq!(main.sources.len(), 2);
     }
 
     // Labels ride through untouched — the viewer renders them verbatim.
     #[test]
     fn scene_labels_pass_through_unchanged() {
-        let groups = partition_scenes(
-            vec![tagged_source("cka", "Expert Diff", 0, 4)],
-            0,
-        );
+        let groups = partition_scenes(vec![tagged_source("cka", "Expert Diff", 0, 4)], 0);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].label, "Expert Diff");
         assert_eq!(groups[0].order, 0);

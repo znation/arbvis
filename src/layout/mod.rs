@@ -333,7 +333,10 @@ mod tests {
         fn applicable(&self, _ctx: &crate::registry::LayoutBuildCtx<'_>) -> bool {
             true
         }
-        fn build(&self, _ctx: &crate::registry::LayoutBuildCtx<'_>) -> Option<Box<dyn LayoutShape>> {
+        fn build(
+            &self,
+            _ctx: &crate::registry::LayoutBuildCtx<'_>,
+        ) -> Option<Box<dyn LayoutShape>> {
             None
         }
     }

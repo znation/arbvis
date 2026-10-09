@@ -165,9 +165,13 @@ fn validate_range_body(
 /// A remote HF file accessed via range requests without a full download.
 #[derive(Clone)]
 pub struct RemoteFileSpec {
+    /// Repo handle backing the range-read paths.
     pub repo: RemoteRepo,
+    /// File path inside the repo, as listed by the tree API.
     pub filename: Arc<String>,
+    /// Pinned revision the URL resolved against.
     pub revision: Arc<String>,
+    /// Total file size in bytes, from the tree listing.
     pub size: u64,
     /// Xet Merkle hash, present iff this file is xet-backed.
     pub xet_hash: Option<String>,
@@ -176,9 +180,13 @@ pub struct RemoteFileSpec {
 /// Parsed destination for streaming output (Hub repo or bucket).
 #[derive(Clone)]
 pub struct HfOutputSpec {
+    /// Destination repo id (`owner/name`).
     pub repo_id: String,
+    /// Hub repo kind, matched exhaustively at the upload dispatch site.
     pub kind: RepoKind,
+    /// Revision to write against (branch, tag, or commit sha).
     pub revision: String,
+    /// Directory prefix inside the repo that streamed files land under.
     pub path_prefix: String,
 }
 
@@ -228,9 +236,13 @@ impl HfOutputSpec {
 /// file's path inside the repo.
 #[derive(Debug)]
 pub struct HfUrl {
+    /// Which hub API surface the URL targets.
     pub kind: RepoKind,
+    /// `owner/name` portion of the URL.
     pub repo_id: String,
+    /// Pinned revision from the `@rev` suffix; `main` when absent.
     pub revision: String,
+    /// File path inside the repo; empty for repo-level URLs.
     pub path_in_repo: String,
 }
 

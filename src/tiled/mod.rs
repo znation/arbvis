@@ -1304,7 +1304,10 @@ async fn render_scene_to_disk(
     .await?;
 
     log::info!("Draining pyramid encode tasks...");
-    pyramid.drain().await;
+    pyramid
+        .drain()
+        .await
+        .context("pyramid overview-tile encode/upload failed; the tile set is incomplete")?;
     drop(pyramid);
 
     // Variable-depth detail tiles: sparse deeper levels rendered directly from

@@ -25,10 +25,14 @@ struct TileAcc {
 /// contributed, the encode+upload work is offloaded to
 /// [`tokio::task::spawn_blocking`] so the calling thread can return immediately.
 /// Outstanding tasks are tracked in `outstanding` and drained by
-/// [`Self::drain`] before commit.
+/// [`Self::drain`] before commit. The first failure any detached task hits
+/// (encode or sink upload) is recorded in `first_error` and surfaced by
+/// [`Self::drain`] as an `Err`, so a pyramid tile that silently failed to
+/// persist cannot pass for a completed run.
 pub struct PyramidAccumulator<S: TileSink> {
     pending: Mutex<HashMap<(u32, u32, u32), Box<TileAcc>>>,
     outstanding: Mutex<Vec<JoinHandle<()>>>,
+    first_error: Mutex<Option<anyhow::Error>>,
     tile_size: u32,
     sink: Arc<S>,
     /// Maps `(zoom, x, y)` → destination path string. The sink interprets it
@@ -95,6 +99,7 @@ impl<S: TileSink> PyramidAccumulator<S> {
         Self {
             pending: Mutex::new(HashMap::new()),
             outstanding: Mutex::new(Vec::new()),
+            first_error: Mutex::new(None),
             tile_size,
             sink,
             path_fn,
@@ -196,12 +201,18 @@ impl<S: TileSink> PyramidAccumulator<S> {
                     log::error!(
                         "pyramid: encode error at zoom {parent_z} ({parent_x},{parent_y}): {e}"
                     );
+                    me.record_error(anyhow::anyhow!(
+                        "pyramid encode error at zoom {parent_z} ({parent_x},{parent_y}): {e}"
+                    ));
                     return;
                 }
             };
             let path = (me.path_fn)(parent_z, parent_x, parent_y);
             if let Err(e) = me.sink.upload_tile(path, bytes) {
                 log::error!("pyramid: write error at zoom {parent_z} ({parent_x},{parent_y}): {e}");
+                me.record_error(anyhow::anyhow!(
+                    "pyramid write error at zoom {parent_z} ({parent_x},{parent_y}): {e}"
+                ));
                 return;
             }
 
@@ -212,24 +223,45 @@ impl<S: TileSink> PyramidAccumulator<S> {
         self.outstanding.lock().unwrap().push(handle);
     }
 
-    /// Await all outstanding encode+upload tasks. Call this before
+    /// Records the first error seen by any detached encode/upload task (later
+    /// ones are dropped; the first is the root cause of the cascade) so
+    /// [`Self::drain`] can fail the run instead of letting missing pyramid
+    /// tiles pass silently.
+    fn record_error(&self, e: anyhow::Error) {
+        let mut g = self.first_error.lock().unwrap();
+        if g.is_none() {
+            *g = Some(e);
+        }
+    }
+
+    /// Await all outstanding encode+upload tasks, failing if any of them hit
+    /// an encode, upload, or panic error. Call this before
     /// `HfTileSink::commit` so every staged file is on disk by commit time.
     ///
     /// The set may grow while we drain (a task may spawn another for its own
     /// parent), so we loop until the outstanding list is empty.
-    pub async fn drain(&self) {
+    pub async fn drain(&self) -> anyhow::Result<()> {
         loop {
             let handles = {
                 let mut g = self.outstanding.lock().unwrap();
                 std::mem::take(&mut *g)
             };
             if handles.is_empty() {
-                return;
+                break;
             }
             for h in handles {
-                let _ = h.await;
+                if let Err(join_err) = h.await {
+                    self.record_error(anyhow::anyhow!("pyramid task panicked: {join_err}"));
+                }
             }
         }
+        // Report (don't consume) the first recorded failure so a repeat
+        // drain — e.g. the next scene in the streaming path — cannot pass
+        // after a prior drain already observed the error.
+        if let Some(e) = self.first_error.lock().unwrap().as_ref() {
+            return Err(anyhow::anyhow!("{e}"));
+        }
+        Ok(())
     }
 }
 #[cfg(test)]
@@ -302,10 +334,47 @@ mod tests {
     async fn uploads_after(
         acc: &Arc<PyramidAccumulator<RecordingSink>>,
     ) -> Vec<(String, image::ImageBuffer<Rgb<u8>, Vec<u8>>)> {
-        acc.drain().await;
+        acc.drain().await.expect("pyramid drain succeeds");
         let mut uploads = acc.sink.uploads.lock().unwrap().clone();
         uploads.sort_by(|a, b| a.0.cmp(&b.0));
         uploads
+    }
+
+    /// A sink whose every upload fails, to prove drain() surfaces the
+    /// failure instead of letting an incomplete pyramid pass for success.
+    struct FailingSink;
+    impl TileSink for FailingSink {
+        fn upload_tile(&self, _path: String, _bytes: Vec<u8>) -> anyhow::Result<()> {
+            anyhow::bail!("simulated sink failure")
+        }
+    }
+
+    /// All four children of one parent upload through a failing sink:
+    /// drain() must return a descriptive error naming the failed tile.
+    #[tokio::test]
+    async fn upload_failure_is_surfaced_by_drain() {
+        let acc: Arc<PyramidAccumulator<FailingSink>> = Arc::new(PyramidAccumulator::new(
+            4,
+            Arc::new(FailingSink),
+            Arc::new(|z, x, y| format!("{z}/{x}/{y}.png")),
+            TileFormat::Png,
+        ));
+        for x in 0..2 {
+            for y in 0..2 {
+                acc.contribute(1, x, y, &constant_tile(4, [1, 2, 3]));
+            }
+        }
+        let err = acc
+            .drain()
+            .await
+            .expect_err("failed upload must surface through drain");
+        assert!(
+            err.to_string()
+                .contains("pyramid write error at zoom 0 (0,0)"),
+            "unexpected error: {err:#}"
+        );
+        // A repeat drain must still report the failure, not reset to Ok.
+        assert!(acc.drain().await.is_err());
     }
 
     #[tokio::test]

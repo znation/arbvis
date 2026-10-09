@@ -10,6 +10,8 @@
 
 use std::sync::Arc;
 
+use anyhow::Context;
+
 use crate::hf_upload::HfTileSink;
 use crate::hf_url::HfOutputSpec;
 use crate::layout::LayoutMode;
@@ -195,7 +197,10 @@ async fn stream_scene(
 
     // Await any in-flight pyramid encode/upload tasks before the next scene (or
     // commit) so every staged file is present when the folder is walked.
-    pyramid.drain().await;
+    pyramid
+        .drain()
+        .await
+        .context("pyramid overview-tile encode/upload failed; the tile set is incomplete")?;
     drop(pyramid);
 
     // Variable-depth detail tiles (sparse deeper levels, no accumulation).

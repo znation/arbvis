@@ -80,6 +80,29 @@ Note: the original combined entry also listed `lib.rs` at 1131 lines, which was 
 
 ## Fixed
 
+### `src/data/mod.rs` (853 lines) exceeds the one-sitting readability budget — fixed 2026-10-09 by bugfix
+
+**Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
+"several modules" entry; siblings: volume/html.rs, tiled/mod.rs, volume/mod.rs, volume/brick.rs,
+xet.rs). Fixed in two ticks: first the diff subsystem was extracted into `src/data/diff.rs` (see
+the earlier Fixed entry); this tick split the remainder into `src/data/source.rs` (local source
+construction: `collect_files_recursive`, `prepare_sources`, `load_source_data`, and the
+`prepare_sources_tests` moved alongside) and `src/data/remote.rs` (Hub plumbing:
+`prepare_sources_from_specs`, `materialize_http_sources`, `download_specs_to_paths`,
+`populate_xet_terms`). `src/data/mod.rs` now holds only the shared type definitions (Data,
+SourceKind, Source, Extensions, SceneTag, InputSpec, CustomSource, LazyFetcher) plus re-exports,
+so the `crate::data::{...}` surface and `lib.rs` are unchanged. Code was moved verbatim, with one
+exception: `diff_bytes_to_color` now lives in `src/data/source.rs` next to its two callers and its
+`diff_bytes_to_color_tests` module moved with it (revision 2 restored the function and its tests,
+which had been dropped and its body inlined into two source.rs closures).
+
+**Reproduce (was):** `wc -l src/data/mod.rs`. Now: mod.rs 318, source.rs 293, remote.rs 340,
+diff.rs 492 lines — each in budget.
+
+**Validation gap:** none — `wc -l` confirms the split, and the existing suite (including the
+prepare_sources tests and the diff_bytes_to_color_tests in source.rs) plus `cargo build`/
+`cargo fmt --check` passed after the change.
+
 ### Extract the diff subsystem of the former single-file data module into `src/data/diff.rs` — fixed 2026-10-09 by bugfix
 
 **Found by steward 2026-10-09** as part of the combined "several modules exceed the one-sitting

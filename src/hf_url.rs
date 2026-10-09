@@ -205,7 +205,9 @@ pub struct HfUrl {
 /// file names holding raw escape sequences (ESC [ … m recolors, OSC … BEL
 /// rewrites the title / clipboard), so escape bytes must not survive.
 pub fn sanitize_log_text(s: &str) -> String {
-    s.chars().map(|c| if c.is_control() { '?' } else { c }).collect()
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 /// Parse an `hf://` URL into its components.
@@ -627,10 +629,7 @@ pub async fn resolve(path: &Path) -> anyhow::Result<PathBuf> {
     .await
     .with_context(|| format!("downloading hf://{}/{}", hf.repo_id, path_disp))?;
 
-    log::info!(
-        "Cached at {}",
-        sanitize_log_text(&local.to_string_lossy())
-    );
+    log::info!("Cached at {}", sanitize_log_text(&local.to_string_lossy()));
     Ok(local)
 }
 
@@ -672,16 +671,11 @@ async fn resolve_bucket(hf: &HfUrl) -> anyhow::Result<PathBuf> {
     let dest = local.to_string_lossy().into_owned();
     with_throttle(
         &format!("hf buckets cp {src} {}", sanitize_log_text(&dest)),
-        || async {
-            hf_cli::run_hf(["buckets", "cp", src.as_str(), dest.as_str()]).await
-        },
+        || async { hf_cli::run_hf(["buckets", "cp", src.as_str(), dest.as_str()]).await },
     )
     .await
     .with_context(|| format!("fetching hf://buckets/{bucket_id}/{}", path_disp))?;
-    log::info!(
-        "Cached at {}",
-        sanitize_log_text(&local.to_string_lossy())
-    );
+    log::info!("Cached at {}", sanitize_log_text(&local.to_string_lossy()));
     Ok(local)
 }
 
@@ -709,7 +703,11 @@ pub async fn resolve_to_http(path: &Path) -> anyhow::Result<RemoteFileSpec> {
         })?;
 
     let size = entry.size.unwrap_or(0);
-    log::info!("Remote file {}: {} bytes", sanitize_log_text(&hf.path_in_repo), size);
+    log::info!(
+        "Remote file {}: {} bytes",
+        sanitize_log_text(&hf.path_in_repo),
+        size
+    );
     Ok(RemoteFileSpec {
         repo,
         filename: Arc::new(hf.path_in_repo),

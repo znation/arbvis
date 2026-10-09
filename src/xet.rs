@@ -616,13 +616,12 @@ impl XetReader {
     /// Build a reader for a xet-backed remote file. Errors if the file has
     /// no xet hash (i.e. plain LFS / regular Hub file).
     pub async fn new(spec: &RemoteFileSpec) -> anyhow::Result<Arc<Self>> {
-        let hash = spec
-            .xet_hash
-            .as_deref()
-            .ok_or_else(|| anyhow!(
+        let hash = spec.xet_hash.as_deref().ok_or_else(|| {
+            anyhow!(
                 "{}: not xet-backed, cannot build XetReader",
                 hf_url::sanitize_log_text(&spec.filename)
-            ))?;
+            )
+        })?;
         let api_segment = spec.repo.api_segment().to_string();
         let repo_id = spec.repo.repo_id().to_string();
         let revision: String = (*spec.revision).clone();

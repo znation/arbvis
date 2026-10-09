@@ -1004,6 +1004,12 @@ where
     Ok(())
 }
 
+/// Render a single loaded leaf tile to a `TileFormat`-encoded image.
+///
+/// Shared entry point for the byte-Hilbert leaf renderers: matches the
+/// [`LeafMode`] ([`LeafMode::Plain`] LUT, [`LeafMode::Xet`] xorbs/tableau,
+/// or [`LeafMode::Diff`]) to the corresponding `render_leaf_tile*` helper
+/// and encodes the result as the leaf format [`derive_leaf_format`] picked.
 pub(super) fn render_one(
     tile: LoadedTile,
     mode: &LeafMode,

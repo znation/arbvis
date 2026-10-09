@@ -3,6 +3,7 @@
 //! Kept in its own module so [`crate::volume::html`] stays readable: the
 //! template is a single ~1860-line string with no Rust logic in it.
 
+/// The complete Three.js viewer HTML/JS bundle served as `index.html`.
 pub(super) const TEMPLATE: &str = r##"<!DOCTYPE html>
 <html lang="en">
 <head>

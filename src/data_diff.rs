@@ -198,24 +198,8 @@ pub fn byte_directory_diff(
     } else {
         DiffFill::Red
     };
-    let orig_map: HashMap<PathBuf, PathBuf> = orig_files
-        .iter()
-        .filter(|p| !skip(p))
-        .filter_map(|p| {
-            p.strip_prefix(original)
-                .ok()
-                .map(|rel| (rel.to_path_buf(), p.clone()))
-        })
-        .collect();
-    let mod_map: HashMap<PathBuf, PathBuf> = mod_files
-        .iter()
-        .filter(|p| !skip(p))
-        .filter_map(|p| {
-            p.strip_prefix(modified)
-                .ok()
-                .map(|rel| (rel.to_path_buf(), p.clone()))
-        })
-        .collect();
+    let orig_map = rel_file_map(&orig_files, original, skip);
+    let mod_map = rel_file_map(&mod_files, modified, skip);
 
     let mut mod_only_keys: Vec<&PathBuf> = mod_map
         .keys()
@@ -317,6 +301,25 @@ pub fn byte_directory_diff(
     }
 
     Ok((sources, total))
+}
+
+/// Maps each diff-side file's relative path (under `root`) to its absolute
+/// path, skipping files the `skip` predicate rejects. Both sides of
+/// `byte_directory_diff` build the same map this way.
+fn rel_file_map(
+    files: &[PathBuf],
+    root: &Path,
+    skip: &dyn Fn(&Path) -> bool,
+) -> HashMap<PathBuf, PathBuf> {
+    files
+        .iter()
+        .filter(|p| !skip(p))
+        .filter_map(|p| {
+            p.strip_prefix(root)
+                .ok()
+                .map(|rel| (rel.to_path_buf(), p.clone()))
+        })
+        .collect()
 }
 
 /// Returns the file's length, or `None` (after logging a warning) when its

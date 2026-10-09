@@ -189,7 +189,7 @@ mod tests {
         assert!(!tempdir_path.exists(), "tempdir must be cleaned up");
     }
 
-    use crate::hf_cli::tests::{ENV_LOCK, FakeHfBinGuard};
+    use crate::hf_cli::tests::{FakeHfBinGuard, ENV_LOCK};
 
     /// Script asserting it was invoked as `hf sync <localdir> <dest> --delete`,
     /// that `<localdir>` actually holds the staged tile, and exiting 0.
@@ -206,9 +206,8 @@ printf 'unexpected argv: %s\\n' \"$*\" >&2; exit 9\n",
     #[tokio::test]
     async fn commit_bucket_uploads_with_sync_delete() {
         let _env = ENV_LOCK.lock().await;
-        let _guard = FakeHfBinGuard::with_script(&bucket_sync_script(
-            "hf://buckets/test/repo/tiles",
-        ));
+        let _guard =
+            FakeHfBinGuard::with_script(&bucket_sync_script("hf://buckets/test/repo/tiles"));
         let spec = HfOutputSpec {
             repo_id: "test/repo".to_string(),
             kind: RepoKind::Bucket,
@@ -264,7 +263,8 @@ printf 'unexpected argv: %s\\n' \"$*\" >&2; exit 9\n",
         let sink = HfTileSink::new(spec).expect("sink");
         sink.upload_tile("tiles/0/0_0.png".to_string(), b"png".to_vec())
             .expect("staging succeeds");
-        let err = sink.commit("summary")
+        let err = sink
+            .commit("summary")
             .await
             .expect_err("failed sync must error");
         let msg = err.to_string();

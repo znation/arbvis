@@ -517,7 +517,13 @@ __UPDATE_LABELS_BODY__
       }});
     }};
     fetch('labels.json')
-      .then(function(r) {{ return r.json(); }})
+      .then(function(r) {{
+        // A 404/403/429 reply has an HTML or JSON-error body, which r.json()
+        // would turn into a confusing SyntaxError. Name the status instead —
+        // same contract as the 3D viewer's meta.json fetch.
+        if (!r.ok) throw new Error('labels.json load failed: HTTP ' + r.status + ' ' + r.statusText);
+        return r.json();
+      }})
       .then(function(data) {{
         // New schema: {{ files: [...] }}. Legacy schema: bare array of file entities.
         var files = Array.isArray(data) ? data : (data.files || []);
@@ -907,7 +913,12 @@ __UPDATE_LABELS_BODY__
     });
 
     fetch('labels.json')
-      .then(function(r) { return r.json(); })
+      .then(function(r) {
+        // Same !r.ok contract as the single-scene viewer above: surface the
+        // HTTP status instead of a JSON.parse SyntaxError from an HTML body.
+        if (!r.ok) throw new Error('labels.json load failed: HTTP ' + r.status + ' ' + r.statusText);
+        return r.json();
+      })
       .then(function(data) {
         var scenes = data.scenes || [];
         for (var i = 0; i < scenes.length; i++) {
@@ -1484,6 +1495,10 @@ mod tests {
             assert!(
                 tail.contains(".catch(function(e) {"),
                 "labels.json fetch chain must end in a .catch: {html}"
+            );
+            assert!(
+                tail.contains("if (!r.ok) throw new Error('labels.json load failed: HTTP ' + r.status"),
+                "the fetch must check r.ok and name the HTTP status: a 404/403/429 body would otherwise surface as a JSON.parse SyntaxError: {html}"
             );
             assert!(
                 tail.contains("labels.json failed to load or parse"),

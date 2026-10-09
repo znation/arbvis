@@ -24,8 +24,14 @@ mod tests {
     fn appends_part_after_full_file_name() {
         // The `.part` suffix attaches to the whole file name, replacing any
         // extension, so `bricks.bin` never stages as `bricks.part`.
-        assert_eq!(part_path(Path::new("out/bricks.bin")), PathBuf::from("out/bricks.bin.part"));
-        assert_eq!(part_path(Path::new("viewer.html")), PathBuf::from("viewer.html.part"));
+        assert_eq!(
+            part_path(Path::new("out/bricks.bin")),
+            PathBuf::from("out/bricks.bin.part")
+        );
+        assert_eq!(
+            part_path(Path::new("viewer.html")),
+            PathBuf::from("viewer.html.part")
+        );
     }
 
     #[test]

@@ -724,8 +724,7 @@ pub(crate) mod tests {
 
     // The fake-binary tests mutate the process-global ARBVIS_HF_BIN env var;
     // cargo runs tests on parallel threads, so they serialize on this lock.
-    pub(crate) static ENV_LOCK: tokio::sync::Mutex<()> =
-        tokio::sync::Mutex::const_new(());
+    pub(crate) static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Writes a fake `hf` executable to a temp path, points `ARBVIS_HF_BIN`
     /// at it, and restores the previous env value on drop so failures don't

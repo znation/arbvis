@@ -295,6 +295,9 @@ impl Throttle {
         Duration::from_millis(jitter_ms.min(cap_ms))
     }
 
+    /// Sleep duration before a timeout retry. A fixed short backoff (unlike
+    /// the 429 path's exponential ramp): timeouts usually mean one wedged
+    /// connection, not server-side saturation, so `attempt` is unused.
     pub fn timeout_backoff(&self, _attempt: u32) -> Duration {
         Duration::from_secs(2)
     }

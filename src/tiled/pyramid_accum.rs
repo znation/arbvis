@@ -93,6 +93,8 @@ impl TileSink for LocalFileSink {
 }
 
 impl<S: TileSink> PyramidAccumulator<S> {
+    /// Create an accumulator that folds rendered `(zoom, x, y)` tiles upward
+    /// through the pyramid, writing each encoded tile via `path_fn` to `sink`.
     pub fn new(
         tile_size: u32,
         sink: Arc<S>,

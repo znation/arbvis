@@ -30,6 +30,8 @@ pub struct HfTileSink {
 }
 
 impl HfTileSink {
+    /// Create a sink staging tiles into a fresh `arbvis-tiles-*` tempdir; the
+    /// upload/commit happens later against `spec`.
     pub fn new(spec: HfOutputSpec) -> anyhow::Result<Self> {
         let tempdir = tempfile::Builder::new()
             .prefix("arbvis-tiles-")

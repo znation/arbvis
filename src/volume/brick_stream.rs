@@ -28,7 +28,7 @@ use crate::geometry::{hilbert3d_node_origin, hilbert_d2xyz};
 /// `apron` is `0` (nearest filtering): the flat block layout can't carry
 /// neighbour borders. Framing uses the occupied-brick bbox via
 /// [`super::box_focus`].
-
+///
 /// Fold one occupied brick at voxel-space `origin` (side `brick`) into the
 /// occupied-region framing stats shared by [`StreamBrickAgg`] and
 /// [`BrickBuilder`]: a running bbox min/max plus a centroid sum that weights
@@ -47,6 +47,8 @@ fn track_occupied_brick(
     }
 }
 
+/// Occupied-brick octree plus fine-data framing stats accumulated while
+/// streaming brick-aligned Z-slabs of a dense/structured volume.
 pub struct StreamBrickAgg {
     extent: [u32; 3],
     brick: u32,
@@ -59,6 +61,8 @@ pub struct StreamBrickAgg {
 }
 
 impl StreamBrickAgg {
+    /// Prepare an aggregator for a volume of `extent` voxels split into
+    /// `brick`-sized cubes.
     pub fn new(extent: [u32; 3], brick: u32) -> Self {
         // Page dims per axis (bricks), and the power-of-two brick cube the octree
         // spans. Short axes never populate their high cells → empty subtrees.

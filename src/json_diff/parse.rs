@@ -34,6 +34,7 @@ pub struct Node {
 }
 
 impl Node {
+    /// Byte range this node's source text occupies in the original document.
     pub fn range(&self) -> Range<u64> {
         self.byte_start..self.byte_end
     }

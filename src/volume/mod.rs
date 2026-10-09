@@ -99,7 +99,9 @@ pub(crate) fn derive_volume_resolution(grid: u32, volume_res: u32) -> (u32, u32)
     }
 }
 
+/// Everything `render_volume` needs to emit the 3D viewer bundle.
 pub(crate) struct BuildResult {
+    /// Dense (or slab-folded) RGBA volume as written to `volume.bin`.
     pub(crate) volume_rgba: Vec<u8>,
     /// Extent of the grid actually written to `volume.bin` (`volume_rgba`). Equals
     /// the bake extent for the dense paths, but the **coarse** extent when the

@@ -248,9 +248,8 @@ pub fn hilbert3d_node_origin(node_idx: u64, depth: u32, order: u32) -> [u32; 3] 
 ///
 /// The forward map ([`hilbert_d2xyz`]) is all the render path needs; this
 /// inverse completes the API and anchors the round-trip property tests.
-// Only exercised by geometry's round-trip tests today; it is the documented
-// public inverse of [`hilbert_d2xyz`], kept so downstream code can map a
-// position back to its curve index.
+/// Only exercised by geometry's round-trip tests today; kept public so
+/// downstream code can map a position back to its curve index.
 #[allow(dead_code)]
 pub fn hilbert_xyz2d(mut x: [u32; N3], bits: u32) -> u64 {
     debug_assert!((1..=21).contains(&bits));

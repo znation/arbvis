@@ -199,6 +199,7 @@ impl XorbMap {
         XorbMap { global_ranges }
     }
 
+    /// True when no source had xet terms, so there is nothing to tint with.
     pub fn is_empty(&self) -> bool {
         self.global_ranges.is_empty()
     }

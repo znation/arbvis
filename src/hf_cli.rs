@@ -606,8 +606,11 @@ mod tests {
     impl FakeHfBinGuard {
         fn with_script(script: &str) -> Self {
             let mut path = std::env::temp_dir();
-            path.push(format!("arbvis-hf-fake-{}-{}.sh", std::process::id(),
-                uuid_like_suffix()));
+            path.push(format!(
+                "arbvis-hf-fake-{}-{}.sh",
+                std::process::id(),
+                uuid_like_suffix()
+            ));
             std::fs::write(&path, script).expect("write fake hf script");
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
@@ -644,7 +647,9 @@ mod tests {
         let _guard = FakeHfBinGuard::with_script(
             "#!/bin/sh\nyes | head -c 10240 >&2\nprintf 'TAIL-MARKER-9Z\\n' >&2\nexit 3\n",
         );
-        let err = check_hf_available().await.expect_err("child exits non-zero");
+        let err = check_hf_available()
+            .await
+            .expect_err("child exits non-zero");
         let HfCliError::Exit { stderr_excerpt, .. } = err else {
             panic!("expected Exit error, got {err:?}");
         };

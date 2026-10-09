@@ -239,6 +239,7 @@ pub struct Branding {
 }
 
 impl Branding {
+    /// Build a `Branding` from a viewer title and the repo URL to link back to.
     pub fn new(name: impl Into<Cow<'static, str>>, repo_url: impl Into<Cow<'static, str>>) -> Self {
         Self {
             name: name.into(),

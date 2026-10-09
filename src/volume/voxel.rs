@@ -164,6 +164,8 @@ pub struct VoxelRegistry {
 }
 
 impl VoxelRegistry {
+    /// Empty registry. The byte-floor 3D path needs no built-in renderer (see
+    /// [`VoxelRegistry::with_defaults`]).
     pub fn new() -> Self {
         Self::default()
     }
@@ -174,10 +176,13 @@ impl VoxelRegistry {
         Self::new()
     }
 
+    /// Register `r` under its own [`VoxelRenderer::id`], replacing any
+    /// previous registration with the same id.
     pub fn register_renderer(&mut self, r: Arc<dyn VoxelRenderer>) {
         self.renderers.insert(r.id(), r);
     }
 
+    /// Look up a renderer by the id it was registered under.
     pub fn renderer(&self, id: &str) -> Option<Arc<dyn VoxelRenderer>> {
         self.renderers.get(id).cloned()
     }

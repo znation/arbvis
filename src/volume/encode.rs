@@ -288,6 +288,8 @@ fn coarse_block(i: u32, c: u32, f: u32) -> (u32, u32) {
 }
 
 impl CoarseAcc {
+    /// Create an accumulator for a `full`-sized volume downsampled to the
+    /// `coarse` cell grid.
     pub fn new(full: [u32; 3], coarse: [u32; 3]) -> Self {
         let cells = coarse[0] as usize * coarse[1] as usize * coarse[2] as usize;
         CoarseAcc {

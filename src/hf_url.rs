@@ -204,6 +204,7 @@ impl HfOutputSpec {
             format!("{p}/{sub}/{z}/{x}/{y}.{ext}")
         }
     }
+    /// Repo-relative path of the viewer's `index.html` under `path_prefix`.
     pub fn index_html_path(&self) -> String {
         let p = &self.path_prefix;
         if p.is_empty() {
@@ -212,6 +213,7 @@ impl HfOutputSpec {
             format!("{p}/index.html")
         }
     }
+    /// Repo-relative path of the viewer's `labels.json` under `path_prefix`.
     pub fn labels_json_path(&self) -> String {
         let p = &self.path_prefix;
         if p.is_empty() {
@@ -502,6 +504,7 @@ pub fn split_owner_name(repo_id: &str) -> anyhow::Result<(&str, &str)> {
 /// outside this module can't forge one for range I/O; tests (e.g. hostile-
 /// filename rejection in `data::remote`) build it directly.
 #[cfg(test)]
+/// Marker for [`remote_repo_for_tests`].
 pub(crate) fn remote_repo_for_tests(kind: RepoKind, repo_id: &str) -> RemoteRepo {
     RemoteRepo {
         kind,

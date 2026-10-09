@@ -216,6 +216,11 @@ async fn restart_space(space_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Deploy a rendered tile bundle to HF as a Space + storage bucket.
+///
+/// Validates `tiles_dir`, creates (or reuses) the `{repo}_bucket` storage repo,
+/// syncs `tiles/` into it, uploads the Space app files that fetch tiles from the
+/// bucket, and restarts the Space so the new bundle goes live.
 pub async fn run_deploy(tiles_dir: &Path, space_id: &str) -> anyhow::Result<()> {
     validate_tiles_dir(tiles_dir)?;
 
@@ -276,6 +281,8 @@ pub async fn run_deploy_bundle(dir: &Path, space_id: &str) -> anyhow::Result<()>
     deploy_space_app(space_id, bucket_id, index_html).await
 }
 
+/// Check that `dir` looks like a rendered 2D output bundle: `index.html`,
+/// `labels.json`, and a `tiles/` directory are all present.
 pub(crate) fn validate_tiles_dir(dir: &Path) -> anyhow::Result<()> {
     for name in ["index.html", "labels.json"] {
         let p = dir.join(name);
@@ -290,6 +297,9 @@ pub(crate) fn validate_tiles_dir(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Derive the storage-bucket repo id for a Space: `owner/repo` becomes
+/// `owner/repo_bucket`. Refuses an input that already ends in `_bucket` so the
+/// suffix is never applied twice.
 pub(crate) fn derive_bucket_id(space_id: &str) -> anyhow::Result<String> {
     let (namespace, repo) = hf_url::split_owner_name(space_id)
         .with_context(|| format!("--space must be namespace/repo, got {space_id:?}"))?;
@@ -303,6 +313,9 @@ pub(crate) fn derive_bucket_id(space_id: &str) -> anyhow::Result<String> {
     Ok(format!("{namespace}/{repo}_bucket"))
 }
 
+/// Write the Space app bundle (`README.md`, `Dockerfile`, `requirements.txt`,
+/// `app.py`) rendered from the packaged templates into `dir`. `app.py` embeds
+/// `bucket_id` so the viewer knows where to fetch tiles from.
 pub(crate) fn write_space_files(dir: &Path, bucket_id: &str, space_id: &str) -> anyhow::Result<()> {
     let repo_name = space_id.split('/').nth(1).unwrap_or(space_id);
 

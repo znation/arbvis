@@ -113,22 +113,30 @@ pub struct LeafRegistry {
 }
 
 impl LeafRegistry {
+    /// Empty registry: the built-in byte-floor renderer registers itself via
+    /// [`LeafRegistry::with_defaults`] callers.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Register `l` under its own [`LeafLoader::id`], replacing any previous
+    /// registration with the same id.
     pub fn register_loader(&mut self, l: Arc<dyn LeafLoader>) {
         self.loaders.insert(l.id(), l);
     }
 
+    /// Register `r` under its own [`LeafRenderer::id`], replacing any previous
+    /// registration with the same id.
     pub fn register_renderer(&mut self, r: Arc<dyn LeafRenderer>) {
         self.renderers.insert(r.id(), r);
     }
 
+    /// Look up a loader by the id it was registered under.
     pub fn loader(&self, id: &str) -> Option<Arc<dyn LeafLoader>> {
         self.loaders.get(id).cloned()
     }
 
+    /// Look up a renderer by the id it was registered under.
     pub fn renderer(&self, id: &str) -> Option<Arc<dyn LeafRenderer>> {
         self.renderers.get(id).cloned()
     }

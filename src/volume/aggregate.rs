@@ -449,15 +449,21 @@ fn voxel_coord(i: usize, extent: [u32; 3]) -> [u32; 3] {
     ]
 }
 
-/// World-space framing for a structured (baked-RGBA) grid — occupancy is `a > 0`.
-/// Mirrors [`occupied_focus`] but reads [`VoxelCell`] instead of [`VoxelAcc`].
-fn occupied_focus_cells(grid: &[VoxelCell], extent: [u32; 3]) -> ([f32; 3], f32) {
+/// Shared scan behind [`occupied_focus_cells`] and [`occupied_focus`]: walk the
+/// linear grid, collect bounding-box / centroid statistics for occupied voxels
+/// (`is_occupied` decides occupancy by linear index), and map the result
+/// through [`box_focus`].
+fn occupied_focus_stats(
+    len: usize,
+    extent: [u32; 3],
+    is_occupied: impl Fn(usize) -> bool,
+) -> ([f32; 3], f32) {
     let mut bmin = [u32::MAX; 3];
     let mut bmax = [0u32; 3];
     let mut sum = [0f64; 3];
     let mut n: u64 = 0;
-    for (i, cell) in grid.iter().enumerate() {
-        if cell.a == 0 {
+    for i in 0..len {
+        if !is_occupied(i) {
             continue;
         }
         n += 1;
@@ -471,27 +477,16 @@ fn occupied_focus_cells(grid: &[VoxelCell], extent: [u32; 3]) -> ([f32; 3], f32)
     box_focus(bmin, bmax, sum, n, extent)
 }
 
+/// World-space framing for a structured (baked-RGBA) grid — occupancy is `a > 0`.
+fn occupied_focus_cells(grid: &[VoxelCell], extent: [u32; 3]) -> ([f32; 3], f32) {
+    occupied_focus_stats(grid.len(), extent, |i| grid[i].a != 0)
+}
+
 /// World-space framing center + radius for the occupied voxels of the byte grid.
 /// Falls back to the whole box when nothing is occupied. See [`box_focus`] for
 /// the voxel→world mapping.
 fn occupied_focus(grid: &[VoxelAcc], extent: [u32; 3]) -> ([f32; 3], f32) {
-    let mut bmin = [u32::MAX; 3];
-    let mut bmax = [0u32; 3];
-    let mut sum = [0f64; 3];
-    let mut n: u64 = 0;
-    for (i, acc) in grid.iter().enumerate() {
-        if acc.count == 0 {
-            continue;
-        }
-        n += 1;
-        let coord = voxel_coord(i, extent);
-        for a in 0..3 {
-            bmin[a] = bmin[a].min(coord[a]);
-            bmax[a] = bmax[a].max(coord[a]);
-            sum[a] += coord[a] as f64;
-        }
-    }
-    box_focus(bmin, bmax, sum, n, extent)
+    occupied_focus_stats(grid.len(), extent, |i| grid[i].count != 0)
 }
 
 #[cfg(test)]

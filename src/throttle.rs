@@ -303,8 +303,8 @@ impl Throttle {
 
     /// Sleep duration before a timeout retry. A fixed short backoff (unlike
     /// the 429 path's exponential ramp): timeouts usually mean one wedged
-    /// connection, not server-side saturation, so `attempt` is unused.
-    pub fn timeout_backoff(&self, _attempt: u32) -> Duration {
+    /// connection, not server-side saturation.
+    pub fn timeout_backoff(&self) -> Duration {
         Duration::from_secs(2)
     }
 
@@ -432,7 +432,7 @@ where
                         "transient error",
                         timeout_retries,
                         MAX_TIMEOUT_RETRIES,
-                        throttle.timeout_backoff(timeout_retries),
+                        throttle.timeout_backoff(),
                     )
                     .await
                     {

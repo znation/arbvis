@@ -19,7 +19,8 @@ use crate::progress::{counter_style, multi};
 use super::{Data, Extensions, Source, SourceKind};
 
 /// Recursively collect the files under `root` as sorted, full `PathBuf`s.
-/// Unreadable directories are logged and skipped.
+/// Unreadable directories and unreadable entries are logged (warned) and
+/// skipped.
 pub fn collect_files_recursive(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     collect_recursive(root, &mut files);
@@ -27,6 +28,13 @@ pub fn collect_files_recursive(root: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Recursively collects regular files under `dir`, following symlinks to
+/// files and directories. Paths that exist but are neither a readable
+/// regular file nor a directory — a dangling symlink left by an interrupted
+/// download or checkout, a FIFO/socket, an entry the OS refuses to stat —
+/// are warned about rather than vanishing silently: a caller building a
+/// diff would otherwise treat the missing side as empty and render a wrong
+/// answer with no explanation.
 fn collect_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -35,12 +43,32 @@ fn collect_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
             return;
         }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        // One unreadable entry must not silently swallow its neighbors
+        // (entries.flatten() dropped the whole entry with no warning).
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                log::warn!("{}: {} — skipping", dir.display(), e);
+                continue;
+            }
+        };
         let path = entry.path();
-        if path.is_file() {
-            files.push(path);
-        } else if path.is_dir() {
+        // Cheap non-following classification first, so a directory is never
+        // charged for a stat of its whole subtree.
+        // `entry.file_type()` does not follow symlinks, so classification is
+        // done through the path with `is_dir`/`is_file`, which do: a link to a
+        // directory is recursed into, a link to a regular file is collected,
+        // and a dangling link (or FIFO/socket) lands in the else branch below.
+        if path.is_dir() {
             collect_recursive(&path, files);
+        } else if path.is_file() {
+            files.push(path);
+        } else {
+            log::warn!(
+                "{}: not a readable regular file (dangling symlink or special file) — skipping",
+                path.display()
+            );
         }
     }
 }
@@ -228,6 +256,62 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
             base: *start,
         }),
         SourceKind::Custom(cs) => cs.open(),
+    }
+}
+
+#[cfg(test)]
+mod collect_recursive_tests {
+    use super::collect_recursive;
+
+    /// A dangling symlink inside an input/diff directory must be *warned
+    /// about*, not silently dropped: a directory diff would otherwise render
+    /// the missing side as an "only in modified" region with no explanation.
+    #[test]
+    fn dangling_symlink_is_skipped_with_real_and_linked_files_kept() {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.bin"), b"abc").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/nested.bin"), b"def").unwrap();
+        #[cfg(unix)]
+        {
+            symlink(dir.path().join("real.bin"), dir.path().join("link.bin")).unwrap();
+            // A symlink to a subdirectory must be recursed into, not skipped.
+            symlink(dir.path().join("sub"), dir.path().join("sublink")).unwrap();
+            symlink(
+                dir.path().join("no-such-target"),
+                dir.path().join("dangling.bin"),
+            )
+            .unwrap();
+        }
+
+        let mut files = Vec::new();
+        collect_recursive(dir.path(), &mut files);
+
+        let names: Vec<String> = files
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str().map(String::from)))
+            .collect();
+        assert!(names.contains(&"real.bin".to_string()));
+        assert!(names.contains(&"nested.bin".to_string()));
+        #[cfg(unix)]
+        {
+            assert!(
+                names.contains(&"link.bin".to_string()),
+                "a symlink pointing at a regular file must still be collected"
+            );
+            assert!(
+                names.contains(&"nested.bin".to_string())
+                    && files.iter().any(|p| p.starts_with(dir.path().join("sublink"))),
+                "a symlink pointing at a directory must be recursed into"
+            );
+            assert!(
+                !names.contains(&"dangling.bin".to_string()),
+                "a dangling symlink must be excluded (warned about, not silently dropped)"
+            );
+        }
     }
 }
 

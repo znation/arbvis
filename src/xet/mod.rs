@@ -544,7 +544,7 @@ impl XetReader {
         if end > self.file_size {
             anyhow::bail!(
                 "{}: range [{},{}) past file size {}",
-                self.filename,
+                hf_url::sanitize_log_text(&self.filename),
                 start,
                 end,
                 self.file_size,
@@ -569,7 +569,7 @@ impl XetReader {
         if out.len() != len {
             anyhow::bail!(
                 "{}: fetch_range[{},{}) produced {} bytes (expected {})",
-                self.filename,
+                hf_url::sanitize_log_text(&self.filename),
                 start,
                 end,
                 out.len(),
@@ -754,14 +754,14 @@ impl XetReader {
         if missing > 0 {
             log::warn!(
                 "{}: refresh swapped {} URLs but {} descriptors had no match in the new reconstruction response — those will continue to 403 until process restart",
-                self.filename,
+                hf_url::sanitize_log_text(&self.filename),
                 swapped,
                 missing,
             );
         } else {
             log::info!(
                 "{}: refreshed {} xorb URLs (new expiry in {}s)",
-                self.filename,
+                hf_url::sanitize_log_text(&self.filename),
                 swapped,
                 new_expires_at.saturating_sub(unix_now_secs()),
             );
@@ -1016,6 +1016,34 @@ mod tests {
                 expires_at: u64::MAX,
             }),
         }
+    }
+
+    /// The reader's filename comes from a hostile repo's tree listing
+    /// (repo-level `hf://owner/repo` inputs expand to per-file specs built
+    /// from the Hub tree API), so every error message or log line that
+    /// interpolates it must pass it through `sanitize_log_text` first — raw
+    /// C0/C1 control bytes (terminal escape sequences) must never reach the
+    /// operator's terminal.
+    #[test]
+    fn fetch_range_error_sanitizes_hostile_filename() {
+        let hostile = "\x1b]0;pwned\x07.bin";
+        let reader = XetReader {
+            filename: Arc::new(hostile.to_string()),
+            file_size: 0,
+            ..reader_with(Vec::new(), HashMap::new())
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let err = rt
+            .block_on(reader.fetch_range(0, 1))
+            .expect_err("range past file size must fail");
+        let msg = err.to_string();
+        // No raw escape bytes survive, and the `?` replacement is visible.
+        assert!(!msg.contains('\x1b'), "raw ESC in error message: {msg:?}");
+        assert!(!msg.contains('\x07'), "raw BEL in error message: {msg:?}");
+        assert!(msg.contains('?'), "control bytes must be replaced: {msg:?}");
     }
 
     fn desc(chunk_start: u32, chunk_end: u32, byte_start: u64, byte_end: u64) -> ReaderDescriptor {

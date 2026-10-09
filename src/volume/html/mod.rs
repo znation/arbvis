@@ -23,8 +23,13 @@ pub fn build_volume_html(title: &str, inputs: &[String], branding: &Branding) ->
         "repoUrl": branding.repo_url,
         "inputs": inputs,
     });
-    // `</` would prematurely close the inline <script>; neutralize it.
-    let config = config.to_string().replace("</", "<\\/");
+    // Escape every `<` in the JSON blob, not just `</`: `<!--` followed by
+    // `<script>` puts the HTML parser into the script-data-double-escaped
+    // state, in which the template's own closing `</script>` no longer closes
+    // the element (page break). `\u003C` is a valid JSON escape that JS string
+    // literals decode back to `<`, so no `<` sequence from the config survives
+    // into the inline script.
+    let config = config.to_string().replace('<', "\\u003C");
     TEMPLATE.replace("__CONFIG_JSON__", &config)
 }
 
@@ -61,18 +66,23 @@ mod build_tests {
 
     #[test]
     fn script_closing_sequences_in_config_are_neutralized() {
-        // A raw `</` inside the injected JSON would prematurely close the
-        // inline <script>; it must be escaped in the emitted HTML.
+        // A raw `<` inside the injected JSON would be dangerous beyond `</`:
+        // `</script>` closes the inline script, and `<!--` + `<script>` flips
+        // the parser into the double-escaped state that swallows the
+        // template's own closing tag. Every `<` must be escaped to `\u003C`.
         let html = build_volume_html(
-            "</script><script>alert(1)</script>",
+            "<!--<script></script><script>alert(1)</script>",
             &[],
             &Branding::default(),
         );
+        let marker = "const CFG = ";
+        let start = html.find(marker).unwrap() + marker.len();
+        let cfg_line = &html[start..html[start..].find('\n').unwrap() + start];
         assert!(
-            !html.contains("</script><script>alert"),
-            "unescaped close tag could terminate the inline script"
+            !cfg_line.contains('<'),
+            "no raw `<` may survive in the config line: {cfg_line}"
         );
-        assert!(html.contains("<\\/script>"));
+        assert!(cfg_line.contains("\\u003C"));
         // The document itself still parses down to the template's own ending.
         assert!(html.trim_end().ends_with("</html>"));
     }

@@ -603,10 +603,13 @@ fn json_str(s: &str) -> String {
     format!("\"{}\"", json_escape_body(s))
 }
 
-/// Escape a string body for embedding in JSON / JS source. Neutralizes `</`
-/// so a hostile value like `</script>` cannot prematurely close an inline
-/// `<script>` block (same treatment as the 3D viewer's config JSON; `<\/` is
-/// a valid JSON/JS escape for `/`), and `\u00XX`-escapes every control
+/// Escape a string body for embedding in JSON / JS source. `\u003C`-escapes
+/// every `<` so a hostile value like `</script>` cannot prematurely close an
+/// inline `<script>` block, and `<!--` + `<script>` cannot push the HTML
+/// parser into the script-data-double-escaped state that swallows the
+/// template's own closing tag (same treatment as the 3D viewer's config JSON;
+/// `\u003C` is a valid JSON escape that JS decodes back to `<`), and
+/// `\u00XX`-escapes every control
 /// character, which JSON forbids raw inside strings — a raw byte like
 /// U+000B from a hostile labels.json key would otherwise make the emitted
 /// labels.json invalid and the viewer's inline script a SyntaxError.
@@ -617,10 +620,12 @@ fn json_escape_body(s: &str) -> String {
         match c {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
-            '<' if chars.peek() == Some(&'/') => {
-                out.push_str("<\\/");
-                chars.next();
-            }
+            // Escape every `<`, not just `</`: `<!--` followed by `<script>`
+            // puts the HTML parser into the script-data-double-escaped state,
+            // in which the template's own closing `</script>` no longer closes
+            // the element (page break). `\u003C` is a valid JSON escape that
+            // JS string literals decode back to `<`.
+            '<' => out.push_str("\\u003C"),
             c if (c as u32) < 0x20 => {
                 const HEX: &[u8; 16] = b"0123456789abcdef";
                 let v = c as u32;
@@ -1147,8 +1152,9 @@ mod tests {
         assert_eq!(json_str("plain"), "\"plain\"");
         assert_eq!(json_str("a\\b"), "\"a\\\\b\"");
         assert_eq!(json_str("say \"hi\""), "\"say \\\"hi\\\"\"");
-        assert_eq!(json_str("</script>"), "\"<\\/script>\"");
-        assert_eq!(json_str("</div>"), "\"<\\/div>\"");
+        assert_eq!(json_str("</script>"), "\"\\u003C/script>\"");
+        assert_eq!(json_str("</div>"), "\"\\u003C/div>\"");
+        assert_eq!(json_str("<!--<script>"), "\"\\u003C!--\\u003Cscript>\"");
     }
 
     /// The multi-scene labels JSON must parse as JSON (regen.rs reads it back)
@@ -1424,8 +1430,8 @@ mod tests {
             "the hostile label must not add closing </script> tags beyond the template's own: {html}"
         );
         assert!(
-            html.contains("<\\/script>"),
-            "`</` must be neutralized to `<\\/`: {html}"
+            html.contains("\\u003C/script>"),
+            "`<` must be neutralized to `\\u003C`: {html}"
         );
     }
 

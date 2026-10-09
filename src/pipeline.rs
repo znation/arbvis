@@ -199,6 +199,16 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
         }
         return if hints.diff_mode {
             tiled::single::render_single_diff_png(&sources, total, &out_path).await
+        } else if hints.show_xet_xorbs {
+            match tiled::single::render_single_xet_png(&sources, total, &out_path).await? {
+                true => Ok(()),
+                false => {
+                    log::warn!(
+                        "no xet/xorb ranges found for the given sources; rendering plain mode"
+                    );
+                    tiled::single::render_single_png(&sources, total, &out_path).await
+                }
+            }
         } else {
             tiled::single::render_single_png(&sources, total, &out_path).await
         };

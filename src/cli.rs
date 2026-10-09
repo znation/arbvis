@@ -153,14 +153,15 @@ pub struct Args {
 
     /// Write the entire 2D render as one PNG file (plain mode: indexed, one
     /// pixel per byte, same byte-color scheme as the tile pyramid; diff mode:
-    /// truecolor with the signed-delta LUT, crosshatch fills, and tints)
-    /// instead of a viewer bundle — for embedding arbvis output in docs and
+    /// truecolor with the signed-delta LUT, crosshatch fills, and tints;
+    /// `--show-xet-xorbs`: truecolor xorb coloring, Tableau hue scaled by
+    /// byte) instead of a viewer bundle — for embedding arbvis output in docs and
     /// PRs without serving a web bundle. With `--out DIR`, FILE is placed
     /// inside DIR; otherwise FILE is used as given.
     #[arg(
         long = "png",
         value_name = "FILE",
-        conflicts_with_all = ["three_d", "space", "regen_html", "show_xet_xorbs"]
+        conflicts_with_all = ["three_d", "space", "regen_html"]
     )]
     pub(crate) png: Option<PathBuf>,
 
@@ -636,14 +637,13 @@ mod png_flag_tests {
     }
 
     #[test]
-    fn png_conflicts_with_3d_space_regen_and_xorbs() {
+    fn png_conflicts_with_3d_space_regen_and_composes_with_xorbs() {
         let png = ["arbvis", "--png", "out.png"];
         assert!(Args::try_parse_from(png).is_ok());
         for flag in [
             vec!["--3d"],
             vec!["--space", "me/vis"],
             vec!["--regen-html", "dir"],
-            vec!["--show-xet-xorbs"],
         ] {
             let mut argv = png.clone().to_vec();
             argv.extend_from_slice(&flag);
@@ -653,9 +653,12 @@ mod png_flag_tests {
                 flag.join(" ")
             );
         }
-        // `--png` composes with `--diff` (diff PNG export is supported).
+        // `--png` composes with `--diff` and `--show-xet-xorbs` (both export
+        // as a single PNG).
         let with_diff = ["arbvis", "--diff", "a", "b", "--png", "out.png"];
         assert!(Args::try_parse_from(with_diff).is_ok());
+        let with_xorbs = ["arbvis", "--show-xet-xorbs", "a.bin", "--png", "out.png"];
+        assert!(Args::try_parse_from(with_xorbs).is_ok());
     }
 
     #[test]

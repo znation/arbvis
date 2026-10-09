@@ -261,6 +261,86 @@ pub async fn render_single_png(sources: &[Source], total: u64, out: &Path) -> an
     Ok(())
 }
 
+/// Render all `sources` (concatenated, `total` bytes) in xet/xorb mode into
+/// one truecolor RGB PNG written to `out`.
+///
+/// The tile grid and I/O are identical to plain mode (`single_geometry`,
+/// `load_tile_bytes`, `blit_tile`), but each tile is rendered with
+/// [`crate::tiled::leaf::render_leaf_tile_xet_from_buf`] using the
+/// [`crate::tiled::xet_xorb_ranges`] color table and the Tableau-20 palette,
+/// so each pixel's color is its xorb's Tableau hue scaled by its byte value.
+/// Output is truecolor (xet scales colors per byte, so the 256-entry indexed
+/// palette does not apply; see [`encode_rgb_png`]); write goes to a `.tmp`
+/// sibling, then rename. Returns whether any xorb ranges were found — an
+/// empty table (e.g. a local file with no xet terms) renders nothing but
+/// background, and callers can fall back to plain mode.
+pub async fn render_single_xet_png(
+    sources: &[Source],
+    total: u64,
+    out: &Path,
+) -> anyhow::Result<bool> {
+    use crate::tiled::leaf::{load_tile_bytes, render_leaf_tile_xet_from_buf, TileFormat};
+    use crate::tiled::{tableau_palette, xet_xorb_ranges};
+
+    let xorb_ranges = xet_xorb_ranges(sources, &open_sources(sources)?.1);
+    if xorb_ranges.is_empty() {
+        return Ok(false);
+    }
+
+    let geom = single_geometry(total);
+    let pixel_lut = build_pixel_lut();
+    let tableau = tableau_palette();
+
+    let (source_data, cumulative) = open_sources(sources)?;
+
+    let height_tiles = geom.height / TILE;
+    let width_tiles = geom.width / TILE;
+    let mut img = image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::new(geom.width, geom.height);
+    for ty in 0..height_tiles {
+        for tx in 0..width_tiles {
+            let tile_buf = load_tile_bytes(
+                tx,
+                ty,
+                geom.kh,
+                height_tiles,
+                geom.square_pixels,
+                total,
+                &source_data,
+                &cumulative,
+            )
+            .await?;
+            let (tile_img, _) = render_leaf_tile_xet_from_buf(
+                tx,
+                ty,
+                geom.kh,
+                height_tiles,
+                geom.square_pixels,
+                total,
+                &tile_buf,
+                &pixel_lut,
+                &xorb_ranges.global_ranges,
+                &tableau,
+                TileFormat::Png,
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
+            blit_tile(&mut img, &tile_img, tx, ty, geom.width);
+        }
+    }
+
+    let png = encode_rgb_png(&img)?;
+    let tmp = out.with_extension("png.tmp");
+    fs::write(&tmp, &png).with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, out).with_context(|| format!("renaming into {}", out.display()))?;
+    log::info!(
+        "wrote {} ({}x{}, xet xorb mode, {} bytes of input)",
+        out.display(),
+        geom.width,
+        geom.height,
+        total
+    );
+    Ok(true)
+}
+
 /// Render all `sources` (concatenated, `total` bytes) in diff mode into one
 /// truecolor RGB PNG written to `out`.
 ///
@@ -398,7 +478,7 @@ pub fn png_output_path(png: &Path, out: Option<&Path>) -> anyhow::Result<PathBuf
 mod tests {
     use super::*;
     use crate::data::Source;
-    use std::io::Write;
+    use std::io::{Seek, Write};
 
     /// chunk_span reproduces the original inline chunk selection: chunks cap
     /// at CHUNK_BYTES and at the owning source's end, and the source switch
@@ -610,6 +690,90 @@ mod tests {
         assert_eq!(&raw_pal[0..3], &[0, 0, 0]);
         assert_eq!(raw_pal[0x41 * 3..0x41 * 3 + 3], lut[0x41].0[..]);
         assert_eq!(raw_pal.len() % 3, 0);
+    }
+
+    #[tokio::test]
+    async fn renders_xet_xorbs_as_truecolor_png() {
+        // 512 bytes of 0x00 in xorb "A", 512 bytes of 0xFF in xorb "B": the
+        // first half renders black (Tableau color scaled by 0), the second
+        // half renders the full Tableau color of the second xorb.
+        let (_keep, path) = temp_input(512, 512).unwrap();
+        // Overwrite the second half with 0xFF so both regions are uniform.
+        {
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(std::io::SeekFrom::Start(512)).unwrap();
+            f.write_all(&[0xFFu8; 512]).unwrap();
+        }
+        let total = 1024;
+        let mut src = file_source(&path, total);
+        src.xet_terms = Some(vec![
+            crate::xet::XetTerm {
+                file_offset: 0,
+                byte_len: 512,
+                xorb_hash: "A".into(),
+            },
+            crate::xet::XetTerm {
+                file_offset: 512,
+                byte_len: 512,
+                xorb_hash: "B".into(),
+            },
+        ]);
+        let sources = vec![src];
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let out = out_dir.path().join("out.png");
+        assert!(render_single_xet_png(&sources, total, &out)
+            .await
+            .unwrap());
+
+        let f = std::fs::File::open(&out).unwrap();
+        let dec = png::Decoder::new(std::io::BufReader::new(f));
+        let mut reader = dec.read_info().unwrap();
+        assert_eq!(reader.info().color_type, png::ColorType::Rgb);
+        let mut bytes = vec![0u8; reader.output_buffer_size().unwrap()];
+        reader.next_frame(&mut bytes).unwrap();
+
+        // Reference colors straight from the Tableau palette, scaled with
+        // the same (t*scale + 127)/255 rounding as
+        // render_leaf_tile_xet_from_buf.
+        let tableau = crate::tiled::tableau_palette();
+        let expected = |scale: u16, idx: usize| -> [u8; 3] {
+            let t = tableau[idx];
+            [
+                ((t[0] as u16 * scale + 127) / 255) as u8,
+                ((t[1] as u16 * scale + 127) / 255) as u8,
+                ((t[2] as u16 * scale + 127) / 255) as u8,
+            ]
+        };
+        let geom = single_geometry(total);
+        for (byte_idx, scale, xorb) in [(0u64, 0u16, 0usize), (511, 0, 0), (512, 255, 1), (1023, 255, 1)]
+        {
+            let off = pixel_offset(byte_idx, &geom);
+            assert_eq!(
+                bytes[off * 3..off * 3 + 3],
+                expected(scale, xorb),
+                "pixel at byte index {byte_idx}"
+            );
+        }
+        // Bytes past the end of input render black in both regions' frames.
+        let off = pixel_offset(total, &geom);
+        assert_eq!(bytes[off * 3..off * 3 + 3], [0, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn xet_png_falls_back_when_no_xorb_ranges() {
+        let (_keep, path) = temp_input(300, 100).unwrap();
+        let total = 400;
+        let mut src = file_source(&path, total);
+        src.xet_terms = Some(Vec::new());
+        let sources = vec![src];
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let out = out_dir.path().join("out.png");
+        assert!(!render_single_xet_png(&sources, total, &out)
+            .await
+            .unwrap());
+        assert!(!out.exists());
     }
 
     /// Pull the PLTE chunk out of a PNG file (test-only helper).

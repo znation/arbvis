@@ -303,6 +303,30 @@ pub(super) struct TilePlan {
     leaf_tile: LeafTile,
 }
 
+/// Build the xet/xorb color table for `sources` (in canvas order): each
+/// source's `xet_terms` shifted by its cumulative offset into one sorted,
+/// non-overlapping `(start, end, color_idx)` list. Empty when no source has
+/// xet terms. Shared by `build_tile_plan` and the single-image xet PNG
+/// renderer.
+pub(super) fn xet_xorb_ranges(sources: &[Source], cumulative_offsets: &[u64]) -> XorbMap {
+    XorbMap::build(
+        sources
+            .iter()
+            .zip(cumulative_offsets.iter())
+            .map(|(s, &off)| (s.xet_terms.as_deref(), off)),
+    )
+}
+
+/// The Tableau-20 palette as `Rgb<u8>` values, indexed by xorb color index.
+/// Shared by `build_tile_plan` and the single-image xet PNG renderer.
+pub(super) fn tableau_palette() -> [image::Rgb<u8>; 20] {
+    let mut arr = [image::Rgb([0u8, 0, 0]); 20];
+    for (i, c) in TABLEAU_20.iter().enumerate() {
+        arr[i] = image::Rgb(*c);
+    }
+    arr
+}
+
 /// Build the diff-mode leaf mode for `sources` (in canvas order): the
 /// signed-delta LUT as `pixel_lut`, the plain byte LUT as `plain_lut`, plus
 /// crosshatch `fills` from `UnmatchedRegion` sources and `tints` from
@@ -386,25 +410,14 @@ pub(super) async fn build_tile_plan(
     // The xorb_map drives leaf coloring (LeafMode::Xet) — only build it when
     // the user explicitly asked for xorb coloring.
     let xorb_map = if show_xet_xorbs {
-        XorbMap::build(
-            sources
-                .iter()
-                .zip(cumulative_offsets.iter())
-                .map(|(s, &off)| (s.xet_terms.as_deref(), off)),
-        )
+        xet_xorb_ranges(&sources, &cumulative_offsets)
     } else {
         XorbMap {
             global_ranges: Vec::new(),
         }
     };
     let xet_mode = !xorb_map.is_empty();
-    let tableau: [image::Rgb<u8>; 20] = {
-        let mut arr = [image::Rgb([0u8, 0, 0]); 20];
-        for (i, c) in TABLEAU_20.iter().enumerate() {
-            arr[i] = image::Rgb(*c);
-        }
-        arr
-    };
+    let tableau: [image::Rgb<u8>; 20] = tableau_palette();
 
     // Per-element overlays (per-region color ranges + per-region entity
     // labels) for structure-aware specializations live downstream now —

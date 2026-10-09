@@ -5,7 +5,11 @@ Each plan: goal, approach, files touched, acceptance criteria. Move finished pla
 
 ## Planned
 
-### Xet-mode single-image PNG export (`--png FILE` with `--show-xet-xorbs`) — _Plan written 2026-10-09._
+_None yet._
+
+## Done
+
+### Xet-mode single-image PNG export (`--png FILE` with `--show-xet-xorbs`) — Done 2026-10-09
 
 **Goal:** let `arbvis --show-xet-xorbs <hf-file> --png out.png` write the xorb-colored render as one PNG — the last remaining `--png` conflict (diff-mode PNG already shipped; `--3d`/`--space`/`--regen-html` conflicts stay, since PNG is a 2D single-image export).
 
@@ -25,7 +29,8 @@ Each plan: goal, approach, files touched, acceptance criteria. Move finished pla
 
 **Sizing:** ~150–200 lines across four existing files plus tests — one run. With this landed, `--png` conflicts shrink to `--3d`, `--space`, `--regen-html`.
 
-## Done
+**Implemented 2026-10-09 by feature.** `render_single_xet_png` returns `Ok(bool)` (false when the built `XorbMap` is empty) so the pipeline can warn and fall back to plain mode; the Tableau palette was factored into `pub(super) fn tableau_palette()` alongside `xet_xorb_ranges`. Manual check: `arbvis <local file> --show-xet-xorbs --png out.png` warned "no xet/xorb ranges found" and wrote the plain indexed PNG; the remote-hf truecolor path is covered by the fabricated-terms test (`renders_xet_xorbs_as_truecolor_png`).
+
 
 ### JSON parser error-path and escape-decoding test coverage — Done 2026-10-09
 

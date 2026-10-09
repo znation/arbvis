@@ -399,45 +399,72 @@ where
                 Outcome::RateLimit => {
                     rate_limit_retries += 1;
                     throttle.record_rate_limit();
-                    if rate_limit_retries > MAX_RATE_LIMIT_RETRIES {
-                        log::warn!(
-                            "{label}: giving up after {rate_limit_retries} rate-limit retries",
-                        );
-                        return Err(e);
-                    }
-                    let delay = throttle.rate_limit_backoff(rate_limit_retries);
-                    log::debug!(
-                        "{label}: rate-limited; sleeping {:.1}s before retry {}/{}",
-                        delay.as_secs_f32(),
+                    if !retry_sleep(
+                        throttle,
+                        label,
+                        "rate-limit",
+                        "rate-limited",
                         rate_limit_retries,
                         MAX_RATE_LIMIT_RETRIES,
-                    );
-                    throttle.in_backoff.fetch_add(1, Ordering::Relaxed);
-                    tokio::time::sleep(delay).await;
-                    throttle.in_backoff.fetch_sub(1, Ordering::Relaxed);
+                        throttle.rate_limit_backoff(rate_limit_retries),
+                    )
+                    .await
+                    {
+                        return Err(e);
+                    }
                 }
                 Outcome::Timeout => {
                     timeout_retries += 1;
                     throttle.record_timeout();
-                    if timeout_retries > MAX_TIMEOUT_RETRIES {
-                        log::warn!("{label}: giving up after {timeout_retries} transient retries",);
-                        return Err(e);
-                    }
-                    let delay = throttle.timeout_backoff(timeout_retries);
-                    log::debug!(
-                        "{label}: transient error; sleeping {:.1}s before retry {}/{}",
-                        delay.as_secs_f32(),
+                    if !retry_sleep(
+                        throttle,
+                        label,
+                        "transient",
+                        "transient error",
                         timeout_retries,
                         MAX_TIMEOUT_RETRIES,
-                    );
-                    throttle.in_backoff.fetch_add(1, Ordering::Relaxed);
-                    tokio::time::sleep(delay).await;
-                    throttle.in_backoff.fetch_sub(1, Ordering::Relaxed);
+                        throttle.timeout_backoff(timeout_retries),
+                    )
+                    .await
+                    {
+                        return Err(e);
+                    }
                 }
                 Outcome::Permanent => return Err(e),
             },
         }
     }
+}
+
+/// Shared retry bookkeeping for one retryable failure inside [`with_throttle`].
+/// Returns `false` once the retry budget for this failure kind is exhausted
+/// (the caller then returns the original error); otherwise logs the retry and
+/// sleeps out the backoff `delay` outside the throttle permit, returning
+/// `true`. `kind` names the budget in the give-up warning ("rate-limit" /
+/// "transient retries") and `cause` describes the failure in the debug log.
+async fn retry_sleep(
+    throttle: &Throttle,
+    label: &str,
+    kind: &str,
+    cause: &str,
+    retries: u32,
+    max: u32,
+    delay: Duration,
+) -> bool {
+    if retries > max {
+        log::warn!("{label}: giving up after {retries} {kind} retries");
+        return false;
+    }
+    log::debug!(
+        "{label}: {cause}; sleeping {:.1}s before retry {}/{}",
+        delay.as_secs_f32(),
+        retries,
+        max,
+    );
+    throttle.in_backoff.fetch_add(1, Ordering::Relaxed);
+    tokio::time::sleep(delay).await;
+    throttle.in_backoff.fetch_sub(1, Ordering::Relaxed);
+    true
 }
 
 fn unix_now() -> i64 {

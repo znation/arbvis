@@ -77,6 +77,8 @@ pub struct CanvasGeom {
     pub total: u64,
 }
 
+/// A canvas layout shape: knows its dimensions and how the tile pipeline
+/// should fetch and render bytes for it (see the per-method docs).
 pub trait LayoutShape: Send + Sync {
     /// Short stable identifier; also names the `LeafLoader`/`LeafRenderer`
     /// pair this layout dispatches to (`"hilbert-bytes"`, `"arch"`).

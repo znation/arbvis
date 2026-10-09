@@ -62,6 +62,9 @@ fn setup_progress(label: &str, total: u64) -> Option<ProgressBar> {
     Some(pb)
 }
 
+/// The backing storage for a file's bytes: a local memory map, an owned
+/// buffer, or one of the remote readers (HTTP range requests against the
+/// Hub, or the direct xet CAS decoder).
 pub enum Data {
     Mapped(Mmap),
     Owned(Vec<u8>),
@@ -222,6 +225,8 @@ pub enum SourceKind {
     Custom(Box<dyn CustomSource>),
 }
 
+/// One input to a render: a local filesystem path (expanded to the files
+/// under it when it names a directory) or a remote Hub file spec.
 pub enum InputSpec {
     Local(PathBuf),
     Remote(RemoteFileSpec),

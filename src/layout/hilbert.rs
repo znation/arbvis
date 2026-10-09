@@ -5,6 +5,9 @@
 
 use crate::tiled::leaf::{TILE, TILE_LOG2};
 
+/// Geometry knobs for the byte-Hilbert canvas: the curve order, tile grid
+/// dimensions, world size, and byte budget. Computed once by
+/// [`HilbertLayout::from_total`] and consumed by the tile pipeline.
 #[derive(Debug, Clone, Copy)]
 pub struct HilbertLayout {
     pub kh: u8,

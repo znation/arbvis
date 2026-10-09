@@ -173,6 +173,8 @@ pub struct LoadedTile {
     pub extra: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
+/// A fully rendered leaf tile: its pyramid coordinates, decoded RGB pixels,
+/// and the encoded PNG bytes handed to the tile sink.
 pub struct EncodedTile {
     pub tx: u32,
     pub ty: u32,

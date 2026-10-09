@@ -70,6 +70,7 @@ impl HfTreeEntry {
     }
 }
 
+/// The `lfs` block of an [`HfTreeEntry`] for LFS- or xet-backed files.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HfTreeLfs {
     #[serde(default)]

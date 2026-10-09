@@ -79,6 +79,8 @@ static CAS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 /// Cumulative bytes received from CAS HTTP responses.
 static CAS_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Snapshot of the process-wide CAS request counters (see the `CAS_*`
+/// statics above), for the perf monitor.
 #[derive(Clone, Copy, Debug)]
 pub struct CasStats {
     pub in_flight: usize,
@@ -86,6 +88,7 @@ pub struct CasStats {
     pub bytes: u64,
 }
 
+/// Read the current [`CasStats`] snapshot.
 pub fn cas_stats() -> CasStats {
     CasStats {
         in_flight: CAS_INFLIGHT.load(Ordering::Relaxed),

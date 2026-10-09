@@ -12,6 +12,7 @@
 
 use std::ops::Range;
 
+/// Which JSON value kind a [`Node`] wraps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NodeKind {
     Object,
@@ -22,6 +23,8 @@ pub enum NodeKind {
     Null,
 }
 
+/// One parsed JSON value. Offsets are byte positions in the original source,
+/// so [`Node::range`] locates the value's full span for diff alignment.
 #[derive(Debug)]
 pub struct Node {
     pub kind: NodeKind,
@@ -36,6 +39,8 @@ impl Node {
     }
 }
 
+/// A member of an object or an element of an array: the value subtree plus
+/// the surrounding syntax the alignment layer must preserve.
 #[derive(Debug)]
 pub enum Child {
     /// Object member: a quoted key, the colon-and-whitespace separator, the
@@ -54,6 +59,8 @@ pub enum Child {
     },
 }
 
+/// A parsed JSON document: optional leading/trailing whitespace and the root
+/// value, with all spans referring to the original source bytes.
 #[derive(Debug)]
 pub struct Document {
     pub leading_ws: Range<u64>,
@@ -61,6 +68,8 @@ pub struct Document {
     pub trailing_ws: Range<u64>,
 }
 
+/// A JSON parse failure: the byte offset where it was detected and a
+/// human-readable message.
 #[derive(Debug)]
 pub struct ParseError {
     pub byte_offset: u64,

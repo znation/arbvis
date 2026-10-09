@@ -191,6 +191,8 @@ impl HfOutputSpec {
     }
 }
 
+/// A parsed HF repo URL: the repo kind and id, the pinned revision, and the
+/// file's path inside the repo.
 #[derive(Debug)]
 pub struct HfUrl {
     pub kind: RepoKind,
@@ -363,6 +365,8 @@ pub async fn fetch_model_card(repo_id: &str) -> anyhow::Result<serde_json::Value
     Ok(json)
 }
 
+/// Split an `owner/name` repo id at its single slash, erroring when the id
+/// has none.
 pub fn split_owner_name(repo_id: &str) -> anyhow::Result<(&str, &str)> {
     let slash = repo_id
         .find('/')

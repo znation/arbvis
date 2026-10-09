@@ -55,6 +55,7 @@ pub fn multi() -> &'static MultiProgress {
     })
 }
 
+/// Progress-bar style for byte-position counters (bar with rate and ETA).
 pub fn counter_style() -> ProgressStyle {
     ProgressStyle::with_template(
         "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg} ({per_sec}, ETA {smart_eta})",
@@ -166,12 +167,14 @@ fn duration_within_cap(secs: f64) -> Option<Duration> {
     Some(Duration::from_secs_f64(secs))
 }
 
+/// Indented sub-bar style for per-queue progress under a main counter.
 pub fn queue_style() -> ProgressStyle {
     ProgressStyle::with_template("  └─ {msg}: {pos}/{len} [{bar:30.yellow/dim}]")
         .expect("queue_style template parse")
         .progress_chars("=>-")
 }
 
+/// Plain message style for status lines that only show elapsed time.
 pub fn status_style() -> ProgressStyle {
     ProgressStyle::with_template("{msg}  ({elapsed_precise})").expect("status_style template parse")
 }

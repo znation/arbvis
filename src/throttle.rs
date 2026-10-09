@@ -80,6 +80,8 @@ pub struct Throttle {
     in_backoff: AtomicUsize,
 }
 
+/// Snapshot of a [`Throttle`]'s AIMD state and cumulative counters, for the
+/// perf monitor.
 #[derive(Clone, Copy, Debug)]
 pub struct ThrottleStats {
     pub in_flight: usize,
@@ -337,6 +339,8 @@ impl Drop for Permit<'_> {
     }
 }
 
+/// How a transient error should be treated by the retry loop: back off and
+/// retry (`RateLimit`/`Timeout`) or give up (`Permanent`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     RateLimit,
@@ -344,6 +348,9 @@ pub enum Outcome {
     Permanent,
 }
 
+/// Maps an error onto an [`Outcome`] so callers can decide between retry
+/// with backoff and hard failure. Implemented for `reqwest::Error` and
+/// [`crate::hf_cli::HfCliError`] in-tree; plugins may add their own.
 pub trait ErrorClassify {
     fn classify(&self) -> Outcome;
 }

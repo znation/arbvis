@@ -477,6 +477,16 @@ pub fn parse(raw: &str) -> anyhow::Result<HfUrl> {
     })
 }
 
+/// Parse an `hf://` URL, naming the offending URL in the error.
+///
+/// Wraps [`parse`] with the shared context used by every caller that gets a
+/// URL string from user input (`resolve`, `resolve_to_http`,
+/// `list_repo_as_http_specs`). `parse_hf_output` deliberately keeps its own
+/// "invalid hf:// output URL" wording.
+pub fn parse_hf_url(raw: &str) -> anyhow::Result<HfUrl> {
+    parse(raw).with_context(|| format!("invalid hf:// URL: {raw:?}"))
+}
+
 /// The HF endpoint used when `HF_ENDPOINT` is unset or invalid.
 pub const DEFAULT_ENDPOINT: &str = "https://huggingface.co";
 
@@ -959,7 +969,7 @@ pub async fn resolve(path: &Path) -> anyhow::Result<PathBuf> {
         return Ok(path.to_path_buf());
     }
 
-    let hf = parse(&s).with_context(|| format!("invalid hf:// URL: {s:?}"))?;
+    let hf = parse_hf_url(&s)?;
 
     if hf.kind == RepoKind::Bucket {
         return resolve_bucket(&hf).await;
@@ -1052,7 +1062,7 @@ async fn resolve_bucket(hf: &HfUrl) -> anyhow::Result<PathBuf> {
 /// tree listing on every call.
 pub async fn resolve_to_http(path: &Path) -> anyhow::Result<RemoteFileSpec> {
     let s = path.to_string_lossy();
-    let hf = parse(&s).with_context(|| format!("invalid hf:// URL: {s:?}"))?;
+    let hf = parse_hf_url(&s)?;
     let repo = make_remote_repo(&hf)?;
 
     let entries = list_repo_entries(hf.kind, &hf.repo_id, &hf.revision).await?;
@@ -1159,7 +1169,7 @@ pub fn is_hf_path(p: &Path) -> bool {
 pub async fn list_repo_as_http_specs(
     url_str: &str,
 ) -> anyhow::Result<Vec<(String, RemoteFileSpec)>> {
-    let hf = parse(url_str).with_context(|| format!("invalid hf:// URL: {url_str:?}"))?;
+    let hf = parse_hf_url(url_str)?;
     let repo = make_remote_repo(&hf)?;
 
     let entries = list_repo_entries(hf.kind, &hf.repo_id, &hf.revision).await?;
@@ -1766,6 +1776,14 @@ mod tests {
 
     fn p(s: &str) -> anyhow::Result<HfUrl> {
         parse(s)
+    }
+
+    #[test]
+    fn parse_hf_url_names_the_offending_url_in_its_error() {
+        let err = parse_hf_url("hf://alice").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid hf:// URL"), "{msg}");
+        assert!(msg.contains("\"hf://alice\""), "{msg}");
     }
 
     #[test]

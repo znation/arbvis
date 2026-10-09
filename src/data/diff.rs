@@ -17,6 +17,17 @@ pub enum DiffFill {
 }
 
 impl DiffFill {
+    /// Fill for original-side-only regions: grey when `is_finetune` marks an
+    /// expected finetune drop, red otherwise. The diff paths in
+    /// `crate::data_diff` and `crate::json_diff` share this mapping.
+    pub fn orig_only(is_finetune: bool) -> DiffFill {
+        if is_finetune {
+            DiffFill::Grey
+        } else {
+            DiffFill::Red
+        }
+    }
+
     /// `(stripe, base)` colors for the crosshatch pattern. `stripe` is the
     /// foreground diagonal line color; `base` is the fill behind it.
     pub fn colors(self) -> (image::Rgb<u8>, image::Rgb<u8>) {
@@ -40,5 +51,11 @@ mod tests {
         assert_ne!(grey_stripe, red_stripe);
         assert_ne!(red_stripe, green_stripe);
         assert_ne!(grey_stripe, green_stripe);
+    }
+
+    #[test]
+    fn orig_only_fill_maps_finetune_to_grey() {
+        assert_eq!(DiffFill::orig_only(true), DiffFill::Grey);
+        assert_eq!(DiffFill::orig_only(false), DiffFill::Red);
     }
 }

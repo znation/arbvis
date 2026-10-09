@@ -22,11 +22,7 @@ pub fn spans_to_sources(
     orig_label: &str,
     mod_label: &str,
 ) -> (Vec<Source>, u64) {
-    let orig_fill = if is_finetune {
-        DiffFill::Grey
-    } else {
-        DiffFill::Red
-    };
+    let orig_fill = DiffFill::orig_only(is_finetune);
 
     let mut sources: Vec<Source> = Vec::with_capacity(spans.len() * 2);
     let mut total: u64 = 0;

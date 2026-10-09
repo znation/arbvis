@@ -193,11 +193,7 @@ pub fn byte_directory_diff(
     // Match by relative path. Same-size pairs become a byte diff; different-size
     // or single-side files become crosshatched unmatched regions so they remain
     // visible.
-    let orig_fill_kind = if is_finetune {
-        DiffFill::Grey
-    } else {
-        DiffFill::Red
-    };
+    let orig_fill_kind = DiffFill::orig_only(is_finetune);
     let orig_map = rel_file_map(&orig_files, original, skip);
     let mod_map = rel_file_map(&mod_files, modified, skip);
 

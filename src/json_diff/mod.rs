@@ -289,11 +289,7 @@ fn fallback_byte_diff(
     mod_bytes: &[u8],
     is_finetune: bool,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
-    let orig_fill = if is_finetune {
-        DiffFill::Grey
-    } else {
-        DiffFill::Red
-    };
+    let orig_fill = DiffFill::orig_only(is_finetune);
     if orig_bytes.len() == mod_bytes.len() {
         let size = orig_bytes.len() as u64;
         let source = Source {

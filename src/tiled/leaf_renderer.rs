@@ -3,9 +3,9 @@
 //! `LeafTile` describes one tile in terms of what data it needs (raw bytes,
 //! per-tensor regions, or just padding). Both pipeline stages — load and
 //! render — look up an implementation by `LeafTile::renderer_id` instead of
-//! branching on layout type. Today the registry has two built-in pairs
-//! (`"hilbert-bytes"` and `"arch"`); once `modelweightvis` is its own crate
-//! it will ship `"arch"` from there and register it on the shared registry.
+//! branching on layout type. The registry has one built-in pair
+//! (`"hilbert-bytes"`); `modelweightvis` registers its own `"arch"` pair on
+//! the shared registry so the arbvis binary stays byte-only.
 //!
 //! Loaders and renderers share the same id so a `LeafTile` resolves both
 //! halves of the pipeline in one lookup.
@@ -158,12 +158,11 @@ impl LeafRegistry {
         self.renderers.get(id).cloned()
     }
 
-    /// Registry pre-populated with the two built-in loader+renderer pairs
     /// Registry pre-populated with arbvis's own `"hilbert-bytes"`
-    /// loader+renderer pair. The `"arch"` pair (still defined in this file)
-    /// is registered by `modelweightvis::register_all` so the arbvis binary
-    /// stays byte-only
-    /// and the modelweightvis binary picks up tensor-aware rendering.
+    /// loader+renderer pair (and nothing else). The `"arch"` pair — owned by
+    /// `modelweightvis` — is registered by `modelweightvis::register_all`, so
+    /// the arbvis binary stays byte-only and the modelweightvis binary picks
+    /// up tensor-aware rendering.
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
         r.register_loader(Arc::new(HilbertBytesLoader));

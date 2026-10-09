@@ -295,8 +295,9 @@ pub(super) struct TilePlan {
     pub(super) entities: Vec<FileEntity>,
     layout: Arc<dyn LayoutShape>,
     /// Loader+renderer registry consulted by the load and render stages.
-    /// Constructed with the two built-in pairs (`"hilbert-bytes"`, `"arch"`);
-    /// future plugin wiring will let callers extend it before plan construction.
+    /// Constructed with arbvis's built-in `"hilbert-bytes"` pair; a
+    /// downstream specialization (e.g. modelweightvis) extends it — its
+    /// `"arch"` pair — before plan construction via the shared [`Registry`].
     leaf: Arc<LeafRegistry>,
     /// Per-plan tile descriptor; today uniform across every tile in the plan
     /// (one variant per layout). See [`leaf_renderer::LeafTile`].

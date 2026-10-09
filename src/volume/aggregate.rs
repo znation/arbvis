@@ -950,7 +950,11 @@ mod tests {
 
     impl RecordingRenderer {
         fn fill(&self, ctx: &VoxelRenderCtx<'_>, grid: &mut VoxelGridMut<'_>, z0: u32, z1: u32) {
-            assert_eq!(ctx.bytes.first().copied(), Some(self.value), "fetched span matches");
+            assert_eq!(
+                ctx.bytes.first().copied(),
+                Some(self.value),
+                "fetched span matches"
+            );
             let b = &ctx.entity.bbox;
             for z in z0..z1 {
                 if z < b.z0 || z >= b.z1 {
@@ -989,7 +993,10 @@ mod tests {
             grid: &mut VoxelGridMut<'_>,
             z_range: std::ops::Range<u32>,
         ) {
-            self.windows.lock().unwrap().push((z_range.start, z_range.end));
+            self.windows
+                .lock()
+                .unwrap()
+                .push((z_range.start, z_range.end));
             self.fill(ctx, grid, z_range.start, z_range.end);
         }
     }
@@ -1073,10 +1080,7 @@ mod tests {
         }
         // Occupied focus targets the centroid (the bbox center here) and
         // keeps the whole 2×2×2 bbox in view.
-        assert!(built
-            .focus_center
-            .iter()
-            .all(|c| c.abs() < 1e-6));
+        assert!(built.focus_center.iter().all(|c| c.abs() < 1e-6));
         assert!(built.focus_radius > 0.0 && built.focus_radius <= 0.5);
     }
 

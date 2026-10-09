@@ -2,7 +2,7 @@
 //! and branding into the Leaflet viewer template (single- and multi-scene).
 
 use anyhow::{bail, Context};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::registry::Branding;
 
@@ -102,6 +102,8 @@ pub fn write_leaflet_html(
     write_viewer_pair(dir, html.as_bytes(), entities_json.as_bytes())
 }
 
+use crate::fsutil::part_path;
+
 /// Write the viewer's `index.html` and `labels.json` as a pair.
 ///
 /// Both artifacts are staged to `<name>.part` siblings first, then renamed
@@ -123,13 +125,8 @@ fn write_viewer_pair(dir: &Path, html: &[u8], labels: &[u8]) -> anyhow::Result<(
             );
         }
     }
-    let part = |p: &Path| -> PathBuf {
-        let mut name = p.file_name().map(|n| n.to_os_string()).unwrap_or_default();
-        name.push(".part");
-        p.with_file_name(name)
-    };
-    let index_part = part(&index);
-    let labels_part = part(&labels_path);
+    let index_part = part_path(&index);
+    let labels_part = part_path(&labels_path);
 
     let res: anyhow::Result<()> = (|| {
         std::fs::write(&index_part, html)

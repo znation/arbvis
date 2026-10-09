@@ -64,12 +64,7 @@ pub fn write_tile_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating tile dir {}", parent.display()))?;
     }
-    let mut part_name = path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_default();
-    part_name.push(".part");
-    let part = path.with_file_name(part_name);
+    let part = crate::fsutil::part_path(path);
     let res = std::fs::write(&part, bytes);
     if let Err(e) = res {
         // Best effort: don't leave a stale partial staging file behind.

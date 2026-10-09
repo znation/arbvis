@@ -39,16 +39,7 @@ use encode::VolumeMeta;
 
 pub(crate) use aggregate::box_focus;
 
-/// Stage path for an artifact being written atomically: `bricks.bin` is
-/// staged at `bricks.bin.part` and renamed into place when complete.
-fn part_path(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new(""))
-        .to_os_string();
-    name.push(".part");
-    path.with_file_name(name)
-}
+pub(crate) use crate::fsutil::part_path;
 
 /// Write `bytes` to `path` atomically: stage to `<file>.part` in the same
 /// directory, then rename over `path`. A process killed mid-write leaves the

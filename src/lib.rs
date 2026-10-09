@@ -12,6 +12,7 @@ pub mod color;
 pub mod data;
 pub mod data_diff;
 mod deploy;
+mod fsutil;
 mod geometry;
 pub mod hf_cli;
 mod hf_upload;

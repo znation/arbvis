@@ -5,7 +5,26 @@ Each plan: goal, approach, files touched, acceptance criteria. Move finished pla
 
 ## Planned
 
-_None yet._
+### 3D file-boundary overlays (wireframe boxes per source, toggleable) 
+
+**Goal:** close the first README-deferred 3D item (README "Known limitations"/roadmap bullet "3D file-boundary overlays"): in `--3d` byte mode with multiple sources, show where each input file sits in the Hilbert cube as toggleable wireframe boxes, so section boundaries produce a recognizable 3D signature the same way `geometry::file_rects` outlines files in 2D.
+
+Confirmed absent: no `boundaries`/overlay code exists in `src/volume/` or `template.rs` (grep for `boundar`/`overlay` finds only brick/slab-boundary comments); the byte floor's `manifest()` returns empty and `VolumeLabel` is pick-only.
+
+**Approach:**
+- `src/geometry.rs`: add `pub fn decompose_hilbert_range(start: u64, len: u64, order: u32) -> Vec<([u32; 3], u32)>` — decompose the Hilbert-index range `[start, start+len)` into maximal aligned octree nodes (greedy: while remaining, take the largest k where the running start is 8^k-aligned and remaining ≥ 8^k; the node's voxel origin comes from the existing `hilbert3d_node_origin` and its side is the matching power of two; map the node's Hilbert index through `hilbert_d2xyz` for the origin when `hilbert3d_node_origin`'s indexing doesn't line up — verify which fits with a round-trip test). Return `(origin, side)` pairs; a single-file span of the whole cube yields one box.
+- `src/volume/mod.rs` (`render_volume`, where `manifest = shape.manifest()` is built and `meta.json` is assembled): for byte shapes (`shape.is_byte_volume()`), compute per-source boxes from `cumulative_offsets` + source lengths via the new helper and add a `boundaries` field to the meta JSON: `[{ "name": <source name>, "boxes": [{"x0","y0","z0","x1","y1","z1"}] }]` (reuse/extend `VoxelBox`'s `Serialize`, which already derives `Serialize`). Structured shapes keep emitting no `boundaries` (their `VolumeEntity` bboxes already serve this). Guard: skip the field (or emit an empty array) when there is a single source covering the whole cube — one giant wireframe box is noise.
+- `src/volume/html/template.rs`: when `meta.boundaries` is present and non-empty, build `THREE.LineSegments` wireframe boxes (12-edge segments per box, `EdgesGeometry` or a hand-rolled edge index), one color per source via the existing hue scheme — mirror how the 2D viewer colors file outlines if that's reachable from the template, else use `geometry::name_hue`-style HSL computed client-side from the name. Add a checkbox toggle in the control panel (default off, like the other optional overlays) and include the box in `load()`'s meta handling next to `manifestG`. Keep all additions in the meta-handling + control-panel regions; do not touch the ray-march shader.
+
+**Files touched:** `src/geometry.rs`, `src/volume/mod.rs`, `src/volume/html/template.rs`. No new dependency (std + three.js, already the viewer's renderer).
+
+**Acceptance criteria:**
+- `cargo test` passes, including new tests: (a) `decompose_hilbert_range` round-trip — for every box and every Hilbert index in its node range, `hilbert_d2xyz` lands inside the box, boxes are disjoint and their total index length equals `len` (full-cube, straddling, and multi-source ranges, e.g. boundaries at 7_777 like `src/tiled/leaf.rs`'s boundary tests); (b) a `render_volume` (or meta-assembly-level) test asserting two-source byte runs write a `boundaries` array with one entry per source and a single-source run writes none/empty.
+- Template string tests in `src/volume/html/mod.rs`: the template references `meta.boundaries`, guards on empty, and wires the toggle checkbox (assert on the checkbox id + the guard, following the existing `template_tests` style).
+- Manual check in the run summary: `arbvis a.bin b.bin --3d out-dir` writes `meta.json` containing `boundaries`, and the viewer opens with the toggle rendering two wireframe boxes (or note it if a browser check is impractical; the template assertions then carry the behavior).
+
+**Sizing:** ~200–300 lines across three files including tests — one run. The sibling deferred item (interactive transfer-function editor with density histogram) is NOT part of this plan; it should get its own plan later.
+
 
 ## Done
 

@@ -37,6 +37,21 @@ impl RepoKind {
         }
     }
 
+    /// The URL path prefix the Hub carries for a repo kind in non-`/api/` URLs
+    /// — `datasets/` and `spaces/`; model repos carry none (the `/api/` routes
+    /// do include `models/`, which is why [`Self::api_segment`] is wrong for
+    /// these URLs). Panics on [`RepoKind::Bucket`], which has no web or
+    /// `/resolve/` URL surface; both current call sites (`fetch_range` on
+    /// `RemoteRepo` and `web_url`) reject it before reaching here.
+    pub(crate) fn web_path_prefix(self) -> &'static str {
+        match self {
+            RepoKind::Model => "",
+            RepoKind::Dataset => "datasets/",
+            RepoKind::Space => "spaces/",
+            RepoKind::Bucket => unreachable!("bucket URLs have no web/resolve surface"),
+        }
+    }
+
     /// Value to pass to `hf {download,upload} --type ...`. Only valid for
     /// model/dataset/space — buckets are addressed via the `hf buckets` /
     /// `hf sync` subcommand groups instead.
@@ -89,18 +104,9 @@ impl RemoteRepo {
         range: std::ops::Range<u64>,
     ) -> anyhow::Result<Vec<u8>> {
         let label = format!("fetch_range {}", sanitize_log_text(filename));
-        // The Hub `/resolve/` URL doesn't include the `models/` segment for
-        // model repos — only `datasets/` and `spaces/` get a prefix. The
-        // `/api/` URLs DO include `models/`, which is why `api_segment` here
-        // would be wrong.
-        let kind_prefix = match self.kind {
-            RepoKind::Model => String::new(),
-            RepoKind::Dataset => "datasets/".to_string(),
-            RepoKind::Space => "spaces/".to_string(),
-            // RemoteRepo can't be constructed with Bucket (rejected in
-            // `make_remote_repo`), but match exhaustively to keep this honest.
-            RepoKind::Bucket => unreachable!("RemoteRepo can't hold a bucket"),
-        };
+        // The Hub `/resolve/` URL prefix per kind lives in
+        // `web_path_prefix` (see there for why `api_segment` is wrong).
+        let kind_prefix = self.kind.web_path_prefix();
         let url = format!(
             "{}/{}{}/resolve/{}/{}",
             endpoint(),
@@ -928,12 +934,9 @@ pub fn web_url(raw: &str) -> Option<String> {
     if hf.kind == RepoKind::Bucket {
         return None;
     }
-    let kind_prefix = match hf.kind {
-        RepoKind::Model => String::new(),
-        RepoKind::Dataset => "datasets/".to_string(),
-        RepoKind::Space => "spaces/".to_string(),
-        RepoKind::Bucket => unreachable!("bucket returned above"),
-    };
+    // The bucket case already returned above, so `web_path_prefix`'s
+    // unreachable arm can't fire here.
+    let kind_prefix = hf.kind.web_path_prefix();
     let base = format!("{}/{kind_prefix}{}", endpoint(), hf.repo_id);
     if hf.path_in_repo.is_empty() {
         return Some(base);

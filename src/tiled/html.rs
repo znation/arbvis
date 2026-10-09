@@ -203,6 +203,10 @@ fn build_info_html(title: &str, inputs: &[String], branding: &Branding) -> Strin
             .map(|s| {
                 let display = escape_html(s);
                 if let Some(url) = hf_url_to_web(s) {
+                    // The URL is built from the raw input string, so it can
+                    // contain `"` or `>` — escape it too, or it breaks out of
+                    // the href attribute and injects HTML into the viewer.
+                    let url = escape_html(&url);
                     format!("<a href=\"{url}\" target=\"_blank\" rel=\"noopener\">{display}</a>")
                 } else {
                     format!("<span>{display}</span>")
@@ -921,8 +925,7 @@ pub fn generate_leaflet_content_multi(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_html, build_html_multi, hf_url_to_web, Branding, SceneView};
-
+    use super::{build_html, build_html_multi, build_info_html, hf_url_to_web, Branding, SceneView};
     fn scene(key: &str, world_w: u32, world_h: u32) -> SceneView {
         SceneView {
             key: Some(key.to_string()),
@@ -1076,5 +1079,25 @@ mod tests {
     fn non_hf_url_returns_none() {
         assert_eq!(hf_url_to_web("/local/path/file.safetensors"), None);
         assert_eq!(hf_url_to_web("hf://owner"), None);
+    }
+
+    /// An hf:// input string containing `"` must not break out of the href
+    /// attribute in the sources panel - the URL is built from the raw input,
+    /// so it must be attribute-escaped before interpolation.
+    #[test]
+    fn hf_source_url_is_attribute_escaped() {
+        let html = build_info_html(
+            "t",
+            &["hf://a\"b\"c/x\"><script>alert(1)</script>".to_string()],
+            &Branding::default(),
+        );
+        assert!(
+            !html.contains("\"><script>"),
+            "raw `\"><script>` must not survive in the href context: {html}"
+        );
+        assert!(
+            html.contains("&quot;"),
+            "quotes in the URL must be escaped: {html}"
+        );
     }
 }

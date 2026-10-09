@@ -171,6 +171,62 @@ mod tests {
         }
     }
 
+    fn tagged_source(key: &str, label: &str, order: u32, byte_size: u64) -> Source {
+        let mut extensions = Extensions::default();
+        extensions.insert(SceneTag {
+            key: key.to_string(),
+            label: label.to_string(),
+            order,
+        });
+        Source {
+            file_idx: 0,
+            kind: SourceKind::Buffered(Vec::new()),
+            byte_size,
+            name_override: Some("t".to_string()),
+            xet_terms: None,
+            extensions,
+        }
+    }
+
+    // An untagged source in an otherwise-tagged run must land in a `main`
+    // scene ordered last (u32::MAX), so it never displaces a real scene —
+    // the multi-scene viewer tabs render in `order` sequence.
+    #[test]
+    fn untagged_sources_in_tagged_run_join_main_scene_sorted_last() {
+        let groups = partition_scenes(
+            vec![
+                src(5, Some(("cka", 1))),
+                src(7, None),
+                src(3, Some(("summary", 0))),
+                src(2, None),
+            ],
+            0,
+        );
+        assert_eq!(groups.len(), 3);
+        let keys: Vec<&str> = groups
+            .iter()
+            .map(|g| g.key.as_deref().unwrap())
+            .collect();
+        assert_eq!(keys, ["summary", "cka", "main"]);
+        let main = groups.last().unwrap();
+        assert_eq!(main.label, "Main");
+        assert_eq!(main.total, 9, "untagged sources' sizes sum into the scene total");
+        assert_eq!(main.sources.len(), 2);
+    }
+
+    // Labels ride through untouched — the viewer renders them verbatim.
+    #[test]
+    fn scene_labels_pass_through_unchanged() {
+        let groups = partition_scenes(
+            vec![tagged_source("cka", "Expert Diff", 0, 4)],
+            0,
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].label, "Expert Diff");
+        assert_eq!(groups[0].order, 0);
+        assert_eq!(groups[0].total, 4);
+    }
+
     #[test]
     fn distinct_keys_sanitizing_to_the_same_slug_share_one_scene() {
         // Grouping happens on the sanitized key so a run cannot end up with

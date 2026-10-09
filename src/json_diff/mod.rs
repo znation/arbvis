@@ -47,13 +47,6 @@ pub async fn build_json_diff_sources(
     let is_jsonl = matches!(original.extension().and_then(|e| e.to_str()), Some("jsonl"))
         || matches!(modified.extension().and_then(|e| e.to_str()), Some("jsonl"));
 
-    // Mmap each file for the per-tile RangeDiff / OneSidedRange path. Even
-    // though we already have the bytes in `orig_bytes`/`mod_bytes`, the
-    // existing diff machinery expects `Arc<Data>` handles, and reusing the
-    // mmap path keeps the lazy-fetch semantics for free.
-    let orig_data = open_mmap_data(original)?;
-    let mod_data = open_mmap_data(modified)?;
-
     let spans = if is_jsonl {
         align_jsonl(&orig_bytes, &mod_bytes)
     } else {
@@ -61,15 +54,7 @@ pub async fn build_json_diff_sources(
             (Ok(o), Ok(m)) => align_documents(&o, &m, 0, 0),
             (orig_r, mod_r) => {
                 log_parse_failures(original, &orig_r, modified, &mod_r);
-                return fallback_byte_diff(
-                    original,
-                    modified,
-                    &orig_bytes,
-                    &mod_bytes,
-                    is_finetune,
-                    orig_data,
-                    mod_data,
-                );
+                return fallback_byte_diff(original, modified, &orig_bytes, &mod_bytes, is_finetune);
             }
         }
     };
@@ -83,16 +68,17 @@ pub async fn build_json_diff_sources(
             modified.display(),
             MAX_SPANS
         );
-        return fallback_byte_diff(
-            original,
-            modified,
-            &orig_bytes,
-            &mod_bytes,
-            is_finetune,
-            orig_data,
-            mod_data,
-        );
+        return fallback_byte_diff(original, modified, &orig_bytes, &mod_bytes, is_finetune);
     }
+
+    // Mmap each file for the per-tile RangeDiff / OneSidedRange path. Even
+    // though we already have the bytes in `orig_bytes`/`mod_bytes`, the
+    // existing diff machinery expects `Arc<Data>` handles, and reusing the
+    // mmap path keeps the lazy-fetch semantics for free. Built only after the
+    // fallback decision: a zero-length file (e.g. crash-truncated output)
+    // cannot be mmap'd, and the fallback path handles it without needing one.
+    let orig_data = open_mmap_data(original)?;
+    let mod_data = open_mmap_data(modified)?;
 
     let (sources, total) = source::spans_to_sources(
         &spans,
@@ -248,6 +234,11 @@ fn strip_trailing_newline(s: &[u8]) -> (&[u8], u64) {
 
 fn open_mmap_data(path: &Path) -> anyhow::Result<Arc<Data>> {
     let f = std::fs::File::open(path).with_context(format!("opening {}", path.display()))?;
+    // memmap2 refuses to map a zero-length file, so serve one from memory
+    // instead of failing the whole diff over a readable-if-empty input.
+    if f.metadata()?.len() == 0 {
+        return Ok(Arc::new(Data::Owned(Vec::new())));
+    }
     let mmap = unsafe { Mmap::map(&f)? };
     Ok(Arc::new(Data::Mapped(mmap)))
 }
@@ -288,8 +279,6 @@ fn fallback_byte_diff(
     orig_bytes: &[u8],
     mod_bytes: &[u8],
     is_finetune: bool,
-    _orig_data: Arc<Data>,
-    _mod_data: Arc<Data>,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     let orig_fill = if is_finetune {
         DiffFill::Grey
@@ -501,6 +490,32 @@ mod tests {
             sources[1].name_override.as_deref(),
             Some("[only in modified] mod2.json")
         );
+    }
+
+    #[tokio::test]
+    async fn build_json_diff_sources_empty_file_falls_back_instead_of_mmap_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A zero-length file (e.g. crash-truncated output) cannot be mmap'd;
+        // the diff must still run — the fallback byte-diff path handles it —
+        // rather than hard-erroring on the mmap.
+        let empty = write_temp(&dir, "empty.json", b"");
+        let nonempty = write_temp(&dir, "full.json", b"{\"a\":1}");
+        let (sources, total) = build_json_diff_sources(&empty, &nonempty, false)
+            .await
+            .expect("empty input file must fall back, not error");
+        assert_eq!(total, 0 + nonempty.metadata().unwrap().len());
+        assert!(matches!(
+            sources[0].kind,
+            SourceKind::UnmatchedRegion { .. }
+        ));
+
+        // Both empty: same size, single whole-file Diff source over 0 bytes.
+        let empty2 = write_temp(&dir, "empty2.json", b"");
+        let (sources, total) = build_json_diff_sources(&empty, &empty2, false)
+            .await
+            .expect("both-empty pair must fall back, not error");
+        assert_eq!(total, 0);
+        assert!(matches!(sources[0].kind, SourceKind::Diff { .. }));
     }
 
     #[tokio::test]

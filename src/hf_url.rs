@@ -128,8 +128,8 @@ impl RemoteRepo {
     /// `dst` instead of buffering a `Bytes` body and copying it out, so the
     /// per-chunk tile reads on remote sources skip two whole-buffer copies
     /// (and an over-long body aborts as soon as it overflows `dst`).
-    /// Semantics and error wording mirror [`Self::fetch_range`] /
-    /// [`validate_range_body`].
+    /// Semantics and error wording mirror [`Self::fetch_range`] and the
+    /// private `validate_range_body` helper.
     pub async fn fetch_range_into(
         &self,
         filename: &str,

@@ -571,9 +571,7 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("empty directory pair should fail"),
         };
-        assert!(err
-            .to_string()
-            .contains("no matching file pairs found"));
+        assert!(err.to_string().contains("no matching file pairs found"));
     }
 
     /// In finetune mode, modified-only files render green crosshatch, unlike

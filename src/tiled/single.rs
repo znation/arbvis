@@ -147,25 +147,34 @@ fn scatter_offset(tile: &mut TileScatter, i: u64, geom: &SingleGeom) -> usize {
 /// Render all `sources` (concatenated, `total` bytes) into one indexed PNG
 /// written to `out`. Reads through the mmap / range-fetch `Data` path in
 /// `CHUNK_BYTES` chunks; writes to a `.tmp` sibling and renames on success.
-pub async fn render_single_png(sources: &[Source], total: u64, out: &Path) -> anyhow::Result<()> {
-    let geom = single_geometry(total);
-    let mut pixels = vec![0u8; geom.width as usize * geom.height as usize];
-
-    // Open every source up front (mmap for local, lightweight handle for
-    // HTTP) — mirrors `build_tile_plan`'s `load_source_data` loop.
+/// Open every source and build the cumulative-offset table used to locate a
+/// byte position's owning source.
+///
+/// Returns the opened `Data` handles (mmap for local, lightweight handle for
+/// HTTP — mirrors `build_tile_plan`'s `load_source_data` loop) paired with
+/// `cumulative[i]`, the concatenated offset at which source `i` begins.
+fn open_sources(sources: &[Source]) -> anyhow::Result<(Vec<Data>, Vec<u64>)> {
     let source_data: Vec<Data> = sources
         .iter()
         .map(load_source_data)
         .collect::<anyhow::Result<Vec<_>>>()?;
-
-    // Walk byte indices sequentially across source boundaries so mmap pages
-    // stay warm and each source sees one ascending range-fetch sequence.
-    let mut cumulative: Vec<u64> = Vec::with_capacity(sources.len());
+    let mut cumulative = Vec::with_capacity(sources.len());
     let mut off = 0u64;
     for s in sources {
         cumulative.push(off);
         off += s.byte_size;
     }
+    Ok((source_data, cumulative))
+}
+
+pub async fn render_single_png(sources: &[Source], total: u64, out: &Path) -> anyhow::Result<()> {
+    let geom = single_geometry(total);
+    let mut pixels = vec![0u8; geom.width as usize * geom.height as usize];
+
+    let (source_data, cumulative) = open_sources(sources)?;
+
+    // Walk byte indices sequentially across source boundaries so mmap pages
+    // stay warm and each source sees one ascending range-fetch sequence.
 
     let mut pos = 0u64;
     while pos < total {
@@ -233,21 +242,7 @@ pub async fn render_single_diff_png(
         unreachable!("diff_leaf_mode always returns LeafMode::Diff")
     };
 
-    // Open every source up front — mirrors `build_tile_plan`'s
-    // `load_source_data` loop and `render_single_png`'s.
-    let source_data: Vec<Data> = sources
-        .iter()
-        .map(load_source_data)
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let cumulative: Vec<u64> = {
-        let mut v = Vec::with_capacity(sources.len());
-        let mut off = 0u64;
-        for s in sources {
-            v.push(off);
-            off += s.byte_size;
-        }
-        v
-    };
+    let (source_data, cumulative) = open_sources(sources)?;
 
     let height_tiles = geom.height / TILE;
     let width_tiles = geom.width / TILE;
@@ -673,17 +668,7 @@ mod tests {
         else {
             unreachable!()
         };
-        let source_data: Vec<Data> = sources
-            .iter()
-            .map(crate::data::load_source_data)
-            .collect::<anyhow::Result<Vec<_>>>()
-            .unwrap();
-        let mut cumulative = Vec::new();
-        let mut off = 0u64;
-        for s in &sources {
-            cumulative.push(off);
-            off += s.byte_size;
-        }
+        let (source_data, cumulative) = open_sources(&sources).unwrap();
         let geom = single_geometry(total);
         let (ht, wt) = (geom.height / TILE, geom.width / TILE);
         let mut reference =
@@ -787,17 +772,7 @@ mod tests {
         else {
             unreachable!()
         };
-        let source_data: Vec<Data> = sources
-            .iter()
-            .map(crate::data::load_source_data)
-            .collect::<anyhow::Result<Vec<_>>>()
-            .unwrap();
-        let mut cumulative = Vec::new();
-        let mut off = 0u64;
-        for s in &sources {
-            cumulative.push(off);
-            off += s.byte_size;
-        }
+        let (source_data, cumulative) = open_sources(&sources).unwrap();
         let geom = single_geometry(total);
         assert!(
             geom.kw > geom.kh,

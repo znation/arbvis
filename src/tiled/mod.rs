@@ -1357,6 +1357,127 @@ mod mode_helpers_tests {
 }
 
 #[cfg(test)]
+mod detail_level_tests {
+    use super::*;
+    use crate::data::{Source, SourceKind};
+    use crate::layout::{CanvasGeom as LayoutCanvasGeom, LayoutShape};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    async fn plain_plan() -> TilePlan {
+        let sources = vec![Source {
+            file_idx: 0,
+            kind: SourceKind::Buffered(vec![0u8; 64]),
+            byte_size: 64,
+            name_override: Some("tiny.bin".to_string()),
+            xet_terms: None,
+            extensions: Default::default(),
+        }];
+        build_tile_plan(
+            sources,
+            64,
+            false,
+            false,
+            crate::layout::LayoutMode::Hilbert,
+            &crate::registry::Registry::with_defaults(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A layout that reports `detail_depth` detail levels; geometry is
+    /// delegated to the inner Hilbert layout, so only the detail knobs are
+    /// overridden. `coords` decides which detail zooms get tiles.
+    struct StubDetail {
+        inner: Arc<dyn LayoutShape>,
+        depth: u32,
+        coords: Box<dyn Fn(u32) -> Vec<(u32, u32)> + Send + Sync>,
+    }
+
+    impl LayoutShape for StubDetail {
+        fn id(&self) -> &'static str {
+            self.inner.id()
+        }
+        fn canvas_geom(&self) -> LayoutCanvasGeom {
+            self.inner.canvas_geom()
+        }
+        fn detail_depth(&self) -> u32 {
+            self.depth
+        }
+        fn detail_coords(&self, zoom: u32) -> Vec<(u32, u32)> {
+            (self.coords)(zoom)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_detail_depth_returns_ok_and_writes_nothing() {
+        // Hilbert plans carry no detail levels: the function is a no-op that
+        // never touches the writer.
+        let plan = plain_plan().await;
+        assert_eq!(plan.layout.detail_depth(), 0);
+        let res = render_detail_levels(&plan, TileFormat::Png, &|_, _| {
+            panic!("write_tile must not be called for a detail_depth=0 plan")
+        })
+        .await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn empty_detail_coords_skip_the_pipeline() {
+        // A layout with detail depth but no detail coordinates for a level
+        // skips that level entirely — the writer is never reached.
+        let mut plan = plain_plan().await;
+        let max_zoom = plan.layout.canvas_geom().max_zoom;
+        plan.layout = Arc::new(StubDetail {
+            inner: plan.layout.clone(),
+            depth: 1,
+            coords: Box::new(move |_| Vec::new()),
+        });
+        let res = render_detail_levels(&plan, TileFormat::Png, &|_, _| {
+            panic!("write_tile must not be called when a level has no coords")
+        })
+        .await;
+        assert!(res.is_ok());
+        let _ = max_zoom;
+    }
+
+    #[tokio::test]
+    async fn failed_detail_pass_is_logged_not_propagated() {
+        // Detail tiles are an enhancement layer: a failure inside one detail
+        // pass must not fail the render — the viewer upsamples the overview
+        // there. Force the pass to fail by giving the plan a `Padding` tile
+        // descriptor (no loader is registered for it, so drive_pipeline
+        // errors before spawning any worker).
+        let mut plan = plain_plan().await;
+        let max_zoom = plan.layout.canvas_geom().max_zoom;
+        plan.layout = Arc::new(StubDetail {
+            inner: plan.layout.clone(),
+            depth: 2,
+            coords: Box::new(move |z| {
+                if z == max_zoom + 1 {
+                    vec![(0, 0)]
+                } else {
+                    Vec::new()
+                }
+            }),
+        });
+        plan.leaf_tile = LeafTile::Padding;
+        let writes = Arc::new(AtomicU32::new(0));
+        let w = writes.clone();
+        let res = render_detail_levels(&plan, TileFormat::Png, &move |_t, _z| {
+            w.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+        assert!(res.is_ok(), "detail failures must not propagate: {res:?}");
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+    }
+
+}
+
+#[cfg(test)]
 mod scene_tests {
     #[test]
     fn regen_html_missing_labels_json_says_the_dir_must_be_a_viewer_bundle() {

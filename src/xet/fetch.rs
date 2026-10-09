@@ -209,3 +209,77 @@ pub(super) async fn fetch_reconstruction_terms(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_v2_reconstruction_response_wire_fields() {
+        // Field renames (`unpacked_length`, `accessToken`/`casUrl`) and the
+        // inclusive-end `bytes` range are what the reader path depends on.
+        let json = r#"{
+            "terms": [
+                {"hash": "abc/123", "unpacked_length": 64, "range": {"start": 0, "end": 2}},
+                {"hash": "def/456", "unpacked_length": 10, "range": {"start": 2, "end": 5}}
+            ],
+            "xorbs": {
+                "abc/123": [
+                    {"url": "https://cas.example/chunk", "ranges": [
+                        {"chunks": {"start": 0, "end": 2}, "bytes": {"start": 0, "end": 63}}
+                    ]}
+                ]
+            }
+        }"#;
+        let resp: ReconstructionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.terms.len(), 2);
+        assert_eq!(resp.terms[0].hash, "abc/123");
+        assert_eq!(resp.terms[0].unpacked_length, 64);
+        assert_eq!(resp.terms[0].range.start, 0);
+        assert_eq!(resp.terms[0].range.end, 2);
+        assert_eq!(resp.terms[1].range.end, 5);
+        let fetches = resp.xorbs.get("abc/123").unwrap();
+        assert_eq!(fetches.len(), 1);
+        assert_eq!(fetches[0].url, "https://cas.example/chunk");
+        let d = &fetches[0].ranges[0];
+        assert_eq!((d.chunks.start, d.chunks.end), (0, 2));
+        assert_eq!((d.bytes.start, d.bytes.end), (0, 63));
+    }
+
+    #[test]
+    fn v1_response_without_xorbs_field_defaults_to_empty() {
+        // V1 responses omit `xorbs`; `#[serde(default)]` must turn that into
+        // an empty map rather than a parse error.
+        let json = r#"{"terms": [{"hash": "h", "unpacked_length": 1, "range": {"start": 0, "end": 0}}]}"#;
+        let resp: ReconstructionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.terms.len(), 1);
+        assert!(resp.xorbs.is_empty());
+    }
+
+    #[test]
+    fn wrong_field_names_rejected() {
+        // Guards the serde renames: a response using camelCase or an unrenamed
+        // length field must fail to parse, not silently produce zero values.
+        for bad in [
+            r#"{"terms":[{"hash":"h","unpackedLength":1,"range":{"start":0,"end":0}}]}"#,
+            r#"{"terms":[{"hash":"h","unpacked_length":1,"range":{"start":0}}]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ReconstructionResponse>(bad).is_err(),
+                "expected parse failure for {bad}"
+            );
+        }
+        // Missing terms field entirely is also an error (no default on terms).
+        assert!(serde_json::from_str::<ReconstructionResponse>(r#"{}"#).is_err());
+    }
+
+    #[test]
+    fn invalidate_cas_token_cache_ignores_unknown_key_and_uninitialized_cache() {
+        // Fresh process: cache never populated — invalidation must not panic
+        // (no key inserted, no error surfaced).
+        invalidate_cas_token_cache("api", "owner/repo", "main");
+        // Unknown key on an initialized cache is a no-op removal.
+        invalidate_cas_token_cache("api", "owner/other", "dev");
+        invalidate_cas_token_cache("api", "owner/repo", "main");
+    }
+}

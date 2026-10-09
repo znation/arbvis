@@ -500,4 +500,62 @@ mod tests {
         let _ = acc.drain().await;
         assert!(acc.sink.uploads.lock().unwrap().is_empty());
     }
+
+    /// A sink that panics: the JoinError from the detached spawn_blocking
+    /// task must be recorded and surfaced by drain() as a panic error, not
+    /// lost when the task dies outside any caller's await.
+    struct PanickingSink;
+    impl TileSink for PanickingSink {
+        fn upload_tile(&self, _path: String, _bytes: Vec<u8>) -> anyhow::Result<()> {
+            panic!("simulated sink panic")
+        }
+    }
+
+    #[tokio::test]
+    async fn task_panic_is_surfaced_by_drain() {
+        let acc: Arc<PyramidAccumulator<PanickingSink>> = Arc::new(PyramidAccumulator::new(
+            4,
+            Arc::new(PanickingSink),
+            Arc::new(|z, x, y| format!("{z}/{x}/{y}.png")),
+            TileFormat::Png,
+        ));
+        for x in 0..2 {
+            for y in 0..2 {
+                acc.contribute(1, x, y, &constant_tile(4, [1, 2, 3]));
+            }
+        }
+        let err = acc
+            .drain()
+            .await
+            .expect_err("panicked task must surface through drain");
+        assert!(
+            err.to_string().contains("pyramid task panicked"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// drain_and_report_incomplete wraps drain failures in the uniform
+    /// "tile set is incomplete" context so callers see a consistent message.
+    #[tokio::test]
+    async fn drain_and_report_incomplete_contextualizes_failure() {
+        let acc: Arc<PyramidAccumulator<FailingSink>> = Arc::new(PyramidAccumulator::new(
+            4,
+            Arc::new(FailingSink),
+            Arc::new(|z, x, y| format!("{z}/{x}/{y}.png")),
+            TileFormat::Png,
+        ));
+        for x in 0..2 {
+            for y in 0..2 {
+                acc.contribute(1, x, y, &constant_tile(4, [1, 2, 3]));
+            }
+        }
+        let err = drain_and_report_incomplete(acc)
+            .await
+            .expect_err("sink failure must map to the incomplete-tile-set error");
+        assert!(
+            err.to_string()
+                .contains("pyramid overview-tile encode/upload failed"),
+            "unexpected error: {err:#}"
+        );
+    }
 }

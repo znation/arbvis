@@ -336,6 +336,68 @@ const UPDATE_LABELS_BODY: &str = r#"      var bounds = map.getBounds();
         }
       }"#;
 
+/// JS fetched-`labels.json` chain shared verbatim by both 2D viewer templates
+/// (the `format!`-built single-scene template in [`build_html`] and
+/// [`TEMPLATE_MULTI`]). Injected by token replacement so the brace style
+/// stays right for each template; `__THEN_BODY__` is replaced with each
+/// viewer's success handler (single-scene maps the file list straight onto
+/// `updateLabels`, multi-scene buckets it by scene key first). Both viewers
+/// get the same !r.ok status surface and the same loud `.catch`.
+const LABELS_FETCH_JS: &str = r#"    fetch('labels.json')
+      .then(function(r) {
+        // A 404/403/429 reply has an HTML or JSON-error body, which r.json()
+        // would turn into a confusing SyntaxError. Name the status instead —
+        // same contract as the 3D viewer's meta.json fetch.
+        if (!r.ok) throw new Error('labels.json load failed: HTTP ' + r.status + ' ' + r.statusText);
+        return r.json();
+      })
+      .then(function(data) {
+__THEN_BODY__
+      })
+      .catch(function(e) {
+        // A missing/corrupt labels.json (network blip, partial upload,
+        // non-JSON body) must fail loudly: without this the rejection is
+        // unhandled and the label overlay silently never renders. Surface it
+        // both in the info panel (debuggable bundle) and as a loud banner.
+        console.error('labels.json failed to load; file labels unavailable', e);
+        var info = document.getElementById('arbvis-info');
+        if (info) {
+          var note = document.createElement('div');
+          note.textContent = 'labels.json missing or invalid — file labels unavailable';
+          info.appendChild(note);
+        }
+        var warn = document.createElement('div');
+        warn.textContent = 'labels.json failed to load or parse: ' + e;
+        warn.style.cssText = 'position:fixed;bottom:8px;left:8px;z-index:9999;'
+          + 'background:#a00;color:#fff;padding:4px 8px;font:12px sans-serif;';
+        document.body.appendChild(warn);
+      });"#;
+
+/// Per-viewer success handler for [`LABELS_FETCH_JS`]: the single-scene
+/// viewer treats labels.json's entity array as one overlay.
+const SINGLE_LABELS_THEN_BODY: &str = r#"        // New schema: { files: [...] }. Legacy schema: bare array of file entities.
+        var files = Array.isArray(data) ? data : (data.files || []);
+        function redraw() {
+          updateLabels(files);
+        }
+        redraw();
+        map.on('zoomend moveend', redraw);"#;
+
+/// Per-viewer success handler for [`LABELS_FETCH_JS`]: the multi-scene
+/// viewer buckets each scene's entity list by its scene key.
+const MULTI_LABELS_THEN_BODY: &str = r#"        var scenes = data.scenes || [];
+        for (var i = 0; i < scenes.length; i++) {
+          filesByKey[scenes[i].key] = scenes[i].files || [];
+        }
+        updateLabels();
+        map.on('zoomend moveend', updateLabels);"#;
+
+/// Substitute a viewer's success handler into the shared labels.json fetch
+/// chain ([`LABELS_FETCH_JS`]).
+fn labels_fetch_js(then_body: &str) -> String {
+    LABELS_FETCH_JS.replace("__THEN_BODY__", then_body)
+}
+
 fn build_html(
     world_w: u32,
     world_h: u32,
@@ -514,41 +576,7 @@ __UPDATE_LABELS_BODY__
         return {{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }}[c];
       }});
     }};
-    fetch('labels.json')
-      .then(function(r) {{
-        // A 404/403/429 reply has an HTML or JSON-error body, which r.json()
-        // would turn into a confusing SyntaxError. Name the status instead —
-        // same contract as the 3D viewer's meta.json fetch.
-        if (!r.ok) throw new Error('labels.json load failed: HTTP ' + r.status + ' ' + r.statusText);
-        return r.json();
-      }})
-      .then(function(data) {{
-        // New schema: {{ files: [...] }}. Legacy schema: bare array of file entities.
-        var files = Array.isArray(data) ? data : (data.files || []);
-        function redraw() {{
-          updateLabels(files);
-        }}
-        redraw();
-        map.on('zoomend moveend', redraw);
-      }})
-      .catch(function(e) {{
-        // A missing/corrupt labels.json (network blip, partial upload,
-        // non-JSON body) must fail loudly: without this the rejection is
-        // unhandled and the label overlay silently never renders. Surface it
-        // both in the info panel (debuggable bundle) and as a loud banner.
-        console.error('labels.json failed to load; file labels unavailable', e);
-        var info = document.getElementById('arbvis-info');
-        if (info) {{
-          var note = document.createElement('div');
-          note.textContent = 'labels.json missing or invalid — file labels unavailable';
-          info.appendChild(note);
-        }}
-        var warn = document.createElement('div');
-        warn.textContent = 'labels.json failed to load or parse: ' + e;
-        warn.style.cssText = 'position:fixed;bottom:8px;left:8px;z-index:9999;'
-          + 'background:#a00;color:#fff;padding:4px 8px;font:12px sans-serif;';
-        document.body.appendChild(warn);
-      }});
+__LABELS_FETCH__
   </script>
 </body>
 </html>"#,
@@ -567,6 +595,10 @@ __UPDATE_LABELS_BODY__
         pyramid_ext = pyramid_ext,
     )
     .replace("__UPDATE_LABELS_BODY__", UPDATE_LABELS_BODY)
+    .replace(
+        "__LABELS_FETCH__",
+        &labels_fetch_js(SINGLE_LABELS_THEN_BODY),
+    )
 }
 
 // ===========================================================================
@@ -745,6 +777,7 @@ fn build_html_multi(
         .replace("__ATTRIBUTION__", &attribution_html(branding))
         .replace("__TITLE_ESCAPED__", &escape_html(title))
         .replace("__UPDATE_LABELS_BODY__", UPDATE_LABELS_BODY)
+        .replace("__LABELS_FETCH__", &labels_fetch_js(MULTI_LABELS_THEN_BODY))
 }
 
 /// Tile edge length used by the viewer; matches [`crate::tiled::leaf::TILE`].
@@ -910,39 +943,7 @@ __UPDATE_LABELS_BODY__
       updateLabels();
     });
 
-    fetch('labels.json')
-      .then(function(r) {
-        // Same !r.ok contract as the single-scene viewer above: surface the
-        // HTTP status instead of a JSON.parse SyntaxError from an HTML body.
-        if (!r.ok) throw new Error('labels.json load failed: HTTP ' + r.status + ' ' + r.statusText);
-        return r.json();
-      })
-      .then(function(data) {
-        var scenes = data.scenes || [];
-        for (var i = 0; i < scenes.length; i++) {
-          filesByKey[scenes[i].key] = scenes[i].files || [];
-        }
-        updateLabels();
-        map.on('zoomend moveend', updateLabels);
-      })
-      .catch(function(e) {
-        // Same loud-failure contract as the single-scene viewer: a missing or
-        // malformed labels.json must show an error, not silently drop the
-        // per-scene label overlays. Surface it in the info panel and as a
-        // loud banner.
-        console.error('labels.json failed to load; file labels unavailable', e);
-        var info = document.getElementById('arbvis-info');
-        if (info) {
-          var note = document.createElement('div');
-          note.textContent = 'labels.json missing or invalid — file labels unavailable';
-          info.appendChild(note);
-        }
-        var warn = document.createElement('div');
-        warn.textContent = 'labels.json failed to load or parse: ' + e;
-        warn.style.cssText = 'position:fixed;bottom:8px;left:8px;z-index:9999;'
-          + 'background:#a00;color:#fff;padding:4px 8px;font:12px sans-serif;';
-        document.body.appendChild(warn);
-      });
+    __LABELS_FETCH__
   </script>
 </body>
 </html>"#;

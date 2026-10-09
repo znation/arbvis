@@ -437,6 +437,12 @@ mod tests {
     use crate::geometry::hilbert_d2xyz;
     use crate::volume::brick::BRICK;
 
+    /// Synthetic non-zero byte for test feed loops: the low 7 bits of the
+    /// Hilbert index, with bit 0 forced on so every fed voxel is occupied.
+    fn feed_byte(h: u64) -> u8 {
+        ((h & 0x7f) as u8) | 1
+    }
+
     /// Descend the serialized **octree** node pool exactly as the shader/JS will,
     /// returning the 1-based brick id at brick cell `(cx,cy,cz)` (`0` = empty).
     /// This is the authoritative check that the built tree round-trips.
@@ -499,7 +505,7 @@ mod tests {
         let mut per_byte = BrickBuilder::new(order_v, BRICK, [3u16; 256], Vec::new(), false);
         let mut bulk = BrickBuilder::new(order_v, BRICK, [3u16; 256], Vec::new(), true);
         for h in 0..n {
-            let byte = ((h & 0x7f) as u8) | 1;
+            let byte = feed_byte(h);
             per_byte.push(h, byte);
             bulk.push(h, byte);
             if h % 3 == 0 {
@@ -525,7 +531,7 @@ mod tests {
             "accumulator is one brick"
         );
         for h in 0..n {
-            b.push(h, ((h & 0x7f) as u8) | 1); // byte > 0 ⇒ voxel occupied
+            b.push(h, feed_byte(h)); // feed_byte > 0 ⇒ voxel occupied
         }
         let (bv, blocks) = b.finish_streaming().unwrap();
         assert!(bv.occupied >= 1);
@@ -567,7 +573,7 @@ mod tests {
         let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256], Vec::new(), false);
         let n = 1u64 << (3 * 5); // 32768 voxels
         for h in 0..n {
-            b.push(h, ((h & 0x7f) as u8) | 1);
+            b.push(h, feed_byte(h));
         }
         let (bv, _) = b.finish_streaming().unwrap();
         assert!(
@@ -610,7 +616,7 @@ mod tests {
         let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256], Vec::new(), false);
         let n = 1u64 << (3 * 6); // 262144 voxels → a small corner of the cube
         for h in 0..n {
-            b.push(h, ((h & 0x7f) as u8) | 1);
+            b.push(h, feed_byte(h));
         }
         let (bv, _) = b.finish_streaming().unwrap();
         assert_eq!(bv.tree_depth, 8);

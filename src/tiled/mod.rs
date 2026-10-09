@@ -21,13 +21,14 @@ use indicatif::ProgressBar;
 use crate::color::{build_diff_signed_lut, build_pixel_lut};
 use crate::data::{load_source_data, Data, DiffFill, Source, SourceKind};
 use crate::geometry::{file_rects, hilbert_to_xy_u64, name_hue, outer_segments, rects_centroid};
+use crate::layout::hilbert::{hilbert_canvas, CanvasGeom};
 use crate::layout::{select_layout, LayoutMode, LayoutShape};
 use crate::progress::{counter_style, multi, queue_style, status_style};
 use crate::throttle::{Throttle, MAX_FETCH_WORKERS};
 use crate::tiled::html::FileEntity;
 use crate::tiled::leaf::{
     render_leaf_tile_diff, render_leaf_tile_from_buf, render_leaf_tile_xet_from_buf, TileFormat,
-    TILE, TILE_LOG2, TILE_PIXELS,
+    TILE, TILE_PIXELS,
 };
 use crate::tiled::leaf_renderer::{LeafRegistry, LeafTile, LoadCtx, RenderCtx};
 use crate::tiled::pyramid_accum::{write_tile_file, LocalFileSink, PyramidAccumulator};
@@ -325,15 +326,14 @@ pub(super) async fn build_tile_plan(
     // generic file-rects entity path (`file_rects` reads `total_pixels`,
     // `square_pixels`, `num_squares`, `height`, `kh`). For arch the trait's
     // `canvas_geom`/`layout_entities` override these downstream.
-    let mut s = 2 * TILE_LOG2 as u32;
-    while (1u64 << s) < total {
-        s += 1;
-    }
-    let kh = s / 2;
-    let kw = s.div_ceil(2);
-    let height = 1u32 << kh;
-    let width = 1u32 << kw;
-    let square_pixels: u64 = (height as u64) * (height as u64);
+    let g = hilbert_canvas(total);
+    let CanvasGeom {
+        kh,
+        kw,
+        width,
+        height,
+        square_pixels,
+    } = g;
     let total_pixels: u64 = width as u64 * height as u64;
     let num_squares = 1u32 << (kw - kh);
 

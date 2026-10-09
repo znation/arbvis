@@ -5,6 +5,41 @@
 
 use crate::tiled::leaf::{TILE, TILE_LOG2};
 
+/// The Hilbert canvas for `total` bytes at 1 px/byte: the smallest power-of-two
+/// canvas with side `2^s` (starting at `2^(2·TILE_LOG2)`) split into a
+/// `(1<<kw) × (1<<kh)` rectangle with `kw = s.div_ceil(2)`, `kh = s / 2`.
+/// `square_pixels` is the side of one Hilbert square (`height²`).
+/// Shared by [`HilbertLayout::from_total`], `tiled::build_tile_plan`, and
+/// `tiled::single_geometry`, which each derived this inline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanvasGeom {
+    pub kw: u8,
+    pub kh: u8,
+    pub width: u32,
+    pub height: u32,
+    pub square_pixels: u64,
+}
+
+/// Compute the [`CanvasGeom`] for `total` bytes. A zero total yields the
+/// smallest canvas (`s = 2·TILE_LOG2`), since `1 << s` always covers it.
+pub fn hilbert_canvas(total: u64) -> CanvasGeom {
+    let mut s = 2 * TILE_LOG2 as u32;
+    while (1u64 << s) < total {
+        s += 1;
+    }
+    let kh = s / 2;
+    let kw = s.div_ceil(2);
+    let height = 1u32 << kh;
+    let width = 1u32 << kw;
+    CanvasGeom {
+        kh: kh as u8,
+        kw: kw as u8,
+        width,
+        height,
+        square_pixels: (height as u64) * (height as u64),
+    }
+}
+
 /// Geometry knobs for the byte-Hilbert canvas: the curve order, tile grid
 /// dimensions, world size, and byte budget. Computed once by
 /// [`HilbertLayout::from_total`] and consumed by the tile pipeline.
@@ -27,20 +62,20 @@ impl HilbertLayout {
     /// 1px-per-byte square-tiled Hilbert curve, matching the formula in the
     /// previous `build_tile_plan`.
     pub fn from_total(total: u64) -> Self {
-        let mut s = 2 * TILE_LOG2 as u32;
-        while (1u64 << s) < total.max(1) {
-            s += 1;
-        }
-        let kh = (s / 2) as u8;
-        let kw = s.div_ceil(2) as u8;
-        let height = 1u32 << kh;
-        let width = 1u32 << kw;
+        let g = hilbert_canvas(total);
+        let CanvasGeom {
+            kw,
+            kh,
+            width,
+            height,
+            square_pixels,
+            ..
+        } = g;
         let tile_size = TILE;
         let max_zoom = kh as u32 - TILE_LOG2 as u32;
         let width_tiles = width / tile_size;
         let height_tiles = height / tile_size;
         let world_w = TILE << (kw as u32 - kh as u32);
-        let square_pixels: u64 = (height as u64) * (height as u64);
         Self {
             kh,
             width_tiles,

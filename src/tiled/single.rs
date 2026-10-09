@@ -24,6 +24,7 @@ use anyhow::Context;
 use crate::color::build_pixel_lut;
 use crate::data::{load_source_data, Data, Source};
 use crate::geometry::hilbert_to_xy_u64;
+use crate::layout::hilbert::hilbert_canvas;
 use crate::tiled::leaf::{local_curve_to_xy, tile_curve_frame, TILE, TILE_LOG2};
 
 /// Bytes fetched from a source per `fetch_range` call. Large enough to keep
@@ -46,25 +47,18 @@ pub struct SingleGeom {
     pub square_pixels: u64,
 }
 
-/// Derive the single-image canvas geometry from the byte `total`.
-///
-/// `s` starts at `2 * TILE_LOG2` (the smallest canvas a tile pyramid would
-/// build) and grows until `2^s >= total`; the image is `(1<<kw) × (1<<kh)`.
+/// Derive the single-image canvas geometry from the byte `total`, via
+/// [`hilbert_canvas`](crate::layout::hilbert::hilbert_canvas): `s` starts at
+/// `2 * TILE_LOG2` (the smallest canvas a tile pyramid would build) and grows
+/// until `2^s >= total`; the image is `(1<<kw) × (1<<kh)`.
 pub fn single_geometry(total: u64) -> SingleGeom {
-    let mut s = 2 * TILE_LOG2 as u32;
-    while (1u64 << s) < total {
-        s += 1;
-    }
-    let kh = s / 2;
-    let kw = s.div_ceil(2);
-    let height = 1u32 << kh;
-    let width = 1u32 << kw;
+    let g = hilbert_canvas(total);
     SingleGeom {
-        kh: kh as u8,
-        kw: kw as u8,
-        width,
-        height,
-        square_pixels: (height as u64) * (height as u64),
+        kh: g.kh,
+        kw: g.kw,
+        width: g.width,
+        height: g.height,
+        square_pixels: g.square_pixels,
     }
 }
 

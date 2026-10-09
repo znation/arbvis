@@ -61,8 +61,9 @@ pub struct VolumeLabel {
 
 /// One placed entity in the cube. arbvis does not interpret `extra` or
 /// `renderer_id`; it fetches `[byte_start, byte_start + byte_len)` from
-/// `sources[source_idx]` and hands the bytes to the [`VoxelRenderer`](crate::volume::VoxelRenderer) named by
-/// `renderer_id`, exactly as the 2D path routes a `LeafTile` to a `LeafRenderer`.
+/// `sources[source_idx]` and hands the bytes to the
+/// [`VoxelRenderer`](crate::volume::VoxelRenderer) named by `renderer_id`, exactly as the 2D
+/// path routes a `LeafTile` to a `LeafRenderer`.
 pub struct VolumeEntity {
     /// Index into the run's `sources` list.
     pub source_idx: usize,
@@ -72,7 +73,8 @@ pub struct VolumeEntity {
     pub byte_len: u64,
     /// Target box in the bounded grid.
     pub bbox: VoxelBox,
-    /// Names the [`VoxelRenderer`](crate::volume::VoxelRenderer) that decodes + colors this entity.
+    /// Names the [`VoxelRenderer`](crate::volume::VoxelRenderer) that decodes and colors
+    /// this entity.
     pub renderer_id: &'static str,
     /// Opaque per-entity payload the renderer downcasts (dtype, element shape,
     /// colormap choice, diff partner span, …).
@@ -82,8 +84,8 @@ pub struct VolumeEntity {
 /// 3D analog of [`crate::LayoutShape`]: how the byte stream maps into a bounded
 /// voxel box.
 pub trait VolumeShape: Send + Sync {
-    /// Stable id; also the default [`VoxelRenderer`](crate::volume::VoxelRenderer) id for entities that don't
-    /// override it. Mirrors [`crate::LayoutShape::id`].
+    /// Stable id; also the default [`VoxelRenderer`](crate::volume::VoxelRenderer) id for entities
+    /// that don't override it. Mirrors [`crate::LayoutShape::id`].
     fn id(&self) -> &'static str;
 
     /// The voxel box `[x, y, z]` this shape renders into. A byte volume

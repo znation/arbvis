@@ -609,7 +609,8 @@ mod tests {
     fn longer_number_value_emits_mod_only_tail() {
         let r = align(r#"{"a":1}"#, r#"{"a":100}"#);
         // Expect: Aligned over "{\"a\":1" (6 bytes orig, 6 bytes mod), ModOnly "00", Aligned "}".
-        // After coalesce the leading Aligned merges with the closing-brace-aligned only if contiguous; they're not contiguous on the mod side because of the ModOnly.
+        // After coalesce the leading Aligned merges with the closing-brace-aligned only if
+        // contiguous; they're not contiguous on the mod side because of the ModOnly.
         // So we expect 3 spans.
         assert_eq!(r.len(), 3);
         match &r[1] {

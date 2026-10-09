@@ -722,9 +722,7 @@ mod tests {
 
         let out_dir = tempfile::tempdir().unwrap();
         let out = out_dir.path().join("out.png");
-        assert!(render_single_xet_png(&sources, total, &out)
-            .await
-            .unwrap());
+        assert!(render_single_xet_png(&sources, total, &out).await.unwrap());
 
         let f = std::fs::File::open(&out).unwrap();
         let dec = png::Decoder::new(std::io::BufReader::new(f));
@@ -746,8 +744,12 @@ mod tests {
             ]
         };
         let geom = single_geometry(total);
-        for (byte_idx, scale, xorb) in [(0u64, 0u16, 0usize), (511, 0, 0), (512, 255, 1), (1023, 255, 1)]
-        {
+        for (byte_idx, scale, xorb) in [
+            (0u64, 0u16, 0usize),
+            (511, 0, 0),
+            (512, 255, 1),
+            (1023, 255, 1),
+        ] {
             let off = pixel_offset(byte_idx, &geom);
             assert_eq!(
                 bytes[off * 3..off * 3 + 3],
@@ -770,9 +772,7 @@ mod tests {
 
         let out_dir = tempfile::tempdir().unwrap();
         let out = out_dir.path().join("out.png");
-        assert!(!render_single_xet_png(&sources, total, &out)
-            .await
-            .unwrap());
+        assert!(!render_single_xet_png(&sources, total, &out).await.unwrap());
         assert!(!out.exists());
     }
 

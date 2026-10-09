@@ -237,7 +237,7 @@ impl XorbMap {
     }
 }
 
-// ─── XetReader: direct-CAS byte fetcher ──────────────────────────────────────
+// ─── XetReader: direct-CAS byte fetcher ─────────────────────
 //
 // The `hf` CLI exposes no byte-range surface, so per-tile range reads on
 // xet-backed files implement their own xet streaming: fetch the V2

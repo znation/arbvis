@@ -185,7 +185,8 @@ pub fn prepare_sources(
     Ok((sources, total))
 }
 
-/// Load a source's bytes for random access: snapshots file sources into memory, clones buffered sources.
+/// Load a source's bytes for random access: snapshots file sources into memory,
+/// clones buffered sources.
 /// For diff sources, returns a LazyDiff that computes bytes on demand per tile.
 /// For Http sources, returns a `Data::Http` handle that fetches byte ranges on demand.
 pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {

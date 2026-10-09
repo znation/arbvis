@@ -115,7 +115,8 @@ pub struct Args {
     #[arg(long = "volume-res", default_value_t = 0)]
     pub(crate) volume_res: u32,
 
-    /// Visualize abs(modified - original) byte differences; ORIGINAL and MODIFIED are files or directories
+    /// Visualize abs(modified - original) byte differences; ORIGINAL and MODIFIED are
+    /// files or directories
     #[arg(long, num_args = 2, value_names = ["ORIGINAL", "MODIFIED"])]
     pub(crate) diff: Option<Vec<PathBuf>>,
 
@@ -709,16 +710,13 @@ mod png_flag_tests {
 
     #[test]
     fn space_plus_local_out_is_allowed() {
-        let args = Args::try_parse_from([
-            "arbvis",
-            "a.bin",
-            "--out",
-            "outdir",
-            "--space",
-            "org/space",
-        ])
-        .unwrap();
-        let dest = match OutputDest::from_args(&args) { Ok(d) => d, Err(e) => panic!("local out + space is legal: {e}") };
+        let args =
+            Args::try_parse_from(["arbvis", "a.bin", "--out", "outdir", "--space", "org/space"])
+                .unwrap();
+        let dest = match OutputDest::from_args(&args) {
+            Ok(d) => d,
+            Err(e) => panic!("local out + space is legal: {e}"),
+        };
         let OutputDest::Bundle {
             local,
             upload_hf,
@@ -736,15 +734,12 @@ mod png_flag_tests {
         // 2D + --stream + hf:// out: tiles are pushed as produced, so no
         // tempdir is allocated (the point of --stream: a full /tmp must not
         // kill the run).
-        let args = Args::try_parse_from([
-            "arbvis",
-            "a.bin",
-            "--stream",
-            "--out",
-            "hf://org/repo",
-        ])
-        .unwrap();
-        let dest = match OutputDest::from_args(&args) { Ok(d) => d, Err(e) => panic!("streaming hf out should be legal: {e}") };
+        let args = Args::try_parse_from(["arbvis", "a.bin", "--stream", "--out", "hf://org/repo"])
+            .unwrap();
+        let dest = match OutputDest::from_args(&args) {
+            Ok(d) => d,
+            Err(e) => panic!("streaming hf out should be legal: {e}"),
+        };
         let OutputDest::Bundle {
             local, upload_hf, ..
         } = &dest;
@@ -757,37 +752,49 @@ mod png_flag_tests {
         // Same flags without --stream: disk-backed upload needs a local
         // staging dir, allocated lazily as a tempdir.
         let args = Args::try_parse_from(["arbvis", "a.bin", "--out", "hf://org/repo"]).unwrap();
-        let dest = match OutputDest::from_args(&args) { Ok(d) => d, Err(e) => panic!("disk-backed hf out should be legal: {e}") };
+        let dest = match OutputDest::from_args(&args) {
+            Ok(d) => d,
+            Err(e) => panic!("disk-backed hf out should be legal: {e}"),
+        };
         let OutputDest::Bundle {
             local, upload_hf, ..
         } = &dest;
         let local = local.as_ref().expect("staging dir must exist");
-        assert!(local.is_absolute(), "tempdir path {local:?} should be absolute");
+        assert!(
+            local.is_absolute(),
+            "tempdir path {local:?} should be absolute"
+        );
         assert_eq!(upload_hf.as_deref(), Some("hf://org/repo"));
     }
 
     #[test]
     fn space_without_out_stages_locally_unless_streaming() {
         // --space alone: 3D-off but not streaming → disk-backed sync tempdir.
-        let args =
-            Args::try_parse_from(["arbvis", "a.bin", "--space", "org/space"]).unwrap();
-        let dest = match OutputDest::from_args(&args) { Ok(d) => d, Err(e) => panic!("space-only should be legal: {e}") };
+        let args = Args::try_parse_from(["arbvis", "a.bin", "--space", "org/space"]).unwrap();
+        let dest = match OutputDest::from_args(&args) {
+            Ok(d) => d,
+            Err(e) => panic!("space-only should be legal: {e}"),
+        };
         let OutputDest::Bundle { local, space, .. } = &dest;
-        assert!(local.as_ref().is_some(), "disk-backed space sync stages locally");
+        assert!(
+            local.as_ref().is_some(),
+            "disk-backed space sync stages locally"
+        );
         assert_eq!(space.as_deref(), Some("org/space"));
 
         // 2D --stream --space: uploads go through the bucket sink, no tempdir.
-        let args = Args::try_parse_from([
-            "arbvis",
-            "a.bin",
-            "--stream",
-            "--space",
-            "org/space",
-        ])
-        .unwrap();
-        let dest = match OutputDest::from_args(&args) { Ok(d) => d, Err(e) => panic!("streaming space-only should be legal: {e}") };
+        let args =
+            Args::try_parse_from(["arbvis", "a.bin", "--stream", "--space", "org/space"]).unwrap();
+        let dest = match OutputDest::from_args(&args) {
+            Ok(d) => d,
+            Err(e) => panic!("streaming space-only should be legal: {e}"),
+        };
         let OutputDest::Bundle { local, space, .. } = &dest;
-        assert_eq!(local.as_deref(), None, "streaming space sync must not stage locally");
+        assert_eq!(
+            local.as_deref(),
+            None,
+            "streaming space sync must not stage locally"
+        );
         assert_eq!(space.as_deref(), Some("org/space"));
     }
 

@@ -429,7 +429,8 @@ impl<'a> Parser<'a> {
                         Some(b't') => out.push('\t'),
                         Some(b'u') => {
                             let cp = self.parse_hex4()?;
-                            // Surrogate pair handling: if cp is a high surrogate, expect \uXXXX low surrogate.
+                            // Surrogate pair handling: if cp is a high surrogate, expect a
+                            // \uXXXX low surrogate.
                             if (0xD800..=0xDBFF).contains(&cp) {
                                 if self.advance() != Some(b'\\') || self.advance() != Some(b'u') {
                                     return Err(

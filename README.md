@@ -1,6 +1,6 @@
 # arbvis
 
-Visualize arbitrary binary files in a way that makes structure visible at a glance. arbvis lays bytes out along a [Hilbert curve](https://en.wikipedia.org/wiki/Hilbert_curve) and colors them by value range. Null regions, ASCII text, compressed payloads, and section boundaries all produce recognizable visual signatures. The default 2D mode renders a zoomable image (one pixel per byte); the [3D mode](#3d-mode) lifts the same idea into a volume you can fly through, using opacity to reveal the cube's interior.
+Visualize arbitrary binary files in a way that makes structure visible at a glance. arbvis lays bytes out along a [Hilbert curve](https://en.wikipedia.org/wiki/Hilbert_curve) and colors them by value range. Null regions, ASCII text, compressed payloads, and section boundaries all produce recognizable visual signatures. The default 2D mode renders a zoomable image (one pixel per byte); the [3D mode](#3d-mode--3d) lifts the same idea into a volume you can fly through, using opacity to reveal the cube's interior.
 
 **For ML model weights**, use [**modelweightvis**](https://github.com/znation/modelweightvis), built on top of arbvis. arbvis renders `.safetensors` / `.gguf` / `.bin` checkpoints as raw bytes; modelweightvis adds tensor-format parsing, an architectural layout that stacks transformer blocks at each tensor's natural element shape, MoE expert-vs-expert diffs, finetune auto-detection, and dtype-aware coloring. Architecturally, modelweightvis is a thin crate that registers tensor-aware plugins and hooks against arbvis's registry — see [Relationship to modelweightvis](#relationship-to-modelweightvis) below.
 
@@ -129,7 +129,7 @@ In 2D this generates a Leaflet pyramid (`out/tiles/{z}/{x}/{y}.{ext}`, `out/inde
 - No size limit — works on files of any size; lower zoom levels are averaged.
 - HTML labels positioned at each region's area-weighted centroid.
 
-In `--3d` it generates the volume bundle (`index.html`, `volume.bin`, `bricks.bin`, `pagetable.bin`, `meta.json`) — see [3D mode](#3d-mode). Either bundle loads its rendering library from a CDN and fetches its data over HTTP, so open `index.html` through a web server, not a `file://` URL.
+In `--3d` it generates the volume bundle (`index.html`, `volume.bin`, `bricks.bin`, `pagetable.bin`, `meta.json`) — see [3D mode](#3d-mode--3d). Either bundle loads its rendering library from a CDN and fetches its data over HTTP, so open `index.html` through a web server, not a `file://` URL.
 
 ![arbvis screenshot](arbvis.png)
 

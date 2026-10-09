@@ -581,23 +581,44 @@ fn json_str(s: &str) -> String {
 /// max_zoom, detail_depth, files: [...] }, ... ] }`. Per-scene geometry is
 /// persisted so [`crate::tiled::regen_html`] can rebuild the viewer without
 /// scanning the (now per-scene) tile directories.
+/// Comma-separated `name:value` serialization of the ten per-scene fields
+/// shared by the labels-JSON object and the viewer's JS literal. Keys are
+/// double-quoted when `quoted_keys` (JSON); bare otherwise (JS literal).
+/// String values go through [`json_str`]; numeric values render bare.
+fn scene_fields(s: &SceneView, quoted_keys: bool) -> String {
+    let key = |name: &str| {
+        if quoted_keys {
+            format!("\"{name}\"")
+        } else {
+            name.to_string()
+        }
+    };
+    [
+        ("key", json_str(s.key.as_deref().unwrap_or(""))),
+        ("label", json_str(&s.label)),
+        ("world_w", s.world_w.to_string()),
+        ("world_h", s.world_h.to_string()),
+        ("width", s.width.to_string()),
+        ("height", s.height.to_string()),
+        ("max_zoom", s.max_zoom.to_string()),
+        ("detail_depth", s.detail_depth.to_string()),
+        ("leaf_ext", json_str(&s.leaf_ext)),
+        ("pyramid_ext", json_str(&s.pyramid_ext)),
+    ]
+    .map(|(name, value)| format!("{}:{}", key(name), value))
+    .join(",")
+}
+
 fn build_labels_json_scenes(scenes: &[SceneView]) -> String {
     let arr: Vec<String> = scenes
         .iter()
         .map(|s| {
             format!(
-                "{{\"key\":{key},\"label\":{label},\"order\":{order},\"world_w\":{ww},\"world_h\":{wh},\"width\":{w},\"height\":{h},\"max_zoom\":{mz},\"detail_depth\":{dd},\"leaf_ext\":{le},\"pyramid_ext\":{pe},\"files\":{files}}}",
-                key = json_str(s.key.as_deref().unwrap_or("")),
-                label = json_str(&s.label),
+                "{{{fields},\"order\":{order},\"files\":{files}}}",
+                fields = scene_fields(s, true),
+                // Keep `order` adjacent to the identifying fields for humans;
+                // JSON is parsed by key (regen.rs), so placement is free.
                 order = s.order,
-                ww = s.world_w,
-                wh = s.world_h,
-                w = s.width,
-                h = s.height,
-                mz = s.max_zoom,
-                dd = s.detail_depth,
-                le = json_str(&s.leaf_ext),
-                pe = json_str(&s.pyramid_ext),
                 files = entities_to_json(&s.entities),
             )
         })
@@ -609,21 +630,7 @@ fn build_labels_json_scenes(scenes: &[SceneView]) -> String {
 fn scenes_js_literal(scenes: &[SceneView]) -> String {
     let items: Vec<String> = scenes
         .iter()
-        .map(|s| {
-            format!(
-                "{{key:{key},label:{label},world_w:{ww},world_h:{wh},width:{w},height:{h},max_zoom:{mz},detail_depth:{dd},leaf_ext:{le},pyramid_ext:{pe}}}",
-                key = json_str(s.key.as_deref().unwrap_or("")),
-                label = json_str(&s.label),
-                ww = s.world_w,
-                wh = s.world_h,
-                w = s.width,
-                h = s.height,
-                mz = s.max_zoom,
-                dd = s.detail_depth,
-                le = json_str(&s.leaf_ext),
-                pe = json_str(&s.pyramid_ext),
-            )
-        })
+        .map(|s| format!("{{{}}}", scene_fields(s, false)))
         .collect();
     format!("[{}]", items.join(","))
 }

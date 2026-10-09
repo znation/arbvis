@@ -1220,7 +1220,10 @@ mod mode_helpers_tests {
         };
         // Fills: UnmatchedRegion sources at their cumulative offsets, sorted
         // by start and non-overlapping (the contract documented on LeafMode::Diff).
-        assert_eq!(&fills[..], &[(40, 50, DiffFill::Red), (75, 90, DiffFill::Grey)]);
+        assert_eq!(
+            &fills[..],
+            &[(40, 50, DiffFill::Red), (75, 90, DiffFill::Grey)]
+        );
         // Tints: the OneSidedRange source at its own cumulative offset.
         assert_eq!(&tints[..], &[(55, 75, DiffFill::Green)]);
         // Plain sources contribute to the cumulative offsets without adding
@@ -1260,7 +1263,13 @@ mod mode_helpers_tests {
         };
         // Avif over Plain (≤256 colors) downgrades to indexed PNG.
         assert!(matches!(
-            derive_leaf_format(TileFormat::Avif { quality: 50, speed: 6 }, &plain),
+            derive_leaf_format(
+                TileFormat::Avif {
+                    quality: 50,
+                    speed: 6
+                },
+                &plain
+            ),
             TileFormat::IndexedPng
         ));
         // Xet tiles can exceed 256 distinct colors: Avif stays Avif.
@@ -1270,9 +1279,15 @@ mod mode_helpers_tests {
             tableau: Arc::new([image::Rgb([0, 0, 0]); 20]),
         };
         assert!(matches!(
-            derive_leaf_format(TileFormat::Avif { quality: 50, speed: 6 }, &xet),
+            derive_leaf_format(
+                TileFormat::Avif {
+                    quality: 50,
+                    speed: 6
+                },
+                &xet
+            ),
             TileFormat::Avif { .. }
-        ));        // Non-AVIF choices pass through unchanged even in palette-safe modes.
+        )); // Non-AVIF choices pass through unchanged even in palette-safe modes.
         assert!(matches!(
             derive_leaf_format(TileFormat::IndexedPng, &plain),
             TileFormat::IndexedPng

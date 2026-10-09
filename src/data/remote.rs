@@ -18,7 +18,9 @@ use super::{Data, Extensions, InputSpec, Source, SourceKind};
 /// safetensors header fetches, non-safetensors diff downloads). The global
 /// AIMD throttle still caps the *actual* in-flight count; this just lets the
 /// runtime have enough simultaneous awaiting tasks to keep the throttle full.
-const SETUP_FETCH_CONCURRENCY: usize = 16;
+/// Also shared with `providers::resolve_input_sources` (input resolution), so
+/// every setup-time stage stays user-visibly consistent.
+pub(crate) const SETUP_FETCH_CONCURRENCY: usize = 16;
 
 /// Build sources from a mixed list of local paths and remote HF file specs.
 /// Remote specs are turned into `SourceKind::Http` entries (no download).

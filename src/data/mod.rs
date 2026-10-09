@@ -34,6 +34,7 @@ pub type LazyFetcher =
 /// sites (`data::prepare_sources`, `diff.rs`) and the `lib.rs` surface intact.
 mod remote;
 mod source;
+pub(crate) use remote::SETUP_FETCH_CONCURRENCY;
 pub use remote::{
     download_specs_to_paths, materialize_http_sources, populate_xet_terms,
     prepare_sources_from_specs,

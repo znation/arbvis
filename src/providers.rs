@@ -14,11 +14,6 @@ use crate::data::{self, InputSpec, Source};
 use crate::hf_url;
 use crate::registry::{Registry, RenderHints, SourceCtx, SourceProvider};
 
-/// Concurrency cap when resolving (downloading) `hf://` inputs at startup.
-/// Mirrors `data::SETUP_FETCH_CONCURRENCY` so user-visible parallelism stays
-/// consistent across the input-resolution and materialisation stages.
-const RESOLVE_CONCURRENCY: usize = 16;
-
 /// Byte/JSON diff over a `--diff` pair (priority 100). Resolves both sides
 /// (local path or single-file `hf://`) and dispatches through the file-pair
 /// builder cascade or [`crate::data_diff::byte_directory_diff`].
@@ -131,7 +126,7 @@ pub(crate) async fn resolve_input_sources(
     if !stream && !show_xet_xorbs {
         let resolved: Vec<PathBuf> =
             futures::stream::iter(files.iter().cloned().map(resolve_input))
-                .buffered(RESOLVE_CONCURRENCY)
+                .buffered(data::SETUP_FETCH_CONCURRENCY)
                 .try_collect()
                 .await?;
         return data::prepare_sources(&resolved, registry);
@@ -161,7 +156,7 @@ pub(crate) async fn resolve_input_sources(
             anyhow::Ok(vec![InputSpec::Local(p)])
         }
     }))
-    .buffered(RESOLVE_CONCURRENCY)
+    .buffered(data::SETUP_FETCH_CONCURRENCY)
     .try_collect::<Vec<_>>()
     .await?
     .into_iter()

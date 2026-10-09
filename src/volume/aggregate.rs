@@ -139,12 +139,30 @@ pub(super) fn aggregate_bytes_hilbert(
     };
 
     for src in &sources {
-        let data = load_source_data(src)?;
+        let data = std::sync::Arc::new(load_source_data(src)?);
         let size = src.byte_size;
         let mut local: u64 = 0;
+        // One-chunk-ahead pipeline: the fetch of chunk i+1 is spawned before
+        // chunk i is scattered, hiding one round-trip per 4 MiB chunk behind
+        // the per-byte Hilbert aggregation work. `pending` always holds the
+        // fetch for the chunk at the next `local`, so ranges stay in order and
+        // each chunk is fetched exactly once.
+        let mut pending: Option<tokio::task::JoinHandle<anyhow::Result<Vec<u8>>>> = None;
         while local < size {
             let len = (size - local).min(CHUNK) as usize;
-            let buf = rt.block_on(data.fetch_range(local, len))?;
+            let buf = match pending.take() {
+                Some(h) => rt
+                    .block_on(h)
+                    .context("chunk fetch task panicked")?
+                    .context("prefetched chunk fetch failed")?,
+                None => rt.block_on(data.fetch_range(local, len))?,
+            };
+            let next = local + len as u64;
+            if next < size {
+                let d = std::sync::Arc::clone(&data);
+                let nlen = (size - next).min(CHUNK) as usize;
+                pending = Some(rt.spawn(async move { d.fetch_range(next, nlen).await }));
+            }
             for (i, &b) in buf.iter().enumerate() {
                 let g = global_start + local + i as u64;
 
@@ -174,7 +192,7 @@ pub(super) fn aggregate_bytes_hilbert(
                     }
                 }
             }
-            local += len as u64;
+            local = next;
         }
         global_start += size;
     }
@@ -598,5 +616,95 @@ mod tests {
         let (center, radius) = occupied_focus_cells(&grid, [2, 2, 2]);
         assert_eq!(center, [0.0, 0.0, 0.0]);
         assert_eq!(radius, 0.5);
+    }
+
+    /// The one-chunk-ahead fetch pipeline in `aggregate_bytes_hilbert` must
+    /// request each CHUNK window exactly once, in ascending order, feed the
+    /// aggregator the identical bytes a local `Buffered` source would, and —
+    /// what actually distinguishes pipelining from the old serialized loop —
+    /// fetch every chunk after the first from inside a spawned runtime task
+    /// (so it overlaps the previous chunk's scatter), while the first chunk
+    /// is awaited directly under `block_on`.
+    #[test]
+    fn aggregate_fetches_chunks_once_in_ascending_order_and_matches_buffered() {
+        use crate::color::build_pixel_lut;
+        use crate::data::{Data, DiffFill, SourceKind};
+
+        let len = 2 * CHUNK as usize + 1000;
+        let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let expected: Vec<(u64, usize, bool)> = vec![
+            (0, CHUNK as usize, false),
+            (CHUNK, CHUNK as usize, true),
+            (2 * CHUNK, 1000, true),
+        ];
+
+        let served = bytes.clone();
+        let rec = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let caller = std::thread::current().id();
+        let fetcher: crate::data::LazyFetcher = {
+            let served = std::sync::Arc::new(served);
+            let rec = std::sync::Arc::clone(&rec);
+            std::sync::Arc::new(move |start: u64, len: usize| {
+                let served = std::sync::Arc::clone(&served);
+                let rec = std::sync::Arc::clone(&rec);
+                Box::pin(async move {
+                    // On a multi-thread runtime, `block_on` polls the root
+                    // future on the calling thread, while `spawn`ed tasks are
+                    // polled only on runtime worker threads — so a different
+                    // thread id proves this fetch came from the prefetch task.
+                    let in_task = std::thread::current().id() != caller;
+                    rec.lock().unwrap().push((start, len, in_task));
+                    let s = start as usize;
+                    Ok(served[s..s + len].to_vec())
+                })
+            })
+        };
+        let src = Source {
+            file_idx: 0,
+            kind: SourceKind::OneSidedRange {
+                data: std::sync::Arc::new(Data::LazyDiff(fetcher)),
+                start: 0,
+                fill: DiffFill::Grey,
+            },
+            byte_size: len as u64,
+            name_override: None,
+            xet_terms: None,
+            extensions: Default::default(),
+        };
+        let buffered = Source {
+            file_idx: 0,
+            kind: SourceKind::Buffered(bytes),
+            byte_size: len as u64,
+            name_override: None,
+            xet_terms: None,
+            extensions: Default::default(),
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let lut = build_pixel_lut();
+        let dir = tempfile::tempdir().unwrap();
+        let pipelined = aggregate_bytes_hilbert(
+            vec![src],
+            len as u64,
+            32,
+            32,
+            lut,
+            rt.handle().clone(),
+            dir.path(),
+        )
+        .unwrap();
+        let local = aggregate_bytes_hilbert(
+            vec![buffered],
+            len as u64,
+            32,
+            32,
+            lut,
+            rt.handle().clone(),
+            dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(*rec.lock().unwrap(), expected);
+        assert_eq!(pipelined.volume_rgba, local.volume_rgba);
     }
 }

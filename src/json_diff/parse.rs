@@ -108,11 +108,22 @@ fn ws_sentinel_element(ws: Range<u64>) -> Child {
 struct Parser<'a> {
     src: &'a [u8],
     pos: usize,
+    depth: u32,
 }
+
+/// Maximum object/array nesting the parser will traverse. Each level costs a
+/// stack frame, so a hostile or accidentally degenerate document with tens of
+/// thousands of nested containers would otherwise overflow the stack and abort
+/// the process instead of returning a [`ParseError`].
+const MAX_DEPTH: u32 = 512;
 
 impl<'a> Parser<'a> {
     fn new(src: &'a [u8]) -> Self {
-        Parser { src, pos: 0 }
+        Parser {
+            src,
+            pos: 0,
+            depth: 0,
+        }
     }
 
     fn err(&self, msg: impl Into<String>) -> ParseError {
@@ -179,8 +190,18 @@ impl<'a> Parser<'a> {
     fn parse_value(&mut self) -> Result<Node, ParseError> {
         let start = self.pos;
         match self.peek() {
-            Some(b'{') => self.parse_object(),
-            Some(b'[') => self.parse_array(),
+            Some(b'{') => {
+                self.enter_container()?;
+                let r = self.parse_object();
+                self.depth -= 1;
+                r
+            }
+            Some(b'[') => {
+                self.enter_container()?;
+                let r = self.parse_array();
+                self.depth -= 1;
+                r
+            }
             Some(b'"') => {
                 let (_decoded, end) = self.parse_string_at(start)?;
                 Ok(Node {
@@ -196,6 +217,18 @@ impl<'a> Parser<'a> {
             Some(b) => Err(self.err(format!("unexpected byte 0x{b:02x} at start of value"))),
             None => Err(self.err("unexpected EOF where value expected")),
         }
+    }
+
+    /// Count one level of container nesting, rejecting documents deeper than
+    /// [`MAX_DEPTH`] with a normal [`ParseError`] instead of a stack overflow.
+    fn enter_container(&mut self) -> Result<(), ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(self.err(format!(
+                "nesting deeper than the maximum of {MAX_DEPTH} levels"
+            )));
+        }
+        Ok(())
     }
 
     fn parse_object(&mut self) -> Result<Node, ParseError> {
@@ -776,5 +809,29 @@ mod tests {
         for s in inputs {
             rt(s);
         }
+    }
+
+    #[test]
+    fn deep_nesting_within_limit_parses() {
+        // 200 levels is well under MAX_DEPTH (512): must parse and round-trip.
+        let src = format!("{}1{}", "[".repeat(200), "]".repeat(200));
+        parse(src.as_bytes()).expect("nesting below MAX_DEPTH must parse");
+    }
+
+    #[test]
+    fn deep_nesting_beyond_limit_is_a_parse_error_not_a_crash() {
+        // Far past MAX_DEPTH: the parser must report a normal ParseError
+        // instead of overflowing the stack and aborting the process.
+        let src = "[".repeat(100_000);
+        let err = parse(src.as_bytes()).expect_err("over-deep nesting must fail");
+        assert!(err.msg.contains("maximum"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn deep_object_nesting_beyond_limit_is_a_parse_error() {
+        let src = format!("{}{}", "{\"a\":".repeat(100_000), "}".repeat(100_000));
+        // Nested-object chain must fail with a depth error, not overflow.
+        let err = parse(src.as_bytes()).expect_err("over-deep object nesting must fail");
+        assert!(err.msg.contains("maximum"), "unexpected error: {err}");
     }
 }

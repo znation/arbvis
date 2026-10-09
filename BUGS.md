@@ -8,6 +8,19 @@ unclear-invariant).
 
 ## Open
 
+### `cargo fmt --check` fails on main (pre-existing drift, not from the Space-app tick)
+
+**Found by improve 2026-10-09.** `cargo fmt --check` reports rustfmt diffs in
+`src/data/source.rs` (~line 304, a boolean `&&` chain in a test assert) and
+`src/volume/html/mod.rs` (~lines 36–48, two test-fn formatting sites). The drift
+is committed on main — `git status` showed only the Space-app tick's two Python
+files modified, and the diffs came from HEAD's versions of those Rust files.
+Fix is mechanical: run `cargo fmt` on those two files (or the tree) and commit;
+no behavior change. Not done in the originating tick because it touched only
+`src/space_template/*` and wanted a code-free diff to review.
+
+_Reproduce:_ `cargo fmt --check 2>&1 | grep '^Diff in'`.
+
 _None yet._
 
 ## Fixed

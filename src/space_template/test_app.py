@@ -150,15 +150,38 @@ class RangeStreamingTest(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.content, self.data)
 
+    def test_no_range_missing_file_gets_404_not_500(self):
+        # cached_size succeeded (the size cache is pre-seeded in setUp), so a
+        # FileNotFoundError can only come from the open itself (asset vanished
+        # between the metadata call and the open). That open happens inside
+        # body() in the template... no: up front — so the client must see 404,
+        # not a 200 with a truncated, error-terminated stream.
+        class VanishedFS:
+            def size(self, path):
+                return len(vfs.data)
+
+            def open(self, path, mode="rb", block_size=None):
+                raise FileNotFoundError(path)
+
+        vfs = self
+        self.mod._fs = VanishedFS()
+        self.mod._fs = VanishedFS()
+        client = TestClient(self.mod.app, raise_server_exceptions=False)
+        r = client.get("/bricks.bin")
+        self.assertEqual(r.status_code, 404)
+
     def test_oversized_range_digit_string_gets_400_not_500(self):
         # Python >=3.11 raises ValueError when int() sees more digits than the
-        # interpreter's max-digit limit; the Range header is attacker
-        # controlled on this public endpoint, so the route must answer 400
-        # instead of letting that escape as an unhandled 500.
+        # interpreter's max-digit limit, which the template turns into 400. On
+        # older interpreters the int parses fine: the open-ended form then has
+        # start >= size (416), and the suffix form "bytes=-N" with N >= size
+        # clamps to the whole file (206, correct per RFC 9110). The invariant
+        # is only that the attacker-controlled header never surfaces as an
+        # unhandled 500.
         r = self.client.get("/bricks.bin", headers={"Range": "bytes=" + "9" * 5000 + "-"})
-        self.assertEqual(r.status_code, 400)
+        self.assertIn(r.status_code, (400, 416))
         r = self.client.get("/bricks.bin", headers={"Range": "bytes=-" + "9" * 5000})
-        self.assertEqual(r.status_code, 400)
+        self.assertIn(r.status_code, (400, 416, 206))
         # A normal open-ended range still works after the hardening.
         r = self.client.get("/bricks.bin", headers={"Range": "bytes=0-"})
         self.assertEqual(r.status_code, 206)

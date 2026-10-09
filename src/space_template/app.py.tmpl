@@ -304,10 +304,18 @@ def asset(rest: str, request: Request):
     # labels.json, and a defensively-large volume.bin) streams in fixed chunks so
     # peak RAM is one `_CHUNK`, never the whole file — and nothing accumulates
     # across requests (the stream file uses `cache_type="none"`).
+    # Open up front, inside the request, so a vanished asset answers 404 —
+    # otherwise the error escapes the generator after the 200 headers are
+    # already sent and the client sees a truncated, error-terminated stream.
+    try:
+        fobj = fs().open(path, "rb", block_size=0)
+    except (FileNotFoundError, EntryNotFoundError):
+        return Response(status_code=404)
+
     def body():
-        with fs().open(path, "rb", block_size=0) as f:
+        with fobj:
             while True:
-                chunk = f.read(_CHUNK)
+                chunk = fobj.read(_CHUNK)
                 if not chunk:
                     break
                 yield chunk

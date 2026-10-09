@@ -94,6 +94,9 @@ pub struct HfTreeLfs {
 #[derive(Debug)]
 pub enum HfCliError {
     Spawn(std::io::Error),
+    /// Reading the child's stdout failed mid-stream; the captured output is
+    /// truncated, so it must not be parsed or acted on.
+    StdoutRead(std::io::Error),
     Exit {
         argv: String,
         status: ExitStatus,
@@ -126,6 +129,10 @@ impl std::fmt::Display for HfCliError {
                     "decoding `hf {argv}` JSON output failed: {source}\nstderr tail: {stderr_excerpt}"
                 )
             }
+            HfCliError::StdoutRead(e) => write!(
+                f,
+                "reading `hf` CLI output failed mid-stream ({e}); captured stdout is incomplete"
+            ),
             HfCliError::TimedOut { argv, seconds } => {
                 write!(
                     f,
@@ -140,6 +147,7 @@ impl std::error::Error for HfCliError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             HfCliError::Spawn(e) => Some(e),
+            HfCliError::StdoutRead(e) => Some(e),
             HfCliError::Exit { .. } => None,
             HfCliError::JsonDecode { source, .. } => Some(source),
             HfCliError::TimedOut { .. } => None,
@@ -156,6 +164,9 @@ impl ErrorClassify for HfCliError {
         match self {
             // Missing binary won't fix itself — don't burn the AIMD retry budget on it.
             HfCliError::Spawn(_) => Outcome::Permanent,
+            // Truncated output: retrying won't heal a failed pipe read, and
+            // acting on partial output would be silently wrong.
+            HfCliError::StdoutRead(_) => Outcome::Permanent,
             HfCliError::JsonDecode { .. } => Outcome::Permanent,
             HfCliError::Exit { stderr_excerpt, .. } => {
                 let s = stderr_excerpt.to_ascii_lowercase();
@@ -279,6 +290,18 @@ fn exit_error(argv_display: String, status: ExitStatus, stderr_excerpt: String) 
 /// stderr is forwarded to the parent process's stderr line-by-line as it
 /// arrives, AND a bounded tail is kept for the error excerpt. stdout is
 /// captured in full (it carries `--json` payloads).
+/// Read `reader` to end, propagating read errors so a failed capture is
+/// never mistaken for complete output. Tested with a reader that fails
+/// mid-stream (see `failing_read_propagates_error`).
+async fn read_all<R>(mut reader: R) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).await?;
+    Ok(buf)
+}
+
 async fn run_and_capture<I, S>(args: I) -> Result<(ExitStatus, Vec<u8>, String), HfCliError>
 where
     I: IntoIterator<Item = S> + Clone,
@@ -321,12 +344,9 @@ where
 
     // Read all of stdout into a buffer (no size cap — JSON payloads can be
     // large for repo listings, and truncating mid-array breaks the parser).
-    let stdout_task = tokio::spawn(async move {
-        let mut reader = stdout;
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf).await;
-        buf
-    });
+    // A read error is propagated (not swallowed): truncated output must fail
+    // loudly rather than be parsed as if complete.
+    let stdout_task = tokio::spawn(read_all(stdout));
 
     let timeout_secs = hf_timeout_secs();
     let status = match timeout_secs {
@@ -349,7 +369,14 @@ where
         None => child.wait().await.map_err(HfCliError::Spawn)?,
     };
 
-    let stdout = stdout_task.await.unwrap_or_default();
+    let stdout = match stdout_task.await {
+        Ok(Ok(buf)) => buf,
+        Ok(Err(e)) => return Err(HfCliError::StdoutRead(e)),
+        Err(join) => {
+            let e = std::io::Error::other(format!("stdout capture task failed: {join}"));
+            return Err(HfCliError::StdoutRead(e));
+        }
+    };
     let _ = stderr_task.await;
     let stderr_tail = {
         let buf = stderr_buf.lock().await;
@@ -463,6 +490,44 @@ pub async fn check_hf_available() -> Result<String, HfCliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reader that serves a few bytes, then fails: simulates a pipe error
+    /// mid-capture of the child's stdout.
+    struct FailingReader {
+        yielded: usize,
+    }
+
+    impl tokio::io::AsyncRead for FailingReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.yielded == 0 {
+                self.yielded += 1;
+                buf.put_slice(b"partial");
+                return std::task::Poll::Ready(Ok(()));
+            }
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected mid-stream failure",
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn read_all_propagates_mid_stream_read_error_instead_of_silently_truncating() {
+        let err = read_all(FailingReader { yielded: 0 })
+            .await
+            .expect_err("a mid-stream read failure must not be swallowed into truncated output");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn read_all_collects_full_output_on_success() {
+        let buf = read_all(&b"{\"ok\": 1}"[..]).await.unwrap();
+        assert_eq!(buf, b"{\"ok\": 1}");
+    }
 
     #[test]
     fn parse_hf_timeout_values() {

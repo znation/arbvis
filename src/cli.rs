@@ -393,6 +393,52 @@ pub(crate) fn ignored_3d_flags_warning(ignored: &[&str]) -> String {
     }
 }
 
+/// Flags that have no effect under `--regen-html`: that path rewrites
+/// `index.html`/`labels.json` in an existing viewer bundle and returns before
+/// any input collection, rendering, or destination resolution happens, so
+/// those flags are silently ignored. Clap already conflicts `--regen-html`
+/// with `--diff`, `--out`, `--space`, positional FILES, and `--png`, and `--3d`
+/// selects which regen path runs, so none of those appear here. Defaults
+/// (1024 grid, 0 volume-res, no flags set) yield an empty list.
+pub(crate) fn regen_html_ignored_flags(args: &Args) -> Vec<&'static str> {
+    let mut flags = Vec::new();
+    if args.file_list.is_some() {
+        flags.push("--file-list");
+    }
+    if args.stream {
+        flags.push("--stream");
+    }
+    if args.show_xet_xorbs {
+        flags.push("--show-xet-xorbs");
+    }
+    if args.tile_format.is_some() {
+        flags.push("--tile-format");
+    }
+    if args.grid != 1024 {
+        flags.push("--grid");
+    }
+    if args.volume_res != 0 {
+        flags.push("--volume-res");
+    }
+    flags
+}
+
+/// Warning text for `--regen-html` runs that set regen-ignored flags, with the
+/// verb and pronoun agreeing with how many flags are actually set.
+pub(crate) fn regen_html_ignored_warning(ignored: &[&str]) -> String {
+    if ignored.len() == 1 {
+        format!(
+            "{} has no effect with --regen-html; ignoring it",
+            ignored[0]
+        )
+    } else {
+        format!(
+            "{} have no effect with --regen-html; ignoring them",
+            ignored.join(", ")
+        )
+    }
+}
+
 /// Pick the viewer title: the user's `--title` if set, else the brand name
 /// with a mode suffix (`"{name} moe"` / `"{name} diff"`, or just `"{name}"`
 /// when `suffix` is empty). Built once per run, so the fallback allocation is
@@ -605,9 +651,11 @@ mod title_validation_tests {
 #[cfg(test)]
 mod grid_validation_tests {
     use super::{
-        ignored_3d_flags, ignored_3d_flags_warning, validate_grid, validate_volume_res,
-        volume_res_ignored_warning,
+        ignored_3d_flags, ignored_3d_flags_warning, regen_html_ignored_flags,
+        regen_html_ignored_warning, validate_grid, validate_volume_res, volume_res_ignored_warning,
+        Args,
     };
+    use clap::Parser;
 
     #[test]
     fn grid_cap_raised_to_16384() {
@@ -644,6 +692,50 @@ mod grid_validation_tests {
         assert_eq!(ignored_3d_flags(512, 0), vec!["--grid"]);
         assert_eq!(ignored_3d_flags(1024, 4096), vec!["--volume-res"]);
         assert_eq!(ignored_3d_flags(512, 4096), vec!["--grid", "--volume-res"]);
+    }
+
+    #[test]
+    fn regen_html_ignored_flags_only_names_non_defaults() {
+        let base = Args::parse_from(["arbvis", "--regen-html", "dir"]);
+        assert!(regen_html_ignored_flags(&base).is_empty());
+        let flagged = Args::parse_from([
+            "arbvis",
+            "--regen-html",
+            "dir",
+            "--file-list",
+            "l.txt",
+            "--stream",
+            "--show-xet-xorbs",
+            "--tile-format",
+            "png",
+            "--grid",
+            "512",
+            "--volume-res",
+            "256",
+        ]);
+        assert_eq!(
+            regen_html_ignored_flags(&flagged),
+            vec![
+                "--file-list",
+                "--stream",
+                "--show-xet-xorbs",
+                "--tile-format",
+                "--grid",
+                "--volume-res",
+            ]
+        );
+    }
+
+    #[test]
+    fn regen_html_ignored_warning_agrees_with_flag_count() {
+        assert_eq!(
+            regen_html_ignored_warning(&["--stream"]),
+            "--stream has no effect with --regen-html; ignoring it"
+        );
+        assert_eq!(
+            regen_html_ignored_warning(&["--file-list", "--stream"]),
+            "--file-list, --stream have no effect with --regen-html; ignoring them"
+        );
     }
 
     #[test]

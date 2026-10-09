@@ -1539,16 +1539,23 @@ mod render_one_tests {
     #[test]
     fn render_one_plain_mode_maps_bytes_and_preserves_tile_coords() {
         let t = loaded_tile(3, 3, 0x40);
-        let out = render_one(t, &plain_mode(), KH, HEIGHT_TILES, SQUARE_PIXELS, SQUARE_PIXELS, TileFormat::IndexedPng)
-            .expect("plain render should succeed");
+        let out = render_one(
+            t,
+            &plain_mode(),
+            KH,
+            HEIGHT_TILES,
+            SQUARE_PIXELS,
+            SQUARE_PIXELS,
+            TileFormat::IndexedPng,
+        )
+        .expect("plain render should succeed");
         assert_eq!((out.tx, out.ty), (3, 3));
         assert_eq!(out.image.dimensions(), (leaf::TILE, leaf::TILE));
         // Every tile byte is 0x40, so the LUT color for 0x40 must appear.
         let expected = build_pixel_lut()[0x40];
-        assert!(out
-            .image
-            .pixels()
-            .all(|p| p.0[0] == expected.0[0] && p.0[1] == expected.0[1] && p.0[2] == expected.0[2]));
+        assert!(out.image.pixels().all(|p| p.0[0] == expected.0[0]
+            && p.0[1] == expected.0[1]
+            && p.0[2] == expected.0[2]));
         assert!(!out.bytes.is_empty(), "encoded bytes must not be empty");
     }
 
@@ -1571,10 +1578,9 @@ mod render_one_tests {
         .expect("xet render should succeed");
         assert_eq!(out.image.dimensions(), (leaf::TILE, leaf::TILE));
         let expected = build_pixel_lut()[0x7f];
-        assert!(out
-            .image
-            .pixels()
-            .all(|p| p.0[0] == expected.0[0] && p.0[1] == expected.0[1] && p.0[2] == expected.0[2]));
+        assert!(out.image.pixels().all(|p| p.0[0] == expected.0[0]
+            && p.0[1] == expected.0[1]
+            && p.0[2] == expected.0[2]));
     }
 
     #[test]
@@ -1623,7 +1629,15 @@ mod render_one_tests {
                 extra: None,
             };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = render_one(tile, &mode, KH, HEIGHT_TILES, SQUARE_PIXELS, SQUARE_PIXELS, TileFormat::IndexedPng);
+                let _ = render_one(
+                    tile,
+                    &mode,
+                    KH,
+                    HEIGHT_TILES,
+                    SQUARE_PIXELS,
+                    SQUARE_PIXELS,
+                    TileFormat::IndexedPng,
+                );
             }));
             assert!(result.is_err(), "expected panic");
         }
@@ -1663,7 +1677,12 @@ mod render_one_tests {
     fn xet_xorb_ranges_is_empty_without_xet_terms() {
         let sources = vec![
             source(SourceKind::Buffered(vec![]), 10),
-            source(SourceKind::UnmatchedRegion { fill: DiffFill::Grey }, 4),
+            source(
+                SourceKind::UnmatchedRegion {
+                    fill: DiffFill::Grey,
+                },
+                4,
+            ),
         ];
         let map = xet_xorb_ranges(&sources, &[0, 10]);
         assert!(map.is_empty());
@@ -1759,8 +1778,10 @@ mod plan_pipeline_tests {
         .await
         .unwrap();
         let LeafMode::Xet { xorb_ranges, .. } = &plan.mode else {
-            panic!("expected LeafMode::Xet, got {:?}",
-                std::mem::discriminant(&plan.mode));
+            panic!(
+                "expected LeafMode::Xet, got {:?}",
+                std::mem::discriminant(&plan.mode)
+            );
         };
         assert_eq!(&**xorb_ranges, &[(0, 10, 0), (15, 18, 1)]);
         assert_eq!(&*plan.cumulative_offsets, &[0, 10]);
@@ -1789,4 +1810,3 @@ mod plan_pipeline_tests {
         assert_eq!(seen.len() as u32, expected, "coordinates are unique");
     }
 }
-

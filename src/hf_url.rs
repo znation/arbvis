@@ -424,11 +424,23 @@ pub fn read_token() -> Option<String> {
         format!("{home}/.cache/huggingface")
     });
     let token_file = PathBuf::from(&hf_home).join("token");
-    if let Ok(s) = std::fs::read_to_string(&token_file) {
-        let t = s.trim();
-        if !t.is_empty() {
-            return Some(t.to_string());
+    match std::fs::read_to_string(&token_file) {
+        Ok(s) => {
+            let t = s.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
         }
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            // A missing token file is the normal no-token case; any other
+            // failure (permissions, it being a directory, a partial read)
+            // silently dropping the token would surface later as a confusing
+            // 401, so say why the token was ignored here instead.
+            log::warn!(
+                "default token file {token_file:?} exists but could not be read ({e}); ignoring it"
+            );
+        }
+        Err(_) => {}
     }
     None
 }
@@ -1018,6 +1030,10 @@ pub fn parse_hf_output(hf_url_str: &str) -> anyhow::Result<HfOutputSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate process-global HF_* env vars.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn parse_endpoint_accepts_http_and_https_and_strips_trailing_slashes() {
@@ -1036,7 +1052,86 @@ mod tests {
     }
 
     #[test]
+    fn read_token_warns_when_default_token_file_is_unreadable_but_exists() {
+        let _env = ENV_LOCK.lock().unwrap();
+        use std::sync::{Mutex, OnceLock};
+
+        // One-shot capture logger for the whole test binary; log::set_boxed_logger
+
+        // One-shot capture logger for the whole test binary; log::set_boxed_logger
+        // only succeeds once, so guard it and tolerate a previous winner.
+        static CAPTURE: OnceLock<Mutex<Vec<(log::Level, String)>>> = OnceLock::new();
+        struct Capture;
+        impl log::Log for Capture {
+            fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                CAPTURE
+                    .get_or_init(|| Mutex::new(Vec::new()))
+                    .lock()
+                    .unwrap()
+                    .push((record.level(), record.args().to_string()));
+            }
+            fn flush(&self) {}
+        }
+        let _ = log::set_boxed_logger(Box::new(Capture));
+        log::set_max_level(log::LevelFilter::Warn);
+
+        let prev_disable = std::env::var("HF_HUB_DISABLE_IMPLICIT_TOKEN").ok();
+        let prev_token = std::env::var("HF_TOKEN").ok();
+        let prev_path = std::env::var("HF_TOKEN_PATH").ok();
+        let prev_home = std::env::var("HF_HOME").ok();
+        std::env::remove_var("HF_HUB_DISABLE_IMPLICIT_TOKEN");
+        let home =
+            std::env::temp_dir().join(format!("arbvis-token-dir-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("create temp HF_HOME");
+        std::env::set_var("HF_HOME", &home);
+        std::env::remove_var("HF_TOKEN");
+        std::env::remove_var("HF_TOKEN_PATH");
+
+        // The default token file exists but is a directory, so reading it fails
+        // with a non-NotFound error: the token is dropped (None) and a warning
+        // is logged instead of failing silently.
+        let token_file = home.join("token");
+        std::fs::create_dir_all(&token_file).expect("make token a directory");
+        assert_eq!(read_token(), None);
+
+        let capture = CAPTURE
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap();
+        assert!(capture
+            .iter()
+            .any(|(level, msg)| *level == log::Level::Warn && msg.contains("could not be read")));
+        drop(capture);
+
+        let (d, t, p, h) = (prev_disable, prev_token, prev_path, prev_home);
+        if let Some(v) = d {
+            std::env::set_var("HF_HUB_DISABLE_IMPLICIT_TOKEN", v);
+        } else {
+            std::env::remove_var("HF_HUB_DISABLE_IMPLICIT_TOKEN");
+        }
+        if let Some(v) = t {
+            std::env::set_var("HF_TOKEN", v);
+        } else {
+            std::env::remove_var("HF_TOKEN");
+        }
+        if let Some(v) = p {
+            std::env::set_var("HF_TOKEN_PATH", v);
+        } else {
+            std::env::remove_var("HF_TOKEN_PATH");
+        }
+        if let Some(v) = h {
+            std::env::set_var("HF_HOME", v);
+        } else {
+            std::env::remove_var("HF_HOME");
+        }
+    }
+
+    #[test]
     fn read_token_warns_and_falls_through_on_blank_hf_token_and_unreadable_path() {
+        let _env = ENV_LOCK.lock().unwrap();
         // Env is process-global in the test binary; save, mutate, restore.
         let prev_disable = std::env::var("HF_HUB_DISABLE_IMPLICIT_TOKEN").ok();
         let prev_token = std::env::var("HF_TOKEN").ok();

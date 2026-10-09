@@ -494,7 +494,6 @@ fn occupied_focus(grid: &[VoxelAcc], extent: [u32; 3]) -> ([f32; 3], f32) {
     box_focus(bmin, bmax, sum, n, extent)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

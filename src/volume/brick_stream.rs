@@ -27,9 +27,7 @@ use crate::geometry::{hilbert3d_node_origin, hilbert_d2xyz};
 /// renders them unchanged, and the full anisotropic `extent` is the `vol_dim`.
 /// `apron` is `0` (nearest filtering): the flat block layout can't carry
 /// neighbour borders. Framing uses the occupied-brick bbox via
-/// [`super::box_focus`].
-///
-/// Fold one occupied brick at voxel-space `origin` (side `brick`) into the
+/// [`super::box_focus`]. Fold one occupied brick at voxel-space `origin` (side `brick`) into the
 /// occupied-region framing stats shared by [`StreamBrickAgg`] and
 /// [`BrickBuilder`]: a running bbox min/max plus a centroid sum that weights
 /// each brick at its voxel-space center (`origin + brick/2`).

@@ -828,6 +828,89 @@ mod tests {
         assert!(err.msg.contains("maximum"), "unexpected error: {err}");
     }
 
+    fn err(s: &[u8], needle: &str) {
+        let e = parse(s).unwrap_err();
+        assert!(
+            e.msg.contains(needle),
+            "expected {:?} in error, got: {}",
+            needle,
+            e
+        );
+    }
+
+    #[test]
+    fn surrogate_pair_decodes_and_round_trips() {
+        // U+1F600 as a UTF-16 surrogate pair: \uD83D\uDE00.
+        let doc = parse(b"{\"\\uD83D\\uDE00\":1}").unwrap();
+        match &doc.root.children[0] {
+            Child::Member { key_decoded, .. } => assert_eq!(key_decoded, "\u{1F600}"),
+            _ => panic!("expected Member"),
+        }
+    }
+
+    #[test]
+    fn basic_escapes_decode() {
+        let doc = parse(br#"{"a\n\t\b\f\r\/\\\"":1}"#).unwrap();
+        match &doc.root.children[0] {
+            Child::Member { key_decoded, .. } => {
+                assert_eq!(key_decoded, "a\n\t\u{0008}\u{000C}\r/\\\"")
+            }
+            _ => panic!("expected Member"),
+        }
+    }
+
+    #[test]
+    fn string_error_paths() {
+        err(b"\"abc", "unterminated string");
+        err(b"\"abc\\", "EOF in escape");
+        err(b"\"a\\x\"", "invalid escape");
+        err(b"\"a\nb\"", "unescaped control byte");
+        err(b"\"a\\uZZ11\"", "invalid hex digit");
+        err(b"\"a\\uD8", "EOF in \\uXXXX");
+        err(b"\"a\\uDC00\"", "unexpected low surrogate");
+        err(
+            b"\"a\\uD83D\"",
+            "expected low surrogate after high surrogate",
+        );
+        err(b"\"a\\uD83D\\u0041\"", "invalid low surrogate");
+        // 4-byte sequences that aren't valid UTF-8.
+        err(b"\"\x80\"", "invalid UTF-8 lead byte");
+        err(b"\"\xC3\"", "invalid UTF-8 continuation");
+        // Malformed multi-byte sequence degrades to U+FFFD but still parses.
+        let doc = parse(b"\"\xC3\xA9\"").unwrap();
+        assert!(matches!(doc.root.kind, NodeKind::String));
+    }
+
+    #[test]
+    fn number_error_paths() {
+        err(b"-", "missing integer part");
+        err(b"--1", "missing integer part");
+        err(b"1.", "empty fraction");
+        err(b"1e", "empty exponent");
+        err(b"1e+", "empty exponent");
+        // Valid signed/exponent forms still parse as a single number.
+        for ok in ["-0.5e-3", "1E+4"] {
+            let doc = parse(ok.as_bytes()).unwrap();
+            assert!(matches!(doc.root.kind, NodeKind::Number), "{ok}");
+        }
+    }
+
+    #[test]
+    fn literal_error_paths() {
+        err(b"truthy", "invalid bool literal");
+        err(b"nul", "invalid null literal");
+        err(b"x", "unexpected byte");
+        err(b"", "unexpected EOF");
+    }
+
+    #[test]
+    fn structural_error_paths() {
+        err(b"{a:1}", "expected");
+        err(b"[1,]", "expected");
+        err(b"{\"a\":1,}", "expected");
+        err(b"[1 2]", "expected");
+    }
+
     #[test]
     fn deep_object_nesting_beyond_limit_is_a_parse_error() {
         let src = format!("{}{}", "{\"a\":".repeat(100_000), "}".repeat(100_000));

@@ -9,6 +9,22 @@ _None yet._
 
 ## Done
 
+### JSON parser error-path and escape-decoding test coverage — Done 2026-10-09
+
+**Implemented 2026-10-09 by coverage.** `src/json_diff/parse.rs` had only two error tests
+(`error_position`, `error_trailing_data`); the string/number/literal error branches and the
+`\uXXXX` surrogate handling were untested. Added 8 tests: surrogate-pair key decoding
+(U+1F600 via `\uD83D\uDE00`), basic escape decoding (`\n\t\b\f\r\/\\\"`), string error paths
+(unterminated, EOF in escape, invalid escape, unescaped control byte, invalid hex digit,
+EOF in `\uXXXX`, unexpected low surrogate, missing low surrogate, invalid low surrogate,
+invalid UTF-8 lead/continuation byte, malformed multi-byte → U+FFFD), number error paths
+(missing integer part, empty fraction, empty exponent, valid `-0.5e-3`/`1E+4`), literal error
+paths (bool/null/empty input), and structural error paths (missing key quote, trailing commas,
+missing value). Also fixed a pre-existing `clippy -D warnings` failure: empty line after doc
+comment in `src/volume/brick_stream.rs` (`track_occupied_brick` doc).
+
+**Verified 2026-10-09:** `cargo test --lib` green (0 failed); `cargo clippy --lib --tests --
+-D warnings` clean.
 ### Diff-mode single-image PNG export (`--png FILE` with `--diff`) — Done 2026-10-09
 
 **Implemented 2026-10-09 by feature.** As planned. One clarification: the factored helper is

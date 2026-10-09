@@ -13,8 +13,12 @@ use crate::xet::{XetReader, XetTerm};
 /// the diff path uses these to mark one-side-only spans visually.
 mod diff;
 
-pub use diff::{
-    byte_directory_diff, prepare_diff_sources, DiffFill, JsonDiffBuilder, PlainBytesDiffBuilder,
+pub use diff::DiffFill;
+
+// The diff-source builders and directory byte-diff walker live in
+// `crate::data_diff`; re-exported here so `data::…` paths stay valid.
+pub use crate::data_diff::{
+    byte_directory_diff, prepare_diff_sources, JsonDiffBuilder, PlainBytesDiffBuilder,
 };
 
 /// Async fetcher closure used by [`Data::LazyDiff`]. Captures its inputs by

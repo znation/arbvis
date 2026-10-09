@@ -338,10 +338,19 @@ pub fn byte_directory_diff(
 
 #[cfg(test)]
 mod tests {
-    use super::{byte_directory_diff, prepare_diff_sources};
-    use crate::registry::Registry;
+    use super::{
+        byte_directory_diff, prepare_diff_sources, JsonDiffBuilder, PlainBytesDiffBuilder,
+    };
+    use crate::data::{DiffFill, SourceKind};
+    use crate::registry::{DiffSourceBuilder, Registry};
     use std::fs;
     use std::path::Path;
+
+    fn mkfile(dir: &Path, rel: &str, len: usize) {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, vec![0u8; len]).unwrap();
+    }
 
     /// Skipped files must not produce sources, and same-size pairs become
     /// byte diffs while one-side-only files become unmatched regions.
@@ -408,5 +417,96 @@ mod tests {
         assert!(err
             .to_string()
             .contains("files or both must be directories"));
+    }
+
+    /// A directory pair is classified into matched/mismatched byte diffs and
+    /// one-sided crosshatch regions; empty files are skipped.
+    #[test]
+    fn byte_directory_diff_classifies_matched_mismatched_and_one_sided_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("orig");
+        let mod_ = tmp.path().join("mod");
+        mkfile(&orig, "same.bin", 8);
+        mkfile(&orig, "shrunk.bin", 8); // size mismatch → padded byte diff
+        mkfile(&orig, "gone.bin", 4); // original-only → grey/red crosshatch
+        mkfile(&orig, "empty.bin", 0); // zero bytes on the original side → skipped
+        mkfile(&mod_, "same.bin", 8);
+        mkfile(&mod_, "shrunk.bin", 3);
+        mkfile(&mod_, "new.bin", 5); // mod-only → green crosshatch
+        mkfile(&mod_, "empty.bin", 0); // zero bytes on the modified side → skipped
+
+        let (sources, total) = byte_directory_diff(&orig, &mod_, false, &|_| false).unwrap();
+        let by_name = |needle: &str| {
+            sources
+                .iter()
+                .find(|s| {
+                    s.name_override
+                        .as_deref()
+                        .unwrap_or("none")
+                        .contains(needle)
+                })
+                .unwrap_or_else(|| panic!("no source for {needle}"))
+        };
+        let matched = sources
+            .iter()
+            .find(|s| matches!(s.kind, SourceKind::Diff { .. }))
+            .expect("matched pair present");
+        assert!(matches!(matched.kind, SourceKind::Diff { .. }));
+        assert_eq!(matched.byte_size, 8);
+        // Size-mismatched pair (8 vs 3) is padded up to the max side.
+        assert_eq!(
+            sources
+                .iter()
+                .filter(|s| matches!(s.kind, SourceKind::Diff { .. }))
+                .map(|s| s.byte_size)
+                .collect::<Vec<_>>(),
+            vec![8, 8]
+        );
+        assert!(matches!(
+            by_name("gone.bin").kind,
+            SourceKind::UnmatchedRegion {
+                fill: DiffFill::Red
+            }
+        ));
+        assert!(matches!(
+            by_name("new.bin").kind,
+            SourceKind::UnmatchedRegion {
+                fill: DiffFill::Green
+            }
+        ));
+        assert!(!sources.iter().any(|s| s
+            .name_override
+            .as_deref()
+            .unwrap_or("none")
+            .contains("empty.bin")));
+        assert_eq!(total, 8 + 8 + 4 + 5);
+        // file_idx is compacted over the emitted sources.
+        for (i, s) in sources.iter().enumerate() {
+            assert_eq!(s.file_idx, i);
+        }
+    }
+
+    /// In finetune mode, original-only files render grey instead of red.
+    #[test]
+    fn finetune_diff_renders_original_only_files_grey() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("orig");
+        let mod_ = tmp.path().join("mod");
+        mkfile(&orig, "dropped.bin", 4);
+        let (sources, _) = byte_directory_diff(&orig, &mod_, true, &|_| false).unwrap();
+        assert!(matches!(
+            sources[0].kind,
+            SourceKind::UnmatchedRegion {
+                fill: DiffFill::Grey
+            }
+        ));
+    }
+
+    /// Builder ids and priority ordering are part of the registry contract.
+    #[test]
+    fn builder_ids_and_priority_order_are_stable() {
+        assert_eq!(JsonDiffBuilder.id(), "json");
+        assert_eq!(PlainBytesDiffBuilder.id(), "plain-bytes");
+        assert!(JsonDiffBuilder.priority() > PlainBytesDiffBuilder.priority());
     }
 }

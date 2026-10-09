@@ -15,6 +15,7 @@
 
 mod aggregate;
 pub mod brick;
+mod brick_stream;
 pub mod encode;
 pub mod html;
 pub mod shape;

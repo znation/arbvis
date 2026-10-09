@@ -48,15 +48,6 @@ are unchanged. No tests lived in the moved block (the `regen_html` error-path te
 **Reproduce:** `wc -l src/tiled/mod.rs`.
 
 
-### `src/volume/brick.rs` (1172 lines) exceeds the one-sitting readability budget
-
-**Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
-"several modules" entry; siblings: volume/html.rs, tiled/mod.rs, volume/mod.rs, xet/mod.rs, data/mod.rs).
-Suggested direction: split cohesive units opportunistically, one split per tick, with tests moved
-alongside. Do not refactor for refactoring's sake.
-
-**Reproduce:** `wc -l src/volume/brick.rs`.
-
 ### `src/data/mod.rs` (853 lines) exceeds the one-sitting readability budget
 
 **Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
@@ -72,6 +63,32 @@ Note: the original combined entry also listed `lib.rs` at 1131 lines, which was 
 
 ## Fixed
 
+### `src/volume/brick.rs` (1172 lines at fix time) exceeds the one-sitting readability budget — fixed 2026-10-09 by bugfix
+
+**Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
+"several modules" entry; siblings: volume/html.rs, tiled/mod.rs, volume/mod.rs, xet/mod.rs, data/mod.rs).
+Suggested direction: split cohesive units opportunistically, one split per tick, with tests moved
+alongside. Do not refactor for refactoring's sake.
+
+Split landed 2026-10-09 by bugfix: the streaming-writers unit — `StreamBrickAgg`,
+`build_streamed_brick_volume`, and `BrickBuilder`, plus their nine tests and the shared test helpers
+`descend_octree`/`sample_streamed` — moved verbatim to new `src/volume/brick_stream.rs` (789 lines).
+`brick.rs` keeps the on-disk format (`BrickVolume`, `build_brick_volume`, `BRICK`/`APRON`) and the
+shared sparse `Octree` (now `pub(super)`, with `pub(super)` methods and fields, since both halves
+use it); it is now 464 lines. `brick.rs` re-exports `BrickBuilder`/`StreamBrickAgg`
+(`pub(super) use`) so the existing `brick::BrickBuilder` / `brick::StreamBrickAgg` caller paths in
+`aggregate.rs` are unchanged; `lib.rs` untouched; no public API change. Remaining budget note:
+`brick_stream.rs` at 789 lines may still read as over budget — next split candidate would be
+separating `BrickBuilder`'s bulk-LUT push path from its brick finalization.
+
+**Validation gap:** unclear-invariant — the split is a pure code move, so a passing suite could not
+distinguish a faithful move from one that silently changed visibility or caller paths; had to
+reconstruct the `brick::` import surface (`aggregate.rs`'s `brick::BrickBuilder`/
+`brick::StreamBrickAgg` paths) and drive it through compile errors before the `pub(super)`
+re-export was right.
+
+**Reproduce (was):** `wc -l src/volume/brick.rs` (1172 lines before the split; the module was
+single-file then). Now: brick.rs 464, brick_stream.rs 789 lines.
 ### `src/volume/mod.rs` (1428 lines at fix time) exceeds the one-sitting readability budget — fixed 2026-10-09 by bugfix
 
 **Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined

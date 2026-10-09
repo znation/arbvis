@@ -473,8 +473,8 @@ mod tests {
     async fn drain_is_idempotent_when_idle() {
         let sink = Arc::new(RecordingSink::default());
         let acc = make_acc(sink, 4);
-        acc.drain().await;
-        acc.drain().await;
+        let _ = acc.drain().await;
+        let _ = acc.drain().await;
         assert!(acc.sink.uploads.lock().unwrap().is_empty());
     }
 }

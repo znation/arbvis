@@ -987,7 +987,9 @@ pub fn generate_leaflet_content_multi(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_html, build_html_multi, build_info_html, Branding, SceneView};
+    use super::{
+        build_html, build_html_multi, build_info_html, build_labels_json_scenes, json_str, scenes_js_literal, scene_fields, Branding, FileEntity, SceneView,
+    };
     fn scene(key: &str, world_w: u32, world_h: u32) -> SceneView {
         SceneView {
             key: Some(key.to_string()),
@@ -1003,6 +1005,95 @@ mod tests {
             pyramid_ext: "avif".to_string(),
             entities: Vec::new(),
         }
+    }
+
+    /// The labels JSON and the inline JS literal are written by the same
+    /// [`scene_fields`] serializer, so a bug there corrupts both consumers:
+    /// `regen.rs` parses the JSON (double-quoted keys required) and the viewer
+    /// evals the JS literal (bare identifiers). Both string-valued fields and
+    /// hostile content must round-trip identically in each mode.
+    #[test]
+    fn scene_fields_json_and_js_literals_agree_field_for_field() {
+        let sv = scene("k", 10, 20);
+        let json = scene_fields(&sv, true);
+        let js = scene_fields(&sv, false);
+        for name in [
+            "key", "label", "world_w", "world_h", "width", "height", "max_zoom", "detail_depth",
+            "leaf_ext", "pyramid_ext",
+        ] {
+            assert!(json.contains(&format!("\"{name}\":")), "JSON key: {json}");
+            assert!(js.contains(&format!("{name}:")), "JS key: {js}");
+        }
+        // Geometry and extensions must be identical in both encodings.
+        assert!(json.contains("\"world_w\":10") && js.contains("world_w:10"));
+        assert!(json.contains("\"leaf_ext\":\"png\"") && js.contains("leaf_ext:\"png\""));
+    }
+
+    /// A scene with no key (the legacy lone-pyramid layout, tagged scenes are
+    /// the only other producer) serializes as the empty string in both the
+    /// labels JSON and the JS literal — regen.rs keys scenes by this value.
+    #[test]
+    fn scene_fields_keyless_scene_serializes_empty_key() {
+        let mut sv = scene("ignored", 10, 20);
+        sv.key = None;
+        let json = scene_fields(&sv, true);
+        let js = scene_fields(&sv, false);
+        assert!(json.starts_with("\"key\":\"\","), "{json}");
+        assert!(js.starts_with("key:\"\","), "{js}");
+    }
+
+    /// `json_str` is the sink for every scene string that lands inside a JS
+    /// string literal in the inline `var SCENES` block — a `</script>` in a
+    /// label would terminate the inline script; a stray quote or backslash
+    /// would corrupt the surrounding literal.
+    #[test]
+    fn json_str_escapes_quotes_backslashes_and_script_closers() {
+        assert_eq!(json_str("plain"), "\"plain\"");
+        assert_eq!(json_str("a\\b"), "\"a\\\\b\"");
+        assert_eq!(json_str("say \"hi\""), "\"say \\\"hi\\\"\"");
+        assert_eq!(json_str("</script>"), "\"<\\/script>\"");
+        assert_eq!(json_str("</div>"), "\"<\\/div>\"");
+    }
+
+    /// The multi-scene labels JSON must parse as JSON (regen.rs reads it back)
+    /// and carry each scene's order and entity list, with hostile entity names
+    /// surviving the JSON round-trip byte-for-byte.
+    #[test]
+    fn multi_scene_labels_json_round_trips_through_serde() {
+        let mut sv = scene("k", 10, 20);
+        sv.order = 3;
+        sv.entities = vec![FileEntity {
+            name: "a\"b</script>c\\d".to_string(),
+            pixel_x: 1,
+            pixel_y: 2,
+            hue: 180,
+            byte_size: 7,
+            bbox: (0, 0, 3, 4),
+            segments: vec![(0, 0, 1, 1), (2, 2, 3, 3)],
+        }];
+        let json = build_labels_json_scenes(&[sv]);
+        let v: serde_json::Value = serde_json::from_str(&json).expect("labels JSON parses");
+        let s = &v["scenes"][0];
+        assert_eq!(s["key"], "k");
+        assert_eq!(s["order"], 3);
+        assert_eq!(s["max_zoom"], 2);
+        let e = &s["files"][0];
+        assert_eq!(e["name"], "a\"b</script>c\\d");
+        assert_eq!(e["segs"], serde_json::json!([[0, 0, 1, 1], [2, 2, 3, 3]]));
+    }
+
+    /// The inline JS literal is the viewer's scene table; unlike the JSON it
+    /// uses bare identifier keys, and it must contain no top-level quotes on
+    /// key names (the viewer indexes `SCENES[i].key` etc.).
+    #[test]
+    fn scenes_js_literal_uses_bare_keys_and_single_object_per_scene() {
+        let scenes = [scene("a", 10, 20), scene("b", 30, 40)];
+        let js = scenes_js_literal(&scenes);
+        assert!(js.starts_with("[") && js.ends_with("]"));
+        assert_eq!(js.matches("{key:").count(), 2);
+        assert!(!js.contains("{\"key\""), "keys must be bare: {js}");
+        assert!(js.contains("{key:\"a\",label:\"a\",world_w:10"), "{js}");
+        assert!(js.contains("{key:\"b\",label:\"b\",world_w:30"), "{js}");
     }
 
     /// Scene labels reach Leaflet's `L.control.layers(baseLayers, …)`, which

@@ -514,6 +514,7 @@ mod tests {
     /// `TimedOut` well before the child's own sleep elapses.
     #[tokio::test]
     async fn hung_child_is_killed_at_optin_timeout() {
+        let _env = ENV_LOCK.lock().await;
         let mut path = std::env::temp_dir();
         path.push(format!("arbvis-hf-hang-{}.sh", std::process::id()));
         std::fs::write(&path, "#!/bin/sh\nsleep 300\n").expect("write fake hf script");
@@ -588,6 +589,119 @@ mod tests {
             serde_json::from_str(r#"{"path": "config.json", "size": 665}"#).unwrap();
         assert!(entry.is_file());
         assert_eq!(entry.size, Some(665));
+    }
+
+    // The fake-binary tests mutate the process-global ARBVIS_HF_BIN env var;
+    // cargo runs tests on parallel threads, so they serialize on this lock.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Writes a fake `hf` executable to a temp path, points `ARBVIS_HF_BIN`
+    /// at it, and restores the previous env value on drop so failures don't
+    /// poison sibling tests.
+    struct FakeHfBinGuard {
+        path: std::path::PathBuf,
+        prev: Option<String>,
+    }
+
+    impl FakeHfBinGuard {
+        fn with_script(script: &str) -> Self {
+            let mut path = std::env::temp_dir();
+            path.push(format!("arbvis-hf-fake-{}-{}.sh", std::process::id(),
+                uuid_like_suffix()));
+            std::fs::write(&path, script).expect("write fake hf script");
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake hf script");
+            let prev = std::env::var("ARBVIS_HF_BIN").ok();
+            std::env::set_var("ARBVIS_HF_BIN", &path);
+            Self { path, prev }
+        }
+    }
+
+    impl Drop for FakeHfBinGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(b) => std::env::set_var("ARBVIS_HF_BIN", b),
+                None => std::env::remove_var("ARBVIS_HF_BIN"),
+            }
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    // Distinguishes concurrently-alive temp scripts from each other.
+    fn uuid_like_suffix() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        N.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The captured stderr tail is bounded at STDERR_CAPTURE_LIMIT and keeps
+    /// the newest bytes: a child that emits far more than the cap on stderr
+    /// must still surface its final lines in the error excerpt.
+    #[tokio::test]
+    async fn stderr_tail_is_bounded_and_keeps_the_newest_bytes() {
+        let _env = ENV_LOCK.lock().await;
+        let _guard = FakeHfBinGuard::with_script(
+            "#!/bin/sh\nyes | head -c 10240 >&2\nprintf 'TAIL-MARKER-9Z\\n' >&2\nexit 3\n",
+        );
+        let err = check_hf_available().await.expect_err("child exits non-zero");
+        let HfCliError::Exit { stderr_excerpt, .. } = err else {
+            panic!("expected Exit error, got {err:?}");
+        };
+        assert!(
+            stderr_excerpt.len() <= STDERR_CAPTURE_LIMIT,
+            "excerpt {} exceeds cap",
+            stderr_excerpt.len()
+        );
+        assert!(
+            stderr_excerpt.ends_with("TAIL-MARKER-9Z\n"),
+            "newest stderr line must survive the sliding window"
+        );
+    }
+
+    /// `download` appends `--quiet` and returns the last non-empty stdout
+    /// line (incidental leading output must not corrupt the path).
+    #[tokio::test]
+    async fn download_returns_last_nonempty_stdout_line() {
+        let _env = ENV_LOCK.lock().await;
+        let _guard = FakeHfBinGuard::with_script(
+            "#!/bin/sh\nprintf 'progress noise\\n\\n/tmp/arbvis-test-snapshot\\n'\n",
+        );
+        let path = download(["download", "foo/bar"])
+            .await
+            .expect("download succeeds");
+        assert_eq!(path, std::path::PathBuf::from("/tmp/arbvis-test-snapshot"));
+    }
+
+    /// A zero-exit `download` that prints no path is an error, not a silent
+    /// empty path.
+    #[tokio::test]
+    async fn download_reports_error_when_stdout_has_no_path() {
+        let _env = ENV_LOCK.lock().await;
+        let _guard = FakeHfBinGuard::with_script("#!/bin/sh\nexit 0\n");
+        let err = download(["download", "foo/bar"])
+            .await
+            .expect_err("no path printed");
+        let HfCliError::Exit { stderr_excerpt, .. } = err else {
+            panic!("expected Exit error, got {err:?}");
+        };
+        assert!(stderr_excerpt.contains("printed no path"));
+    }
+
+    /// `run_hf_json` appends `--json` to the argv it passes to the child and
+    /// decodes the child's stdout as the requested type.
+    #[tokio::test]
+    async fn run_hf_json_appends_json_flag_and_decodes() {
+        let _env = ENV_LOCK.lock().await;
+        let _guard = FakeHfBinGuard::with_script(
+            "#!/bin/sh\nif [ \"$1\" = buckets ] && [ \"$2\" = ls ] && [ \"$3\" = -R ] && [ \"$4\" = --json ]; then\n  printf '[{\\\"path\\\":\\\"a.bin\\\",\\\"size\\\":5}]'\nelse\n  printf 'unexpected argv: %s\\n' \"$*\" >&2\n  exit 9\nfi\n",
+        );
+        let entries: Vec<HfTreeEntry> = run_hf_json(["buckets", "ls", "-R"])
+            .await
+            .expect("listing decodes");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "a.bin");
+        assert_eq!(entries[0].size, Some(5));
     }
 
     /// Smoke test against the real `hf` CLI. Ignored by default so cargo

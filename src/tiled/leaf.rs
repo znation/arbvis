@@ -233,7 +233,7 @@ fn local_curve_lut() -> &'static [u32] {
 /// across the tile, so the composition acting on the low `TILE_LOG2` bits is
 /// a fixed affine map — swap parity `m` plus complements folded into the
 /// constants. O(kh) per tile, replacing an O(kh) computation per pixel.
-fn tile_curve_frame(tx: u32, ty: u32, kh: u8) -> (bool, u32, u32) {
+pub(super) fn tile_curve_frame(tx: u32, ty: u32, kh: u8) -> (bool, u32, u32) {
     debug_assert!(kh >= TILE_LOG2, "leaf tiles need kh ≥ TILE_LOG2");
     let mut x = (tx as u64) << TILE_LOG2;
     let mut y = (ty as u64) << TILE_LOG2;
@@ -266,7 +266,7 @@ fn tile_curve_frame(tx: u32, ty: u32, kh: u8) -> (bool, u32, u32) {
 /// with one lookup.
 static LOCAL_CURVE_TO_XY: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
 
-fn local_curve_to_xy() -> &'static [u32] {
+pub(super) fn local_curve_to_xy() -> &'static [u32] {
     LOCAL_CURVE_TO_XY.get_or_init(|| {
         let lut = local_curve_lut();
         let mut inv = vec![0u32; TILE_AREA as usize];

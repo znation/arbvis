@@ -24,7 +24,7 @@ use anyhow::Context;
 use crate::color::build_pixel_lut;
 use crate::data::{load_source_data, Data, Source};
 use crate::geometry::hilbert_to_xy_u64;
-use crate::tiled::leaf::TILE_LOG2;
+use crate::tiled::leaf::{local_curve_to_xy, tile_curve_frame, TILE, TILE_LOG2};
 
 /// Bytes fetched from a source per `fetch_range` call. Large enough to keep
 /// mmap/HTTP overhead negligible, small enough to bound peak RAM.
@@ -97,18 +97,65 @@ fn encode_indexed_single_png(width: u32, height: u32, pixels: &[u8]) -> anyhow::
     Ok(out)
 }
 
-/// Map Hilbert byte index `i` to its image pixel (row-major offset).
+/// Scatter state for one leaf-size tile (TILE×TILE pixels) of the canvas.
 ///
-/// Square `sq` sits at x-offset `sq * height`, matching the pyramid's
-/// per-square layout (`sq_off` / `xy2h_u64` in `src/tiled/leaf.rs`).
-#[inline]
-fn pixel_offset(i: u64, geom: &SingleGeom) -> usize {
+/// Bytes arrive in Hilbert order, and each leaf tile covers one contiguous
+/// run of Hilbert indices, so the render loop advances this state once per
+/// 256 KiB instead of paying a full O(kh) Hilbert decode plus div/mod per
+/// byte. Within the run, the pixel for curve position `v` comes from the
+/// tile's precomputed Hilbert frame (see `tile_curve_frame` in
+/// `src/tiled/leaf.rs`) applied to `local_curve_to_xy()[v]`.
+struct TileScatter {
+    /// Hilbert index of the tile's first byte.
+    base: u64,
+    /// Hilbert index one past the tile's last byte.
+    end: u64,
+    /// Raster offset of the tile's top-left pixel.
+    origin: usize,
+    /// The tile's Hilbert frame: `(swap, cx, cy)`. A pixel `(px, py)` sits at
+    /// curve offset `LOCAL_CURVE_LUT[(b << TILE_LOG2) | a]` where
+    /// `(a, b) = (py ^ cy, px ^ cx)` when swapped, else `(px ^ cx, py ^ cy)`.
+    frame: (bool, u32, u32),
+}
+
+/// Scatter state for the tile containing Hilbert index `i`.
+fn tile_scatter(i: u64, geom: &SingleGeom) -> TileScatter {
+    let tile_area = TILE as u64 * TILE as u64;
     let sq = i / geom.square_pixels;
     let local = i % geom.square_pixels;
-    let (lx, ly) = hilbert_to_xy_u64(local, geom.kh);
-    let x = sq * geom.height as u64 + lx as u64;
-    let y = ly as u64;
-    (y * geom.width as u64 + x) as usize
+    let tile_order = geom.kh - TILE_LOG2;
+    // Tiles fill the square in curve order: coarse tile index `c` starts at
+    // Hilbert offset `c * tile_area` within the square.
+    let c = local / tile_area;
+    let (ltx, lty) = hilbert_to_xy_u64(c, tile_order);
+    let sq_base = sq * geom.square_pixels;
+    TileScatter {
+        base: sq_base + c * tile_area,
+        end: sq_base + (c + 1) * tile_area,
+        origin: ((sq * geom.height as u64 + ltx as u64 * TILE as u64)
+            + lty as u64 * TILE as u64 * geom.width as u64) as usize,
+        frame: tile_curve_frame(ltx, lty, geom.kh),
+    }
+}
+
+/// Raster offset of the byte at Hilbert index `i`, advancing `tile` when `i`
+/// crosses into the next tile. Equivalent to `pixel_offset(i, geom)`.
+#[inline]
+fn scatter_offset(tile: &mut TileScatter, i: u64, geom: &SingleGeom) -> usize {
+    if i >= tile.end {
+        *tile = tile_scatter(i, geom);
+    }
+    let (swap, cx, cy) = tile.frame;
+    let packed = local_curve_to_xy()[(i - tile.base) as usize];
+    // Unpack the identity-frame pixel (px_id, py_id) for this curve position,
+    // then invert the frame transform to reach the tile's real pixel.
+    let (px_id, py_id) = (packed & (TILE - 1), packed >> TILE_LOG2);
+    let (px, py) = if swap {
+        (py_id ^ cx, px_id ^ cy)
+    } else {
+        (px_id ^ cx, py_id ^ cy)
+    };
+    tile.origin + py as usize * geom.width as usize + px as usize
 }
 
 /// Render all `sources` (concatenated, `total` bytes) into one indexed PNG
@@ -147,8 +194,9 @@ pub async fn render_single_png(sources: &[Source], total: u64, out: &Path) -> an
             .fetch_range(pos - cumulative[src_idx], chunk_len)
             .await
             .with_context(|| format!("reading byte range at {} of source {src_idx}", pos))?;
+        let mut tile = tile_scatter(pos, &geom);
         for (k, &b) in buf.iter().enumerate() {
-            pixels[pixel_offset(pos + k as u64, &geom)] = b;
+            pixels[scatter_offset(&mut tile, pos + k as u64, &geom)] = b;
         }
         pos += chunk_len as u64;
     }
@@ -207,6 +255,19 @@ mod tests {
     use super::*;
     use crate::data::Source;
     use std::io::Write;
+
+    /// Reference implementation (full O(kh) Hilbert decode plus div/mod per
+    /// byte); the equivalence oracle for [`TileScatter`], which the render
+    /// loop actually uses.
+    #[inline]
+    fn pixel_offset(i: u64, geom: &SingleGeom) -> usize {
+        let sq = i / geom.square_pixels;
+        let local = i % geom.square_pixels;
+        let (lx, ly) = hilbert_to_xy_u64(local, geom.kh);
+        let x = sq * geom.height as u64 + lx as u64;
+        let y = ly as u64;
+        (y * geom.width as u64 + x) as usize
+    }
 
     /// Write a temp file: `fill` bytes of 0x00 followed by a 0x41 run.
     fn temp_input(zeros: usize, a_run: usize) -> anyhow::Result<(PathBuf, PathBuf)> {
@@ -278,6 +339,58 @@ mod tests {
             assert_eq!(
                 pixel_offset(i, &g),
                 ly as usize * g.width as usize + lx as usize
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "timing harness: cargo test --release --lib -- --ignored bench_scatter"]
+    fn bench_scatter() {
+        let g = single_geometry(1u64 << 44);
+        let n = 1u64 << 24;
+        let mut sink = 0usize;
+        let t0 = std::time::Instant::now();
+        let mut tile = tile_scatter(0, &g);
+        for i in 0..n {
+            sink = sink.wrapping_add(scatter_offset(&mut tile, i, &g));
+        }
+        let t1 = std::time::Instant::now();
+        for i in 0..n {
+            sink = sink.wrapping_add(pixel_offset(i, &g));
+        }
+        let t2 = std::time::Instant::now();
+        eprintln!(
+            "sink={sink} scatter={:?} ({:.1} ns/byte) pixel_offset={:?} ({:.1} ns/byte)",
+            t1 - t0,
+            (t1 - t0).as_nanos() as f64 / n as f64,
+            t2 - t1,
+            (t2 - t1).as_nanos() as f64 / n as f64,
+        );
+    }
+
+    #[test]
+    fn scatter_matches_pixel_offset() {
+        // Canvas wider than tall (odd s → two squares per row) and taller
+        // than one leaf tile in both axes, so every code path exercises:
+        // tile transitions within a square, square transitions, and the
+        // framed (non-identity) Hilbert frames most tiles land on.
+        let g = single_geometry((1u64 << 18) * 3 + 7); // kh=9, kw=10, 4 tiles
+        let mut tile = tile_scatter(0, &g);
+        for i in 0..((1u64 << 18) * 3 + 7) {
+            assert_eq!(
+                scatter_offset(&mut tile, i, &g),
+                pixel_offset(i, &g),
+                "Hilbert index {i}"
+            );
+        }
+        // A canvas with kh > TILE_LOG2: nested tiles inside one square.
+        let g = single_geometry(1u64 << 21); // kh=10, kw=10, 16 tiles
+        let mut tile = tile_scatter(0, &g);
+        for i in 0..(1u64 << 21) {
+            assert_eq!(
+                scatter_offset(&mut tile, i, &g),
+                pixel_offset(i, &g),
+                "Hilbert index {i}"
             );
         }
     }

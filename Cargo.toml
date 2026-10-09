@@ -29,7 +29,7 @@ tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # xet-core-structures is the xet chunk/xorb wire format. arbvis fetches CAS
-# URLs directly (see `xet.rs`) for per-tile byte-range reads under `--stream`
+# URLs directly (see `xet/mod.rs`) for per-tile byte-range reads under `--stream`
 # and the `--show-xet-xorbs` overlay — the official `hf` CLI handles xet
 # dedup for whole-file downloads internally, but exposes no byte-range surface
 # we can hook into for the per-tile path.

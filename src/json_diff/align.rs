@@ -114,34 +114,39 @@ fn align_bytes(
     }
 }
 
-fn push_orig_only(r: Range<u64>, base: u64, out: &mut Vec<AlignmentSpan>) {
+/// Which side of the diff a one-sided span belongs to. The orig-only and
+/// mod-only emission paths share the same guard-and-offset logic; one helper
+/// parameterized on `Side` keeps them from drifting apart.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Side {
+    Orig,
+    Mod,
+}
+
+/// Push `base + r` as an `OrigOnly` (Side::Orig) or `ModOnly` (Side::Mod)
+/// span when `r` is non-empty.
+fn push_side(r: Range<u64>, base: u64, side: Side, out: &mut Vec<AlignmentSpan>) {
     if r.start != r.end {
-        out.push(AlignmentSpan::OrigOnly {
-            orig: base + r.start..base + r.end,
+        out.push(match side {
+            Side::Orig => AlignmentSpan::OrigOnly {
+                orig: base + r.start..base + r.end,
+            },
+            Side::Mod => AlignmentSpan::ModOnly {
+                mod_: base + r.start..base + r.end,
+            },
         });
     }
 }
 
-fn push_mod_only(r: Range<u64>, base: u64, out: &mut Vec<AlignmentSpan>) {
-    if r.start != r.end {
-        out.push(AlignmentSpan::ModOnly {
-            mod_: base + r.start..base + r.end,
-        });
-    }
-}
-
-fn push_node_orig_only(n: &Node, base: u64, out: &mut Vec<AlignmentSpan>) {
-    push_orig_only(n.range(), base, out);
-}
-
-fn push_node_mod_only(n: &Node, base: u64, out: &mut Vec<AlignmentSpan>) {
-    push_mod_only(n.range(), base, out);
+/// Push `n`'s byte range as a one-sided span.
+fn push_node_side(n: &Node, base: u64, side: Side, out: &mut Vec<AlignmentSpan>) {
+    push_side(n.range(), base, side, out);
 }
 
 fn align_node(o: &Node, m: &Node, orig_base: u64, mod_base: u64, out: &mut Vec<AlignmentSpan>) {
     if o.kind != m.kind {
-        push_node_orig_only(o, orig_base, out);
-        push_node_mod_only(m, mod_base, out);
+        push_node_side(o, orig_base, Side::Orig, out);
+        push_node_side(m, mod_base, Side::Mod, out);
         return;
     }
     match o.kind {
@@ -191,7 +196,7 @@ fn align_object(o: &Node, m: &Node, orig_base: u64, mod_base: u64, out: &mut Vec
                     // Synthetic ws-only sentinel (from empty object with interior ws).
                     // Emit its trailing as orig-only — there is no peer on the mod side
                     // (the mod-side ws lives in its own sentinel, if any).
-                    push_orig_only(trailing.clone(), orig_base, out);
+                    push_side(trailing.clone(), orig_base, Side::Orig, out);
                     continue;
                 }
                 if let Some(&mi) = mod_by_key.get(key_decoded.as_str()) {
@@ -224,10 +229,10 @@ fn align_object(o: &Node, m: &Node, orig_base: u64, mod_base: u64, out: &mut Vec
                     }
                 } else {
                     // Orig-only member: dump the whole member span.
-                    push_orig_only(key_range.clone(), orig_base, out);
-                    push_orig_only(between_key_value.clone(), orig_base, out);
-                    push_node_orig_only(value, orig_base, out);
-                    push_orig_only(trailing.clone(), orig_base, out);
+                    push_side(key_range.clone(), orig_base, Side::Orig, out);
+                    push_side(between_key_value.clone(), orig_base, Side::Orig, out);
+                    push_node_side(value, orig_base, Side::Orig, out);
+                    push_side(trailing.clone(), orig_base, Side::Orig, out);
                 }
             }
             Child::Element { .. } => unreachable!("object should not contain Element"),
@@ -248,13 +253,13 @@ fn align_object(o: &Node, m: &Node, orig_base: u64, mod_base: u64, out: &mut Vec
                 trailing,
             } => {
                 if key_decoded.is_empty() && key_range.start == key_range.end {
-                    push_mod_only(trailing.clone(), mod_base, out);
+                    push_side(trailing.clone(), mod_base, Side::Mod, out);
                     continue;
                 }
-                push_mod_only(key_range.clone(), mod_base, out);
-                push_mod_only(between_key_value.clone(), mod_base, out);
-                push_node_mod_only(value, mod_base, out);
-                push_mod_only(trailing.clone(), mod_base, out);
+                push_side(key_range.clone(), mod_base, Side::Mod, out);
+                push_side(between_key_value.clone(), mod_base, Side::Mod, out);
+                push_node_side(value, mod_base, Side::Mod, out);
+                push_side(trailing.clone(), mod_base, Side::Mod, out);
             }
             Child::Element { .. } => unreachable!(),
         }
@@ -316,11 +321,11 @@ fn emit_array_pairs(
     let mut mi = 0usize;
     for &(po, pm) in pairs {
         while oi < po {
-            emit_child_orig_only(o_elems[oi], orig_base, out);
+            emit_child_side(o_elems[oi], orig_base, Side::Orig, out);
             oi += 1;
         }
         while mi < pm {
-            emit_child_mod_only(m_elems[mi], mod_base, out);
+            emit_child_side(m_elems[mi], mod_base, Side::Mod, out);
             mi += 1;
         }
         // Align the matched pair.
@@ -329,11 +334,11 @@ fn emit_array_pairs(
         mi += 1;
     }
     while oi < o_elems.len() {
-        emit_child_orig_only(o_elems[oi], orig_base, out);
+        emit_child_side(o_elems[oi], orig_base, Side::Orig, out);
         oi += 1;
     }
     while mi < m_elems.len() {
-        emit_child_mod_only(m_elems[mi], mod_base, out);
+        emit_child_side(m_elems[mi], mod_base, Side::Mod, out);
         mi += 1;
     }
 }
@@ -363,17 +368,11 @@ fn emit_child_paired(
     }
 }
 
-fn emit_child_orig_only(c: &Child, orig_base: u64, out: &mut Vec<AlignmentSpan>) {
+/// Emit one child's value and trailing whitespace as one-sided spans.
+fn emit_child_side(c: &Child, base: u64, side: Side, out: &mut Vec<AlignmentSpan>) {
     if let Child::Element { value, trailing } = c {
-        push_node_orig_only(value, orig_base, out);
-        push_orig_only(trailing.clone(), orig_base, out);
-    }
-}
-
-fn emit_child_mod_only(c: &Child, mod_base: u64, out: &mut Vec<AlignmentSpan>) {
-    if let Child::Element { value, trailing } = c {
-        push_node_mod_only(value, mod_base, out);
-        push_mod_only(trailing.clone(), mod_base, out);
+        push_node_side(value, base, side, out);
+        push_side(trailing.clone(), base, side, out);
     }
 }
 

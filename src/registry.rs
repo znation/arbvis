@@ -148,7 +148,7 @@ pub struct SourceCtx<'a> {
     /// `--show-xet-xorbs`.
     pub show_xet_xorbs: bool,
     /// The registry, so a provider can reuse arbvis's byte machinery
-    /// (`data::prepare_sources`, `data::byte_directory_diff`, the diff-builder
+    /// (`data::prepare_sources`, `data_diff::byte_directory_diff`, the diff-builder
     /// cascade, `hf_url` helpers).
     pub registry: &'a Registry,
 }
@@ -305,8 +305,8 @@ impl Registry {
             voxel: crate::volume::VoxelRegistry::with_defaults(),
             leaf: LeafRegistry::with_defaults(),
             diffs: vec![
-                Arc::new(crate::data::JsonDiffBuilder),
-                Arc::new(crate::data::PlainBytesDiffBuilder),
+                Arc::new(crate::data_diff::JsonDiffBuilder),
+                Arc::new(crate::data_diff::PlainBytesDiffBuilder),
             ],
             providers: vec![
                 Arc::new(crate::providers::ByteDiffProvider),

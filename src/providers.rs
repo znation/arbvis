@@ -21,7 +21,7 @@ const RESOLVE_CONCURRENCY: usize = 16;
 
 /// Byte/JSON diff over a `--diff` pair (priority 100). Resolves both sides
 /// (local path or single-file `hf://`) and dispatches through the file-pair
-/// builder cascade or [`data::byte_directory_diff`].
+/// builder cascade or [`data_diff::byte_directory_diff`].
 pub(crate) struct ByteDiffProvider;
 
 #[async_trait(?Send)]
@@ -50,7 +50,7 @@ impl SourceProvider for ByteDiffProvider {
             resolve_input(PathBuf::from(diff.modified)),
         )?;
         let (sources, total) =
-            data::prepare_diff_sources(&orig, &mod_, false, ctx.registry).await?;
+            crate::data_diff::prepare_diff_sources(&orig, &mod_, false, ctx.registry).await?;
         let hints = RenderHints {
             diff_mode: true,
             title_suffix: std::borrow::Cow::Borrowed("diff"),

@@ -3,6 +3,7 @@
 mod cli;
 pub mod color;
 pub mod data;
+pub mod data_diff;
 mod deploy;
 mod geometry;
 pub mod hf_cli;
@@ -25,10 +26,10 @@ pub mod xet;
 // model-aware plugins to plug into.
 pub use cli::Args;
 pub use data::{
-    byte_directory_diff, load_source_data, prepare_diff_sources, prepare_sources,
-    prepare_sources_from_specs, CustomSource, Data, DiffFill, Extensions, LazyFetcher, SceneTag,
-    Source, SourceKind,
+    load_source_data, prepare_sources, prepare_sources_from_specs, CustomSource, Data, DiffFill,
+    Extensions, LazyFetcher, SceneTag, Source, SourceKind,
 };
+pub use data_diff::{byte_directory_diff, prepare_diff_sources};
 pub use geometry::name_hue;
 pub use layout::{CanvasGeom, LayoutMode, LayoutShape};
 pub use pipeline::run;

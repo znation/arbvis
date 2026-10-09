@@ -5,3 +5,6 @@
 /*-diff-tiles/
 .tumwater/
 tumwater.json
+
+__pycache__/
+*.pyc

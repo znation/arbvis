@@ -83,6 +83,9 @@ class RangeStreamingTest(unittest.TestCase):
 
             return Ctx(self.data)
 
+        def size(self, path):
+            return len(self.data)
+
     def setUp(self):
         self.mod, _tmpdir = load_app()
         self.client = TestClient(self.mod.app)
@@ -146,6 +149,22 @@ class RangeStreamingTest(unittest.TestCase):
         r = self.client.get("/bricks.bin")
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.content, self.data)
+
+    def test_path_traversal_segments_rejected(self):
+        # A public visitor controls `rest`, which is interpolated into the
+        # bucket path `hf://buckets/{BUCKET_ID}/{rest}` (and, for mirror
+        # assets, joined onto local disk paths). Dot segments must never
+        # reach those sinks: percent-encoded or literal, they get a 404.
+        for p in ("/%2e%2e/other-bucket/file", "/..%2F..%2Fetc/passwd",
+                  "/tiles/%2e/tile.avif", "/..%5C..%5Cfile", "/%2e/x"):
+            r = self.client.get(p)
+            self.assertEqual(r.status_code, 404, f"{p} must be rejected")
+        # No Hub fetch was attempted for any of them (the fake FS serves
+        # anything, so reaching it would return 200/206 instead).
+
+    def test_traversal_free_asset_paths_still_served(self):
+        r = self.client.get("/tiles/0/0/0.avif")
+        self.assertEqual(r.status_code, 200)
 
 
 if __name__ == "__main__":

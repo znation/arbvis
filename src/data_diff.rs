@@ -604,4 +604,94 @@ mod tests {
         assert_eq!(PlainBytesDiffBuilder.id(), "plain-bytes");
         assert!(JsonDiffBuilder.priority() > PlainBytesDiffBuilder.priority());
     }
+
+    /// A `.json` pair routes through the JSON builder and yields
+    /// structure-aware span sources instead of one plain whole-file diff.
+    #[tokio::test]
+    async fn json_pair_dispatches_to_the_json_builder() {
+        let dir = tempfile::tempdir().unwrap();
+        let (o, m) = (dir.path().join("o.json"), dir.path().join("m.json"));
+        fs::write(&o, b"{\"a\":1,\"b\":2}").unwrap();
+        fs::write(&m, b"{\"a\":1,\"c\":3}").unwrap();
+        let registry = Registry::with_defaults();
+        let (sources, total) = prepare_diff_sources(&o, &m, false, &registry)
+            .await
+            .unwrap();
+        assert!(
+            !sources.is_empty(),
+            "json pair should produce span sources"
+        );
+        assert_eq!(
+            total,
+            sources.iter().map(|s| s.byte_size).sum::<u64>(),
+            "total bytes equal the sum of the emitted span sources"
+        );
+        assert!(total > 0);
+        assert!(
+            !sources
+                .iter()
+                .any(|s| matches!(s.kind, SourceKind::Diff { .. })),
+            "plain whole-file byte diff must not be emitted for a json pair"
+        );
+        assert!(
+            sources
+                .iter()
+                .any(|s| matches!(
+                    s.kind,
+                    SourceKind::RangeDiff { .. } | SourceKind::OneSidedRange { .. }
+                )),
+            "expected structure-aware span sources, got {:?}",
+            sources
+                .iter()
+                .map(|s| std::mem::discriminant(&s.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A `.jsonl` pair aligns line-by-line: changed/added lines become span
+    /// sources rather than a single plain byte diff.
+    #[tokio::test]
+    async fn jsonl_pair_aligns_line_by_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let (o, m) = (dir.path().join("o.jsonl"), dir.path().join("m.jsonl"));
+        fs::write(&o, b"{\"a\":1}\n").unwrap();
+        fs::write(&m, b"{\"a\":1}\n{\"b\":2}\n").unwrap();
+        let registry = Registry::with_defaults();
+        let (sources, total) = prepare_diff_sources(&o, &m, false, &registry)
+            .await
+            .unwrap();
+        assert!(!sources.is_empty());
+        assert_eq!(
+            total,
+            sources.iter().map(|s| s.byte_size).sum::<u64>(),
+            "total bytes equal the sum of the emitted span sources"
+        );
+        assert!(total > 0);
+        assert!(
+            !sources
+                .iter()
+                .any(|s| matches!(s.kind, SourceKind::Diff { .. })),
+            "jsonl pair must not collapse to a plain byte diff"
+        );
+    }
+
+    /// Only one side carrying a JSON extension fails the `is_json_path` gate
+    /// on `JsonDiffBuilder`, so the pair falls through to the plain-bytes
+    /// floor builder even when the .json side holds valid JSON.
+    #[tokio::test]
+    async fn mixed_json_binary_pair_falls_through_to_plain_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (o, m) = (dir.path().join("o.json"), dir.path().join("m.bin"));
+        fs::write(&o, b"{\"a\":1}").unwrap();
+        fs::write(&m, b"{\"a\":2}").unwrap();
+        let registry = Registry::with_defaults();
+        let (sources, _) = prepare_diff_sources(&o, &m, false, &registry)
+            .await
+            .unwrap();
+        assert_eq!(sources.len(), 1);
+        assert!(matches!(
+            sources[0].kind,
+            SourceKind::Diff { .. }
+        ));
+    }
 }

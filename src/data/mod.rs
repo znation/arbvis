@@ -431,8 +431,9 @@ impl Source {
 
 #[cfg(test)]
 mod data_fetch_tests {
-    use super::Data;
+    use super::{is_json_path, Data};
     use crate::xet::seeded_test_reader;
+    use std::path::Path;
     use std::sync::Arc;
 
     fn owned(bytes: &[u8]) -> Data {
@@ -522,6 +523,18 @@ mod data_fetch_tests {
         }));
         assert!(!data.is_local(), "LazyDiff may hit the network");
         assert_eq!(data.fetch_range(10, 3).await.unwrap(), [10, 11, 12]);
+    }
+
+    /// The JSON-extension gate: only lowercase `.json` / `.jsonl` qualify,
+    /// and a path with no extension at all does not.
+    #[test]
+    fn is_json_path_matches_only_json_extensions() {
+        assert!(is_json_path(Path::new("a/b/model.json")));
+        assert!(is_json_path(Path::new("lines.jsonl")));
+        assert!(!is_json_path(Path::new("a/b/weights.bin")));
+        assert!(!is_json_path(Path::new("no-extension")));
+        assert!(!is_json_path(Path::new("upper.JSON")));
+        assert!(!is_json_path(Path::new("dotfile.jsonx")));
     }
 
     #[test]

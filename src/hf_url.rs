@@ -153,26 +153,52 @@ impl RemoteRepo {
     /// throttled-operation label, the `/resolve/` URL, and the inclusive
     /// `Range: bytes=START-END` header (our `range.end` is exclusive, so the
     /// header subtracts 1). The URL prefix per kind is `web_path_prefix` (see
-    /// there for why `api_segment` is wrong).
+    /// there for why `api_segment` is wrong). Delegates to the free function
+    /// of the same name, which also serves `fetch_range_into_at`.
     fn range_request_parts(
         &self,
         filename: &str,
         revision: &str,
         range: &std::ops::Range<u64>,
     ) -> (String, String, String) {
-        let label = format!("fetch_range {}", sanitize_log_text(filename));
-        let kind_prefix = self.kind.web_path_prefix();
-        let url = format!(
-            "{}/{}{}/resolve/{}/{}",
-            endpoint(),
-            kind_prefix,
-            encode_url_path(&self.repo_id),
-            encode_url_path(revision),
-            encode_url_path(filename),
-        );
-        let header = format!("bytes={}-{}", range.start, range.end.saturating_sub(1));
-        (label, url, header)
+        range_request_parts(
+            &endpoint(),
+            self.kind,
+            &self.repo_id,
+            filename,
+            revision,
+            range,
+        )
     }
+}
+
+/// Shared request construction for `fetch_range` / `fetch_range_into`: a
+/// throttled-operation label, the `/resolve/` URL, and the inclusive
+/// `Range: bytes=START-END` header (our `range.end` is exclusive, so the
+/// header subtracts 1). The URL prefix per kind is `web_path_prefix` (see
+/// there for why `api_segment` is wrong). A free function with explicit
+/// endpoint and repo fields so the streaming worker `fetch_range_into_at`
+/// (whose tests point it at a stub server) shares this exact construction.
+fn range_request_parts(
+    endpoint: &str,
+    kind: RepoKind,
+    repo_id: &str,
+    filename: &str,
+    revision: &str,
+    range: &std::ops::Range<u64>,
+) -> (String, String, String) {
+    let label = format!("fetch_range {}", sanitize_log_text(filename));
+    let kind_prefix = kind.web_path_prefix();
+    let url = format!(
+        "{}/{}{}/resolve/{}/{}",
+        endpoint,
+        kind_prefix,
+        encode_url_path(repo_id),
+        encode_url_path(revision),
+        encode_url_path(filename),
+    );
+    let header = format!("bytes={}-{}", range.start, range.end.saturating_sub(1));
+    (label, url, header)
 }
 
 /// Streaming worker behind [`RemoteRepo::fetch_range_into`], split out with an
@@ -193,17 +219,8 @@ async fn fetch_range_into_at(
         "fetch_range_into: dst is {} bytes, range needs {want}",
         dst.len()
     );
-    let label = format!("fetch_range {}", sanitize_log_text(filename));
-    let kind_prefix = kind.web_path_prefix();
-    let url = format!(
-        "{}/{}{}/resolve/{}/{}",
-        endpoint,
-        kind_prefix,
-        encode_url_path(repo_id),
-        encode_url_path(revision),
-        encode_url_path(filename),
-    );
-    let header = format!("bytes={}-{}", range.start, range.end.saturating_sub(1));
+    let (label, url, header) =
+        range_request_parts(endpoint, kind, repo_id, filename, revision, &range);
     // Throttle only the request itself (same shape as `xet::fetch`'s
     // `authed_get_json`): the streaming body work runs outside the throttled
     // closure, so nothing borrowed escapes into a retryable future.

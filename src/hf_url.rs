@@ -123,8 +123,40 @@ impl RemoteRepo {
         })
         .await
         .with_context(|| format!("range GET {} {header}", sanitize_log_text(&url)))?;
+        validate_range_body(&label, &range, &bytes)?;
         Ok(bytes.to_vec())
     }
+}
+
+/// Reject a range-GET response whose body does not exactly cover the requested
+/// range. A server that ignores or strips the `Range` header replies 200 with
+/// the whole file, and a dropped connection can truncate the body; both pass
+/// `error_for_status`. Callers slice the returned bytes into fixed-size buffers
+/// (e.g. `tiled::leaf::load_tile_bytes`'s `copy_from_slice`), so an unvalidated
+/// length turns a server fault into a mid-render panic with an opaque message
+/// instead of a clean error naming the fetch.
+fn validate_range_body(
+    label: &str,
+    range: &std::ops::Range<u64>,
+    body: &[u8],
+) -> anyhow::Result<()> {
+    let want = (range.end - range.start) as usize;
+    if body.len() == want {
+        return Ok(());
+    }
+    let verdict = if body.len() > want {
+        "server ignored the Range header (full-file body)"
+    } else {
+        "truncated response"
+    };
+    anyhow::bail!(
+        "{}: range {}-{} returned {} bytes (expected {}): {verdict}",
+        label,
+        range.start,
+        range.end.saturating_sub(1),
+        body.len(),
+        want,
+    )
 }
 
 /// A remote HF file accessed via range requests without a full download.
@@ -904,6 +936,30 @@ pub fn parse_hf_output(hf_url_str: &str) -> anyhow::Result<HfOutputSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_range_body_accepts_exact_body() {
+        validate_range_body("fetch_range f.bin", &(10..14), &[1, 2, 3, 4]).unwrap();
+        // An empty range must accept an empty body.
+        validate_range_body("fetch_range f.bin", &(5..5), &[]).unwrap();
+    }
+
+    #[test]
+    fn validate_range_body_rejects_truncated_body() {
+        let err = validate_range_body("fetch_range f.bin", &(0..8), &[1, 2, 3]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("returned 3 bytes (expected 8)"), "{}", msg);
+        assert!(msg.contains("truncated response"), "{}", msg);
+    }
+
+    #[test]
+    fn validate_range_body_rejects_full_file_body_for_ignored_range() {
+        let err =
+            validate_range_body("fetch_range f.bin", &(1_000..1_004), &[0u8; 10]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("returned 10 bytes (expected 4)"), "{}", msg);
+        assert!(msg.contains("ignored the Range header"), "{}", msg);
+    }
 
     #[test]
     fn sanitize_log_text_strips_control_and_escape_bytes() {

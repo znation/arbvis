@@ -1,7 +1,9 @@
 //! Leaf-tile rendering and encoding: the highest-resolution tile level, where
 //! one pixel is one byte, in plain and diff variants, as AVIF or PNG.
 
+use std::cell::RefCell;
 use std::io::Cursor;
+use std::sync::Arc;
 
 use image::codecs::avif::AvifEncoder;
 use image::{ImageEncoder, ImageFormat, Rgb};
@@ -322,6 +324,40 @@ fn tile_local_curve_idx(frame: (bool, u32, u32), px: u32, py: u32) -> u64 {
     local_curve_lut()[((b << TILE_LOG2) | a) as usize] as u64
 }
 
+/// Indexed-encoding tables derived from a byte LUT: the distinct LUT colors
+/// (plus pure black, for out-of-range bytes) as an RGB palette in
+/// first-encounter order, `remap[byte]` = that byte color's palette index,
+/// and `black_idx` = the palette index for the black out-of-range color.
+type IndexedPalette = (Vec<[u8; 3]>, [u8; 256], u8);
+
+thread_local! {
+    /// Single-entry memo of the last [`indexed_palette_from_lut`] result.
+    ///
+    /// Every leaf-tile render in a run passes the same 256-entry LUT (built
+    /// once per tile plan), so the per-tile 256×palette dedup scan (up to
+    /// ~100k byte comparisons per tile for a fully-gradient LUT) collapses to
+    /// a 768-byte array compare. Thread-local so concurrent tile workers
+    /// never contend on a shared lock.
+    static INDEXED_PALETTE_CACHE:
+        std::cell::RefCell<Option<([Rgb<u8>; 256], Arc<IndexedPalette>)>> =
+        const { RefCell::new(None) };
+}
+
+/// [`indexed_palette_from_lut`] with a per-thread single-entry memo.
+fn indexed_palette_from_lut_cached(lut: &[Rgb<u8>; 256]) -> Option<Arc<IndexedPalette>> {
+    INDEXED_PALETTE_CACHE.with(|cache| {
+        let mut slot = cache.borrow_mut();
+        if let Some((key, hit)) = slot.as_ref() {
+            if key[..] == lut[..] {
+                return Some(hit.clone());
+            }
+        }
+        let built = indexed_palette_from_lut(lut).map(Arc::new);
+        *slot = built.clone().map(|p| (*lut, p));
+        built
+    })
+}
+
 /// Render one plain-mode leaf tile from a pre-loaded `tile_buf` of
 /// `TILE_PIXELS` curve-ordered bytes, mapping each byte through `pixel_lut`
 /// and encoding to `fmt`. Bytes beyond `total` (the final partial tile) render
@@ -388,15 +424,15 @@ pub fn render_leaf_tile_from_buf(
     let xy_lut = local_curve_to_xy();
 
     // Indexed fast path: the tile's palette is derivable from `pixel_lut`
-    // alone (256-entry dedup, done per call — negligible next to the pixel
-    // loop), so the indexed stream is one array remap per pixel instead of a
-    // hash-map lookup per RGB pixel in `encode_indexed_png`.
-    let fast = match fmt {
-        TileFormat::IndexedPng => indexed_palette_from_lut(pixel_lut),
+    // alone (memoized per thread — one dedup scan per distinct LUT rather
+    // than one per tile), so the indexed stream is one array remap per pixel
+    // instead of a hash-map lookup per RGB pixel in `encode_indexed_png`.
+    let fast: Option<Arc<IndexedPalette>> = match fmt {
+        TileFormat::IndexedPng => indexed_palette_from_lut_cached(pixel_lut),
         _ => None,
     };
     let mut indexed = fast.as_ref().map(|_| vec![0u8; TILE_AREA as usize]);
-    let (remap, black_idx) = match &fast {
+    let (remap, black_idx) = match fast.as_deref() {
         Some((_, remap, black_idx)) => (Some(remap), *black_idx),
         None => (None, 0u8),
     };
@@ -430,7 +466,7 @@ pub fn render_leaf_tile_from_buf(
         }
     }
 
-    match (fast, indexed) {
+    match (fast.as_deref(), indexed) {
         (Some((palette, _, _)), Some(idx_pixels)) => {
             let flat: Vec<u8> = palette.iter().flat_map(|c| c.iter().copied()).collect();
             let bytes =
@@ -737,6 +773,31 @@ mod tests {
         let h = xy2h_u64(3, 4, 8);
         let (x, y) = crate::geometry::hilbert_to_xy_u64(h, 8);
         assert_eq!((x, y), (3, 4));
+    }
+
+    /// The per-thread palette memo returns the same tables as the direct
+    /// computation, reuses the memoized `Arc` for a repeated LUT, and
+    /// recomputes correctly when the LUT changes.
+    #[test]
+    fn indexed_palette_memo_matches_direct_computation() {
+        let lut_a = crate::color::build_pixel_lut();
+        let lut_b = crate::color::build_diff_signed_lut();
+
+        let direct_a = indexed_palette_from_lut(&lut_a).unwrap();
+        let first = indexed_palette_from_lut_cached(&lut_a).unwrap();
+        assert_eq!(&*first, &direct_a);
+
+        let second = indexed_palette_from_lut_cached(&lut_a).unwrap();
+        assert!(Arc::ptr_eq(&first, &second), "repeated LUT reuses the memo");
+
+        let direct_b = indexed_palette_from_lut(&lut_b).unwrap();
+        let swapped = indexed_palette_from_lut_cached(&lut_b).unwrap();
+        assert_eq!(&*swapped, &direct_b);
+        assert_ne!(&*swapped, &direct_a);
+
+        // Back to the first LUT: still correct (memo replaced, not stale).
+        let back = indexed_palette_from_lut_cached(&lut_a).unwrap();
+        assert_eq!(&*back, &direct_a);
     }
 
     /// End-to-end: `render_leaf_tile_from_buf` must produce the same pixels

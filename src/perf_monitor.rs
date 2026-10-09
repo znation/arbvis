@@ -60,3 +60,54 @@ pub fn spawn_if_enabled() -> Option<Arc<AtomicBool>> {
     });
     Some(stop)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sets/unsets ARBVIS_PERF_LOG around `f` and restores the prior value.
+    /// Tests touching this env var must hold ENV_LOCK (process-global state).
+    fn with_perf_log(value: Option<&str>, f: impl FnOnce()) {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("ARBVIS_PERF_LOG").ok();
+        match value {
+            Some(v) => std::env::set_var("ARBVIS_PERF_LOG", v),
+            None => std::env::remove_var("ARBVIS_PERF_LOG"),
+        }
+        f();
+        match prev {
+            Some(v) => std::env::set_var("ARBVIS_PERF_LOG", v),
+            None => std::env::remove_var("ARBVIS_PERF_LOG"),
+        }
+    }
+
+    #[test]
+    fn disabled_when_env_unset() {
+        with_perf_log(None, || {
+            assert!(spawn_if_enabled().is_none());
+        });
+    }
+
+    #[test]
+    fn disabled_when_env_not_exactly_one() {
+        for value in ["0", "true", "", "11"] {
+            with_perf_log(Some(value), || {
+                assert!(spawn_if_enabled().is_none(), "value {value:?} must disable");
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_spawns_task_and_stop_flag_ends_it() {
+        with_perf_log(Some("1"), || {
+            let stop = spawn_if_enabled().expect("ARBVIS_PERF_LOG=1 must spawn");
+            assert!(!stop.load(Ordering::Relaxed));
+            stop.store(true, Ordering::Relaxed);
+        });
+        // Give the spawned task a moment to observe the stop flag and exit;
+        // the test only checks the handle contract, not the loop internals.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+}

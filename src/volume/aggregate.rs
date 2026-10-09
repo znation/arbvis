@@ -493,3 +493,116 @@ fn occupied_focus(grid: &[VoxelAcc], extent: [u32; 3]) -> ([f32; 3], f32) {
     }
     box_focus(bmin, bmax, sum, n, extent)
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voxel_coord_is_x_fastest() {
+        let extent = [4u32, 2, 2];
+        assert_eq!(voxel_coord(0, extent), [0, 0, 0]);
+        assert_eq!(voxel_coord(3, extent), [3, 0, 0]);
+        assert_eq!(voxel_coord(4, extent), [0, 1, 0]);
+        assert_eq!(voxel_coord(7, extent), [3, 1, 0]);
+        assert_eq!(voxel_coord(8, extent), [0, 0, 1]);
+        assert_eq!(voxel_coord(15, extent), [3, 1, 1]);
+    }
+
+    #[test]
+    fn box_focus_empty_grid_falls_back_to_unit_center() {
+        let (center, radius) = box_focus([u32::MAX; 3], [0; 3], [0.0; 3], 0, [8, 8, 8]);
+        assert_eq!(center, [0.0, 0.0, 0.0]);
+        assert_eq!(radius, 0.5);
+    }
+
+    #[test]
+    fn box_focus_single_occupied_voxel_gets_minimum_radius() {
+        // Single occupied voxel (1,1,1): centroid == the voxel, lo == hi, so
+        // the raw radius is 0 and the 0.02 floor applies.
+        let (center, radius) = box_focus([1, 1, 1], [1, 1, 1], [1.0, 1.0, 1.0], 1, [2, 2, 2]);
+        assert_eq!(center, [0.25, 0.25, 0.25]);
+        assert!((radius - 0.02).abs() < 1e-6);
+    }
+
+    #[test]
+    fn box_focus_cube_maps_voxels_symmetrically() {
+        // Occupied corners (0,0,0) and (1,1,1) of a 2³ grid: the centroid maps
+        // to the box center and the radius reaches each corner (0.25).
+        let (center, radius) = box_focus([0, 0, 0], [1, 1, 1], [1.0, 1.0, 1.0], 2, [2, 2, 2]);
+        assert!(center.iter().all(|c| c.abs() < 1e-6));
+        assert!((radius - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn box_focus_non_cube_extent_scales_axes_by_maxext() {
+        // extent [4,2,2]: the x axis spans the full unit width while y and z
+        // are compressed by 2/4, matching the viewer's unit-cube normalization.
+        let (center, radius) = box_focus([0, 0, 0], [3, 1, 1], [6.0, 1.0, 1.0], 2, [4, 2, 2]);
+        // Centroid x = 6/2 = 3 → (3.5/4 - 0.5) = 0.375.
+        assert!((center[0] - 0.375).abs() < 1e-6);
+        // Centroid y = z = 0.5 → ((1.0/2 - 0.5) * 0.5) = 0.0.
+        assert!(center[1].abs() < 1e-6 && center[2].abs() < 1e-6);
+        // Radius spans centroid→bbox on x: c=0.375, lo=-0.375 → 0.75.
+        assert!((radius - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn box_focus_asymmetric_cluster_targets_centroid_not_bbox_center() {
+        // Occupied voxels at x = 0..3 of a 4³ grid (y=z=0): the centroid sits
+        // at x = 1.5 → world (2.0/4 - 0.5) = 0.0 — the bbox center would be
+        // x = 1.0 → (1.5/4 - 0.5) = -0.125. Centroid wins.
+        let (center, radius) = box_focus([0, 0, 0], [3, 0, 0], [6.0, 0.0, 0.0], 4, [4, 4, 4]);
+        assert!(center[0].abs() < 1e-6);
+        assert!((center[1] - (-0.375)).abs() < 1e-6);
+        // Radius covers from centroid to the bbox far end: 0.375 on x.
+        assert!((radius - 0.375).abs() < 1e-6);
+    }
+
+    #[test]
+    fn occupied_focus_scans_linear_grid_for_occupancy() {
+        // 2³ grid; voxels at linear indices 3 (1,1,1) and 6 (0,1,1) are set.
+        let mut grid = vec![VoxelAcc::default(); 8];
+        grid[3].count = 1;
+        grid[6].count = 5;
+        let (center, radius) = occupied_focus(&grid, [2, 2, 2]);
+        // Occupied voxels: (1,1,0) at index 3 and (0,1,1) at index 6.
+        // Centroid = (0.5, 1, 0.5) → world (0, 0.25, 0) on a unit cube.
+        assert!(center[0].abs() < 1e-6);
+        assert!((center[1] - 0.25).abs() < 1e-6);
+        assert!(center[2].abs() < 1e-6);
+        // bmin = (0,1,0), bmax = (1,1,1): farthest extent from the centroid
+        // is 0.25 (on x and z).
+        assert!((radius - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn occupied_focus_all_zero_grid_falls_back() {
+        let grid = vec![VoxelAcc::default(); 8];
+        let (center, radius) = occupied_focus(&grid, [2, 2, 2]);
+        assert_eq!(center, [0.0, 0.0, 0.0]);
+        assert_eq!(radius, 0.5);
+    }
+
+    #[test]
+    fn occupied_focus_cells_uses_alpha_as_occupancy() {
+        // Same layout as the VoxelAcc test, but a = 0 marks empty cells.
+        let mut grid = vec![VoxelCell::default(); 8];
+        grid[3].a = 255;
+        grid[6].a = 1; // any nonzero alpha counts
+        let (center, radius) = occupied_focus_cells(&grid, [2, 2, 2]);
+        assert!(center[0].abs() < 1e-6);
+        assert!((center[1] - 0.25).abs() < 1e-6);
+        assert!(center[2].abs() < 1e-6);
+        assert!((radius - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn occupied_focus_cells_all_transparent_falls_back() {
+        let grid = vec![VoxelCell::default(); 8];
+        let (center, radius) = occupied_focus_cells(&grid, [2, 2, 2]);
+        assert_eq!(center, [0.0, 0.0, 0.0]);
+        assert_eq!(radius, 0.5);
+    }
+}

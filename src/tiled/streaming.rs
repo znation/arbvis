@@ -109,9 +109,10 @@ pub async fn run_tiles_hf_streaming(
 /// streaming analogue of `super::pipeline::render_scene_to_disk`; `scene = None` is the
 /// legacy lone-pyramid layout. Shares `sink` with its siblings — every clone it
 /// takes is dropped before it returns, so the caller can still `Arc::try_unwrap`.
+/// Generic over the sink so tests can record uploads without touching the Hub.
 #[allow(clippy::too_many_arguments)]
-async fn stream_scene(
-    sink: &Arc<HfTileSink>,
+async fn stream_scene<S: TileSink>(
+    sink: &Arc<S>,
     hf_out: &HfOutputSpec,
     scene: Option<&str>,
     group: SceneGroup,
@@ -222,4 +223,153 @@ async fn stream_scene(
         pyramid_ext: pyramid_ext.to_string(),
         entities: plan.entities,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::{Source, SourceKind};
+    use std::sync::Mutex;
+
+    /// Records every staged (repo_path, bytes) pair; the pyramid accumulator
+    /// runs encode tasks on this sink, so a Mutex keeps it Sync-safe.
+    #[derive(Default)]
+    struct RecordingSink {
+        uploads: Mutex<Vec<(String, Vec<u8>)>>,
+    }
+
+    impl TileSink for RecordingSink {
+        fn upload_tile(&self, path: String, bytes: Vec<u8>) -> anyhow::Result<()> {
+            self.uploads.lock().unwrap().push((path, bytes));
+            Ok(())
+        }
+    }
+
+    fn tiny_source() -> Source {
+        Source {
+            file_idx: 0,
+            kind: SourceKind::Buffered(vec![0xa5u8; 64]),
+            byte_size: 64,
+            name_override: Some("tiny.bin".to_string()),
+            xet_terms: None,
+            extensions: Default::default(),
+        }
+    }
+
+    fn spec() -> HfOutputSpec {
+        HfOutputSpec {
+            repo_id: "test/repo".to_string(),
+            kind: crate::hf_url::RepoKind::Model,
+            revision: "main".to_string(),
+            path_prefix: "viz".to_string(),
+        }
+    }
+
+    fn group() -> SceneGroup {
+        SceneGroup {
+            key: None,
+            label: String::new(),
+            order: 0,
+            sources: vec![tiny_source()],
+            total: 64,
+        }
+    }
+
+    async fn stream_once(sink: &Arc<RecordingSink>) -> SceneView {
+        stream_scene(
+            sink,
+            &spec(),
+            None,
+            group(),
+            false,
+            false,
+            TileFormat::Png,
+            TileFormat::Png,
+            crate::layout::LayoutMode::Hilbert,
+            &crate::registry::Registry::with_defaults(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// 64 bytes → one Hilbert square → a single overview zoom level.
+    #[tokio::test]
+    async fn streams_leaf_and_pyramid_tiles_without_disk() {
+        let sink = Arc::new(RecordingSink::default());
+        let view = stream_once(&sink).await;
+
+        assert_eq!(view.key, None);
+        assert_eq!(view.leaf_ext, "png");
+        assert_eq!(view.pyramid_ext, "png");
+        assert_eq!(view.max_zoom, 0);
+        assert_eq!(view.detail_depth, 0);
+        assert!(view.world_w > 0 && view.world_h > 0);
+
+        let uploads = sink.uploads.lock().unwrap();
+        // The leaf tile and every pyramid tile it contributes are staged via
+        // the same TileSink path the real HfTileSink would upload from.
+        assert!(!uploads.is_empty(), "expected at least the leaf tile");
+        let leaf: Vec<_> = uploads
+            .iter()
+            .filter(|(p, _)| p.starts_with("viz/tiles/0/"))
+            .collect();
+        assert_eq!(leaf.len(), 1, "one leaf at max_zoom 0: {uploads:?}");
+        assert_eq!(leaf[0].0, "viz/tiles/0/0/0.png");
+        assert!(!leaf[0].1.is_empty());
+        assert!(uploads.iter().any(|(p, _)| *p == "viz/tiles/0/0/0.png"));
+        // Every staged path is under the prefix + tiles/, none absolute.
+        for (p, _) in uploads.iter() {
+            assert!(p.starts_with("viz/tiles/"), "unexpected path {p}");
+        }
+    }
+
+    /// A tagged scene routes its tiles under `tiles/<key>/` and carries the
+    /// tag's label/order into the returned view.
+    #[tokio::test]
+    async fn tagged_scene_prefixes_tile_paths_and_carries_metadata() {
+        use crate::data::SceneTag;
+
+        let mut src = tiny_source();
+        src.extensions
+            .insert(SceneTag {
+                key: "alpha".to_string(),
+                label: "Alpha layer".to_string(),
+                order: 3,
+            });
+        let group = SceneGroup {
+            key: Some("alpha".to_string()),
+            label: "Alpha layer".to_string(),
+            order: 3,
+            sources: vec![src],
+            total: 64,
+        };
+
+        let sink = Arc::new(RecordingSink::default());
+        let view = stream_scene(
+            &sink,
+            &spec(),
+            Some("alpha"),
+            group,
+            false,
+            false,
+            TileFormat::Png,
+            TileFormat::Png,
+            crate::layout::LayoutMode::Hilbert,
+            &crate::registry::Registry::with_defaults(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(view.key.as_deref(), Some("alpha"));
+        assert_eq!(view.label, "Alpha layer");
+        assert_eq!(view.order, 3);
+        let uploads = sink.uploads.lock().unwrap();
+        assert!(uploads
+            .iter()
+            .all(|(p, _)| p.starts_with("viz/tiles/alpha/")),
+            "all paths under the scene key: {uploads:?}");
+        assert!(uploads
+            .iter()
+            .any(|(p, _)| *p == "viz/tiles/alpha/0/0/0.png"));
+    }
 }

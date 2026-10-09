@@ -442,4 +442,68 @@ mod tests {
             "world extents must reach the HTML"
         );
     }
+
+    /// The object shape (`{"files": [...], "max_zoom": M, "detail_depth": D}`)
+    /// regen path must use the persisted `max_zoom`/`detail_depth` rather than
+    /// sniffing them from directory names, and must sniff the leaf and pyramid
+    /// extensions independently (mixed png leaves / avif pyramid).
+    #[test]
+    fn regen_html_object_shape_uses_persisted_zoom_fields_and_sniffs_both_exts() {
+        let dir = tempfile::tempdir().unwrap();
+        // Leaf zoom 1 (persisted) with png tiles; pyramid zoom 0 in avif.
+        let leaf = dir.path().join("tiles").join("1").join("0");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(leaf.join("0.png"), b"x").unwrap();
+        let pyramid = dir.path().join("tiles").join("0").join("0");
+        std::fs::create_dir_all(&pyramid).unwrap();
+        std::fs::write(pyramid.join("0.avif"), b"x").unwrap();
+        std::fs::write(
+            dir.path().join("labels.json"),
+            serde_json::json!({
+                "files": [{"name": "a.bin", "x": 0, "y": 0, "size": 4}],
+                "max_zoom": 1,
+                "detail_depth": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let branding = crate::registry::Branding::default();
+        regen_html(dir.path(), &branding, None).unwrap();
+        let index = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
+        // Leaf and pyramid extensions are interpolated independently.
+        assert!(
+            index.contains("? 'png' : 'avif'"),
+            "mixed leaf/png + pyramid/avif extensions must reach the viewer: {index}"
+        );
+        // Persisted max_zoom wins over the deepest zoom dir minus detail_depth.
+        assert!(
+            index.contains("var MAX_ZOOM = 1;"),
+            "persisted max_zoom must reach the viewer"
+        );
+        // detail_depth > 0 emits the variable-depth detail layer.
+        assert!(
+            index.contains("DetailTileLayer"),
+            "detail_depth > 0 must emit the detail tile layer"
+        );
+        // Viewer headroom: max_zoom + detail_depth + 3.
+        assert!(
+            index.contains("maxZoom: 5"),
+            "viewer maxZoom must include detail headroom"
+        );
+    }
+
+    /// A labels.json that is neither an array, an object with `files`, nor a
+    /// scenes object is rejected with a descriptive error instead of
+    /// regenerating a broken viewer.
+    #[test]
+    fn regen_html_rejects_scalar_labels_json_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("labels.json"), "42").unwrap();
+        let branding = crate::registry::Branding::default();
+        let err = regen_html(dir.path(), &branding, None).unwrap_err();
+        assert!(
+            err.to_string().contains("unexpected JSON shape"),
+            "unexpected error: {err:#}"
+        );
+    }
 }

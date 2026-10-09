@@ -240,37 +240,25 @@ pub fn byte_directory_diff(
 
     for rel in sorted_keys {
         let orig_abs = &orig_map[rel];
-        let size_o = match std::fs::metadata(orig_abs) {
-            Ok(m) => m.len(),
-            Err(e) => {
-                log::warn!("{}: {} — skipping", orig_abs.display(), e);
-                continue;
-            }
+        let Some(size_o) = file_len(orig_abs) else {
+            continue;
         };
         match mod_map.get(rel) {
             None => {
                 if size_o == 0 {
                     continue;
                 }
-                sources.push(Source {
-                    file_idx: sources.len(),
-                    kind: SourceKind::UnmatchedRegion {
-                        fill: orig_fill_kind,
-                    },
-                    byte_size: size_o,
-                    name_override: Some(format!("[only in original] {}", rel.display())),
-                    xet_terms: None,
-                    extensions: Extensions::default(),
-                });
+                push_unmatched(
+                    &mut sources,
+                    orig_fill_kind,
+                    size_o,
+                    format!("[only in original] {}", rel.display()),
+                );
                 total += size_o;
             }
             Some(mod_abs) => {
-                let size_m = match std::fs::metadata(mod_abs) {
-                    Ok(m) => m.len(),
-                    Err(e) => {
-                        log::warn!("{}: {} — skipping", mod_abs.display(), e);
-                        continue;
-                    }
+                let Some(size_m) = file_len(mod_abs) else {
+                    continue;
                 };
                 if size_o != size_m {
                     if is_finetune {
@@ -283,9 +271,11 @@ pub fn byte_directory_diff(
                         );
                     } else {
                         log::warn!(
-                                "size mismatch ({} vs {} bytes) for {} — byte-diffing with zero-padding",
-                                size_o, size_m, rel.display()
-                            );
+                            "size mismatch ({} vs {} bytes) for {} — byte-diffing with zero-padding",
+                            size_o,
+                            size_m,
+                            rel.display()
+                        );
                     }
                 }
                 let max_size = size_o.max(size_m);
@@ -311,30 +301,47 @@ pub fn byte_directory_diff(
     // mod-only files (non-finetune case — finetune bailed earlier).
     for rel in &mod_only_keys {
         let mod_abs = &mod_map[*rel];
-        let size_m = match std::fs::metadata(mod_abs) {
-            Ok(m) => m.len(),
-            Err(e) => {
-                log::warn!("{}: {} — skipping", mod_abs.display(), e);
-                continue;
-            }
+        let Some(size_m) = file_len(mod_abs) else {
+            continue;
         };
         if size_m == 0 {
             continue;
         }
-        sources.push(Source {
-            file_idx: sources.len(),
-            kind: SourceKind::UnmatchedRegion {
-                fill: DiffFill::Green,
-            },
-            byte_size: size_m,
-            name_override: Some(format!("[only in modified] {}", rel.display())),
-            xet_terms: None,
-            extensions: Extensions::default(),
-        });
+        push_unmatched(
+            &mut sources,
+            DiffFill::Green,
+            size_m,
+            format!("[only in modified] {}", rel.display()),
+        );
         total += size_m;
     }
 
     Ok((sources, total))
+}
+
+/// Returns the file's length, or `None` (after logging a warning) when its
+/// metadata is unavailable, so callers can skip it.
+fn file_len(path: &Path) -> Option<u64> {
+    match std::fs::metadata(path) {
+        Ok(m) => Some(m.len()),
+        Err(e) => {
+            log::warn!("{}: {} — skipping", path.display(), e);
+            None
+        }
+    }
+}
+
+/// Appends an unmatched-region source that occupies `byte_size` bytes; the
+/// caller adds the same size to the running total.
+fn push_unmatched(sources: &mut Vec<Source>, fill: DiffFill, byte_size: u64, label: String) {
+    sources.push(Source {
+        file_idx: sources.len(),
+        kind: SourceKind::UnmatchedRegion { fill },
+        byte_size,
+        name_override: Some(label),
+        xet_terms: None,
+        extensions: Extensions::default(),
+    });
 }
 
 #[cfg(test)]
@@ -502,11 +509,12 @@ mod tests {
                 fill: DiffFill::Green
             }
         ));
-        assert!(!sources.iter().any(|s| s
-            .name_override
-            .as_deref()
-            .unwrap_or("none")
-            .contains("empty.bin")));
+        assert!(!sources.iter().any(|s| {
+            s.name_override
+                .as_deref()
+                .unwrap_or("none")
+                .contains("empty.bin")
+        }));
         assert_eq!(total, 8 + 8 + 4 + 5);
         // file_idx is compacted over the emitted sources.
         for (i, s) in sources.iter().enumerate() {

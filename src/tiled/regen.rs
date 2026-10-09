@@ -99,6 +99,19 @@ fn regen_html_multi(
             .unwrap_or(dflt)
             .to_string()
     };
+    // Geometry fields are always persisted per scene (see html::scene_fields),
+    // so a missing or non-numeric one means a truncated/hand-edited
+    // labels.json. Defaulting them to 0 would silently render a blank 0×0
+    // scene; fail loud naming the scene and the offending field instead.
+    let req_u32_field = |s: &serde_json::Value, k: &str| -> anyhow::Result<u32> {
+        s.get(k).and_then(|v| v.as_u64()).map(|v| v as u32).ok_or_else(|| {
+            let key = s.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            let label = s.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            anyhow::anyhow!(
+                "labels.json scene (key {key:?}, label {label:?}): missing or non-numeric field {k:?} — the file looks truncated or hand-edited"
+            )
+        })
+    };
     let scenes: Vec<html::SceneView> = scenes_json
         .iter()
         .map(|s| {
@@ -108,22 +121,22 @@ fn regen_html_multi(
                 .map(|a| a.iter().map(file_entity_from_json).collect())
                 .unwrap_or_default();
             let key = s.get("key").and_then(|v| v.as_str()).unwrap_or("");
-            html::SceneView {
+            Ok(html::SceneView {
                 key: (!key.is_empty()).then(|| key.to_string()),
                 label: str_field(s, "label", ""),
                 order: u32_field(s, "order"),
-                world_w: u32_field(s, "world_w"),
-                world_h: u32_field(s, "world_h"),
-                max_zoom: u32_field(s, "max_zoom"),
-                detail_depth: u32_field(s, "detail_depth"),
-                height: u32_field(s, "height"),
-                width: u32_field(s, "width"),
+                world_w: req_u32_field(s, "world_w")?,
+                world_h: req_u32_field(s, "world_h")?,
+                max_zoom: req_u32_field(s, "max_zoom")?,
+                detail_depth: req_u32_field(s, "detail_depth")?,
+                height: req_u32_field(s, "height")?,
+                width: req_u32_field(s, "width")?,
                 leaf_ext: str_field(s, "leaf_ext", "png"),
                 pyramid_ext: str_field(s, "pyramid_ext", "png"),
                 entities,
-            }
+            })
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
     html::write_leaflet_html_multi(
         tile_dir,
         &scenes,
@@ -296,6 +309,26 @@ mod tests {
                 .contains("--regen-html expects a viewer bundle"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[test]
+    fn regen_html_multi_fails_loud_on_scene_missing_geometry() {
+        let dir = tempfile::tempdir().unwrap();
+        // A scene shape without the always-persisted geometry fields (e.g. a
+        // truncated labels.json) must error naming the field, not silently
+        // render a 0×0 scene.
+        std::fs::write(
+            dir.path().join("labels.json"),
+            r#"{"scenes":[{"key":"a","label":"A","order":0,"files":[]}]}"#,
+        )
+        .unwrap();
+        let err = regen_html(dir.path(), &crate::registry::Branding::default(), None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing or non-numeric field \"world_w\""),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("key \"a\""), "unexpected error: {msg}");
     }
 
     #[test]

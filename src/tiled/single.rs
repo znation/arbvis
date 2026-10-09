@@ -100,9 +100,7 @@ fn encode_indexed_single_png(width: u32, height: u32, pixels: &[u8]) -> anyhow::
 /// Encode an RGB image as a truecolor 8-bit PNG. Diff output mixes
 /// signed-delta LUT colors, one-sided-source tints, and crosshatch fills, so
 /// its palette is not bounded at 256 entries — indexed PNG won't do.
-fn encode_rgb_png(
-    img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
-) -> anyhow::Result<Vec<u8>> {
+fn encode_rgb_png(img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>) -> anyhow::Result<Vec<u8>> {
     let (width, height) = img.dimensions();
     let mut out: Vec<u8> = Vec::new();
     {
@@ -645,7 +643,13 @@ mod tests {
                 300,
                 "pair",
             ),
-            mk(SourceKind::UnmatchedRegion { fill: DiffFill::Red }, 100, "unmatched"),
+            mk(
+                SourceKind::UnmatchedRegion {
+                    fill: DiffFill::Red,
+                },
+                100,
+                "unmatched",
+            ),
             mk(
                 SourceKind::OneSidedRange {
                     data: std::sync::Arc::new(Data::Owned(vec![0x41; 50])),
@@ -665,10 +669,7 @@ mod tests {
         o.as_file().write_all(orig)?;
         let m = tempfile::NamedTempFile::new()?;
         m.as_file().write_all(mod_)?;
-        Ok((
-            o.into_temp_path().keep()?,
-            m.into_temp_path().keep()?,
-        ))
+        Ok((o.into_temp_path().keep()?, m.into_temp_path().keep()?))
     }
 
     #[tokio::test]
@@ -720,18 +721,34 @@ mod tests {
         }
         let geom = single_geometry(total);
         let (ht, wt) = (geom.height / TILE, geom.width / TILE);
-        let mut reference = image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::new(geom.width, geom.height);
+        let mut reference =
+            image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::new(geom.width, geom.height);
         for ty in 0..ht {
             for tx in 0..wt {
                 let tile_buf = load_tile_bytes(
-                    tx, ty, geom.kh, ht, geom.square_pixels, total,
-                    &source_data, &cumulative,
+                    tx,
+                    ty,
+                    geom.kh,
+                    ht,
+                    geom.square_pixels,
+                    total,
+                    &source_data,
+                    &cumulative,
                 )
                 .await
                 .unwrap();
                 let (tile_img, _) = render_leaf_tile_diff(
-                    tx, ty, geom.kh, ht, geom.square_pixels, total,
-                    &tile_buf, &pixel_lut, &plain_lut, &fills, &tints,
+                    tx,
+                    ty,
+                    geom.kh,
+                    ht,
+                    geom.square_pixels,
+                    total,
+                    &tile_buf,
+                    &pixel_lut,
+                    &plain_lut,
+                    &fills,
+                    &tints,
                     TileFormat::Png,
                 )
                 .map_err(|e| anyhow::anyhow!(e))
@@ -795,7 +812,13 @@ mod tests {
         assert_eq!(&*tints, &*plan_tints);
         // And the fabricated lists are what the diff renderer expects:
         // sorted by start, covering the fabricated sources only.
-        assert_eq!(fills.as_ref(), &[(300u64, 400u64, crate::data::DiffFill::Red)]);
-        assert_eq!(tints.as_ref(), &[(400u64, 450u64, crate::data::DiffFill::Green)]);
+        assert_eq!(
+            fills.as_ref(),
+            &[(300u64, 400u64, crate::data::DiffFill::Red)]
+        );
+        assert_eq!(
+            tints.as_ref(),
+            &[(400u64, 450u64, crate::data::DiffFill::Green)]
+        );
     }
 }

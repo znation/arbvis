@@ -321,12 +321,34 @@ pub fn parse(raw: &str) -> anyhow::Result<HfUrl> {
     })
 }
 
-/// The HF endpoint (`HF_ENDPOINT` env override, else `https://huggingface.co`).
-/// Trailing slashes stripped. Used by the direct-HTTP paths that bypass the
-/// `hf` CLI (`fetch_range`, `fetch_model_card`, and `xet/mod.rs`).
+/// The HF endpoint used when `HF_ENDPOINT` is unset or invalid.
+pub const DEFAULT_ENDPOINT: &str = "https://huggingface.co";
+
+/// The HF endpoint (`HF_ENDPOINT` env override, else [`DEFAULT_ENDPOINT`]).
+/// Whitespace-trimmed and trailing slashes stripped. Used by the direct-HTTP
+/// paths that bypass the `hf` CLI (`fetch_range`, `fetch_model_card`, and
+/// `xet/mod.rs`).
+///
+/// A value that is not an http(s) URL (including an empty or whitespace-only
+/// one, which would make every request URL start with `/api/...`) is ignored
+/// with a warning, so a typo'd override never silently breaks the URL scheme.
 pub fn endpoint() -> String {
-    let raw = std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
-    raw.trim_end_matches('/').to_string()
+    match std::env::var("HF_ENDPOINT") {
+        Ok(raw) => parse_endpoint(&raw),
+        Err(_) => DEFAULT_ENDPOINT.to_string(),
+    }
+}
+
+/// Validate one `HF_ENDPOINT` value. Returns the trimmed, slash-stripped
+/// endpoint, or [`DEFAULT_ENDPOINT`] with a warning when the value lacks an
+/// `http://` / `https://` scheme.
+fn parse_endpoint(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return trimmed.to_string();
+    }
+    log::warn!("HF_ENDPOINT={raw:?} is not an http(s) URL; ignoring (using {DEFAULT_ENDPOINT})");
+    DEFAULT_ENDPOINT.to_string()
 }
 
 /// Build an HTTP request against `url` with a timeout and the HF token's
@@ -975,6 +997,32 @@ pub fn parse_hf_output(hf_url_str: &str) -> anyhow::Result<HfOutputSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_endpoint_accepts_http_and_https_and_strips_trailing_slashes() {
+        assert_eq!(
+            parse_endpoint("https://hf-mirror.com"),
+            "https://hf-mirror.com"
+        );
+        assert_eq!(
+            parse_endpoint("http://localhost:8080///"),
+            "http://localhost:8080"
+        );
+        assert_eq!(
+            parse_endpoint(" https://mirror.example.com/ "),
+            "https://mirror.example.com"
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_falls_back_with_a_warning_on_non_http_values() {
+        // An empty value would make every request URL start with `/api/...`;
+        // a schemeless host yields invalid URLs too. Each must fall back.
+        assert_eq!(parse_endpoint(""), DEFAULT_ENDPOINT);
+        assert_eq!(parse_endpoint("   "), DEFAULT_ENDPOINT);
+        assert_eq!(parse_endpoint("hf-mirror.com"), DEFAULT_ENDPOINT);
+        assert_eq!(parse_endpoint("ftp://hf-mirror.com"), DEFAULT_ENDPOINT);
+    }
 
     #[tokio::test]
     async fn tree_pagination_stops_when_cursor_never_advances() {

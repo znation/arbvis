@@ -584,14 +584,7 @@ mod png_flag_tests {
             );
         }
         // `--png` composes with `--diff` (diff PNG export is supported).
-        let with_diff = [
-            "arbvis",
-            "--diff",
-            "a",
-            "b",
-            "--png",
-            "out.png",
-        ];
+        let with_diff = ["arbvis", "--diff", "a", "b", "--png", "out.png"];
         assert!(Args::try_parse_from(with_diff).is_ok());
     }
 

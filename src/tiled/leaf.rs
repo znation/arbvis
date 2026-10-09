@@ -628,6 +628,92 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tile_pixel_start_squares_and_hilbert_order() {
+        let kh = 13u8;
+        let height_tiles = 1u32 << (kh - TILE_LOG2);
+        let square_pixels = 1u64 << (2 * kh as u32);
+        for &(tx, ty) in &[(0u32, 0u32), (1, 0), (0, 1), (5, 3)] {
+            assert_eq!(
+                tile_pixel_start(tx, ty, kh, height_tiles, square_pixels),
+                xy2h_u64(tx as u64, ty as u64, kh - TILE_LOG2) * TILE_AREA,
+                "first square: ({tx},{ty})"
+            );
+        }
+        // Second square column shifts by exactly one square's worth of bytes.
+        for ty in [0u32, 7u32, 31u32] {
+            assert_eq!(
+                tile_pixel_start(height_tiles, ty, kh, height_tiles, square_pixels),
+                square_pixels + xy2h_u64(0, ty as u64, kh - TILE_LOG2) * TILE_AREA,
+                "second square, ty={ty}"
+            );
+        }
+        assert_eq!(
+            tile_pixel_start(2 * height_tiles, 0, kh, height_tiles, square_pixels),
+            2 * square_pixels,
+            "third square origin"
+        );
+    }
+
+    /// `load_tile_bytes` fills the tile in Hilbert byte order from `Data`
+    /// sources, including tiles that straddle a source boundary in the
+    /// middle of the tile's byte range.
+    #[tokio::test]
+    async fn load_tile_bytes_spans_two_sources() {
+        let kh = 13u8;
+        let height_tiles = 1u32 << (kh - TILE_LOG2);
+        let square_pixels = 1u64 << (2 * kh as u32);
+        let total = 20_000u64;
+        let split = 7_777u64; // boundary strictly inside tile (0,0)'s range
+        let src0 = Data::Owned((0..split).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+        let src1 = Data::Owned((0..total - split).map(|i| ((i * 7 + 13) % 256) as u8).collect::<Vec<u8>>());
+        let sources = [src0, src1];
+        let cumulative = [0u64, split];
+        let buf = load_tile_bytes(
+            0, 0, kh, height_tiles, square_pixels, total, &sources, &cumulative,
+        )
+        .await
+        .unwrap();
+        for i in 0..total as usize {
+            let expected = if i < split as usize {
+                (i % 251) as u8
+            } else {
+                (((i as u64 - split) * 7 + 13) % 256) as u8
+            };
+            assert_eq!(buf[i], expected, "byte {i}");
+        }
+        // Bytes past `total` stay zero-filled.
+        for i in total as usize..TILE_PIXELS {
+            assert_eq!(buf[i], 0, "tail byte {i}");
+        }
+    }
+
+    /// A tile whose whole Hilbert byte range lies past `total` must come
+    /// back all zeros without touching any source.
+    #[tokio::test]
+    async fn load_tile_bytes_past_eof_returns_zeroes_without_source_reads() {
+        let kh = 13u8;
+        let height_tiles = 1u32 << (kh - TILE_LOG2);
+        let square_pixels = 1u64 << (2 * kh as u32);
+        let sources = [Data::Owned(Vec::new())]; // any read here would panic
+        let cumulative = [0u64];
+        for &(tx, ty) in &[(1u32, 0u32), (0, 1), (3, 3)] {
+            let buf = load_tile_bytes(
+                tx,
+                ty,
+                kh,
+                height_tiles,
+                square_pixels,
+                100u64,
+                &sources,
+                &cumulative,
+            )
+            .await
+            .unwrap();
+            assert!(buf.iter().all(|&b| b == 0), "tile ({tx},{ty}) zero-filled");
+        }
+    }
+
+    #[test]
     fn xy2h_u64_roundtrip_small() {
         let h = xy2h_u64(3, 4, 8);
         let (x, y) = crate::geometry::hilbert_to_xy_u64(h, 8);

@@ -344,7 +344,7 @@ impl std::fmt::Debug for Extensions {
 /// every non-scene render (hilbert / arch / diff) is byte-for-byte unchanged.
 ///
 /// Attached via [`Extensions::insert`] by a producer that wants more than one
-/// lens in a single run (e.g. `modelweightvis --moe` emits a `"summary"` and a
+/// lens in a single run (e.g. `modelweightvis --moe-summary` emits a `"summary"` and a
 /// `"cka"` scene). The tiler partitions on this tag *before* layout selection,
 /// so each scene independently picks its own [`crate::layout::LayoutShape`].
 #[derive(Clone, Debug)]

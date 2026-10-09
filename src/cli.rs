@@ -181,10 +181,9 @@ pub struct Args {
     /// the disk-backed path is much faster and more recoverable. Use
     /// `--stream` when input or output data won't fit on local disk.
     ///
-    /// Applies to every flow that takes `hf://` inputs: the normal renderer,
-    /// `--diff` (when both sides are repo-level URLs), and the MoE viewer
-    /// (`--moe`).
-    /// Single-file / local-path inputs always resolve through
+    /// Applies to every flow that takes `hf://` inputs: the normal renderer
+    /// and `--diff` (when both sides are repo-level URLs). Single-file /
+    /// local-path inputs always resolve through
     /// `hf_url::resolve` + snapshot and are unaffected by `--stream`.
     #[arg(long)]
     pub(crate) stream: bool,

@@ -544,7 +544,8 @@ fn build_html(
 // Multi-scene viewer
 //
 // A *scene* is one independent tile pyramid under `tiles/<key>/`. When a render
-// produces more than one (e.g. `modelweightvis --moe` → "summary" + "cka"), the
+// produces more than one (e.g. `modelweightvis --moe-summary` → the MoE summary
+// and CKA panels), the
 // viewer registers one Leaflet base layer per scene and a `L.control.layers`
 // switcher ("tabs"). The single-scene path above is left untouched, so ordinary
 // renders stay byte-for-byte identical.

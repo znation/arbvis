@@ -512,7 +512,25 @@ struct TreeApiLfs {
 /// returns the same per-file metadata arbvis needs (size, blob oid, LFS
 /// sha256, xet hash) and paginates large repos via an RFC 5988 `Link`
 /// header, which we follow to completion.
+/// Upper bound on pages fetched from one tree-API listing. The Hub paginates
+/// at 1,000 entries per page, so even multi-million-entry repos stay far
+/// below this; hitting it means the `rel="next"` cursor is not advancing
+/// (e.g. a broken mirror behind HF_ENDPOINT) and fetching would never end.
+const MAX_TREE_PAGES: usize = 1_000;
+
 async fn fetch_tree_via_http(
+    kind: RepoKind,
+    repo_id: &str,
+    revision: &str,
+) -> anyhow::Result<Vec<HfTreeEntry>> {
+    fetch_tree_via_http_at(&endpoint(), kind, repo_id, revision).await
+}
+
+/// Same as [`fetch_tree_via_http`], against an explicit endpoint base —
+/// the test seam that avoids mutating `HF_ENDPOINT` (which races with
+/// parallel tests that read it).
+async fn fetch_tree_via_http_at(
+    base: &str,
     kind: RepoKind,
     repo_id: &str,
     revision: &str,
@@ -525,14 +543,24 @@ async fn fetch_tree_via_http(
 
     let mut url = format!(
         "{}/api/{}/{}/tree/{}?recursive=true",
-        endpoint(),
+        base,
         kind.api_segment(),
         encode_url_path(repo_id),
         encode_url_path(revision),
     );
 
     let mut out: Vec<HfTreeEntry> = Vec::new();
+    let mut pages = 0usize;
     loop {
+        pages += 1;
+        if pages > MAX_TREE_PAGES {
+            anyhow::bail!(
+                "listing {} {repo_id}@{revision} exceeded {MAX_TREE_PAGES} tree-API pages; \
+                 the pagination cursor is not advancing — is HF_ENDPOINT pointing at a \
+                 broken mirror?",
+                kind.api_segment()
+            );
+        }
         let (page, next): (Vec<TreeApiEntry>, Option<String>) = with_throttle(&label, || {
             let client = &client;
             let token = token.as_deref();
@@ -936,6 +964,49 @@ pub fn parse_hf_output(hf_url_str: &str) -> anyhow::Result<HfOutputSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tree_pagination_stops_when_cursor_never_advances() {
+        // Stub server that answers every request with one empty JSON page and
+        // a `Link: rel="next"` header pointing back at itself — a
+        // non-advancing pagination cursor, as served by a broken mirror
+        // behind HF_ENDPOINT. The request body is read (and discarded) so
+        // the client sees a well-formed request/response exchange.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Link: <http://{addr}/api/models/stub/repo/tree/main>; rel=\"next\"\r\n\
+                     Content-Length: 2\r\nConnection: close\r\n\r\n[]"
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, resp.as_bytes()).await;
+            }
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            fetch_tree_via_http_at(
+                &format!("http://{addr}"),
+                RepoKind::Model,
+                "stub/repo",
+                "main",
+            ),
+        )
+        .await;
+        let err = result
+            .expect("tree listing must terminate, not loop forever")
+            .expect_err("a non-advancing cursor must be an error, not a hang");
+        assert!(
+            err.to_string().contains("tree-API pages"),
+            "unexpected error: {err:#}"
+        );
+    }
 
     #[test]
     fn validate_range_body_accepts_exact_body() {

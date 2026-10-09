@@ -163,7 +163,11 @@ pub async fn deploy_space_app(
 /// direct-reqwest pattern. A `404` is a clean "does not exist"; `2xx` and the
 /// gated `401`/`403` both mean it exists (we just may lack read access).
 async fn space_exists(space_id: &str) -> anyhow::Result<bool> {
-    let url = format!("{}/api/spaces/{space_id}", hf_url::endpoint());
+    let url = format!(
+        "{}/api/spaces/{}",
+        hf_url::endpoint(),
+        hf_url::encode_url_path(space_id)
+    );
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -189,7 +193,11 @@ async fn space_exists(space_id: &str) -> anyhow::Result<bool> {
 /// Trigger a normal restart of a Space (not a factory reboot — that would wipe
 /// persistent storage). Matches `HfApi.restart_space`: `POST /api/spaces/{id}/restart`.
 async fn restart_space(space_id: &str) -> anyhow::Result<()> {
-    let url = format!("{}/api/spaces/{space_id}/restart", hf_url::endpoint());
+    let url = format!(
+        "{}/api/spaces/{}/restart",
+        hf_url::endpoint(),
+        hf_url::encode_url_path(space_id)
+    );
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()

@@ -102,9 +102,9 @@ impl RemoteRepo {
             "{}/{}{}/resolve/{}/{}",
             endpoint(),
             kind_prefix,
-            self.repo_id,
-            revision,
-            filename,
+            encode_url_path(&self.repo_id),
+            encode_url_path(revision),
+            encode_url_path(filename),
         );
         // `Range: bytes=START-END` is inclusive on both sides; our `range.end`
         // is the exclusive Rust convention, so subtract 1 for the header.
@@ -363,7 +363,7 @@ pub fn require_token() -> anyhow::Result<()> {
 /// [`crate::finetune::detect_relation`], which the modelweightvis split will
 /// own.
 pub async fn fetch_model_card(repo_id: &str) -> anyhow::Result<serde_json::Value> {
-    let url = format!("{}/api/models/{repo_id}", endpoint());
+    let url = format!("{}/api/models/{}", endpoint(), encode_url_path(repo_id));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -474,8 +474,8 @@ async fn fetch_tree_via_http(
         "{}/api/{}/{}/tree/{}?recursive=true",
         endpoint(),
         kind.api_segment(),
-        repo_id,
-        revision,
+        encode_url_path(repo_id),
+        encode_url_path(revision),
     );
 
     let mut out: Vec<HfTreeEntry> = Vec::new();
@@ -800,6 +800,38 @@ pub async fn list_repo_as_http_specs(
     Ok(specs)
 }
 
+/// Percent-encode a user-supplied identifier (`repo_id`, `revision`, `filename`,
+/// `space_id`) for interpolation into a Hub URL path. Unreserved characters and
+/// the segment-separating `/` pass through unchanged; everything else —
+/// including `?`, `#`, `%`, whitespace, and control bytes — is percent-encoded,
+/// so the identifier cannot alter the request's path, query, or fragment.
+/// A segment that is exactly `.` or `..` gets its dots encoded, so the URL
+/// parser cannot normalize it into path traversal (harmless interior dots in
+/// real repo or file names keep their literal form).
+pub fn encode_url_path(s: &str) -> String {
+    s.split('/')
+        .map(|seg| {
+            if seg == "." {
+                "%2E".to_string()
+            } else if seg == ".." {
+                "%2E.".to_string()
+            } else {
+                let mut out = String::with_capacity(seg.len());
+                for &b in seg.as_bytes() {
+                    match b {
+                        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                            out.push(b as char)
+                        }
+                        _ => out.push_str(&format!("%{b:02X}")),
+                    }
+                }
+                out
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Parse an `hf://` output URL into an `HfOutputSpec`.
 pub fn parse_hf_output(hf_url_str: &str) -> anyhow::Result<HfOutputSpec> {
     let hf =
@@ -831,6 +863,31 @@ mod tests {
         assert_eq!(sanitize_log_text("model.safetensors"), "model.safetensors");
         // Non-ASCII printable (CJK, emoji) is preserved.
         assert_eq!(sanitize_log_text("权重 🦙.bin"), "权重 🦙.bin");
+    }
+
+    #[test]
+    fn encode_url_path_blocks_query_fragment_and_traversal_injection() {
+        // `?` / `#` cannot start a query or fragment inside the URL path.
+        assert_eq!(encode_url_path("main?x=1"), "main%3Fx%3D1");
+        assert_eq!(encode_url_path("dev#frag"), "dev%23frag");
+        // A literal `%` cannot forge an escape sequence.
+        assert_eq!(encode_url_path("100%main"), "100%25main");
+        // `.`/`..` segments are encoded, so `../` cannot escape the API path.
+        assert_eq!(
+            encode_url_path("../../api/models/o/r"),
+            "%2E./%2E./api/models/o/r"
+        );
+        // Whitespace and control bytes are encoded too.
+        assert_eq!(encode_url_path("a b\tc"), "a%20b%09c");
+    }
+
+    #[test]
+    fn encode_url_path_leaves_legitimate_identifiers_untouched() {
+        // Owner/repo slash, dots, and dashes survive; non-ASCII names are
+        // percent-encoded as UTF-8, which the Hub decodes identically.
+        assert_eq!(encode_url_path("alice/foo.bar"), "alice/foo.bar");
+        assert_eq!(encode_url_path("refs/pr/1"), "refs/pr/1");
+        assert_eq!(encode_url_path("权/重.bin"), "%E6%9D%83/%E9%87%8D.bin");
     }
 
     #[test]

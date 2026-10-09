@@ -1168,6 +1168,147 @@ mod pipeline_join_tests {
 }
 
 #[cfg(test)]
+mod mode_helpers_tests {
+    use super::*;
+    use crate::data::{Data, DiffFill, SourceKind};
+
+    fn source(kind: SourceKind, byte_size: u64) -> Source {
+        Source {
+            file_idx: 0,
+            kind,
+            byte_size,
+            name_override: None,
+            xet_terms: None,
+            extensions: Default::default(),
+        }
+    }
+
+    #[test]
+    fn diff_leaf_mode_collects_fills_and_tints_in_canvas_order() {
+        let sources = vec![
+            source(SourceKind::Buffered(vec![1, 2]), 40),
+            source(
+                SourceKind::UnmatchedRegion {
+                    fill: DiffFill::Red,
+                },
+                10,
+            ),
+            source(SourceKind::Buffered(vec![]), 5),
+            source(
+                SourceKind::OneSidedRange {
+                    data: Arc::new(Data::Owned(vec![0x41; 3])),
+                    start: 0,
+                    fill: DiffFill::Green,
+                },
+                20,
+            ),
+            source(
+                SourceKind::UnmatchedRegion {
+                    fill: DiffFill::Grey,
+                },
+                15,
+            ),
+        ];
+        let LeafMode::Diff {
+            fills,
+            tints,
+            pixel_lut,
+            plain_lut,
+        } = diff_leaf_mode(&sources)
+        else {
+            panic!("diff_leaf_mode must return LeafMode::Diff");
+        };
+        // Fills: UnmatchedRegion sources at their cumulative offsets, sorted
+        // by start and non-overlapping (the contract documented on LeafMode::Diff).
+        assert_eq!(&fills[..], &[(40, 50, DiffFill::Red), (75, 90, DiffFill::Grey)]);
+        // Tints: the OneSidedRange source at its own cumulative offset.
+        assert_eq!(&tints[..], &[(55, 75, DiffFill::Green)]);
+        // Plain sources contribute to the cumulative offsets without adding
+        // fills or tints of their own.
+        assert_ne!(Arc::as_ptr(&pixel_lut), Arc::as_ptr(&plain_lut));
+    }
+
+    #[test]
+    fn diff_leaf_mode_skips_zero_byte_unmatched_and_onesided_sources() {
+        let sources = vec![
+            source(
+                SourceKind::UnmatchedRegion {
+                    fill: DiffFill::Red,
+                },
+                0,
+            ),
+            source(
+                SourceKind::OneSidedRange {
+                    data: Arc::new(Data::Owned(vec![])),
+                    start: 0,
+                    fill: DiffFill::Green,
+                },
+                0,
+            ),
+        ];
+        let LeafMode::Diff { fills, tints, .. } = diff_leaf_mode(&sources) else {
+            panic!("diff_leaf_mode must return LeafMode::Diff");
+        };
+        assert!(fills.is_empty(), "zero-byte fill leaked in: {fills:?}");
+        assert!(tints.is_empty(), "zero-byte tint leaked in: {tints:?}");
+    }
+
+    #[test]
+    fn derive_leaf_format_routes_palette_safe_avif_to_indexed_png() {
+        let plain = LeafMode::Plain {
+            pixel_lut: Arc::new(build_pixel_lut()),
+        };
+        // Avif over Plain (≤256 colors) downgrades to indexed PNG.
+        assert!(matches!(
+            derive_leaf_format(TileFormat::Avif { quality: 50, speed: 6 }, &plain),
+            TileFormat::IndexedPng
+        ));
+        // Xet tiles can exceed 256 distinct colors: Avif stays Avif.
+        let xet = LeafMode::Xet {
+            pixel_lut: Arc::new(build_pixel_lut()),
+            xorb_ranges: Arc::new(Vec::new()),
+            tableau: Arc::new([image::Rgb([0, 0, 0]); 20]),
+        };
+        assert!(matches!(
+            derive_leaf_format(TileFormat::Avif { quality: 50, speed: 6 }, &xet),
+            TileFormat::Avif { .. }
+        ));        // Non-AVIF choices pass through unchanged even in palette-safe modes.
+        assert!(matches!(
+            derive_leaf_format(TileFormat::IndexedPng, &plain),
+            TileFormat::IndexedPng
+        ));
+    }
+
+    #[test]
+    fn tile_coords_len_and_leaf_mode_predicates() {
+        assert_eq!(
+            TileCoords::Dense {
+                width_tiles: 3,
+                height_tiles: 4,
+            }
+            .len(),
+            12
+        );
+        assert_eq!(TileCoords::Sparse(vec![(0, 0), (1, 1)]).len(), 2);
+        assert_eq!(TileCoords::Sparse(vec![]).len(), 0);
+
+        let lut = Arc::new(build_pixel_lut());
+        let plain = LeafMode::Plain {
+            pixel_lut: lut.clone(),
+        };
+        assert!(plain.needs_bytes());
+        assert!(plain.is_palette_safe());
+        let xet = LeafMode::Xet {
+            pixel_lut: lut.clone(),
+            xorb_ranges: Arc::new(Vec::new()),
+            tableau: Arc::new([image::Rgb([0, 0, 0]); 20]),
+        };
+        assert!(xet.needs_bytes());
+        assert!(!xet.is_palette_safe());
+    }
+}
+
+#[cfg(test)]
 mod scene_tests {
     #[test]
     fn regen_html_missing_labels_json_says_the_dir_must_be_a_viewer_bundle() {

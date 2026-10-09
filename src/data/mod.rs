@@ -184,7 +184,6 @@ pub trait CustomSource: Send + Sync {
     /// pipeline never calls this today — canvas layout reads the
     /// `Source::byte_size` field, which the impl sets when it constructs the
     /// `Source` — but it stays part of the plugin contract for downstream.
-    #[allow(dead_code)]
     fn byte_size(&self) -> u64;
     /// Open the source for the render pipeline. Returns a `Data` handle the
     /// load stage can `fetch_range` against.

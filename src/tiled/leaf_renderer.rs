@@ -29,7 +29,6 @@ use super::{EncodedTile, LeafMode, LoadedTile};
 /// `Regions` with `Padding` for fully-empty tiles — without touching the
 /// dispatch.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub enum LeafTile {
     Bytes { renderer_id: &'static str },
     Regions { renderer_id: &'static str },

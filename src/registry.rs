@@ -99,7 +99,6 @@ pub struct DiffBuildCtx<'a> {
 /// matches its shape.
 #[async_trait]
 pub trait DiffSourceBuilder: Send + Sync {
-    #[allow(dead_code)]
     fn id(&self) -> &'static str;
     fn priority(&self) -> i32;
     async fn try_build(&self, ctx: &DiffBuildCtx<'_>)

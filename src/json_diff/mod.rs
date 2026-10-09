@@ -489,7 +489,10 @@ mod tests {
         let (sources, total) = build_json_diff_sources(&orig, &mod2, false).await.unwrap();
         assert_eq!(sources.len(), 2);
         assert_eq!(total, 15 + 17);
-        assert!(matches!(sources[0].kind, SourceKind::UnmatchedRegion { .. }));
+        assert!(matches!(
+            sources[0].kind,
+            SourceKind::UnmatchedRegion { .. }
+        ));
         assert_eq!(
             sources[0].name_override.as_deref(),
             Some("[only in original] orig.json")

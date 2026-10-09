@@ -524,6 +524,56 @@ pub(crate) async fn authed_send(
         .with_context(|| format!("HF {what} request failed"))
 }
 
+/// Pass through 2xx responses; turn non-2xx HF API responses into an anyhow
+/// error that names the operation, the HTTP status, and — when the body is the
+/// Hub API's usual `{"error": "..."}` shape — the API's own message (with a
+/// truncated raw-body fallback otherwise). The bare `error_for_status()` this
+/// replaces drops both the status code and that message, leaving the user
+/// nothing to distinguish an expired token from a gated repo or a wrong id.
+pub(crate) async fn check_hf_status(
+    resp: reqwest::Response,
+    what: &str,
+) -> anyhow::Result<reqwest::Response> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    // Read the full body: the Hub API's `error` message can exceed the
+    // snippet cap, so parse before any truncation. [`hf_api_error_message`]
+    // caps only the raw-body fallback snippet.
+    let body = resp.text().await.unwrap_or_default();
+    anyhow::bail!(
+        "HF {what} failed with HTTP {status}: {}",
+        hf_api_error_message(status.as_u16(), &body)
+    )
+}
+
+/// Longest raw-body snippet surfaced by [`hf_api_error_message`] when the body
+/// is not the Hub API's `{"error": ...}` shape.
+const MAX_ERROR_BODY_SNIPPET: usize = 300;
+
+/// Extract a human-readable message from a non-2xx HF API response body:
+/// the `error` field when the body is that JSON shape, a truncated snippet of
+/// the raw body otherwise, and a plain status-only line for an empty body.
+fn hf_api_error_message(status: u16, body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return format!("no response body (HTTP {status})");
+    }
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(msg) = json.get("error").and_then(|e| e.as_str()) {
+            return msg.to_string();
+        }
+    }
+    // Cap on a char boundary: slicing at a byte index can panic mid-codepoint.
+    if trimmed.chars().count() > MAX_ERROR_BODY_SNIPPET {
+        let cut: String = trimmed.chars().take(MAX_ERROR_BODY_SNIPPET).collect();
+        format!("{cut}…")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Build an HTTP request against `url` with a timeout and the HF token's
 /// bearer auth already applied (`read_token()` is consulted here, so callers
 /// must not add it again).
@@ -646,9 +696,7 @@ pub async fn fetch_model_card(repo_id: &str) -> anyhow::Result<serde_json::Value
         "model_card",
     )
     .await?;
-    let resp = resp
-        .error_for_status()
-        .context("HF model_card non-2xx status")?;
+    let resp = check_hf_status(resp, &format!("model card fetch for {repo_id}")).await?;
     let json: serde_json::Value = resp
         .json()
         .await
@@ -1206,6 +1254,92 @@ mod tests {
 
     /// Serializes tests that mutate process-global HF_* env vars.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn hf_api_error_message_extracts_error_field() {
+        assert_eq!(
+            hf_api_error_message(401, r#"{"error": "Invalid credentials in token"}"#),
+            "Invalid credentials in token"
+        );
+    }
+
+    #[test]
+    fn hf_api_error_message_falls_back_to_snippet_and_empty() {
+        // Non-JSON body → truncated raw snippet.
+        assert_eq!(
+            hf_api_error_message(503, "upstream  tired"),
+            "upstream  tired"
+        );
+        // Oversized snippet is capped with an ellipsis marker.
+        let big = "x".repeat(400);
+        let msg = hf_api_error_message(500, &big);
+        assert_eq!(msg.chars().count(), 301);
+        assert!(msg.ends_with('…'));
+        // JSON without an `error` field falls back to the raw snippet.
+        assert_eq!(
+            hf_api_error_message(404, r#"{"oops": 1}"#),
+            r#"{"oops": 1}"#
+        );
+        // Empty/whitespace body → status-only line.
+        assert_eq!(
+            hf_api_error_message(404, "  "),
+            "no response body (HTTP 404)"
+        );
+    }
+
+    #[test]
+    fn hf_api_error_message_preserves_long_json_error_message() {
+        // An `error` message longer than the 300-char snippet cap must come
+        // through whole — truncation applies only to the raw-body fallback.
+        let msg = "x".repeat(500);
+        let body = format!(r#"{{"error": "{msg}"}}"#);
+        assert_eq!(hf_api_error_message(403, &body), msg);
+    }
+
+    #[test]
+    fn hf_api_error_message_snippet_truncates_on_char_boundary() {
+        // A multi-byte-character body must not panic when truncated.
+        let body = "é".repeat(400); // 2 bytes per char, 800 bytes total
+        let got = hf_api_error_message(500, &body);
+        assert_eq!(got.chars().count(), 301); // 300 chars + ellipsis
+        assert!(got.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn check_hf_status_passes_2xx_through_and_fails_loud_on_401() {
+        // Minimal one-shot HTTP server: first request gets 200 with a JSON
+        // body, second gets 401 with the Hub API's `{"error": ...}` shape.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            let bodies = [
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: 40\r\nConnection: close\r\n\r\n{\"error\":\"Invalid credentials in token\"}",
+            ];
+            for body in bodies {
+                let (mut sock, _) = listener.accept().unwrap();
+                use std::io::Write;
+                // Drain the request line/headers so the response isn't raced.
+                let mut buf = [0u8; 2048];
+                let _ = std::io::Read::read(&mut sock, &mut buf);
+                sock.write_all(body.as_bytes()).unwrap();
+            }
+        });
+        let url = format!("http://{addr}/");
+
+        let ok = crate::xet::http_client().get(&url).send().await.unwrap();
+        let ok = check_hf_status(ok, "thing").await.unwrap();
+        assert_eq!(ok.status(), reqwest::StatusCode::OK);
+
+        let bad = crate::xet::http_client().get(&url).send().await.unwrap();
+        let err = check_hf_status(bad, "restart of space foo/bar")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("HTTP 401 Unauthorized"), "got: {msg}");
+        assert!(msg.contains("Invalid credentials in token"), "got: {msg}");
+        srv.join().unwrap();
+    }
 
     #[test]
     fn parse_endpoint_accepts_http_and_https_and_strips_trailing_slashes() {

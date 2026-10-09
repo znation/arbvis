@@ -195,15 +195,14 @@ async fn restart_space(space_id: &str) -> anyhow::Result<()> {
         "{}/restart",
         hf_url::api_repo_url(&hf_url::endpoint(), hf_url::RepoKind::Space, space_id)
     );
-    authed_send(
+    let resp = authed_send(
         reqwest::Method::POST,
         &url,
         std::time::Duration::from_secs(30),
         "restart",
     )
-    .await?
-    .error_for_status()
-    .context("HF restart returned non-2xx status")?;
+    .await?;
+    hf_url::check_hf_status(resp, &format!("restart of space {space_id}")).await?;
     Ok(())
 }
 

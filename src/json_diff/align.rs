@@ -43,7 +43,7 @@ pub fn align_documents(
     mod_base: u64,
 ) -> Vec<AlignmentSpan> {
     let mut out = Vec::new();
-    align_ws(
+    align_bytes(
         orig_doc.leading_ws.clone(),
         mod_doc.leading_ws.clone(),
         orig_base,
@@ -51,7 +51,7 @@ pub fn align_documents(
         &mut out,
     );
     align_node(&orig_doc.root, &mod_doc.root, orig_base, mod_base, &mut out);
-    align_ws(
+    align_bytes(
         orig_doc.trailing_ws.clone(),
         mod_doc.trailing_ws.clone(),
         orig_base,
@@ -61,32 +61,10 @@ pub fn align_documents(
     coalesce(out)
 }
 
-/// Align two byte ranges that are pure whitespace (or any opaque byte runs).
-/// Common-prefix length is aligned; surplus on the longer side is one-sided.
-fn align_ws(
-    o: Range<u64>,
-    m: Range<u64>,
-    orig_base: u64,
-    mod_base: u64,
-    out: &mut Vec<AlignmentSpan>,
-) {
-    align_bytes(o, m, orig_base, mod_base, out);
-}
-
-/// Public wrapper used by the JSONL line aligner for trailing-newline ranges.
-pub fn align_bytes_pub(
-    o: Range<u64>,
-    m: Range<u64>,
-    orig_base: u64,
-    mod_base: u64,
-    out: &mut Vec<AlignmentSpan>,
-) {
-    align_bytes(o, m, orig_base, mod_base, out);
-}
-
-/// Generic helper: align two byte ranges (possibly of different lengths) using
-/// the "common prefix + one-sided tail" rule. Empty inputs are a no-op.
-fn align_bytes(
+/// Align two byte ranges (possibly of different lengths) using the "common
+/// prefix + one-sided tail" rule. Empty inputs are a no-op. Also used by the
+/// JSONL line aligner for whitespace and trailing-newline ranges.
+pub(super) fn align_bytes(
     o: Range<u64>,
     m: Range<u64>,
     orig_base: u64,

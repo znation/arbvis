@@ -184,7 +184,7 @@ fn align_jsonl(orig: &[u8], mod_: &[u8]) -> Vec<AlignmentSpan> {
                     out.extend(line_spans);
                     // Align the trailing newline byte(s) explicitly.
                     if o_nl > 0 || m_nl > 0 {
-                        align::align_bytes_pub(
+                        align::align_bytes(
                             or.end - o_nl..or.end,
                             mr.end - m_nl..mr.end,
                             0,
@@ -195,7 +195,7 @@ fn align_jsonl(orig: &[u8], mod_: &[u8]) -> Vec<AlignmentSpan> {
                 }
                 _ => {
                     // Fall back to byte-level align over the two lines.
-                    align::align_bytes_pub(or.clone(), mr.clone(), 0, 0, &mut out);
+                    align::align_bytes(or.clone(), mr.clone(), 0, 0, &mut out);
                 }
             }
         }

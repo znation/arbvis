@@ -22,7 +22,7 @@ use super::shape::VolumeEntity;
 /// and `a` is the opacity/occupancy weight (the viewer uses `a` as both the
 /// ray-march opacity source and the empty-voxel mask). An all-zero cell is an
 /// empty voxel and is never rendered.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct VoxelCell {
     pub r: u8,
     pub g: u8,
@@ -182,3 +182,114 @@ impl VoxelRegistry {
         self.renderers.get(id).cloned()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::volume::shape::VoxelBox;
+    use std::sync::Mutex;
+
+    fn cell(v: u8) -> VoxelCell {
+        VoxelCell { r: v, g: v, b: v, a: v }
+    }
+
+    fn entity() -> VolumeEntity {
+        VolumeEntity {
+            source_idx: 0,
+            byte_start: 0,
+            byte_len: 4,
+            bbox: VoxelBox { x0: 0, y0: 0, z0: 0, x1: 2, y1: 2, z1: 2 },
+            renderer_id: "test",
+            extra: Box::new(()),
+        }
+    }
+
+    #[test]
+    fn full_window_put_uses_x_fastest_index() {
+        let mut cells = vec![VoxelCell::default(); 2 * 3 * 2];
+        {
+            let mut grid = VoxelGridMut::new(&mut cells, [2, 3, 2]);
+            grid.put(1, 0, 0, cell(1));
+            grid.put(0, 1, 0, cell(2));
+            grid.put(0, 0, 1, cell(3));
+            assert_eq!(grid.extent(), [2, 3, 2]);
+        }
+        assert_eq!(cells[1], cell(1)); // x + y*ex + z*ex*ey
+        assert_eq!(cells[2], cell(2));
+        assert_eq!(cells[6], cell(3));
+    }
+
+    #[test]
+    fn slab_view_reports_full_extent_and_offsets_z() {
+        let mut cells = vec![VoxelCell::default(); 2 * 2];
+        {
+            let mut grid = VoxelGridMut::slab(&mut cells, [2, 2, 3], 1, 2);
+            assert_eq!(grid.extent(), [2, 2, 3]);
+            grid.put(1, 1, 1, cell(7)); // absolute z=1 -> plane 0
+        }
+        assert_eq!(cells[3], cell(7));
+    }
+
+    #[test]
+    fn slab_view_drops_puts_outside_its_z_window() {
+        let mut cells = vec![VoxelCell::default(); 2 * 2];
+        VoxelGridMut::slab(&mut cells, [2, 2, 3], 1, 2)
+            .put(0, 0, 0, cell(1)); // below window
+        VoxelGridMut::slab(&mut cells, [2, 2, 3], 1, 2)
+            .put(0, 0, 2, cell(2)); // above window
+        assert!(cells.iter().all(|c| *c == VoxelCell::default()));
+    }
+
+    #[test]
+    fn out_of_range_coordinates_are_dropped_without_panic() {
+        let mut cells = vec![VoxelCell::default(); 8];
+        let mut grid = VoxelGridMut::new(&mut cells, [2, 2, 2]);
+        grid.put(2, 0, 0, cell(1)); // x == ex
+        grid.put(0, 2, 0, cell(2)); // y == ey
+        grid.put(0, 0, 2, cell(3)); // z == ez
+        assert!(cells.iter().all(|c| *c == VoxelCell::default()));
+    }
+
+    struct RecordingRenderer(Mutex<Vec<Vec<u8>>>);
+
+    impl VoxelRenderer for RecordingRenderer {
+        fn id(&self) -> &'static str {
+            "test"
+        }
+        fn render(&self, ctx: &VoxelRenderCtx<'_>, grid: &mut VoxelGridMut<'_>) {
+            self.0.lock().unwrap().push(ctx.bytes.to_vec());
+            for x in 0..2 {
+                grid.put(x, 0, 0, cell(9));
+            }
+        }
+    }
+
+    #[test]
+    fn render_window_default_delegates_to_render() {
+        let r = RecordingRenderer(Mutex::new(Vec::new()));
+        let mut cells = vec![VoxelCell::default(); 4];
+        let e = entity();
+        let bytes = [1u8, 2, 3, 4];
+        let ctx = VoxelRenderCtx {
+            entity: &e,
+            bytes: &bytes,
+            extent: [2, 2, 2],
+            diff_mode: false,
+        };
+        let mut grid = VoxelGridMut::new(&mut cells, [2, 2, 2]);
+        r.render_window(&ctx, &mut grid, 0..2);
+        assert_eq!(r.0.lock().unwrap().as_slice(), &[bytes.to_vec()][..]);
+        assert_eq!(cells[0], cell(9));
+        assert_eq!(cells[1], cell(9));
+    }
+
+    #[test]
+    fn registry_looks_up_by_id_and_misses_unknown() {
+        let mut reg = VoxelRegistry::with_defaults();
+        assert!(reg.renderer("test").is_none());
+        reg.register_renderer(Arc::new(RecordingRenderer(Mutex::new(Vec::new()))));
+        assert!(reg.renderer("test").is_some());
+        assert!(reg.renderer("other").is_none());
+    }
+}
+

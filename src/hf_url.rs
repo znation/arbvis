@@ -368,8 +368,13 @@ pub(crate) fn authed_request(
     url: &str,
     timeout: std::time::Duration,
 ) -> reqwest::Result<reqwest::RequestBuilder> {
-    let client = reqwest::Client::builder().timeout(timeout).build()?;
-    let mut req = client.request(method, url);
+    // Reuse the process-shared client so repeated requests (per-tile range
+    // GETs in the `--stream` path) reuse pooled keep-alive connections
+    // instead of paying a fresh TCP+TLS handshake per call. The timeout is
+    // applied per request, preserving the caller's total-request budget.
+    let mut req = crate::xet::http_client()
+        .request(method, url)
+        .timeout(timeout);
     if let Some(tok) = read_token() {
         req = req.bearer_auth(tok);
     }
@@ -1129,6 +1134,65 @@ mod tests {
         assert!(
             err.to_string().contains("tree-API pages"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authed_request_reuses_one_keep_alive_connection() {
+        // Stub server counting TCP accept()s. Two back-to-back
+        // `authed_request` GETs must share one connection — proof the
+        // shared `crate::xet::http_client()` pool is being reused rather
+        // than a fresh `reqwest::Client` (and its empty pool) being built
+        // per call, which would force a second accept here.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_accepts = accepts.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                server_accepts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::spawn(async move {
+                    // Answer sequential keep-alive requests on this socket.
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = match tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        if std::str::from_utf8(&buf[..n]).is_ok_and(|s| s.contains("\r\n\r\n")) {
+                            let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                            if tokio::io::AsyncWriteExt::write_all(&mut sock, resp.as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let url = format!("http://{addr}/x");
+        for _ in 0..2 {
+            let resp = authed_request(
+                reqwest::Method::GET,
+                &url,
+                std::time::Duration::from_secs(5),
+            )
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+            assert!(resp.status().is_success());
+            assert_eq!(&resp.bytes().await.unwrap()[..], b"ok");
+        }
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "second request must reuse the pooled keep-alive connection"
         );
     }
 

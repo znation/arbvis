@@ -453,6 +453,17 @@ impl XetReader {
                 }
                 let url = Arc::new(fetch.url);
                 for desc in fetch.ranges {
+                    if desc.chunks.end < desc.chunks.start || desc.bytes.end < desc.bytes.start {
+                        anyhow::bail!(
+                            "reconstruction for {}: xorb {} has inverted range chunks [{},{}] bytes [{},{}]",
+                            hf_url::sanitize_log_text(&spec.filename),
+                            xorb_hash,
+                            desc.chunks.start,
+                            desc.chunks.end,
+                            desc.bytes.start,
+                            desc.bytes.end,
+                        );
+                    }
                     descriptors.push(ReaderDescriptor {
                         chunk_start: desc.chunks.start,
                         chunk_end: desc.chunks.end,
@@ -489,7 +500,12 @@ impl XetReader {
                 chunk_start: t.range.start,
                 chunk_end: t.range.end,
             });
-            offset += t.unpacked_length;
+            offset = offset.checked_add(t.unpacked_length).ok_or_else(|| {
+                anyhow!(
+                    "reconstruction for {}: unpacked_length total overflows u64",
+                    hf_url::sanitize_log_text(&spec.filename),
+                )
+            })?;
         }
 
         if offset != spec.size {
@@ -572,7 +588,7 @@ impl XetReader {
         req_end: u64,
         out: &mut Vec<u8>,
     ) -> anyhow::Result<()> {
-        let term_end = term.file_offset + term.byte_len;
+        let term_end = term.file_offset.saturating_add(term.byte_len);
         let need_start = req_start.max(term.file_offset);
         let need_end = req_end.min(term_end);
         // Bytes we want, in term-local coordinates `[0, term.byte_len)`.
@@ -603,6 +619,18 @@ impl XetReader {
             // `[desc_lo_chunk, desc_hi_chunk)` is an absolute xorb chunk range.
             let desc_lo_chunk = desc.chunk_start.max(term.chunk_start);
             let desc_hi_chunk = desc.chunk_end.min(term.chunk_end);
+            // Inverted descriptor chunk ranges (server-controlled data) would
+            // make the `desc_hi_chunk - desc.chunk_start` subtraction below
+            // underflow — refuse the descriptor instead.
+            if desc_hi_chunk < desc_lo_chunk {
+                anyhow::bail!(
+                    "descriptor {}@{}: chunk range [{},{}] inverted relative to term",
+                    term.xorb_hash,
+                    desc.byte_start,
+                    desc.chunk_start,
+                    desc.chunk_end,
+                );
+            }
 
             let decoded = self.load_descriptor(&term.xorb_hash, desc).await?;
             let indices = &decoded.chunk_byte_indices;
@@ -612,11 +640,16 @@ impl XetReader {
             // indexed from 0 = descriptor's first chunk).
             let lo_idx = (desc_lo_chunk - desc.chunk_start) as usize;
             let hi_idx = (desc_hi_chunk - desc.chunk_start) as usize;
-            if hi_idx >= indices.len() {
+            // Sink-side guard: construction validates `chunk_end >= chunk_start`,
+            // but the descriptor table is data from the CAS reconstruction
+            // response — refuse to index with inverted or out-of-bounds chunk
+            // ranges rather than panic on them.
+            if lo_idx > hi_idx || hi_idx >= indices.len() {
                 anyhow::bail!(
-                    "descriptor {}@{}: chunk index {} out of bounds (have {})",
+                    "descriptor {}@{}: chunk index range [{},{}] out of bounds (have {})",
                     term.xorb_hash,
                     desc.byte_start,
+                    lo_idx,
                     hi_idx,
                     indices.len(),
                 );
@@ -942,5 +975,137 @@ mod tests {
     fn compute_expires_at_uses_parsed_value_when_all_present() {
         let v = compute_expires_at(1780049739, false);
         assert_eq!(v, 1780049739);
+    }
+
+    // --- hostile-reconstruction guard tests -----------------------------------
+    // The CAS reconstruction response is server-controlled data. These tests
+    // drive `append_term_range` with descriptor tables no honest server sends
+    // (inverted chunk ranges, chunk indices past the decoded data) and assert
+    // an `Err` — not a panic, and not bogus bytes.
+
+    /// Build a reader with the given terms/xorbs and pre-seed the descriptor
+    /// cache so `append_term_range` needs no network access.
+    fn reader_with(terms: Vec<ReaderTerm>, xorbs: HashMap<String, XorbInfo>) -> XetReader {
+        let mut cache = DescriptorCache::new(DEFAULT_CACHE_BUDGET_BYTES);
+        for info in xorbs.values() {
+            for desc in &info.descriptors {
+                // Two chunks of "ab" and "cd" ⇒ data len 4, indices [0,2,4].
+                cache.put(
+                    ("xorb".to_string(), desc.byte_start),
+                    DecodedDescriptor {
+                        data: Arc::new(b"abcd".to_vec()),
+                        chunk_byte_indices: Arc::new(vec![0, 2, 4]),
+                    },
+                );
+            }
+        }
+        XetReader {
+            terms,
+            xorbs,
+            file_size: u64::MAX,
+            filename: Arc::new("test.bin".to_string()),
+            cache: Mutex::new(cache),
+            inflight: Mutex::new(HashMap::new()),
+            refresh_meta: RefreshMeta {
+                api_segment: String::new(),
+                repo_id: String::new(),
+                revision: String::new(),
+                xet_hash: String::new(),
+            },
+            refresh_state: tokio::sync::Mutex::new(RefreshState {
+                expires_at: u64::MAX,
+            }),
+        }
+    }
+
+    fn desc(chunk_start: u32, chunk_end: u32, byte_start: u64, byte_end: u64) -> ReaderDescriptor {
+        ReaderDescriptor {
+            chunk_start,
+            chunk_end,
+            byte_start,
+            byte_end,
+            url: Mutex::new(Arc::new("https://x/".to_string())),
+        }
+    }
+
+    fn term(file_offset: u64, byte_len: u64, chunk_start: u32, chunk_end: u32) -> ReaderTerm {
+        ReaderTerm {
+            file_offset,
+            byte_len,
+            xorb_hash: "xorb".to_string(),
+            chunk_start,
+            chunk_end,
+        }
+    }
+
+    #[test]
+    fn append_term_range_rejects_inverted_descriptor_chunk_range() {
+        // desc.chunks.end < desc.chunks.start ⇒ desc_hi_chunk < desc_lo_chunk ⇒
+        // the chunk-index subtractions would underflow.
+        let xorbs = HashMap::from([(
+            "xorb".to_string(),
+            XorbInfo {
+                descriptors: vec![desc(2, 1, 0, 4)],
+            },
+        )]);
+        let r = reader_with(vec![term(0, 4, 0, 3)], xorbs);
+        let rt = ReaderTerm {
+            file_offset: 0,
+            byte_len: 4,
+            xorb_hash: "xorb".to_string(),
+            chunk_start: 0,
+            chunk_end: 3,
+        };
+        let mut out = Vec::new();
+        let res = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(r.append_term_range(&rt, 0, 4, &mut out));
+        assert!(res.is_err(), "inverted chunk range must Err, not panic");
+    }
+
+    #[test]
+    fn append_term_range_rejects_chunk_index_past_decoded_data() {
+        // Term claims chunks 0..8 but the decoded descriptor only has 2 —
+        // hi_idx = 6 ≥ indices.len() = 3.
+        let xorbs = HashMap::from([(
+            "xorb".to_string(),
+            XorbInfo {
+                descriptors: vec![desc(0, 8, 0, 4)],
+            },
+        )]);
+        let r = reader_with(vec![term(0, 16, 0, 8)], xorbs);
+        let rt = ReaderTerm {
+            file_offset: 0,
+            byte_len: 16,
+            xorb_hash: "xorb".to_string(),
+            chunk_start: 0,
+            chunk_end: 8,
+        };
+        let mut out = Vec::new();
+        let res = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(r.append_term_range(&rt, 0, 16, &mut out));
+        assert!(
+            res.is_err(),
+            "out-of-bounds chunk index must Err, not panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_term_range_happy_path_unchanged() {
+        // Guard against the security fix breaking the honest path: one term
+        // over two 2-byte chunks, descriptor covering exactly those chunks.
+        let xorbs = HashMap::from([(
+            "xorb".to_string(),
+            XorbInfo {
+                descriptors: vec![desc(0, 2, 0, 4)],
+            },
+        )]);
+        let r = reader_with(vec![term(0, 4, 0, 2)], xorbs);
+        let mut out = Vec::new();
+        r.append_term_range(&r.terms[0], 0, 4, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(out, b"abcd");
     }
 }

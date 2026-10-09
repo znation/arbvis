@@ -326,8 +326,62 @@ mod collect_recursive_tests {
 #[cfg(test)]
 mod prepare_sources_tests {
     use super::prepare_sources;
-    use crate::registry::Registry;
-    use std::path::PathBuf;
+    use crate::data::Extensions;
+    use crate::data::SourceKind;
+    use crate::registry::{FormatPlugin, Registry};
+    use futures::future::BoxFuture;
+    use std::path::{Path, PathBuf};
+
+    /// Marker type a fake format plugin stuffs into `Extensions` so tests can
+    /// observe which plugin ran.
+    struct Tag(String);
+
+    /// Minimal format plugin: matches by extension suffix, optionally fails in
+    /// `populate_local`, and tags the extensions map. Mirrors the mock in
+    /// `data/remote.rs`, which covers the `prepare_sources_from_specs` path;
+    /// these tests cover the local `prepare_sources` loop's copy of the
+    /// first-match-wins / failure-fallback logic.
+    struct FakePlugin {
+        ext: &'static str,
+        tag: &'static str,
+        fail: bool,
+    }
+
+    impl FormatPlugin for FakePlugin {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        fn detects_path(&self, path: &Path) -> bool {
+            path.extension().and_then(|e| e.to_str()) == Some(self.ext)
+        }
+        fn populate_local(
+            &self,
+            _path: &Path,
+            _file_size: u64,
+            exts: &mut Extensions,
+        ) -> anyhow::Result<()> {
+            if self.fail {
+                anyhow::bail!("fake plugin parse failure");
+            }
+            exts.insert(Tag(self.tag.to_string()));
+            Ok(())
+        }
+        fn populate_remote<'a>(
+            &'a self,
+            _data: &'a super::Data,
+            _byte_size: u64,
+            _exts: &'a mut Extensions,
+        ) -> BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn tag_of(s: &crate::data::Source) -> Option<String> {
+        match &s.kind {
+            SourceKind::File(_) => s.extensions.get::<Tag>().map(|t| t.0.clone()),
+            _ => panic!("expected File source"),
+        }
+    }
 
     #[test]
     fn missing_paths_fail_instead_of_rendering_empty() {
@@ -385,6 +439,68 @@ mod prepare_sources_tests {
             sources.iter().map(|s| s.file_idx).collect::<Vec<_>>(),
             [0, 1, 2]
         );
+    }
+
+    // The first registered plugin whose `detects_path` matches wins; a later
+    // plugin that also matches must not overwrite or double-populate.
+    #[test]
+    fn first_matching_format_plugin_wins() {
+        let mut reg = Registry::with_defaults();
+        reg.formats.push(std::sync::Arc::new(FakePlugin {
+            ext: "st",
+            tag: "first",
+            fail: false,
+        }));
+        reg.formats.push(std::sync::Arc::new(FakePlugin {
+            ext: "st",
+            tag: "second",
+            fail: false,
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("model.st");
+        std::fs::write(&p, b"weights").unwrap();
+
+        let (sources, total) = prepare_sources(&[p], &reg).unwrap();
+        assert_eq!(total, 7);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(tag_of(&sources[0]).as_deref(), Some("first"));
+    }
+
+    // A plugin that recognizes the path but fails to parse leaves the source
+    // as plain binary (empty extensions) and does not abort the run.
+    #[test]
+    fn failing_format_plugin_falls_back_to_plain_binary() {
+        let mut reg = Registry::with_defaults();
+        reg.formats.push(std::sync::Arc::new(FakePlugin {
+            ext: "st",
+            tag: "never",
+            fail: true,
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("model.st");
+        std::fs::write(&p, b"weights").unwrap();
+
+        let (sources, total) = prepare_sources(&[p], &reg).unwrap();
+        assert_eq!(total, 7);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(tag_of(&sources[0]), None);
+    }
+
+    // No registered plugin matches the path: plain binary, no tags.
+    #[test]
+    fn unmatched_path_gets_no_format_extensions() {
+        let mut reg = Registry::with_defaults();
+        reg.formats.push(std::sync::Arc::new(FakePlugin {
+            ext: "st",
+            tag: "never",
+            fail: false,
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("other.bin");
+        std::fs::write(&p, b"plain").unwrap();
+
+        let (sources, _) = prepare_sources(&[p], &reg).unwrap();
+        assert_eq!(tag_of(&sources[0]), None);
     }
 }
 

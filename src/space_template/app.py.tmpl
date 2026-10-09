@@ -193,13 +193,26 @@ def asset(rest: str, request: Request):
         except (FileNotFoundError, EntryNotFoundError):
             return Response(status_code=404)
         start_s, end_s = m.group(1), m.group(2)
+        # Parse the bounds defensively: since Python 3.11, int(str) raises
+        # ValueError for digit strings longer than the interpreter's max-digit
+        # limit, and the Range header comes straight off the public wire. A
+        # malformed bound is a client error (400), never an unhandled 500.
+        def _bound(s):
+            try:
+                return int(s)
+            except ValueError:
+                return None
+        start_i = _bound(start_s) if start_s else 0
+        end_i = _bound(end_s) if end_s else None
+        if start_i is None or (end_s and end_i is None):
+            return Response(status_code=400, headers={"Content-Range": f"bytes */{size}"})
         if start_s == "":
             # Suffix range "bytes=-N": the last N bytes.
-            start = max(0, size - int(end_s)) if end_s else 0
+            start = max(0, size - end_i) if end_s else 0
             end = size - 1
         else:
-            start = int(start_s)
-            end = int(end_s) if end_s else size - 1
+            start = start_i
+            end = end_i if end_s else size - 1
         if start >= size or start > end:
             return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
         end = min(end, size - 1)

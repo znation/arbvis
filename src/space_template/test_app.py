@@ -150,6 +150,19 @@ class RangeStreamingTest(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.content, self.data)
 
+    def test_oversized_range_digit_string_gets_400_not_500(self):
+        # Python >=3.11 raises ValueError when int() sees more digits than the
+        # interpreter's max-digit limit; the Range header is attacker
+        # controlled on this public endpoint, so the route must answer 400
+        # instead of letting that escape as an unhandled 500.
+        r = self.client.get("/bricks.bin", headers={"Range": "bytes=" + "9" * 5000 + "-"})
+        self.assertEqual(r.status_code, 400)
+        r = self.client.get("/bricks.bin", headers={"Range": "bytes=-" + "9" * 5000})
+        self.assertEqual(r.status_code, 400)
+        # A normal open-ended range still works after the hardening.
+        r = self.client.get("/bricks.bin", headers={"Range": "bytes=0-"})
+        self.assertEqual(r.status_code, 206)
+
     def test_path_traversal_segments_rejected(self):
         # A public visitor controls `rest`, which is interpolated into the
         # bucket path `hf://buckets/{BUCKET_ID}/{rest}` (and, for mirror

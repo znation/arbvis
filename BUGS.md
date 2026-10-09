@@ -47,14 +47,6 @@ are unchanged. No tests lived in the moved block (the `regen_html` error-path te
 
 **Reproduce:** `wc -l src/tiled/mod.rs`.
 
-### `src/volume/mod.rs` (1215 lines) exceeds the one-sitting readability budget
-
-**Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
-"several modules" entry; siblings: volume/html.rs, tiled/mod.rs, volume/brick.rs, xet/mod.rs, data/mod.rs).
-Suggested direction: split cohesive units opportunistically, one split per tick, with tests moved
-alongside. Do not refactor for refactoring's sake.
-
-**Reproduce:** `wc -l src/volume/mod.rs`.
 
 ### `src/volume/brick.rs` (1172 lines) exceeds the one-sitting readability budget
 
@@ -79,6 +71,25 @@ Note: the original combined entry also listed `lib.rs` at 1131 lines, which was 
 `lib.rs` is 134 lines and in budget.
 
 ## Fixed
+
+### `src/volume/mod.rs` (1428 lines at fix time) exceeds the one-sitting readability budget — fixed 2026-10-09 by bugfix
+
+**Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
+"several modules" entry; siblings: volume/html.rs, tiled/mod.rs, volume/brick.rs, xet/mod.rs, data/mod.rs).
+Split 1 landed 2026-10-09 by bugfix: the aggregation unit — `seal_streamed_bricks`, `CHUNK`,
+`SLAB_BUDGET_BYTES`, `aggregate_bytes_hilbert`, `aggregate_entities`, `fetch_entity_bytes`,
+`box_focus`, `voxel_coord`, `occupied_focus_cells`, `occupied_focus` — moved to new
+`src/volume/aggregate.rs` (498 lines). `mod.rs` keeps `part_path`/`write_atomic` (shared by both
+sides), `BuildResult` (now `pub(crate)`), and re-exports `box_focus` (`pub(crate) use`) so
+`brick.rs`'s `super::box_focus` calls are unchanged. No tests moved (the moved block had none;
+module tests exercise `render_volume`/`regen_html`, which stayed). `volume/mod.rs` is now 951
+lines — still over budget; next split candidates: `render_volume` (the render driver, ~250 lines)
+or `regen_html`/`write_index_html_atomic` into a small `html_io` unit.
+
+**Validation gap:** none — the suite already covered the moved paths (`render_volume`
+end-to-end, atomic-write failure tests), and the module boundary is compile-checked.
+
+**Reproduce:** `wc -l src/volume/mod.rs`.
 
 ### `src/xet/mod.rs` (1121 lines before the fetch split) exceeds the one-sitting readability budget — fixed 2026-10-09 by bugfix
 

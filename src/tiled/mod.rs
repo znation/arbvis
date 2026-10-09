@@ -262,22 +262,36 @@ pub use pipeline::run_tiles;
 /// it gets back from `build_tile_plan`.
 pub(super) struct TilePlan {
     kh: u8,
+    /// Leaflet tile-grid width at `max_zoom` (canvas width / `TILE`).
     pub(super) width_tiles: u32,
+    /// Leaflet tile-grid height at `max_zoom` (canvas height / `TILE`).
     pub(super) height_tiles: u32,
+    /// World extent in leaflet coordinates at zoom 0 (one of the two axes
+    /// always collapses to one tile).
     pub(super) world_w: u32,
+    /// Leaflet world height at zoom 0; the axis not carrying the curve
+    /// collapses to one tile (`TILE` for Hilbert).
     pub(super) world_h: u32,
+    /// Canvas height in pixels (power of two for Hilbert).
     pub(super) height: u32,
+    /// Canvas width in pixels (power of two for Hilbert).
     pub(super) width: u32,
+    /// Deepest pyramid zoom level the tile grid serves.
     pub(super) max_zoom: u32,
     /// Extra zoom levels carrying variable-depth detail (0 for Hilbert / no
     /// shrunk tensors). Mirrors `ArchLayout::detail_depth`.
     pub(super) detail_depth: u32,
+    /// Total tile count at `max_zoom` (`width_tiles * height_tiles`).
     pub(super) total_tiles: u64,
     square_pixels: u64,
     total: u64,
+    /// Coloring mode for every tile in the plan (plain byte LUT or diff);
+    /// see [`LeafMode`].
     pub(super) mode: LeafMode,
     source_data: Arc<Vec<Data>>,
     cumulative_offsets: Arc<Vec<u64>>,
+    /// Overlay entities for the canvas (file rects for Hilbert, per-tensor
+    /// rects for arch), consumed by the detail-level renderer.
     pub(super) entities: Vec<FileEntity>,
     layout: Arc<dyn LayoutShape>,
     /// Loader+renderer registry consulted by the load and render stages.

@@ -10,9 +10,15 @@ use crate::data::{SceneTag, Source};
 pub(super) struct SceneGroup {
     /// `Some(key)` → tiles go under `tiles/<key>/`; `None` → legacy lone scene.
     pub(super) key: Option<String>,
+    /// Display label copied from the scene's [`SceneTag`]; empty for the
+    /// implicit untagged scene.
     pub(super) label: String,
+    /// Sort key copied from the scene's [`SceneTag`]; groups are ordered by it.
     pub(super) order: u32,
+    /// The sources peeled off the input for this scene, in input order.
     pub(super) sources: Vec<Source>,
+    /// Sum of the scene's source sizes (plus the caller's `total` for the
+    /// implicit untagged scene).
     pub(super) total: u64,
 }
 

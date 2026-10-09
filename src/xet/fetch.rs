@@ -63,7 +63,9 @@ pub(super) struct ReconstructionTerm {
 /// inside the xorb, *inclusive end* — `HttpRange` semantics).
 #[derive(Deserialize)]
 pub(super) struct WireXorbRangeDescriptor {
+    /// Chunk index range `[start, end)` inside the xorb to fetch.
     pub(super) chunks: WireRange<u32>,
+    /// Packed-byte range inside the xorb, inclusive end (`HttpRange` semantics).
     pub(super) bytes: WireRange<u64>,
 }
 

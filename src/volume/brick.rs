@@ -74,7 +74,11 @@ fn pack_page_table(slots: &[u32]) -> Vec<u8> {
 /// `super::brick_stream::build_streamed_brick_volume`; the descent (MSB-first octant bits) matches
 /// the shader's boundary-compare walk and the test `descend_octree`.
 pub(super) struct Octree {
+    /// Node pool; `nodes[i]` holds the 8 child entries of node `i` in the
+    /// encoding described above.
     pub(super) nodes: Vec<[u32; 8]>,
+    /// Log2 of the cube edge in brick cells — the number of descent levels
+    /// from root to leaf.
     pub(super) depth: u32,
 }
 

@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use crate::cli::{
-    check_bare_run_inputs, collect_input_files, default_title, ignored_3d_flags, validate_grid,
-    validate_volume_res, volume_res_ignored_warning, Args, OutputDest,
+    check_bare_run_inputs, collect_input_files, default_title, ignored_3d_flags,
+    ignored_3d_flags_warning, validate_grid, validate_volume_res, volume_res_ignored_warning, Args,
+    OutputDest,
 };
 use crate::data::Source;
 use crate::deploy;
@@ -85,10 +86,7 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
     } else {
         let ignored = ignored_3d_flags(args.grid, args.volume_res);
         if !ignored.is_empty() {
-            log::warn!(
-                "{} only take effect with --3d; ignoring them in 2D mode",
-                ignored.join(", ")
-            );
+            log::warn!("{}", ignored_3d_flags_warning(&ignored));
         }
     }
 

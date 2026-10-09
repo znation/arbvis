@@ -361,6 +361,22 @@ pub(crate) fn ignored_3d_flags(grid: u32, volume_res: u32) -> Vec<&'static str> 
     flags
 }
 
+/// Warning text for 2D runs that set 3D-only flags, with the verb and pronoun
+/// agreeing with how many flags are actually set.
+pub(crate) fn ignored_3d_flags_warning(ignored: &[&str]) -> String {
+    if ignored.len() == 1 {
+        format!(
+            "{} only takes effect with --3d; ignoring it in 2D mode",
+            ignored[0]
+        )
+    } else {
+        format!(
+            "{} only take effect with --3d; ignoring them in 2D mode",
+            ignored.join(", ")
+        )
+    }
+}
+
 /// Pick the viewer title: the user's `--title` if set, else the brand name
 /// with a mode suffix (`"{name} moe"` / `"{name} diff"`, or just `"{name}"`
 /// when `suffix` is empty). Built once per run, so the fallback allocation is
@@ -551,7 +567,10 @@ mod title_tests {
 
 #[cfg(test)]
 mod grid_validation_tests {
-    use super::{ignored_3d_flags, validate_grid, validate_volume_res, volume_res_ignored_warning};
+    use super::{
+        ignored_3d_flags, ignored_3d_flags_warning, validate_grid, validate_volume_res,
+        volume_res_ignored_warning,
+    };
 
     #[test]
     fn grid_cap_raised_to_16384() {
@@ -588,6 +607,18 @@ mod grid_validation_tests {
         assert_eq!(ignored_3d_flags(512, 0), vec!["--grid"]);
         assert_eq!(ignored_3d_flags(1024, 4096), vec!["--volume-res"]);
         assert_eq!(ignored_3d_flags(512, 4096), vec!["--grid", "--volume-res"]);
+    }
+
+    #[test]
+    fn ignored_3d_flags_warning_agrees_with_flag_count() {
+        assert_eq!(
+            ignored_3d_flags_warning(&["--grid"]),
+            "--grid only takes effect with --3d; ignoring it in 2D mode"
+        );
+        assert_eq!(
+            ignored_3d_flags_warning(&["--grid", "--volume-res"]),
+            "--grid, --volume-res only take effect with --3d; ignoring them in 2D mode"
+        );
     }
 }
 

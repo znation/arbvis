@@ -133,10 +133,8 @@ fn write_viewer_pair(dir: &Path, html: &[u8], labels: &[u8]) -> anyhow::Result<(
             .with_context(|| format!("staging {}", index_part.display()))?;
         std::fs::write(&labels_part, labels)
             .with_context(|| format!("staging {}", labels_part.display()))?;
-        std::fs::rename(&index_part, &index)
-            .with_context(|| format!("sealing {}", index.display()))?;
-        std::fs::rename(&labels_part, &labels_path)
-            .with_context(|| format!("sealing {}", labels_path.display()))?;
+        crate::fsutil::seal_part(&index_part, &index)?;
+        crate::fsutil::seal_part(&labels_part, &labels_path)?;
         Ok(())
     })();
     if res.is_err() {

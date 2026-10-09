@@ -11,7 +11,7 @@ use anyhow::Context;
 use futures::StreamExt as _;
 use image::Rgb;
 
-use super::{brick, encode, part_path, BuildResult, COARSE_CAP, SLAB_BUDGET_BYTES};
+use super::{brick, encode, part_path, seal_part, BuildResult, COARSE_CAP, SLAB_BUDGET_BYTES};
 use crate::data::{load_source_data, Source};
 use crate::geometry;
 use crate::volume::encode::VoxelAcc;
@@ -30,13 +30,7 @@ pub(super) fn seal_streamed_bricks<W: Write>(
     let part = part_path(&final_path);
     match bb.finish_streaming() {
         Ok((bv, _writer)) => {
-            if let Err(e) = std::fs::rename(&part, &final_path) {
-                // The rename can fail (target path is a directory,
-                // cross-device move, permissions) — the staged file must
-                // not outlive the failure.
-                let _ = std::fs::remove_file(&part);
-                return Err(e).context(format!("sealing {}", final_path.display()));
-            }
+            seal_part(&part, &final_path)?;
             Ok(bv)
         }
         Err(e) => {
@@ -353,8 +347,7 @@ pub(super) fn aggregate_entities(
         match built {
             Ok(res) => {
                 let final_path = out_dir.join("bricks.bin");
-                std::fs::rename(&part, &final_path)
-                    .with_context(|| format!("sealing {}", final_path.display()))?;
+                seal_part(&part, &final_path)?;
                 return Ok(res);
             }
             Err(e) => {

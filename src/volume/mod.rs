@@ -39,7 +39,7 @@ use encode::VolumeMeta;
 
 pub(crate) use aggregate::box_focus;
 
-pub(crate) use crate::fsutil::part_path;
+pub(crate) use crate::fsutil::{part_path, seal_part};
 
 /// Write `bytes` to `path` atomically: stage to `<file>.part` in the same
 /// directory, then rename over `path`. A process killed mid-write leaves the
@@ -49,16 +49,15 @@ pub(crate) use crate::fsutil::part_path;
 /// if complete.
 fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let part = part_path(path);
-    let res = std::fs::write(&part, bytes)
-        .and_then(|()| std::fs::rename(&part, path))
-        .with_context(|| format!("writing {}", path.display()));
-    if res.is_err() {
-        // Best effort: don't leave a stale partial staging file behind — a
-        // later `hf upload` of the bundle directory would push it to the Hub,
-        // and it is indistinguishable from an in-progress staging file.
-        let _ = std::fs::remove_file(&part);
-    }
-    res
+    std::fs::write(&part, bytes)
+        .with_context(|| format!("writing {}", path.display()))
+        .inspect_err(|_| {
+            // Best effort: don't leave a stale partial staging file behind — a
+            // later `hf upload` of the bundle directory would push it to the
+            // Hub, and it is indistinguishable from an in-progress staging file.
+            let _ = std::fs::remove_file(&part);
+        })?;
+    seal_part(&part, path)
 }
 /// The dense `volume.bin` (coarse fallback LOD + CPU pick/histogram buffer) is
 /// capped at this side so the mandatory up-front download stays small and fixed

@@ -65,19 +65,13 @@ pub fn write_tile_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
             .with_context(|| format!("creating tile dir {}", parent.display()))?;
     }
     let part = crate::fsutil::part_path(path);
-    let res = std::fs::write(&part, bytes);
-    if let Err(e) = res {
+    if let Err(e) = std::fs::write(&part, bytes) {
         // Best effort: don't leave a stale partial staging file behind.
         let _ = std::fs::remove_file(&part);
         return Err(e).with_context(|| format!("writing tile {}", part.display()));
     }
-    if let Err(e) = std::fs::rename(&part, path) {
-        // The rename can fail too (target path is a directory, cross-device
-        // move, permissions) — the staged file must not outlive the failure.
-        let _ = std::fs::remove_file(&part);
-        return Err(e).with_context(|| format!("sealing tile {}", path.display()));
-    }
-    Ok(())
+    crate::fsutil::seal_part(&part, path)
+        .map_err(|e| e.context(format!("sealing tile {}", path.display())))
 }
 
 /// Writes encoded tile bytes to a local filesystem path, creating parent

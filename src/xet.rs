@@ -313,7 +313,7 @@ pub async fn reconstruction_for(spec: &RemoteFileSpec) -> anyhow::Result<Vec<Xet
     let Some(hash) = spec.xet_hash.as_deref() else {
         log::warn!(
             "{}: not xet-backed, skipping xet visualization for this source",
-            spec.filename
+            hf_url::sanitize_log_text(&spec.filename)
         );
         return Ok(Vec::new());
     };
@@ -619,7 +619,10 @@ impl XetReader {
         let hash = spec
             .xet_hash
             .as_deref()
-            .ok_or_else(|| anyhow!("{}: not xet-backed, cannot build XetReader", spec.filename))?;
+            .ok_or_else(|| anyhow!(
+                "{}: not xet-backed, cannot build XetReader",
+                hf_url::sanitize_log_text(&spec.filename)
+            ))?;
         let api_segment = spec.repo.api_segment().to_string();
         let repo_id = spec.repo.repo_id().to_string();
         let revision: String = (*spec.revision).clone();
@@ -667,7 +670,7 @@ impl XetReader {
             if !xorbs.contains_key(&t.hash) {
                 anyhow::bail!(
                     "reconstruction for {}: term references xorb {} with no fetch info",
-                    spec.filename,
+                    hf_url::sanitize_log_text(&spec.filename),
                     t.hash
                 );
             }
@@ -684,7 +687,7 @@ impl XetReader {
         if offset != spec.size {
             log::warn!(
                 "{}: reconstruction unpacked_length total {} disagrees with file size {}",
-                spec.filename,
+                hf_url::sanitize_log_text(&spec.filename),
                 offset,
                 spec.size,
             );
@@ -694,7 +697,7 @@ impl XetReader {
             terms,
             xorbs,
             file_size: spec.size,
-            filename: Arc::clone(&spec.filename),
+            filename: Arc::new(hf_url::sanitize_log_text(&spec.filename)),
             cache: Mutex::new(DescriptorCache::new(DEFAULT_CACHE_BUDGET_BYTES)),
             inflight: Mutex::new(HashMap::new()),
             refresh_meta: RefreshMeta {

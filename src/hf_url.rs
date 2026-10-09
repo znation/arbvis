@@ -85,7 +85,7 @@ impl RemoteRepo {
         revision: &str,
         range: std::ops::Range<u64>,
     ) -> anyhow::Result<Vec<u8>> {
-        let label = format!("fetch_range {filename}");
+        let label = format!("fetch_range {}", sanitize_log_text(filename));
         // The Hub `/resolve/` URL doesn't include the `models/` segment for
         // model repos — only `datasets/` and `spaces/` get a prefix. The
         // `/api/` URLs DO include `models/`, which is why `api_segment` here
@@ -123,7 +123,7 @@ impl RemoteRepo {
             Ok::<_, reqwest::Error>(body)
         })
         .await
-        .with_context(|| format!("range GET {url} {header}"))?;
+        .with_context(|| format!("range GET {} {header}", sanitize_log_text(&url)))?;
         Ok(bytes.to_vec())
     }
 }
@@ -196,6 +196,16 @@ pub struct HfUrl {
     pub repo_id: String,
     pub revision: String,
     pub path_in_repo: String,
+}
+
+/// Replace control characters (C0 + C1 + DEL) with `?` before a repo-derived
+/// string — a filename from a tree listing, or a URL built from one — is
+/// interpolated into a log line, throttle label, or anyhow context. These
+/// strings render on the operator's terminal, and a hostile repo can pick
+/// file names holding raw escape sequences (ESC [ … m recolors, OSC … BEL
+/// rewrites the title / clipboard), so escape bytes must not survive.
+pub fn sanitize_log_text(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { '?' } else { c }).collect()
 }
 
 /// Parse an `hf://` URL into its components.
@@ -587,12 +597,13 @@ pub async fn resolve(path: &Path) -> anyhow::Result<PathBuf> {
     }
 
     let repo_type = hf.kind.cli_repo_type()?;
+    let path_disp = sanitize_log_text(&hf.path_in_repo);
     let label = if hf.path_in_repo.is_empty() {
         log::info!("Resolving repo {} ...", hf.repo_id);
         format!("hf download {}", hf.repo_id)
     } else {
-        log::info!("Fetching {} from {} ...", hf.path_in_repo, hf.repo_id);
-        format!("hf download {} {}", hf.repo_id, hf.path_in_repo)
+        log::info!("Fetching {} from {} ...", path_disp, hf.repo_id);
+        format!("hf download {} {}", hf.repo_id, path_disp)
     };
 
     let local = with_throttle(&label, || async {
@@ -614,9 +625,12 @@ pub async fn resolve(path: &Path) -> anyhow::Result<PathBuf> {
         hf_cli::download(args.iter().map(String::as_str)).await
     })
     .await
-    .with_context(|| format!("downloading hf://{}/{}", hf.repo_id, hf.path_in_repo))?;
+    .with_context(|| format!("downloading hf://{}/{}", hf.repo_id, path_disp))?;
 
-    log::info!("Cached at {}", local.display());
+    log::info!(
+        "Cached at {}",
+        sanitize_log_text(&local.to_string_lossy())
+    );
     Ok(local)
 }
 
@@ -648,19 +662,26 @@ async fn resolve_bucket(hf: &HfUrl) -> anyhow::Result<PathBuf> {
         return Ok(dest_root);
     }
 
-    log::info!("Fetching {} from bucket {} ...", hf.path_in_repo, bucket_id);
+    let path_disp = sanitize_log_text(&hf.path_in_repo);
+    log::info!("Fetching {} from bucket {} ...", path_disp, bucket_id);
     let local = dest_root.join(&hf.path_in_repo);
     if let Some(parent) = local.parent() {
         std::fs::create_dir_all(parent).context("creating bucket-file parent dir")?;
     }
     let src = bucket_url(bucket_id, &hf.path_in_repo);
     let dest = local.to_string_lossy().into_owned();
-    with_throttle(&format!("hf buckets cp {src} {dest}"), || async {
-        hf_cli::run_hf(["buckets", "cp", src.as_str(), dest.as_str()]).await
-    })
+    with_throttle(
+        &format!("hf buckets cp {src} {}", sanitize_log_text(&dest)),
+        || async {
+            hf_cli::run_hf(["buckets", "cp", src.as_str(), dest.as_str()]).await
+        },
+    )
     .await
-    .with_context(|| format!("fetching hf://buckets/{bucket_id}/{}", hf.path_in_repo))?;
-    log::info!("Cached at {}", local.display());
+    .with_context(|| format!("fetching hf://buckets/{bucket_id}/{}", path_disp))?;
+    log::info!(
+        "Cached at {}",
+        sanitize_log_text(&local.to_string_lossy())
+    );
     Ok(local)
 }
 
@@ -680,7 +701,7 @@ pub async fn resolve_to_http(path: &Path) -> anyhow::Result<RemoteFileSpec> {
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no file `{}` in {} {}@{} (or it's a directory)",
-                hf.path_in_repo,
+                sanitize_log_text(&hf.path_in_repo),
                 hf.kind.api_segment(),
                 hf.repo_id,
                 hf.revision,
@@ -688,7 +709,7 @@ pub async fn resolve_to_http(path: &Path) -> anyhow::Result<RemoteFileSpec> {
         })?;
 
     let size = entry.size.unwrap_or(0);
-    log::info!("Remote file {}: {} bytes", hf.path_in_repo, size);
+    log::info!("Remote file {}: {} bytes", sanitize_log_text(&hf.path_in_repo), size);
     Ok(RemoteFileSpec {
         repo,
         filename: Arc::new(hf.path_in_repo),
@@ -753,7 +774,7 @@ pub async fn list_repo_as_http_specs(
         }
         let size = entry.size.unwrap_or(0);
         let path = entry.path.clone();
-        log::info!("  {} — {} bytes", path, size);
+        log::info!("  {} — {} bytes", sanitize_log_text(&path), size);
         specs.push((
             path.clone(),
             RemoteFileSpec {
@@ -787,6 +808,23 @@ pub fn parse_hf_output(hf_url_str: &str) -> anyhow::Result<HfOutputSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_log_text_strips_control_and_escape_bytes() {
+        // ANSI color / OSC-title sequences a hostile repo can put in a file
+        // name collapse to plain `?`s.
+        assert_eq!(sanitize_log_text("\x1b[31mred\x1b[0m"), "?[31mred?[0m");
+        assert_eq!(sanitize_log_text("\x1b]0;pwned\x07"), "?]0;pwned?");
+        // Newlines / tabs / C1 / DEL cannot forge log-line boundaries either.
+        assert_eq!(sanitize_log_text("a\nb\tc\u{85}d\u{7f}"), "a?b?c?d?");
+    }
+
+    #[test]
+    fn sanitize_log_text_leaves_normal_names_untouched() {
+        assert_eq!(sanitize_log_text("model.safetensors"), "model.safetensors");
+        // Non-ASCII printable (CJK, emoji) is preserved.
+        assert_eq!(sanitize_log_text("权重 🦙.bin"), "权重 🦙.bin");
+    }
 
     #[test]
     fn bucket_url_omits_empty_path() {

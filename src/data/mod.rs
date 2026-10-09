@@ -655,7 +655,7 @@ pub async fn prepare_sources_from_specs(
                             log::warn!(
                                 "{}: format plugin `{}` (remote) failed: {e} — \
                                  treating as plain binary",
-                                spec.filename,
+                                crate::hf_url::sanitize_log_text(spec.filename.as_str()),
                                 plugin.id()
                             );
                         }
@@ -752,7 +752,10 @@ pub async fn download_specs_to_paths(
                 async move {
                     let filename = (*spec.filename).clone();
                     let revision = (*spec.revision).clone();
-                    let label = format!("hf download {filename}");
+                    let label = format!(
+                        "hf download {}",
+                        crate::hf_url::sanitize_log_text(&filename),
+                    );
                     let repo_id = spec.repo.repo_id().to_string();
                     // Map the api_segment ("models"/"datasets"/"spaces") to the
                     // `--type` flag value the CLI expects.

@@ -634,13 +634,13 @@ async fn resolve_bucket(hf: &HfUrl) -> anyhow::Result<PathBuf> {
     if hf.path_in_repo.is_empty() {
         log::info!("Resolving bucket {} ...", bucket_id);
         let dest = dest_root.to_string_lossy().into_owned();
-        let bucket_url = format!("hf://buckets/{bucket_id}");
+        let src_url = bucket_url(bucket_id, "");
         with_throttle(&format!("hf sync {bucket_id} -> {dest}"), || async {
             // `hf sync <source> <dest>` infers direction from argument order:
             // bucket source + local dest = download. The destination directory
             // already exists from `tempdir().keep()`, which is what `hf sync`
             // expects.
-            hf_cli::run_hf(["sync", bucket_url.as_str(), dest.as_str()]).await
+            hf_cli::run_hf(["sync", src_url.as_str(), dest.as_str()]).await
         })
         .await
         .with_context(|| format!("downloading bucket {bucket_id}"))?;
@@ -652,7 +652,7 @@ async fn resolve_bucket(hf: &HfUrl) -> anyhow::Result<PathBuf> {
     if let Some(parent) = local.parent() {
         std::fs::create_dir_all(parent).context("creating bucket-file parent dir")?;
     }
-    let src = format!("hf://buckets/{bucket_id}/{}", hf.path_in_repo);
+    let src = bucket_url(bucket_id, &hf.path_in_repo);
     let dest = local.to_string_lossy().into_owned();
     with_throttle(&format!("hf buckets cp {src} {dest}"), || async {
         hf_cli::run_hf(["buckets", "cp", src.as_str(), dest.as_str()]).await
@@ -710,6 +710,17 @@ pub fn is_repo_level(url_str: &str) -> anyhow::Result<bool> {
         return Ok(false);
     }
     Ok(parse(url_str)?.path_in_repo.is_empty())
+}
+
+/// Build a bucket URL for `repo_id`, optionally rooted at `path`.
+/// An empty `path` yields the bare bucket URL. Centralises the
+/// `hf://buckets/{id}[/{path}]` form so call sites don't hand-format it.
+pub fn bucket_url(repo_id: &str, path: &str) -> String {
+    if path.is_empty() {
+        format!("hf://buckets/{repo_id}")
+    } else {
+        format!("hf://buckets/{repo_id}/{path}")
+    }
 }
 
 /// True iff `s` is an `hf://` URL. Centralises the prefix check so call sites
@@ -775,6 +786,12 @@ pub fn parse_hf_output(hf_url_str: &str) -> anyhow::Result<HfOutputSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bucket_url_omits_empty_path() {
+        assert_eq!(bucket_url("id", ""), "hf://buckets/id");
+        assert_eq!(bucket_url("id", "tiles"), "hf://buckets/id/tiles");
+    }
 
     fn p(s: &str) -> anyhow::Result<HfUrl> {
         parse(s)

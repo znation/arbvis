@@ -24,11 +24,7 @@ pub async fn upload_dir(
 
     match kind {
         RepoKind::Bucket => {
-            let dest = if path_prefix.is_empty() {
-                format!("hf://buckets/{repo_id}")
-            } else {
-                format!("hf://buckets/{repo_id}/{path_prefix}")
-            };
+            let dest = hf_url::bucket_url(repo_id, path_prefix);
             with_throttle(&label, || async {
                 // `hf sync <local> <hf://...> --delete` matches the prior
                 // `BucketSyncDirection::Upload` + `delete=true` semantics.
@@ -219,7 +215,7 @@ pub async fn run_deploy(tiles_dir: &Path, space_id: &str) -> anyhow::Result<()> 
     log::info!("Syncing tiles to bucket (this may take a while for large outputs)...");
     let tiles_path = tiles_dir.join("tiles");
     let tiles_local = tiles_path.to_string_lossy().into_owned();
-    let tiles_dest = format!("hf://buckets/{bucket_id}/tiles");
+    let tiles_dest = hf_url::bucket_url(bucket_id, "tiles");
     with_throttle(&format!("hf sync tiles -> {bucket_id}"), || async {
         hf_cli::run_hf([
             "sync",
@@ -235,7 +231,7 @@ pub async fn run_deploy(tiles_dir: &Path, space_id: &str) -> anyhow::Result<()> 
     log::info!("Uploading labels.json to bucket...");
     let labels_path = tiles_dir.join("labels.json");
     let labels_local = labels_path.to_string_lossy().into_owned();
-    let labels_dest = format!("hf://buckets/{bucket_id}/labels.json");
+    let labels_dest = hf_url::bucket_url(bucket_id, "labels.json");
     with_throttle(
         &format!("hf buckets cp labels.json -> {bucket_id}"),
         || async {

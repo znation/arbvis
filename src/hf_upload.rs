@@ -4,7 +4,7 @@ use anyhow::Context;
 use tempfile::TempDir;
 
 use crate::hf_cli;
-use crate::hf_url::{HfOutputSpec, RepoKind};
+use crate::hf_url::{bucket_url, HfOutputSpec, RepoKind};
 use crate::throttle::with_throttle;
 use crate::tiled::pyramid_accum::{write_tile_file, TileSink};
 
@@ -66,14 +66,7 @@ impl HfTileSink {
 
         match self.spec.kind {
             RepoKind::Bucket => {
-                let dest = if self.spec.path_prefix.is_empty() {
-                    format!("hf://buckets/{}", self.spec.repo_id)
-                } else {
-                    format!(
-                        "hf://buckets/{}/{}",
-                        self.spec.repo_id, self.spec.path_prefix
-                    )
-                };
+                let dest = bucket_url(&self.spec.repo_id, &self.spec.path_prefix);
                 let label = format!("hf sync {local_dir} {dest}");
                 with_throttle(&label, || async {
                     hf_cli::run_hf(["sync", local_dir.as_str(), dest.as_str(), "--delete"]).await

@@ -95,7 +95,11 @@ fn entities_to_json(entities: &[FileEntity]) -> String {
     let entries: Vec<String> = entities
         .iter()
         .map(|e| {
-            let escaped = e.name.replace('\\', "\\\\").replace('"', "\\\"");
+            let escaped = e
+                .name
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace("</", "<\\/");
             let segs: Vec<String> = e
                 .segments
                 .iter()
@@ -548,9 +552,17 @@ pub struct SceneView {
     pub entities: Vec<FileEntity>,
 }
 
-/// Quote + escape a string for embedding in JSON / JS source.
+/// Quote + escape a string for embedding in JSON / JS source. Neutralizes
+/// `</` so a hostile value like `</script>` cannot prematurely close an
+/// inline `<script>` block (same treatment as the 3D viewer's config JSON);
+/// `<\/` is a valid JSON/JS escape for `/`.
 fn json_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    format!(
+        "\"{}\"",
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace("</", "<\\/")
+    )
 }
 
 /// Scene-keyed labels JSON:
@@ -1041,6 +1053,46 @@ mod tests {
                 "attribution must use the branded name",
             );
         }
+    }
+
+    /// A scene label or key containing `</script>` must not break out of the
+    /// inline `var SCENES = …` script block. Labels/keys can originate in
+    /// data files (labels.json via regen) or from names inside untrusted
+    /// input files via plugin scene tags, so the JSON string escaping used
+    /// there must neutralize `</` (the 3D viewer does the same for its
+    /// config JSON).
+    #[test]
+    fn hostile_scene_label_cannot_close_inline_script() {
+        let evil = "</script><script>alert(1)</script>";
+        let html = build_html_multi(
+            &[SceneView {
+                key: Some(evil.to_string()),
+                label: evil.to_string(),
+                order: 0,
+                world_w: 560,
+                world_h: 64,
+                max_zoom: 2,
+                detail_depth: 0,
+                height: 64,
+                width: 560,
+                leaf_ext: "png".to_string(),
+                pyramid_ext: "avif".to_string(),
+                entities: Vec::new(),
+            }],
+            "t",
+            &[],
+            &Branding::default(),
+        );
+        let benign = build_html_multi(&[scene("ok", 560, 64)], "t", &[], &Branding::default());
+        assert_eq!(
+            html.matches("</script>").count(),
+            benign.matches("</script>").count(),
+            "the hostile label must not add closing </script> tags beyond the template's own: {html}"
+        );
+        assert!(
+            html.contains("<\\/script>"),
+            "`</` must be neutralized to `<\\/`: {html}"
+        );
     }
 
     #[test]

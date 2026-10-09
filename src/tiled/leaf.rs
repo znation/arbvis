@@ -91,6 +91,43 @@ fn encode_truecolor_png(img: &image::ImageBuffer<Rgb<u8>, Vec<u8>>) -> Result<Ve
     Ok(cursor.into_inner())
 }
 
+/// Build and drive a `png::Encoder` for `pixels`, returning the completed
+/// PNG byte stream. The crate's three direct `png::` call sites (indexed
+/// leaf tiles in `encode_indexed_png`, and both single-canvas encoders in
+/// `src/tiled/single.rs`) all use fast compression; when `indexed_palette`
+/// is `Some`, the stream is an 8-bit `Indexed` image with that palette,
+/// otherwise 8-bit `Rgb`.
+pub(crate) fn encode_png(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    indexed_palette: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    let mut out: Vec<u8> = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        match indexed_palette {
+            Some(palette) => {
+                encoder.set_color(png::ColorType::Indexed);
+                encoder.set_depth(png::BitDepth::Eight);
+                encoder.set_palette(palette);
+            }
+            None => {
+                encoder.set_color(png::ColorType::Rgb);
+                encoder.set_depth(png::BitDepth::Eight);
+            }
+        }
+        // Use the fdeflate fast path rather than the crate default (zlib level
+        // 6 via flate2). The indexed pixel stream is highly structured (Hilbert
+        // locality), so it compresses to within +0.4% of level 6 here while
+        // encoding far faster — DEFLATE is a measurable slice of the leaf phase.
+        encoder.set_compression(png::Compression::Fast);
+        let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+        writer.write_image_data(pixels).map_err(|e| e.to_string())?;
+    }
+    Ok(out)
+}
+
 /// Try to encode `img` as an 8-bit indexed-color PNG, returning `Ok(None)` if
 /// the tile uses more than 256 distinct RGB values (caller falls back).
 ///
@@ -128,23 +165,7 @@ fn encode_indexed_png(
 
     let palette_bytes: Vec<u8> = palette.iter().flatten().copied().collect();
 
-    let mut out: Vec<u8> = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut out, img.width(), img.height());
-        encoder.set_color(png::ColorType::Indexed);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder.set_palette(&palette_bytes[..]);
-        // Use the fdeflate fast path rather than the crate default (zlib level
-        // 6 via flate2). The indexed pixel stream is highly structured (Hilbert
-        // locality), so it compresses to within +0.4% of level 6 here while
-        // encoding far faster — DEFLATE is a measurable slice of the leaf phase.
-        encoder.set_compression(png::Compression::Fast);
-        let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
-        writer
-            .write_image_data(&indexed)
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(Some(out))
+    encode_png(img.width(), img.height(), &indexed, Some(&palette_bytes)).map(Some)
 }
 
 /// Compute the starting Hilbert byte index for tile `(tx, ty)`.

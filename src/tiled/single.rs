@@ -77,24 +77,8 @@ fn encode_indexed_single_png(width: u32, height: u32, pixels: &[u8]) -> anyhow::
     let palette: Vec<u8> = lut.iter().flat_map(|c| c.0).collect();
     debug_assert_eq!(palette.len(), 256 * 3);
 
-    let mut out: Vec<u8> = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut out, width, height);
-        encoder.set_color(png::ColorType::Indexed);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder.set_palette(&palette);
-        // Same fast-compression tradeoff as the leaf tiles: the indexed
-        // stream is Hilbert-local and compresses to within ~0.4% of zlib
-        // level 6 while encoding far faster.
-        encoder.set_compression(png::Compression::Fast);
-        let mut writer = encoder
-            .write_header()
-            .map_err(|e: png::EncodingError| anyhow::anyhow!(e.to_string()))?;
-        writer
-            .write_image_data(pixels)
-            .map_err(|e: png::EncodingError| anyhow::anyhow!(e.to_string()))?;
-    }
-    Ok(out)
+    crate::tiled::leaf::encode_png(width, height, pixels, Some(&palette))
+        .map_err(anyhow::Error::msg)
 }
 
 /// Encode an RGB image as a truecolor 8-bit PNG. Diff output mixes
@@ -102,20 +86,7 @@ fn encode_indexed_single_png(width: u32, height: u32, pixels: &[u8]) -> anyhow::
 /// its palette is not bounded at 256 entries — indexed PNG won't do.
 fn encode_rgb_png(img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>) -> anyhow::Result<Vec<u8>> {
     let (width, height) = img.dimensions();
-    let mut out: Vec<u8> = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut out, width, height);
-        encoder.set_color(png::ColorType::Rgb);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder.set_compression(png::Compression::Fast);
-        let mut writer = encoder
-            .write_header()
-            .map_err(|e: png::EncodingError| anyhow::anyhow!(e.to_string()))?;
-        writer
-            .write_image_data(img.as_raw())
-            .map_err(|e: png::EncodingError| anyhow::anyhow!(e.to_string()))?;
-    }
-    Ok(out)
+    crate::tiled::leaf::encode_png(width, height, img.as_raw(), None).map_err(anyhow::Error::msg)
 }
 
 /// Scatter state for one leaf-size tile (TILE×TILE pixels) of the canvas.

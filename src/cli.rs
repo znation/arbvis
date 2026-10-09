@@ -380,16 +380,22 @@ pub(crate) fn ignored_3d_flags(grid: u32, volume_res: u32) -> Vec<&'static str> 
 /// Warning text for 2D runs that set 3D-only flags, with the verb and pronoun
 /// agreeing with how many flags are actually set.
 pub(crate) fn ignored_3d_flags_warning(ignored: &[&str]) -> String {
+    ignored_flags_warning(
+        ignored,
+        "only takes effect with --3d",
+        "only take effect with --3d",
+        " in 2D mode",
+    )
+}
+
+/// Shared singular/plural warning body for runs that set flags which have no
+/// effect. The verb form must agree with the subject, and the pronoun ("it"/
+/// "them") follows the same agreement; `tail` carries any mode suffix.
+fn ignored_flags_warning(ignored: &[&str], verb_s: &str, verb_p: &str, tail: &str) -> String {
     if ignored.len() == 1 {
-        format!(
-            "{} only takes effect with --3d; ignoring it in 2D mode",
-            ignored[0]
-        )
+        format!("{} {}; ignoring it{}", ignored[0], verb_s, tail)
     } else {
-        format!(
-            "{} only take effect with --3d; ignoring them in 2D mode",
-            ignored.join(", ")
-        )
+        format!("{} {}; ignoring them{}", ignored.join(", "), verb_p, tail)
     }
 }
 
@@ -426,17 +432,12 @@ pub(crate) fn regen_html_ignored_flags(args: &Args) -> Vec<&'static str> {
 /// Warning text for `--regen-html` runs that set regen-ignored flags, with the
 /// verb and pronoun agreeing with how many flags are actually set.
 pub(crate) fn regen_html_ignored_warning(ignored: &[&str]) -> String {
-    if ignored.len() == 1 {
-        format!(
-            "{} has no effect with --regen-html; ignoring it",
-            ignored[0]
-        )
-    } else {
-        format!(
-            "{} have no effect with --regen-html; ignoring them",
-            ignored.join(", ")
-        )
-    }
+    ignored_flags_warning(
+        ignored,
+        "has no effect with --regen-html",
+        "have no effect with --regen-html",
+        "",
+    )
 }
 
 /// Pick the viewer title: the user's `--title` if set, else the brand name

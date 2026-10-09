@@ -202,6 +202,39 @@ class RangeStreamingTest(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(kicks, ["bricks.bin"])
 
+    def test_mirror_download_failure_logs_error_and_stays_retryable(self):
+        # The mirror download runs in a daemon thread; a failure there must
+        # not vanish — the Space silently serving every range from the Hub
+        # (then rate-limiting) is the exact problem the mirror exists to
+        # prevent, so the operator needs the error in the container logs.
+        # It must also clear the started marker so a later request retries.
+        class _InlineThread:
+            def __init__(self, target=None, daemon=None):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        class _FailingFS:
+            def open(self, *a, **k):
+                raise OSError("boom: hub unreachable")
+
+        os.remove(os.path.join(self.mirror, "bricks.bin"))
+        real_threading = self.mod.threading
+        real_fs = self.mod._fs
+        self.mod.threading = type("_FakeThreading", (), {"Thread": _InlineThread})
+        self.mod._fs = _FailingFS()
+        try:
+            with self.assertLogs("arbvis.space_app", level="ERROR") as captured:
+                self.mod._start_mirror("bricks.bin")
+        finally:
+            self.mod.threading = real_threading
+            self.mod._fs = real_fs
+        self.assertTrue(any("bricks.bin" in line for line in captured.output))
+        self.assertTrue(any("boom" in line for line in captured.output))
+        # The failure cleared the marker, so a later request can retry.
+        self.assertNotIn("bricks.bin", self.mod._mirror_started)
+
     def test_no_range_missing_file_gets_404_not_500(self):
         # cached_size succeeded (the size cache is pre-seeded in setUp), so a
         # FileNotFoundError can only come from the open itself (asset vanished

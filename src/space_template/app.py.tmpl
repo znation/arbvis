@@ -1,4 +1,5 @@
 import gzip
+import logging
 import os
 import re
 import tempfile
@@ -10,6 +11,12 @@ from huggingface_hub import HfFileSystem
 from huggingface_hub.errors import EntryNotFoundError
 
 BUCKET_ID = "__BUCKET_ID__"
+
+# Failure diagnostics go through a named logger so the Space's container logs
+# show *why* the local mirror is missing — the symptom (every brick range
+# served from the Hub, then rate-limited) is otherwise indistinguishable from
+# a working deployment.
+logger = logging.getLogger("arbvis.space_app")
 
 # Single-range "bytes=start-end" (either bound optional). Multi-range requests
 # fall through to a normal 200 — the 3D viewer only issues single ranges.
@@ -135,7 +142,14 @@ def _start_mirror(rest):
                         break
                     out.write(chunk)
             os.replace(part, dst)  # atomic: readers see the file only when whole
-        except Exception:
+        except Exception as exc:
+            logger.exception(
+                "mirror download of %s failed (%s: %s) — serving ranges from "
+                "the Hub until a later request retries",
+                rest,
+                type(exc).__name__,
+                exc,
+            )
             try:
                 os.remove(part)
             except OSError:

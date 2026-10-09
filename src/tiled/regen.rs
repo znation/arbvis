@@ -267,4 +267,104 @@ mod tests {
             "unexpected error: {err:#}"
         );
     }
+
+    #[test]
+    fn regen_html_errors_when_labels_json_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let branding = crate::registry::Branding::default();
+        let err = regen_html(dir.path(), &branding).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--regen-html expects a viewer bundle"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn file_entity_from_json_parses_fields_and_defaults() {
+        let full: serde_json::Value = serde_json::json!({
+            "name": "model.bin",
+            "x": 7,
+            "y": 9,
+            "hue": 120,
+            "size": 4096,
+            "bbox": [1, 2, 3, 4],
+            "segs": [[0, 1, 2, 3], null, [4, 5, 6, 7], [8]]
+        });
+        let e = file_entity_from_json(&full);
+        assert_eq!(e.name, "model.bin");
+        assert_eq!(e.pixel_x, 7);
+        assert_eq!(e.pixel_y, 9);
+        assert_eq!(e.hue, 120);
+        assert_eq!(e.byte_size, 4096);
+        assert_eq!(e.bbox, (1, 2, 3, 4));
+        // Malformed segment entries (null, too-short) are dropped, not fatal.
+        assert_eq!(e.segments, vec![(0, 1, 2, 3), (4, 5, 6, 7)]);
+
+        let empty = file_entity_from_json(&serde_json::json!({}));
+        assert_eq!(empty.name, "");
+        assert_eq!(empty.pixel_x, 0);
+        assert_eq!(empty.pixel_y, 0);
+        assert_eq!(empty.hue, 0);
+        assert_eq!(empty.byte_size, 0);
+        assert_eq!(empty.bbox, (0, 0, 0, 0));
+        assert!(empty.segments.is_empty());
+    }
+
+    #[test]
+    fn regen_html_multi_scene_shape_rewrites_index_html() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("labels.json"),
+            serde_json::json!({
+                "scenes": [{
+                    "key": "base",
+                    "label": "base scene",
+                    "order": 1,
+                    "world_w": 256,
+                    "world_h": 256,
+                    "max_zoom": 2,
+                    "detail_depth": 0,
+                    "height": 256,
+                    "width": 256,
+                    "leaf_ext": "png",
+                    "pyramid_ext": "png",
+                    "files": [{"name": "a.bin", "x": 0, "y": 0, "size": 4}]
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let branding = crate::registry::Branding::default();
+        regen_html(dir.path(), &branding).unwrap();
+        let index = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
+        assert!(
+            index.contains("base scene"),
+            "scene label must reach the HTML"
+        );
+    }
+
+    #[test]
+    fn regen_html_legacy_array_shape_sniffs_tile_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        // One tile at zoom 0 under tiles/0/0/, in png format, plus a coarser
+        // pyramid level in a different format to exercise independent sniffing.
+        let leaf = dir.path().join("tiles").join("0").join("0");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(leaf.join("0.png"), b"x").unwrap();
+        let labels: serde_json::Value = serde_json::json!([
+            {"name": "a.bin", "x": 0, "y": 0, "size": 4}
+        ]);
+        std::fs::write(dir.path().join("labels.json"), labels.to_string()).unwrap();
+        let branding = crate::registry::Branding::default();
+        regen_html(dir.path(), &branding).unwrap();
+        let index = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
+        // The sniffed leaf extension must reach the generated viewer config.
+        assert!(index.contains("png"), "leaf extension must reach the HTML");
+        // World size for a single tile at zoom 0 is one TILE-sized canvas.
+        assert!(
+            index.contains("WORLD_W = 512"),
+            "world extents must reach the HTML"
+        );
+    }
 }

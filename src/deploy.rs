@@ -167,11 +167,7 @@ pub async fn deploy_space_app(
 /// other HTTP helpers. A `404` is a clean "does not exist"; `2xx` and the
 /// gated `401`/`403` both mean it exists (we just may lack read access).
 async fn space_exists(space_id: &str) -> anyhow::Result<bool> {
-    let url = format!(
-        "{}/api/spaces/{}",
-        hf_url::endpoint(),
-        hf_url::encode_url_path(space_id)
-    );
+    let url = hf_url::api_repo_url(&hf_url::endpoint(), hf_url::RepoKind::Space, space_id);
     let resp = authed_send(
         reqwest::Method::GET,
         &url,
@@ -196,9 +192,8 @@ async fn space_exists(space_id: &str) -> anyhow::Result<bool> {
 /// persistent storage). Matches `HfApi.restart_space`: `POST /api/spaces/{id}/restart`.
 async fn restart_space(space_id: &str) -> anyhow::Result<()> {
     let url = format!(
-        "{}/api/spaces/{}/restart",
-        hf_url::endpoint(),
-        hf_url::encode_url_path(space_id)
+        "{}/restart",
+        hf_url::api_repo_url(&hf_url::endpoint(), hf_url::RepoKind::Space, space_id)
     );
     authed_send(
         reqwest::Method::POST,

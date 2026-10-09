@@ -506,7 +506,7 @@ pub fn require_token() -> anyhow::Result<()> {
 /// `crate::finetune::detect_relation`, which the modelweightvis split will
 /// own.
 pub async fn fetch_model_card(repo_id: &str) -> anyhow::Result<serde_json::Value> {
-    let url = format!("{}/api/models/{}", endpoint(), encode_url_path(repo_id));
+    let url = api_repo_url(&endpoint(), RepoKind::Model, repo_id);
     let resp = authed_send(
         reqwest::Method::GET,
         &url,
@@ -642,10 +642,8 @@ async fn fetch_tree_via_http_at(
     let label = format!("list_tree {} {repo_id}@{revision}", kind.api_segment());
 
     let mut url = format!(
-        "{}/api/{}/{}/tree/{}?recursive=true",
-        base,
-        kind.api_segment(),
-        encode_url_path(repo_id),
+        "{}/tree/{}?recursive=true",
+        api_repo_url(base, kind, repo_id),
         encode_url_path(revision),
     );
 
@@ -1024,6 +1022,18 @@ pub async fn list_repo_as_http_specs(
 /// A segment that is exactly `.` or `..` gets its dots encoded, so the URL
 /// parser cannot normalize it into path traversal (harmless interior dots in
 /// real repo or file names keep their literal form).
+/// Hub API URL for a repo: `{base}/api/{api_segment}/{repo_id}`, with the
+/// repo id percent-encoded. Callers append any route suffix (e.g.
+/// `/tree/{rev}?recursive=true`, `/restart`) to the returned string.
+pub(crate) fn api_repo_url(base: &str, kind: RepoKind, repo_id: &str) -> String {
+    format!(
+        "{}/api/{}/{}",
+        base,
+        kind.api_segment(),
+        encode_url_path(repo_id)
+    )
+}
+
 pub fn encode_url_path(s: &str) -> String {
     s.split('/')
         .map(|seg| {
@@ -1379,6 +1389,23 @@ mod tests {
         );
         // Whitespace and control bytes are encoded too.
         assert_eq!(encode_url_path("a b\tc"), "a%20b%09c");
+    }
+
+    #[test]
+    fn api_repo_url_encodes_and_uses_kind_segment() {
+        use RepoKind::{Dataset, Model, Space};
+        assert_eq!(
+            api_repo_url("https://huggingface.co", Model, "a/b"),
+            "https://huggingface.co/api/models/a/b"
+        );
+        assert_eq!(
+            api_repo_url("http://x", Dataset, "a?b"),
+            "http://x/api/datasets/a%3Fb"
+        );
+        assert_eq!(
+            api_repo_url("http://x", Space, "o/s"),
+            "http://x/api/spaces/o/s"
+        );
     }
 
     #[test]

@@ -245,7 +245,6 @@ impl Extensions {
 
     /// Lookup the value associated with `T`, if any. Plugin readers (step 8
     /// onwards) call this to fetch the typed metadata they care about.
-    #[allow(dead_code)]
     pub fn get<T: Any + Send + Sync>(&self) -> Option<&T> {
         self.map
             .get(&TypeId::of::<T>())

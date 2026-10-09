@@ -54,7 +54,6 @@ pub enum LayoutMode {
 /// Canvas geometry every layout populates. The tile pipeline reads this
 /// once to size the leaflet world, decide pyramid depth, and (for the
 /// Hilbert path) walk the curve.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct CanvasGeom {
     /// Hilbert order in y (`height = 1 << kh`). Zero for non-Hilbert layouts

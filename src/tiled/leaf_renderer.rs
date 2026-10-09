@@ -39,7 +39,6 @@ pub enum LeafTile {
 impl LeafTile {
     /// `None` for `Padding`; the caller paints the padding color directly
     /// without resolving a renderer.
-    #[allow(dead_code)]
     pub fn renderer_id(&self) -> Option<&'static str> {
         match self {
             LeafTile::Bytes { renderer_id } | LeafTile::Regions { renderer_id } => {

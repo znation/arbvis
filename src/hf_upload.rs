@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Mutex;
 
 use anyhow::Context;
@@ -24,14 +23,7 @@ pub struct HfTileSink {
     /// Tiles staged to `tempdir`, recorded so commit can report counts
     /// (the CLI uploads the whole directory and doesn't need this list,
     /// but `is_empty()` is the cheap "did we render anything" check).
-    staged: Mutex<Vec<StagedTile>>,
-}
-
-struct StagedTile {
-    #[allow(dead_code)]
-    repo_path: String,
-    #[allow(dead_code)]
-    local_path: PathBuf,
+    staged: Mutex<usize>,
 }
 
 impl HfTileSink {
@@ -43,7 +35,7 @@ impl HfTileSink {
         Ok(Self {
             spec,
             tempdir,
-            staged: Mutex::new(Vec::new()),
+            staged: Mutex::new(0),
         })
     }
 
@@ -55,9 +47,9 @@ impl HfTileSink {
     /// `delete=true` semantics. Either one inherits its progress UX to
     /// the user's terminal via the helper's stderr forwarding.
     pub async fn commit(self, summary: &str) -> anyhow::Result<()> {
-        let staged = self.staged.into_inner().expect("tile sink mutex poisoned");
+        let staged_count = self.staged.into_inner().expect("tile sink mutex poisoned");
 
-        if staged.is_empty() {
+        if staged_count == 0 {
             log::info!(
                 "No tiles staged; skipping commit to hf://{}",
                 self.spec.repo_id
@@ -66,8 +58,7 @@ impl HfTileSink {
         }
 
         log::info!(
-            "Uploading {} files to hf://{} ...",
-            staged.len(),
+            "Uploading {staged_count} files to hf://{} ...",
             self.spec.repo_id,
         );
 
@@ -132,13 +123,7 @@ impl TileSink for HfTileSink {
     fn upload_tile(&self, repo_path: String, png_bytes: Vec<u8>) -> anyhow::Result<()> {
         let local_path = self.tempdir.path().join(&repo_path);
         write_tile_file(&local_path, &png_bytes)?;
-        self.staged
-            .lock()
-            .expect("tile sink mutex poisoned")
-            .push(StagedTile {
-                repo_path,
-                local_path,
-            });
+        *self.staged.lock().expect("tile sink mutex poisoned") += 1;
         Ok(())
     }
 }

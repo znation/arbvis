@@ -5,7 +5,6 @@
 
 use crate::tiled::leaf::{TILE, TILE_LOG2};
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct HilbertLayout {
     pub kh: u8,

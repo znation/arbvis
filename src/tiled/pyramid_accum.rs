@@ -30,8 +30,6 @@ pub struct PyramidAccumulator<S: TileSink> {
     pending: Mutex<HashMap<(u32, u32, u32), Box<TileAcc>>>,
     outstanding: Mutex<Vec<JoinHandle<()>>>,
     tile_size: u32,
-    #[allow(dead_code)]
-    max_zoom: u32,
     sink: Arc<S>,
     /// Maps `(zoom, x, y)` → destination path string. The sink interprets it
     /// (HF repo path, local filesystem path, …).
@@ -73,7 +71,6 @@ impl TileSink for LocalFileSink {
 impl<S: TileSink> PyramidAccumulator<S> {
     pub fn new(
         tile_size: u32,
-        max_zoom: u32,
         sink: Arc<S>,
         path_fn: Arc<dyn Fn(u32, u32, u32) -> String + Send + Sync>,
         pyramid_format: TileFormat,
@@ -82,7 +79,6 @@ impl<S: TileSink> PyramidAccumulator<S> {
             pending: Mutex::new(HashMap::new()),
             outstanding: Mutex::new(Vec::new()),
             tile_size,
-            max_zoom,
             sink,
             path_fn,
             pyramid_format,
@@ -258,7 +254,6 @@ mod tests {
     ) -> Arc<PyramidAccumulator<RecordingSink>> {
         Arc::new(PyramidAccumulator::new(
             tile_size,
-            2,
             sink,
             Arc::new(|z, x, y| format!("{z}/{x}/{y}.png")),
             TileFormat::Png,

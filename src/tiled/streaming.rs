@@ -152,7 +152,6 @@ async fn stream_scene(
     };
     let pyramid = Arc::new(PyramidAccumulator::new(
         TILE,
-        max_zoom,
         sink.clone(),
         pyramid_path_fn,
         pyramid_format,

@@ -17,11 +17,18 @@ use std::time::{Duration, Instant};
 use crate::throttle::Throttle;
 use crate::xet;
 
-/// Spawn the monitor if `ARBVIS_PERF_LOG=1`. Returns a shutdown handle the
-/// caller can drop to stop the task on exit.
+/// Interpret `ARBVIS_PERF_LOG` and spawn the monitor if it is `1`. Returns a
+/// shutdown handle the caller can drop to stop the task on exit. A set-but
+/// unrecognized value logs a warning naming the accepted value instead of
+/// being silently ignored.
 pub fn spawn_if_enabled() -> Option<Arc<AtomicBool>> {
-    if std::env::var("ARBVIS_PERF_LOG").ok().as_deref() != Some("1") {
-        return None;
+    match check_perf_log(std::env::var("ARBVIS_PERF_LOG").ok().as_deref()) {
+        Ok(false) => return None,
+        Err(msg) => {
+            log::warn!("{msg}");
+            return None;
+        }
+        Ok(true) => {}
     }
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_task = Arc::clone(&stop);
@@ -61,6 +68,21 @@ pub fn spawn_if_enabled() -> Option<Arc<AtomicBool>> {
     Some(stop)
 }
 
+/// Interpret `ARBVIS_PERF_LOG`: `Ok(true)` to spawn the monitor, `Ok(false)`
+/// to stay quiet, `Err(msg)` for a set-but-unrecognized value — the caller
+/// logs `msg` so a typo'd value is not silently ignored.
+fn check_perf_log(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some("1") => Ok(true),
+        // A set-but-unrecognized value means the user asked for perf logging
+        // and would otherwise silently get nothing.
+        Some(other) => Err(format!(
+            "ignoring ARBVIS_PERF_LOG={other:?}: only `1` enables the perf monitor"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +118,23 @@ mod tests {
                 assert!(spawn_if_enabled().is_none(), "value {value:?} must disable");
             });
         }
+    }
+
+    #[test]
+    fn unrecognized_value_is_reported_with_the_accepted_value() {
+        for value in ["0", "true", "", "11"] {
+            let msg = check_perf_log(Some(value)).unwrap_err();
+            assert!(
+                msg.contains("ARBVIS_PERF_LOG") && msg.contains("only `1` enables"),
+                "message must name the var and the accepted value, got {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_value_does_not_report() {
+        assert_eq!(check_perf_log(Some("1")), Ok(true));
+        assert_eq!(check_perf_log(None), Ok(false));
     }
 
     #[tokio::test]

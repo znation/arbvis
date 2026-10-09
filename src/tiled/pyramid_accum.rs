@@ -264,6 +264,23 @@ impl<S: TileSink> PyramidAccumulator<S> {
         Ok(())
     }
 }
+
+/// Await all outstanding pyramid encode/upload tasks and consume the
+/// accumulator's last `Arc`, mapping any failure to a uniform "tile set is
+/// incomplete" error.
+///
+/// Both production drain call sites (`tiled/pipeline.rs` and
+/// `tiled/streaming.rs`) need exactly this sequence — drain, drop the
+/// accumulator, contextualize the error — so it lives here once. The unit
+/// tests below use [`PyramidAccumulator::drain`] directly instead, because
+/// they re-drain or inspect the accumulator after the call.
+pub async fn drain_and_report_incomplete<S: TileSink>(
+    pyramid: Arc<PyramidAccumulator<S>>,
+) -> anyhow::Result<()> {
+    let drained = pyramid.drain().await;
+    drop(pyramid);
+    drained.context("pyramid overview-tile encode/upload failed; the tile set is incomplete")
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -5,6 +5,7 @@
 //! geometry constants) stays in the parent module and is reached via `super`.
 
 use super::*;
+use crate::tiled::pyramid_accum::drain_and_report_incomplete;
 
 /// Run the tiled/pyramidal output pipeline to a local directory.
 ///
@@ -286,11 +287,7 @@ async fn render_scene_to_disk(
     .await?;
 
     log::info!("Draining pyramid encode tasks...");
-    pyramid
-        .drain()
-        .await
-        .context("pyramid overview-tile encode/upload failed; the tile set is incomplete")?;
-    drop(pyramid);
+    drain_and_report_incomplete(pyramid).await?;
 
     // Variable-depth detail tiles: sparse deeper levels rendered directly from
     // source over the shrunk tensors' footprints (no pyramid accumulation).

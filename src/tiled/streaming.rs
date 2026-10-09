@@ -10,14 +10,12 @@
 
 use std::sync::Arc;
 
-use anyhow::Context;
-
 use crate::hf_upload::HfTileSink;
 use crate::hf_url::HfOutputSpec;
 use crate::layout::LayoutMode;
 use crate::tiled::html::{generate_leaflet_content, generate_leaflet_content_multi, SceneView};
 use crate::tiled::leaf::{TileFormat, TILE};
-use crate::tiled::pyramid_accum::{PyramidAccumulator, TileSink};
+use crate::tiled::pyramid_accum::{drain_and_report_incomplete, PyramidAccumulator, TileSink};
 
 use super::scenes::{partition_scenes, SceneGroup};
 use super::{
@@ -197,11 +195,7 @@ async fn stream_scene(
 
     // Await any in-flight pyramid encode/upload tasks before the next scene (or
     // commit) so every staged file is present when the folder is walked.
-    pyramid
-        .drain()
-        .await
-        .context("pyramid overview-tile encode/upload failed; the tile set is incomplete")?;
-    drop(pyramid);
+    drain_and_report_incomplete(pyramid).await?;
 
     // Variable-depth detail tiles (sparse deeper levels, no accumulation).
     let detail_sink = sink.clone();

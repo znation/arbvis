@@ -11,14 +11,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::data::{collect_files_recursive, DiffFill, Extensions, Source, SourceKind};
-
-fn is_json_path(p: &Path) -> bool {
-    matches!(
-        p.extension().and_then(|e| e.to_str()),
-        Some("json") | Some("jsonl")
-    )
-}
+use crate::data::{
+    collect_files_recursive, is_json_path, DiffFill, Extensions, Source, SourceKind,
+};
 
 /// JSON / JSONL structure-aware diff. Applies when both paths have a
 /// `.json` or `.jsonl` extension.

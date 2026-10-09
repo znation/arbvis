@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::{collect_files_recursive, Extensions, Source, SourceKind};
+use super::{collect_files_recursive, is_json_path, Extensions, Source, SourceKind};
 
 /// Crosshatch fill color for `UnmatchedRegion` / `OneSidedRange` sources —
 /// the diff path uses these to mark one-side-only spans visually.
@@ -37,13 +37,6 @@ impl DiffFill {
 // they'll move behind the trait when format detection migrates to
 // `modelweightvis`.
 // ---------------------------------------------------------------------------
-
-fn is_json_path(p: &Path) -> bool {
-    matches!(
-        p.extension().and_then(|e| e.to_str()),
-        Some("json") | Some("jsonl")
-    )
-}
 
 /// JSON / JSONL structure-aware diff. Applies when both paths have a
 /// `.json` or `.jsonl` extension.

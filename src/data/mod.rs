@@ -1,6 +1,6 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
@@ -34,6 +34,16 @@ pub use remote::{
     prepare_sources_from_specs,
 };
 pub use source::{collect_files_recursive, load_source_data, prepare_sources};
+
+/// True when a path carries a `.json` or `.jsonl` extension. Shared by the
+/// JSON diff-source builders (structure-aware diff applies only when both
+/// sides of a pair qualify).
+pub(crate) fn is_json_path(p: &Path) -> bool {
+    matches!(
+        p.extension().and_then(|e| e.to_str()),
+        Some("json") | Some("jsonl")
+    )
+}
 
 /// The backing storage for a file's bytes: a local memory map, an owned
 /// buffer, or one of the remote readers (HTTP range requests against the

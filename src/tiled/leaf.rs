@@ -301,18 +301,14 @@ pub fn render_leaf_tile_from_buf(
     pixel_lut: &[Rgb<u8>; 256],
     fmt: TileFormat,
 ) -> TileResult {
-    let sq = (tx / height_tiles) as u64;
-    let sq_off = sq * square_pixels;
-    let local_tx = tx % height_tiles;
-    let tile_order = kh - TILE_LOG2;
-    let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
-    let frame = tile_curve_frame(local_tx, ty, kh);
+    let tile_pixel_start = tile_pixel_start(tx, ty, kh, height_tiles, square_pixels);
+    let frame = tile_curve_frame(tx % height_tiles, ty, kh);
 
     let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
     for py in 0..TILE {
         for px in 0..TILE {
             let local_idx = tile_local_curve_idx(frame, px, py);
-            let pixel_idx = sq_off + base + local_idx;
+            let pixel_idx = tile_pixel_start + local_idx;
             let color = if pixel_idx < total {
                 pixel_lut[tile_buf[local_idx as usize] as usize]
             } else {
@@ -366,19 +362,14 @@ pub fn render_leaf_tile_diff(
     tints: &[(u64, u64, DiffFill)],
     fmt: TileFormat,
 ) -> TileResult {
-    let sq = (tx / height_tiles) as u64;
-    let sq_off = sq * square_pixels;
-    let local_tx = tx % height_tiles;
-    let tile_order = kh - TILE_LOG2;
-    let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
-    let tile_pixel_start = sq_off + base;
+    let tile_pixel_start = tile_pixel_start(tx, ty, kh, height_tiles, square_pixels);
 
     // Local view of the fills overlapping this tile. Avoids scanning the full
     // (potentially thousands of) fills list per pixel.
     let first_range = fills.partition_point(|r| r.1 <= tile_pixel_start);
     let first_tint = tints.partition_point(|r| r.1 <= tile_pixel_start);
 
-    let (swap, cx, cy) = tile_curve_frame(local_tx, ty, kh);
+    let (swap, cx, cy) = tile_curve_frame(tx % height_tiles, ty, kh);
     let xy_lut = local_curve_to_xy();
     let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
     // Visit pixels in curve order: `pixel_idx` then increases strictly
@@ -388,7 +379,7 @@ pub fn render_leaf_tile_diff(
     let mut fill_cur = first_range;
     let mut tint_cur = first_tint;
     for curve in 0..TILE_AREA {
-        let pixel_idx = sq_off + base + curve;
+        let pixel_idx = tile_pixel_start + curve;
         // Scatter target: unpack the identity-frame pixel at this curve
         // position, then undo this tile's frame (XOR-with-constant plus an
         // optional coordinate swap — each its own inverse) to raster coords.
@@ -460,18 +451,14 @@ pub fn render_leaf_tile_xet_from_buf(
     tableau: &[Rgb<u8>; 20],
     fmt: TileFormat,
 ) -> TileResult {
-    let sq = (tx / height_tiles) as u64;
-    let sq_off = sq * square_pixels;
-    let local_tx = tx % height_tiles;
-    let tile_order = kh - TILE_LOG2;
-    let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
+    let tile_pixel_start = tile_pixel_start(tx, ty, kh, height_tiles, square_pixels);
 
-    let frame = tile_curve_frame(local_tx, ty, kh);
+    let frame = tile_curve_frame(tx % height_tiles, ty, kh);
     let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
     for py in 0..TILE {
         for px in 0..TILE {
             let local_idx = tile_local_curve_idx(frame, px, py);
-            let pixel_idx = sq_off + base + local_idx;
+            let pixel_idx = tile_pixel_start + local_idx;
             let color = if pixel_idx < total {
                 let byte = tile_buf[local_idx as usize];
                 match xorb_color_idx(xorb_ranges, pixel_idx) {

@@ -1,0 +1,152 @@
+"""Tests for the deployed Space app template (`app.py.tmpl`).
+
+The Space app is Python, outside the Rust cargo suite; run it directly with
+any interpreter that has fastapi, httpx, and huggingface_hub installed
+(e.g. `python3 src/space_template/test_app.py`). Tests skip themselves when
+the dependencies are missing.
+
+Focus: HTTP Range handling on the public asset endpoint. The backing
+`bricks.bin` can be multi-GB, and the route is reachable by anyone who can
+load the Space — so a Range request must never buffer more than `_CHUNK` of
+it in RAM per request (memory-exhaustion DoS otherwise).
+"""
+
+import builtins
+import importlib.util
+import os
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+try:
+    from fastapi.testclient import TestClient  # noqa: F401
+    _DEPS_OK = True
+except ImportError:
+    _DEPS_OK = False
+
+
+def load_app():
+    """Render app.py.tmpl with a fake bucket id and import it as a module."""
+    with open(os.path.join(HERE, "app.py.tmpl")) as f:
+        src = f.read().replace("__BUCKET_ID__", "owner/test-bucket")
+    d = tempfile.mkdtemp(prefix="arbvis-space-app-")
+    path = os.path.join(d, "space_app.py")
+    with open(path, "w") as f:
+        f.write(src)
+    spec = importlib.util.spec_from_file_location("space_app", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod, d
+
+
+class TrackingReader:
+    """File wrapper that records the sizes of `read` calls it sees."""
+
+    def __init__(self, f, reads):
+        self._f = f
+        self._reads = reads
+
+    def __enter__(self):
+        self._f.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._f.__exit__(*exc)
+
+    def seek(self, *a):
+        return self._f.seek(*a)
+
+    def read(self, n=None):
+        data = self._f.read(n)
+        self._reads.append(len(data))
+        return data
+
+
+@unittest.skipUnless(_DEPS_OK, "needs fastapi + httpx")
+class RangeStreamingTest(unittest.TestCase):
+    class _FakeFS:
+        """Hub stand-in: serves the test bytes without touching the network."""
+
+        def __init__(self, data):
+            self.data = data
+
+        def open(self, path, mode="rb", block_size=None):
+            import io
+
+            class Ctx(io.BytesIO):
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    self.close()
+
+            return Ctx(self.data)
+
+    def setUp(self):
+        self.mod, _tmpdir = load_app()
+        self.client = TestClient(self.mod.app)
+        self.mirror = tempfile.mkdtemp(prefix="arbvis-space-mirror-")
+        self.mod._MIRROR_DIR = self.mirror
+        self.data = os.urandom(self.mod._CHUNK + self.mod._CHUNK // 2)  # 1.5 chunks
+        with open(os.path.join(self.mirror, "bricks.bin"), "wb") as f:
+            f.write(self.data)
+        size = len(self.data)
+        # Pre-seed the size cache so no Hub metadata call happens in the test.
+        self.mod._size_cache["hf://buckets/owner/test-bucket/bricks.bin"] = size
+        self.mod._fs = self._FakeFS(self.data)
+
+    def test_open_range_never_buffers_more_than_chunk(self):
+        reads = []
+        real_open = builtins.open
+
+        def tracking_open(file, mode="r", *a, **k):
+            f = real_open(file, mode, *a, **k)
+            if os.path.basename(str(file)) == "bricks.bin" and "b" in mode:
+                return TrackingReader(f, reads)
+            return f
+
+        builtins.open = tracking_open
+        try:
+            r = self.client.get("/bricks.bin", headers={"Range": "bytes=0-"})
+        finally:
+            builtins.open = real_open
+
+        self.assertEqual(r.status_code, 206)
+        self.assertEqual(r.content, self.data)
+        self.assertEqual(r.headers["content-range"], "bytes 0-%d/%d" % (len(self.data) - 1, len(self.data)))
+        # The hostile condition: a whole-file Range buffered in one read.
+        self.assertLessEqual(max(reads), self.mod._CHUNK)
+        self.assertGreater(len(reads), 1)
+        # The explicit acquire must be released once the stream is drained.
+        self.assertEqual(self.mod._HUB_SEM._value, 3)
+
+    def test_hub_open_transient_error_releases_semaphore(self):
+        # The Hub path acquires _HUB_SEM before fs().open; a non-404 failure
+        # from that open (transient network error) must still release the slot.
+        self.mod._start_mirror = lambda rest: None
+        os.remove(os.path.join(self.mirror, "bricks.bin"))  # force the Hub path
+
+        class BoomFS:
+            def open(self, path, mode="rb", block_size=None):
+                raise RuntimeError("transient network error")
+
+        self.mod._fs = BoomFS()
+        client = TestClient(self.mod.app, raise_server_exceptions=False)
+        r = client.get("/bricks.bin", headers={"Range": "bytes=0-"})
+        self.assertEqual(r.status_code, 500)
+        self.assertEqual(self.mod._HUB_SEM._value, 3)
+
+    def test_suffix_range_still_correct(self):
+        r = self.client.get("/bricks.bin", headers={"Range": "bytes=-5"})
+        self.assertEqual(r.status_code, 206)
+        self.assertEqual(r.content, self.data[-5:])
+
+    def test_no_range_streams_whole_file(self):
+        r = self.client.get("/bricks.bin")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.content, self.data)
+
+
+if __name__ == "__main__":
+    unittest.main()

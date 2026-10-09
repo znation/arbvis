@@ -197,29 +197,51 @@ def asset(rest: str, request: Request):
         # zero Hub traffic, so the brick storm can't rate-limit us. Until then
         # (and for non-mirrored assets), proxy to the Hub, but ensure the mirror
         # is downloading and pace concurrent Hub reads through the semaphore.
+        # Either way the body streams in ≤_CHUNK pieces: a Range request names
+        # arbitrary offsets into a possibly multi-GB file, and buffering
+        # end-start+1 bytes would let one public request OOM the Space.
         local = _mirror_ready(rest) if rest in _MIRROR_ASSETS else None
+        from_hub = False
         try:
             if local:
-                with open(local, "rb") as f:
-                    f.seek(start)
-                    chunk = f.read(end - start + 1)
+                fobj = open(local, "rb")
             else:
                 if rest in _MIRROR_ASSETS:
                     _start_mirror(rest)
-                with _HUB_SEM:
-                    with fs().open(path, "rb") as f:
-                        f.seek(start)
-                        chunk = f.read(end - start + 1)
+                _HUB_SEM.acquire()  # held until the stream ends (body's finally)
+                from_hub = True
+                try:
+                    fobj = fs().open(path, "rb")
+                except BaseException:
+                    _HUB_SEM.release()
+                    raise
         except (FileNotFoundError, EntryNotFoundError):
+            # semaphore already released by the inner handler when from_hub
             return Response(status_code=404)
-        return Response(
-            content=chunk,
+
+        def body():
+            try:
+                with fobj:
+                    fobj.seek(start)
+                    remaining = end - start + 1
+                    while remaining:
+                        chunk = fobj.read(min(_CHUNK, remaining))
+                        if not chunk:
+                            break
+                        remaining -= len(chunk)
+                        yield chunk
+            finally:
+                if from_hub:
+                    _HUB_SEM.release()
+
+        return StreamingResponse(
+            body(),
             status_code=206,
             media_type=media_type,
             headers={
                 "Content-Range": f"bytes {start}-{end}/{size}",
                 "Accept-Ranges": "bytes",
-                "Content-Length": str(len(chunk)),
+                "Content-Length": str(end - start + 1),
                 "Cache-Control": _CACHE_CONTROL,
             },
         )

@@ -1474,7 +1474,6 @@ mod detail_level_tests {
         assert!(res.is_ok(), "detail failures must not propagate: {res:?}");
         assert_eq!(writes.load(Ordering::SeqCst), 0);
     }
-
 }
 
 #[cfg(test)]

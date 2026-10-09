@@ -520,6 +520,17 @@ fn build_html(
         }}
         redraw();
         map.on('zoomend moveend', redraw);
+      }}
+      .catch(function (e) {{
+        // A missing or malformed labels.json must not fail silently: surface
+        // it in the info panel so a hand-edited or truncated bundle is debuggable.
+        console.warn('labels.json failed to load; file labels unavailable', e);
+        var info = document.getElementById('arbvis-info');
+        if (info) {{
+          var note = document.createElement('div');
+          note.textContent = 'labels.json missing or invalid — file labels unavailable';
+          info.appendChild(note);
+        }}
       }});
   </script>
 </body>
@@ -970,6 +981,17 @@ const TEMPLATE_MULTI: &str = r#"<!DOCTYPE html>
         }
         updateLabels();
         map.on('zoomend moveend', updateLabels);
+      })
+      .catch(function (e) {
+        // Same as the single-scene viewer: a missing or malformed labels.json
+        // must not fail silently.
+        console.warn('labels.json failed to load; file labels unavailable', e);
+        var info = document.getElementById('arbvis-info');
+        if (info) {
+          var note = document.createElement('div');
+          note.textContent = 'labels.json missing or invalid — file labels unavailable';
+          info.appendChild(note);
+        }
       });
   </script>
 </body>
@@ -1007,8 +1029,8 @@ pub fn generate_leaflet_content_multi(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_html, build_html_multi, build_info_html, build_labels_json, build_labels_json_scenes, json_str,
-        scene_fields, scenes_js_literal, Branding, FileEntity, SceneView,
+        build_html, build_html_multi, build_info_html, build_labels_json, build_labels_json_scenes,
+        json_str, scene_fields, scenes_js_literal, Branding, FileEntity, SceneView,
     };
     fn scene(key: &str, world_w: u32, world_h: u32) -> SceneView {
         SceneView {
@@ -1068,6 +1090,38 @@ mod tests {
         let js = scene_fields(&sv, false);
         assert!(json.starts_with("\"key\":\"\","), "{json}");
         assert!(js.starts_with("key:\"\","), "{js}");
+    }
+
+    /// The labels.json fetch must not fail silently: both 2D viewers attach a
+    /// `.catch` that warns and notes the failure in the info panel, so a
+    /// missing/malformed labels.json in a hand-edited bundle is debuggable.
+    #[test]
+    fn labels_fetch_error_is_surfaced_in_both_viewers() {
+        let html = build_html(
+            256,
+            256,
+            2,
+            0,
+            256,
+            256,
+            256,
+            "t",
+            &[],
+            "png",
+            "avif",
+            &Branding::default(),
+        );
+        assert!(
+            html.contains("labels.json failed to load; file labels unavailable"),
+            "single-scene viewer must handle a labels.json load failure"
+        );
+
+        let scenes = [scene("s", 256, 256)];
+        let multi = build_html_multi(&scenes, "t", &[], &Branding::default());
+        assert!(
+            multi.contains("labels.json failed to load; file labels unavailable"),
+            "multi-scene viewer must handle a labels.json load failure"
+        );
     }
 
     /// `json_str` is the sink for every scene string that lands inside a JS

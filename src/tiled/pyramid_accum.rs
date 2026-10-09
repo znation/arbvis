@@ -1,7 +1,8 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use anyhow::Context;
 use image::Rgb;
 use tokio::task::JoinHandle;
 
@@ -45,6 +46,18 @@ pub trait TileSink: Send + Sync + 'static {
     fn upload_tile(&self, path: String, bytes: Vec<u8>) -> anyhow::Result<()>;
 }
 
+/// Writes tile bytes to `path`, creating its parent directory first.
+/// Shared by the local-disk output path and the HF staging sink, which both
+/// persist tiles with exactly this sequence.
+pub fn write_tile_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating tile dir {}", parent.display()))?;
+    }
+    std::fs::write(path, bytes).with_context(|| format!("writing tile {}", path.display()))?;
+    Ok(())
+}
+
 /// Writes encoded tile bytes to a local filesystem path, creating parent
 /// directories as needed. Used by the local `run_tiles` output path.
 pub struct LocalFileSink {
@@ -53,12 +66,7 @@ pub struct LocalFileSink {
 
 impl TileSink for LocalFileSink {
     fn upload_tile(&self, path: String, bytes: Vec<u8>) -> anyhow::Result<()> {
-        let full = self.root.join(path);
-        if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&full, &bytes)?;
-        Ok(())
+        write_tile_file(&self.root.join(path), &bytes)
     }
 }
 
@@ -211,11 +219,18 @@ impl<S: TileSink> PyramidAccumulator<S> {
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn write_tile_file_creates_missing_parents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("a/b/c/tile.png");
+        write_tile_file(&path, b"bytes").expect("write succeeds");
+        assert_eq!(std::fs::read(&path).expect("read back"), b"bytes");
+    }
 
     /// Records (path, decoded RGB pixels) for every tile uploaded.
     #[derive(Default)]
@@ -338,7 +353,13 @@ mod tests {
         let paths: Vec<&str> = uploads.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
             paths,
-            vec!["0/0/0.png", "1/0/0.png", "1/0/1.png", "1/1/0.png", "1/1/1.png"]
+            vec![
+                "0/0/0.png",
+                "1/0/0.png",
+                "1/0/1.png",
+                "1/1/0.png",
+                "1/1/1.png"
+            ]
         );
         for (_, img) in &uploads {
             assert_eq!(img.get_pixel(0, 0), &Rgb([1, 2, 3]));

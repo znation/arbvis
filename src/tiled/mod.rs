@@ -27,7 +27,7 @@ use crate::tiled::leaf::{
     TILE, TILE_LOG2, TILE_PIXELS,
 };
 use crate::tiled::leaf_renderer::{LeafRegistry, LeafTile, LoadCtx, RenderCtx};
-use crate::tiled::pyramid_accum::{LocalFileSink, PyramidAccumulator};
+use crate::tiled::pyramid_accum::{write_tile_file, LocalFileSink, PyramidAccumulator};
 use crate::xet::{XorbMap, TABLEAU_20};
 
 /// Channel capacity for the fetch→process queue, per CPU core. Keeps memory
@@ -1470,12 +1470,7 @@ async fn render_scene_to_disk(
                 "{subdir_for_write}/{max_zoom}/{}/{}.{leaf_ext}",
                 t.tx, t.ty
             ));
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating tile dir {}", parent.display()))?;
-            }
-            std::fs::write(&path, &t.bytes)
-                .with_context(|| format!("writing tile {}", path.display()))?;
+            write_tile_file(&path, &t.bytes)?;
             pyramid_for_write.contribute(max_zoom, t.tx, t.ty, &t.image);
             Ok(())
         },
@@ -1495,10 +1490,7 @@ async fn render_scene_to_disk(
             "{subdir_for_detail}/{z}/{}/{}.{leaf_ext}",
             t.tx, t.ty
         ));
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, &t.bytes)?;
+        write_tile_file(&path, &t.bytes)?;
         Ok(())
     })
     .await?;

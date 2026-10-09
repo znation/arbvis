@@ -7,7 +7,7 @@ use tempfile::TempDir;
 use crate::hf_cli;
 use crate::hf_url::{HfOutputSpec, RepoKind};
 use crate::throttle::with_throttle;
-use crate::tiled::pyramid_accum::TileSink;
+use crate::tiled::pyramid_accum::{write_tile_file, TileSink};
 
 /// Sink for streaming tile output to the Hub.
 ///
@@ -131,12 +131,7 @@ impl HfTileSink {
 impl TileSink for HfTileSink {
     fn upload_tile(&self, repo_path: String, png_bytes: Vec<u8>) -> anyhow::Result<()> {
         let local_path = self.tempdir.path().join(&repo_path);
-        if let Some(parent) = local_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating tile dir {}", parent.display()))?;
-        }
-        std::fs::write(&local_path, &png_bytes)
-            .with_context(|| format!("writing tile {}", local_path.display()))?;
+        write_tile_file(&local_path, &png_bytes)?;
         self.staged
             .lock()
             .expect("tile sink mutex poisoned")

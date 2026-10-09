@@ -19,7 +19,22 @@ const segments. Do not refactor for refactoring's sake.
 
 **Reproduce:** `wc -l src/volume/html.rs`.
 
-### `src/tiled/mod.rs` (1575 lines) exceeds the one-sitting readability budget
+### `src/data/mod.rs` (853 lines) exceeds the one-sitting readability budget
+
+**Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
+"several modules" entry; siblings: volume/html.rs, tiled/mod.rs, volume/mod.rs, volume/brick.rs,
+xet/mod.rs). Already reduced by the diff-subsystem extraction (see Fixed 2026-10-09); remainder is the
+source/IO half (Data, SourceKind, Source, prepare_sources). Suggested direction: opportunistic
+splits only. Do not refactor for refactoring's sake.
+
+**Reproduce:** `wc -l src/data/mod.rs`.
+
+Note: the original combined entry also listed `lib.rs` at 1131 lines, which was stale —
+`lib.rs` is 134 lines and in budget.
+
+## Fixed
+
+### `src/tiled/mod.rs` (1575 lines at find time; 1047 after revision 1) exceeds the one-sitting readability budget — fixed 2026-10-09 by bugfix
 
 **Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
 "several modules" entry; siblings: volume/html.rs, volume/mod.rs, volume/brick.rs, xet/mod.rs, data/mod.rs).
@@ -45,23 +60,21 @@ are unchanged. No tests lived in the moved block (the `regen_html` error-path te
 `SceneGroup`/`sanitize_scene_key`/`partition_scenes` (~1258–1339 in the pre-split file) into a
 `scenes` module, or phases out of `drive_pipeline`.
 
+**Split 4 landed 2026-10-09 by bugfix:** the disk-backed render path (`run_tiles`,
+`remove_stale_tile_backups`, `run_tiles_inner`, `render_scene_to_disk`) moved to new
+`src/tiled/pipeline.rs` (443 lines); `tiled/mod.rs` re-exports `run_tiles`, so the external
+caller (`pipeline.rs` via `tiled::run_tiles`) is unchanged. The three `run_tiles` tests plus
+their `file_source` helper moved verbatim to `pipeline.rs`'s test module (`tiled::pipeline::tests`);
+the `regen_html` error-path test stays in `mod.rs` `scene_tests` only — a duplicate copy that had
+crept into `pipeline.rs`'s test module was removed in revision 1 (2026-10-09), and `run_tiles`'s
+orphaned doc comment (left behind in `mod.rs` by the move) moved onto `pipeline.rs::run_tiles`,
+leaving `pipeline.rs` at 442 lines and `tiled/mod.rs` at 1047 — the latter within the one-sitting
+budget.
+
+**Validation gap:** none — the existing `run_tiles` tests (restore-on-failure, replace-on-success,
+fresh-directory) moved alongside and cover the moved path directly.
+
 **Reproduce:** `wc -l src/tiled/mod.rs`.
-
-
-### `src/data/mod.rs` (853 lines) exceeds the one-sitting readability budget
-
-**Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
-"several modules" entry; siblings: volume/html.rs, tiled/mod.rs, volume/mod.rs, volume/brick.rs,
-xet/mod.rs). Already reduced by the diff-subsystem extraction (see Fixed 2026-10-09); remainder is the
-source/IO half (Data, SourceKind, Source, prepare_sources). Suggested direction: opportunistic
-splits only. Do not refactor for refactoring's sake.
-
-**Reproduce:** `wc -l src/data/mod.rs`.
-
-Note: the original combined entry also listed `lib.rs` at 1131 lines, which was stale —
-`lib.rs` is 134 lines and in budget.
-
-## Fixed
 
 ### `src/volume/brick.rs` (1172 lines at fix time) exceeds the one-sitting readability budget — fixed 2026-10-09 by bugfix
 

@@ -550,13 +550,23 @@ pub struct BrickBuilder<W: Write> {
     fmin: [u32; 3],
     fmax: [u32; 3],
     fsum: [f64; 3],
+    // Bulk mode (`bulk` = true): several bytes map to the same voxel on average
+    // (`total > cells_v` at the call site), so per byte we look the local voxel
+    // index up in `lut` — rebuilt once per brick transition — instead of paying
+    // a full `hilbert_d2xyz` decode per byte. `lut_hidx` is the brick the LUT
+    // was built for.
+    bulk: bool,
+    lut: Vec<u32>,
+    lut_hidx: i128,
 }
 
 impl<W: Write> BrickBuilder<W> {
     /// `order_v` = virtual cube exponent (side `2^order_v`); `brick` = brick
     /// edge (power of two ≤ `2^order_v`); `luma` = per-byte luminance LUT;
-    /// `writer` = sink for the flat brick blocks (`bricks.bin`).
-    pub fn new(order_v: u32, brick: u32, luma: [u16; 256], writer: W) -> Self {
+    /// `writer` = sink for the flat brick blocks (`bricks.bin`). `bulk` enables
+    /// the per-brick voxel-index LUT (see the struct field docs); set it when
+    /// several bytes share a voxel on average (`total > cells_v`).
+    pub fn new(order_v: u32, brick: u32, luma: [u16; 256], writer: W, bulk: bool) -> Self {
         assert!((1..=21).contains(&order_v));
         let brick_log2 = brick.trailing_zeros();
         let side = 1u32 << order_v;
@@ -581,7 +591,29 @@ impl<W: Write> BrickBuilder<W> {
             fmin: [u32::MAX; 3],
             fmax: [0; 3],
             fsum: [0.0; 3],
+            bulk,
+            lut: Vec::new(),
+            lut_hidx: -1,
         }
+    }
+
+    /// Build the bulk-mode LUT: for the brick `hidx`, map each of the `brick³`
+    /// in-brick Hilbert offsets to the brick-local voxel index. Correct because
+    /// the local index depends on `h` only through (brick, low bits) — the brick
+    /// origin is fixed for the whole brick — so one decode per in-brick offset
+    /// serves every byte that lands there.
+    fn build_lut(&mut self, hidx: i128) {
+        let n = 1usize << (3 * self.brick_log2);
+        let base = (hidx as u64) << (3 * self.brick_log2);
+        let bk = self.brick;
+        let o = self.cur_origin;
+        self.lut.clear();
+        for low in 0..n {
+            let v = hilbert_d2xyz(base | low as u64, self.order_v);
+            self.lut
+                .push((v[0] - o[0]) + (v[1] - o[1]) * bk + (v[2] - o[2]) * bk * bk);
+        }
+        self.lut_hidx = hidx;
     }
 
     /// Accumulate one byte `b` whose voxel is at Hilbert distance `h` on the
@@ -596,13 +628,21 @@ impl<W: Write> BrickBuilder<W> {
             for a in self.open.iter_mut() {
                 *a = VoxelAcc::default();
             }
+            if self.bulk {
+                self.build_lut(hidx);
+            }
         }
-        let v = hilbert_d2xyz(h, self.order_v);
-        let bk = self.brick;
-        let li = (v[0] - self.cur_origin[0])
-            + (v[1] - self.cur_origin[1]) * bk
-            + (v[2] - self.cur_origin[2]) * bk * bk;
-        let acc = &mut self.open[li as usize];
+        let li = if self.bulk {
+            debug_assert_eq!(self.lut_hidx, hidx);
+            self.lut[(h & ((1u64 << (3 * self.brick_log2)) - 1)) as usize] as usize
+        } else {
+            let v = hilbert_d2xyz(h, self.order_v);
+            let bk = self.brick;
+            ((v[0] - self.cur_origin[0])
+                + (v[1] - self.cur_origin[1]) * bk
+                + (v[2] - self.cur_origin[2]) * bk * bk) as usize
+        };
+        let acc = &mut self.open[li];
         acc.count += 1;
         acc.sum_val += b as u64;
         acc.sum_luma += self.luma[b as usize] as u64;
@@ -872,12 +912,36 @@ mod tests {
     }
 
     #[test]
+    fn bulk_lut_matches_per_byte_mode() {
+        // Bulk mode must be byte-for-byte equivalent to the per-byte decode:
+        // feed the same non-decreasing Hilbert sequence with repeated voxels
+        // (the `total > cells_v` regime) through both and compare the streamed
+        // bricks.bin output.
+        let order_v = 7;
+        let n = 1u64 << (3 * 6); // 64³ voxel range, spanning many 8³ bricks
+        let mut per_byte = BrickBuilder::new(order_v, BRICK, [3u16; 256], Vec::new(), false);
+        let mut bulk = BrickBuilder::new(order_v, BRICK, [3u16; 256], Vec::new(), true);
+        for h in 0..n {
+            let byte = ((h & 0x7f) as u8) | 1;
+            per_byte.push(h, byte);
+            bulk.push(h, byte);
+            if h % 3 == 0 {
+                per_byte.push(h, byte.wrapping_add(1)); // repeat voxel: bpv > 1
+                bulk.push(h, byte.wrapping_add(1));
+            }
+        }
+        let (_, a) = per_byte.finish_streaming().unwrap();
+        let (_, b) = bulk.finish_streaming().unwrap();
+        assert_eq!(a, b, "bulk LUT path must match the per-byte decode");
+    }
+
+    #[test]
     fn streaming_builder_round_trips_in_hilbert_order() {
         // order_v=5 (32³); feed a contiguous Hilbert prefix (one byte/voxel),
         // spanning several bricks. The accumulator stays O(one brick).
         let order_v = 5;
         let n = 1u64 << (3 * 4); // 4096 voxels
-        let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256], Vec::new());
+        let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256], Vec::new(), false);
         assert_eq!(
             b.open.len(),
             (BRICK as usize).pow(3),
@@ -923,7 +987,7 @@ mod tests {
         // contiguous Hilbert prefix so several bricks fill; the octree must map
         // each occupied brick to a unique 1-based id and report empties as 0.
         let order_v = 6;
-        let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256], Vec::new());
+        let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256], Vec::new(), false);
         let n = 1u64 << (3 * 5); // 32768 voxels
         for h in 0..n {
             b.push(h, ((h & 0x7f) as u8) | 1);
@@ -966,7 +1030,7 @@ mod tests {
         // must handle. Feed a contiguous prefix and confirm every occupied brick
         // still descends to a valid id and a far brick prunes to empty.
         let order_v = 11;
-        let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256], Vec::new());
+        let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256], Vec::new(), false);
         let n = 1u64 << (3 * 6); // 262144 voxels → a small corner of the cube
         for h in 0..n {
             b.push(h, ((h & 0x7f) as u8) | 1);
@@ -1154,7 +1218,7 @@ mod tests {
         // A single occupied brick in a large 256³-voxel volume (32³ = 32768 brick
         // cells) must build only a path of nodes (≈ depth), not a dense table.
         let order_v = 8; // 256³ voxels, depth 5, 32³ brick cells
-        let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256], Vec::new());
+        let mut b = BrickBuilder::new(order_v, BRICK, [3u16; 256], Vec::new(), false);
         b.push(0, 1); // one occupied voxel at Hilbert distance 0 (origin brick)
         let (bv, _) = b.finish_streaming().unwrap();
         assert_eq!(bv.occupied, 1);

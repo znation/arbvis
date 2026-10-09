@@ -472,11 +472,22 @@ fn aggregate_bytes_hilbert(
     };
     // The streamed brick pool writes each finished brick straight to bricks.bin
     // (append-only, O(one brick) RAM) as the Hilbert curve advances.
+    // Bulk regime: when `total > cells_v` several bytes share a voxel on
+    // average, so the builder can amortize its Hilbert decode over a per-brick
+    // LUT and we can advance `cp_v` by threshold instead of a 128-bit mul/div
+    // per byte. In the sparse regime (`total <= cells_v`) `cp_v == g` exactly.
+    let bulk = cells_v > 0 && total as u128 > cells_v;
     let mut brick_builder = if order_v > 0 {
         let w = std::io::BufWriter::new(std::fs::File::create(part_path(
             &out_dir.join("bricks.bin"),
         ))?);
-        Some(brick::BrickBuilder::new(order_v, brick::BRICK, luma, w))
+        Some(brick::BrickBuilder::new(
+            order_v,
+            brick::BRICK,
+            luma,
+            w,
+            bulk,
+        ))
     } else {
         None
     };
@@ -511,6 +522,16 @@ fn aggregate_bytes_hilbert(
     let mut acc = VoxelAcc::default();
     let mut global_start: u64 = 0;
 
+    // Bulk-regime cursor: `cp_v` is the voxel of byte `g`, i.e.
+    // `g·cells_v/total` floored; `next_g` is the first `g` that maps past
+    // `cp_v`, so the 128-bit div runs once per voxel step instead of per byte.
+    let mut cp_v: u64 = 0;
+    let mut next_g: u64 = if bulk {
+        (total as u128).div_ceil(cells_v) as u64
+    } else {
+        0
+    };
+
     for src in &sources {
         let data = load_source_data(src)?;
         let size = src.byte_size;
@@ -535,12 +556,16 @@ fn aggregate_bytes_hilbert(
                 // Feed the high-resolution sparse brick pool (every byte, mapped
                 // to its voxel on the 2^order_v cube).
                 if let Some(bb) = brick_builder.as_mut() {
-                    let cp_v = if total as u128 <= cells_v {
-                        g
+                    if bulk {
+                        while g >= next_g {
+                            cp_v += 1;
+                            next_g =
+                                (((cp_v as u128 + 1) * total as u128).div_ceil(cells_v)) as u64;
+                        }
+                        bb.push(cp_v, b);
                     } else {
-                        ((g as u128) * cells_v / total as u128) as u64
-                    };
-                    bb.push(cp_v, b);
+                        bb.push(g, b);
+                    }
                 }
             }
             local += len as u64;

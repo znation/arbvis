@@ -140,6 +140,35 @@ impl Data {
         }
     }
 
+    /// Return bytes `[start, start+len)` written directly into `dst`.
+    ///
+    /// Semantics match [`Data::fetch_range`] (including the bounds-checked
+    /// error for a shrunken file), but local variants copy straight into the
+    /// caller's buffer instead of allocating an intermediate `Vec`, and
+    /// `ZeroFill` just memsets. Remote variants fall back to `fetch_range`
+    /// plus one copy, so callers on the hot tile-load path can use this
+    /// uniformly and only local sources skip the double copy.
+    pub async fn fetch_range_into(&self, start: u64, dst: &mut [u8]) -> anyhow::Result<()> {
+        match self {
+            Data::Mapped(m) => copy_local(m, start, dst),
+            Data::Owned(v) => copy_local(v, start, dst),
+            Data::ZeroFill => {
+                dst.fill(0);
+                Ok(())
+            }
+            Data::OffsetSlice { inner, base } => {
+                let inner = Arc::clone(inner);
+                let base = *base;
+                Box::pin(async move { inner.fetch_range_into(base + start, dst).await }).await
+            }
+            Data::Http { .. } | Data::Xet(_) | Data::LazyDiff(_) => {
+                let fetched = self.fetch_range(start, dst.len()).await?;
+                dst.copy_from_slice(&fetched);
+                Ok(())
+            }
+        }
+    }
+
     /// Whether `fetch_range` resolves without issuing an HTTP request.
     ///
     /// `Http`, `Xet`, and `LazyDiff` may all hit the network. The tile load
@@ -153,6 +182,28 @@ impl Data {
             Data::Http { .. } | Data::Xet(_) | Data::LazyDiff(_) => false,
         }
     }
+}
+
+/// Copy bytes `[start, start+len)` from a local buffer into `dst` for
+/// [`Data::fetch_range_into`], applying the same bounds check as
+/// [`slice_local`].
+fn copy_local(buf: &[u8], start: u64, dst: &mut [u8]) -> anyhow::Result<()> {
+    let s = start as usize;
+    let end = s.checked_add(dst.len()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "byte range [start {start}, len {}) overflows usize",
+            dst.len()
+        )
+    })?;
+    if end > buf.len() {
+        anyhow::bail!(
+            "byte range [{s}, {end}) is out of bounds: source is {} bytes \
+             (file may have shrunk since it was scanned)",
+            buf.len()
+        );
+    }
+    dst.copy_from_slice(&buf[s..end]);
+    Ok(())
 }
 
 /// Slice a local byte buffer for `fetch_range`, turning an out-of-bounds
@@ -460,6 +511,44 @@ mod data_fetch_tests {
     fn is_local_matches_each_variant() {
         assert!(owned(b"").is_local());
         assert!(Data::ZeroFill.is_local());
+    }
+
+    #[tokio::test]
+    async fn fetch_range_into_copies_local_and_zero_fill_directly() {
+        let data = owned(b"0123456789");
+        let mut dst = [0xFFu8; 4];
+        data.fetch_range_into(3, &mut dst).await.unwrap();
+        assert_eq!(&dst, b"3456");
+
+        let mut z = [7u8; 3];
+        Data::ZeroFill
+            .fetch_range_into(1_000, &mut z)
+            .await
+            .unwrap();
+        assert_eq!(&z, &[0u8; 3]);
+    }
+
+    #[tokio::test]
+    async fn fetch_range_into_falls_back_to_fetch_range_for_remote() {
+        let data = Data::LazyDiff(Arc::new(move |start: u64, len: usize| {
+            Box::pin(async move { Ok((start as u8..).take(len).collect::<Vec<u8>>()) })
+                as futures::future::BoxFuture<'static, anyhow::Result<Vec<u8>>>
+        }));
+        let mut dst = [0u8; 3];
+        data.fetch_range_into(10, &mut dst).await.unwrap();
+        assert_eq!(&dst, &[10, 11, 12]);
+    }
+
+    #[tokio::test]
+    async fn fetch_range_into_offset_slice_and_oob() {
+        let inner = Arc::new(owned(b"0123456789"));
+        let view = Data::OffsetSlice { inner, base: 3 };
+        let mut dst = [0u8; 3];
+        view.fetch_range_into(4, &mut dst).await.unwrap();
+        assert_eq!(&dst, b"789");
+        // Same shrunken-file bounds error shape as fetch_range.
+        let err = view.fetch_range_into(8, &mut dst).await.unwrap_err();
+        assert!(err.to_string().contains("out of bounds"));
     }
 }
 

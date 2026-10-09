@@ -219,8 +219,8 @@ pub async fn load_tile_bytes(
         let chunk_end = readable_end.min(src_end);
         let chunk_len = (chunk_end - pos) as usize;
         let local_off = pos - cumulative_offsets[src_idx];
-        let fetched = data.fetch_range(local_off, chunk_len).await?;
-        tile_buf[buf_off..buf_off + chunk_len].copy_from_slice(&fetched);
+        data.fetch_range_into(local_off, &mut tile_buf[buf_off..buf_off + chunk_len])
+            .await?;
         pos = chunk_end;
         buf_off += chunk_len;
     }

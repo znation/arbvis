@@ -3,6 +3,7 @@ use std::path::Path;
 use anyhow::{bail, Context};
 
 use crate::hf_cli;
+use crate::hf_url::authed_request;
 use crate::hf_url::{self, HfOutputSpec, RepoKind};
 use crate::throttle::with_throttle;
 
@@ -168,15 +169,15 @@ async fn space_exists(space_id: &str) -> anyhow::Result<bool> {
         hf_url::endpoint(),
         hf_url::encode_url_path(space_id)
     );
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .context("building reqwest client")?;
-    let mut req = client.get(&url);
-    if let Some(tok) = hf_url::read_token() {
-        req = req.bearer_auth(tok);
-    }
-    let resp = req.send().await.context("HF space_info request failed")?;
+    let resp = authed_request(
+        reqwest::Method::GET,
+        &url,
+        std::time::Duration::from_secs(10),
+    )
+    .context("building reqwest client")?
+    .send()
+    .await
+    .context("HF space_info request failed")?;
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         Ok(false)
@@ -198,19 +199,17 @@ async fn restart_space(space_id: &str) -> anyhow::Result<()> {
         hf_url::endpoint(),
         hf_url::encode_url_path(space_id)
     );
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .context("building reqwest client")?;
-    let mut req = client.post(&url);
-    if let Some(tok) = hf_url::read_token() {
-        req = req.bearer_auth(tok);
-    }
-    req.send()
-        .await
-        .context("HF restart request failed")?
-        .error_for_status()
-        .context("HF restart returned non-2xx status")?;
+    authed_request(
+        reqwest::Method::POST,
+        &url,
+        std::time::Duration::from_secs(30),
+    )
+    .context("building reqwest client")?
+    .send()
+    .await
+    .context("HF restart request failed")?
+    .error_for_status()
+    .context("HF restart returned non-2xx status")?;
     Ok(())
 }
 

@@ -110,13 +110,12 @@ impl RemoteRepo {
         // is the exclusive Rust convention, so subtract 1 for the header.
         let header = format!("bytes={}-{}", range.start, range.end.saturating_sub(1));
         let bytes = with_throttle(&label, || async {
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .build()?;
-            let mut req = client.get(&url).header(reqwest::header::RANGE, &header);
-            if let Some(tok) = read_token() {
-                req = req.bearer_auth(tok);
-            }
+            let mut req = authed_request(
+                reqwest::Method::GET,
+                &url,
+                std::time::Duration::from_secs(60),
+            )?;
+            req = req.header(reqwest::header::RANGE, &header);
             let resp = req.send().await?;
             let resp = resp.error_for_status()?;
             let body = resp.bytes().await?;
@@ -298,7 +297,29 @@ pub fn endpoint() -> String {
     raw.trim_end_matches('/').to_string()
 }
 
-/// Resolve the HF auth token, returning `None` if no token is available.
+/// Build an HTTP request against `url` with a timeout and the HF token's
+/// bearer auth already applied (`read_token()` is consulted here, so callers
+/// must not add it again).
+///
+/// Returns `reqwest::Result` so both anyhow callers (`.context(...)` on the
+/// returned error) and `reqwest::Error` closures (plain `?`) can consume it.
+/// Deliberately *not* used by `fetch_tree_via_http`, which captures the token
+/// once ahead of its pagination loop; calling this per page would re-read the
+/// token source on every request.
+pub(crate) fn authed_request(
+    method: reqwest::Method,
+    url: &str,
+    timeout: std::time::Duration,
+) -> reqwest::Result<reqwest::RequestBuilder> {
+    let client = reqwest::Client::builder().timeout(timeout).build()?;
+    let mut req = client.request(method, url);
+    if let Some(tok) = read_token() {
+        req = req.bearer_auth(tok);
+    }
+    Ok(req)
+}
+
+/// Read the HF auth token, returning `None` if no token is available.
 ///
 /// Mirrors the resolution order the `hf` CLI uses internally so the direct
 /// HTTP paths (`fetch_range`, `fetch_model_card`, `xet/mod.rs`) sign their
@@ -364,15 +385,15 @@ pub fn require_token() -> anyhow::Result<()> {
 /// own.
 pub async fn fetch_model_card(repo_id: &str) -> anyhow::Result<serde_json::Value> {
     let url = format!("{}/api/models/{}", endpoint(), encode_url_path(repo_id));
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .context("building reqwest client")?;
-    let mut req = client.get(&url);
-    if let Some(tok) = read_token() {
-        req = req.bearer_auth(tok);
-    }
-    let resp = req.send().await.context("HF model_card request failed")?;
+    let resp = authed_request(
+        reqwest::Method::GET,
+        &url,
+        std::time::Duration::from_secs(10),
+    )
+    .context("building reqwest client")?
+    .send()
+    .await
+    .context("HF model_card request failed")?;
     let resp = resp
         .error_for_status()
         .context("HF model_card non-2xx status")?;

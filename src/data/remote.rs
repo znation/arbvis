@@ -557,4 +557,80 @@ mod tests {
             "expected the dash-filename rejection, got: {err}"
         );
     }
+
+    fn plain_source(kind: SourceKind) -> Source {
+        Source {
+            file_idx: 0,
+            kind,
+            byte_size: 0,
+            name_override: None,
+            xet_terms: None,
+            extensions: Extensions::default(),
+        }
+    }
+
+    /// Every non-Http source must end up with `xet_terms = Some(vec![])`
+    /// ("xet vis requested, but this source isn't xet-backed"), never `None`
+    /// (which means "didn't fetch"). This path does no network I/O.
+    #[tokio::test]
+    async fn populate_xet_terms_marks_non_http_sources_as_empty_not_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.bin");
+        fs::write(&path, b"x").unwrap();
+
+        let mut sources = vec![
+            plain_source(SourceKind::File(path)),
+            plain_source(SourceKind::Buffered(vec![1, 2, 3])),
+            plain_source(SourceKind::Diff {
+                original: dir.path().join("a.bin"),
+                modified: dir.path().join("b.bin"),
+            }),
+        ];
+
+        populate_xet_terms(&mut sources).await.unwrap();
+
+        for s in &sources {
+            assert!(matches!(s.xet_terms, Some(ref v) if v.is_empty()));
+        }
+    }
+
+    /// With no `SourceKind::Http` entries the materialisation step must be a
+    /// complete no-op: Ok, and nothing about the sources changes.
+    #[tokio::test]
+    async fn materialize_http_sources_is_a_noop_without_http_sources() {
+        let mut sources = vec![plain_source(SourceKind::Buffered(vec![9]))];
+        let before_name = sources[0].name();
+
+        materialize_http_sources(&mut sources).await.unwrap();
+
+        assert!(matches!(sources[0].kind, SourceKind::Buffered(_)));
+        assert!(sources[0].name_override.is_none());
+        assert_eq!(sources[0].name(), before_name);
+    }
+
+    /// A download failure must propagate as an Err and leave the source list
+    /// untouched (kind still Http, no name_override written) — the Http kind
+    /// stays intact so a caller can retry or report the real URL. Uses the
+    /// dash-filename spec so the failure happens before any CLI spawn.
+    #[tokio::test]
+    async fn materialize_http_sources_propagates_download_error_and_leaves_sources_unchanged() {
+        let repo = crate::hf_url::remote_repo_for_tests(RepoKind::Model, "evil/repo");
+        let spec = crate::hf_url::RemoteFileSpec {
+            repo,
+            filename: Arc::new("--evil".to_string()),
+            revision: Arc::new("main".to_string()),
+            size: 1,
+            xet_hash: None,
+        };
+        let mut sources = vec![plain_source(SourceKind::Http(spec))];
+
+        let err = materialize_http_sources(&mut sources).await.unwrap_err();
+        assert!(
+            err.to_string().contains("starts with `-`"),
+            "expected the dash-filename rejection, got: {err}"
+        );
+        assert!(matches!(sources[0].kind, SourceKind::Http(_)));
+        assert!(sources[0].name_override.is_none());
+        assert!(sources[0].xet_terms.is_none());
+    }
 }

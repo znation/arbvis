@@ -446,21 +446,54 @@ fn discriminant(k: NodeKind) -> u8 {
 
 /// Wagner-Fischer LCS over two hash sequences. Returns matched index pairs
 /// `(i_in_a, i_in_b)` in increasing order on both axes. O(n*m) time and
-/// memory; caller is responsible for bounding inputs.
+/// memory on the untrimmed middle; caller is responsible for bounding
+/// inputs. Common prefix/suffix runs are matched directly before the DP, so
+/// sequences that agree at the ends (the common case for diffing) pay only
+/// for their differing middle. Matching equal elements at the same relative
+/// position is always LCS-optimal, so trimming preserves the result.
 pub fn lcs_pairs(a: &[u64], b: &[u64]) -> Vec<(usize, usize)> {
     let n = a.len();
     let m = b.len();
     if n == 0 || m == 0 {
         return Vec::new();
     }
-    // dp[i][j] = LCS length of a[..i], b[..j].
-    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    // Common prefix.
+    let mut p = 0usize;
+    while p < n && p < m && a[p] == b[p] {
+        p += 1;
+    }
+    // Common suffix over the remainder (never overlaps the prefix).
+    let mut s = 0usize;
+    while s < n - p && s < m - p && a[n - 1 - s] == b[m - 1 - s] {
+        s += 1;
+    }
+    let mid_a = &a[p..n - s];
+    let mid_b = &b[p..m - s];
+    let mut pairs: Vec<(usize, usize)> = (0..p).map(|i| (i, i)).collect();
+    pairs.extend(lcs_pairs_dp(mid_a, mid_b, p, p));
+    for k in 0..s {
+        pairs.push((p + mid_a.len() + k, p + mid_b.len() + k));
+    }
+    pairs
+}
+
+/// O(n*m) DP over the untrimmed middle, emitting pairs offset by
+/// `(base_a, base_b)`. The DP table is one flat allocation (row-major) for
+/// locality instead of n+1 separate heap vectors.
+fn lcs_pairs_dp(a: &[u64], b: &[u64], base_a: usize, base_b: usize) -> Vec<(usize, usize)> {
+    let n = a.len();
+    let m = b.len();
+    if n == 0 || m == 0 {
+        return Vec::new();
+    }
+    // dp[i * (m + 1) + j] = LCS length of a[..i], b[..j].
+    let mut dp = vec![0u32; (n + 1) * (m + 1)];
     for i in 0..n {
         for j in 0..m {
-            dp[i + 1][j + 1] = if a[i] == b[j] {
-                dp[i][j] + 1
+            dp[(i + 1) * (m + 1) + j + 1] = if a[i] == b[j] {
+                dp[i * (m + 1) + j] + 1
             } else {
-                dp[i + 1][j].max(dp[i][j + 1])
+                dp[(i + 1) * (m + 1) + j].max(dp[i * (m + 1) + j + 1])
             };
         }
     }
@@ -469,10 +502,10 @@ pub fn lcs_pairs(a: &[u64], b: &[u64]) -> Vec<(usize, usize)> {
     let (mut i, mut j) = (n, m);
     while i > 0 && j > 0 {
         if a[i - 1] == b[j - 1] {
-            pairs.push((i - 1, j - 1));
+            pairs.push((base_a + i - 1, base_b + j - 1));
             i -= 1;
             j -= 1;
-        } else if dp[i - 1][j] >= dp[i][j - 1] {
+        } else if dp[(i - 1) * (m + 1) + j] >= dp[i * (m + 1) + j - 1] {
             i -= 1;
         } else {
             j -= 1;
@@ -661,6 +694,94 @@ mod tests {
         let r = align(r#"[1,2,3]"#, r#"[1,2,3]"#);
         // Identical, should fold into 1 Aligned span.
         assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn lcs_pairs_matches_full_dp_reference_with_prefix_suffix_trimming() {
+        // Deterministic pseudo-random sequences; compare the trimmed
+        // implementation against an independent full-DP oracle.
+        fn lcg(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *state >> 33
+        }
+        fn reference_lcs(a: &[u64], b: &[u64]) -> Vec<(usize, usize)> {
+            let (n, m) = (a.len(), b.len());
+            let mut dp = vec![vec![0u32; m + 1]; n + 1];
+            for i in 0..n {
+                for j in 0..m {
+                    dp[i + 1][j + 1] = if a[i] == b[j] {
+                        dp[i][j] + 1
+                    } else {
+                        dp[i + 1][j].max(dp[i][j + 1])
+                    };
+                }
+            }
+            let mut pairs = Vec::new();
+            let (mut i, mut j) = (n, m);
+            while i > 0 && j > 0 {
+                if a[i - 1] == b[j - 1] {
+                    pairs.push((i - 1, j - 1));
+                    i -= 1;
+                    j -= 1;
+                } else if dp[i - 1][j] >= dp[i][j - 1] {
+                    i -= 1;
+                } else {
+                    j -= 1;
+                }
+            }
+            pairs.reverse();
+            pairs
+        }
+        let mut state = 0x12345678u64;
+        for _ in 0..64 {
+            let la = (lcg(&mut state) % 25) as usize;
+            let lb = (lcg(&mut state) % 25) as usize;
+            let alphabet = 4u64;
+            let a: Vec<u64> = (0..la).map(|_| lcg(&mut state) % alphabet).collect();
+            let b: Vec<u64> = (0..lb).map(|_| lcg(&mut state) % alphabet).collect();
+            let got = lcs_pairs(&a, &b);
+            let want = reference_lcs(&a, &b);
+            // Same length, and both are valid increasing matchings of equal
+            // elements (the backtrack tie-break may differ; LCS length and
+            // validity must match).
+            assert_eq!(got.len(), want.len(), "a={a:?} b={b:?}");
+            for &(x, y) in &got {
+                assert!(x < la && y < lb && a[x] == b[y], "a={a:?} b={b:?}");
+            }
+            for w in got.windows(2) {
+                assert!(w[0].0 < w[1].0 && w[0].1 < w[1].1, "a={a:?} b={b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn lcs_pairs_identical_long_arrays_is_identity() {
+        let a: Vec<u64> = (0..1000).collect();
+        let b: Vec<u64> = (0..1000).collect();
+        let pairs = lcs_pairs(&a, &b);
+        assert_eq!(pairs.len(), 1000);
+        assert!(pairs
+            .iter()
+            .enumerate()
+            .all(|(i, &(x, y))| x == i && y == i));
+    }
+
+    #[test]
+    fn lcs_pairs_long_prefix_and_suffix_with_small_middle() {
+        let a: Vec<u64> = (0..500).chain([7, 7, 7]).chain(500..1000).collect();
+        let b: Vec<u64> = (0..500).chain([9]).chain(500..1000).collect();
+        let pairs = lcs_pairs(&a, &b);
+        // 500 prefix matches + 500 suffix matches; the middles ([7,7,7] vs
+        // [9]) share nothing.
+        assert_eq!(pairs.len(), 1000);
+        for w in pairs.windows(2) {
+            assert!(w[0].0 < w[1].0 && w[0].1 < w[1].1);
+        }
+        assert!(pairs
+            .iter()
+            .all(|&(x, y)| a[x] == b[y] && x < a.len() && y < b.len()));
     }
 
     #[test]

@@ -236,6 +236,16 @@ cargo install --path .
 
 For modelweightvis, see the [standalone modelweightvis repo](https://github.com/znation/modelweightvis) — it depends on arbvis via a pinned git revision and inherits arbvis's full CLI surface.
 
+### Pre-commit hook
+
+The repo ships a pre-commit hook (`.githooks/pre-commit`) that runs `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings` on every commit touching Rust sources — the same checks CI runs. Git does not pick hooks up from a subdirectory by default, so enable it once per clone with:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+Skip it in emergencies with `git commit --no-verify` (don't make a habit of it).
+
 ## Credits
 
 Color scheme inspired by [Stairwell's binary visualization post](https://stairwell.com/blog/hilbert-curves-visualizing-binary-files-with-color-and-patterns/). Built on [clap](https://crates.io/crates/clap) (CLI), [image](https://crates.io/crates/image) + [png](https://crates.io/crates/png) + rav1e (tile encoding), [fast_hilbert](https://crates.io/crates/fast_hilbert) (2D curve mapping; the 3D curve is a hand-rolled Skilling transform), the official Hugging Face [`hf` CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli) (Hub I/O) + [xet-core-structures](https://crates.io/crates/xet-core-structures) (per-tile xet decode), [Leaflet.js](https://leafletjs.com/) (the 2D viewer), and [Three.js](https://threejs.org/) (the 3D viewer).

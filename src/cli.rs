@@ -314,6 +314,19 @@ pub(crate) fn validate_volume_res(res: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Names of 3D-only flags whose values differ from their defaults and would
+/// therefore be silently ignored without `--3d`.
+pub(crate) fn ignored_3d_flags(grid: u32, volume_res: u32) -> Vec<&'static str> {
+    let mut flags = Vec::new();
+    if grid != 1024 {
+        flags.push("--grid");
+    }
+    if volume_res != 0 {
+        flags.push("--volume-res");
+    }
+    flags
+}
+
 /// Pick the viewer title: the user's `--title` if set, else the brand name
 /// with a mode suffix (`"{name} moe"` / `"{name} diff"`, or just `"{name}"`
 /// when `suffix` is empty). Built once per run, so the fallback allocation is
@@ -377,7 +390,7 @@ mod title_tests {
 
 #[cfg(test)]
 mod grid_validation_tests {
-    use super::validate_grid;
+    use super::{ignored_3d_flags, validate_grid};
 
     #[test]
     fn grid_cap_raised_to_16384() {
@@ -385,6 +398,14 @@ mod grid_validation_tests {
         assert!(validate_grid(1024).is_ok()); // the default
         assert!(validate_grid(32768).is_err()); // above the cap
         assert!(validate_grid(768).is_err()); // not a power of two
+    }
+
+    #[test]
+    fn ignored_3d_flags_only_names_non_defaults() {
+        assert!(ignored_3d_flags(1024, 0).is_empty()); // both defaults
+        assert_eq!(ignored_3d_flags(512, 0), vec!["--grid"]);
+        assert_eq!(ignored_3d_flags(1024, 4096), vec!["--volume-res"]);
+        assert_eq!(ignored_3d_flags(512, 4096), vec!["--grid", "--volume-res"]);
     }
 }
 

@@ -665,11 +665,22 @@ mod tests {
         let total = 20_000u64;
         let split = 7_777u64; // boundary strictly inside tile (0,0)'s range
         let src0 = Data::Owned((0..split).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
-        let src1 = Data::Owned((0..total - split).map(|i| ((i * 7 + 13) % 256) as u8).collect::<Vec<u8>>());
+        let src1 = Data::Owned(
+            (0..total - split)
+                .map(|i| ((i * 7 + 13) % 256) as u8)
+                .collect::<Vec<u8>>(),
+        );
         let sources = [src0, src1];
         let cumulative = [0u64, split];
         let buf = load_tile_bytes(
-            0, 0, kh, height_tiles, square_pixels, total, &sources, &cumulative,
+            0,
+            0,
+            kh,
+            height_tiles,
+            square_pixels,
+            total,
+            &sources,
+            &cumulative,
         )
         .await
         .unwrap();

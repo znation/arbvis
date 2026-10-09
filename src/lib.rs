@@ -1,3 +1,9 @@
+//! arbvis: visualize arbitrary binary files laid out along a Hilbert curve.
+//!
+//! This crate is the byte-only foundation [modelweightvis](https://github.com/znation/modelweightvis)
+//! builds on: tile pipeline, source/diff plumbing, layout traits, and hooks
+//! for the model-aware plugins to plug into.
+
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 mod cli;

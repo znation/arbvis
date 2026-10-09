@@ -1,3 +1,6 @@
+//! Leaf-tile rendering and encoding: the highest-resolution tile level, where
+//! one pixel is one byte, in plain and diff variants, as AVIF or PNG.
+
 use std::io::Cursor;
 
 use image::codecs::avif::AvifEncoder;

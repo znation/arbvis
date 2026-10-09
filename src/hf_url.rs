@@ -1,3 +1,6 @@
+//! `hf://` URL parsing and direct HTTP Hub access: repo/file spec resolution,
+//! byte-range reads, model cards, and the bucket plumbing behind them.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};

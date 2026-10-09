@@ -1,3 +1,6 @@
+//! Tile streaming to the Hub: [`crate::tiled::pyramid_accum::TileSink`]
+//! implementation that stages tiles to a temp dir and uploads them at commit.
+
 use std::sync::Mutex;
 
 use anyhow::Context;

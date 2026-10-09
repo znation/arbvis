@@ -1,3 +1,6 @@
+//! Byte→RGB color mapping: a 256-entry LUT for the plain byte-range scheme
+//! (per Stairwell) and the signed-delta LUT for `--diff` renders.
+
 use image::Rgb;
 
 /// Map a byte to a color based on value range.

@@ -1,3 +1,7 @@
+//! Data sources: backing storage ([`Data`]), source construction and loading,
+//! and the [`DiffFill`] crosshatch colors. The diff-source builders live in
+//! `crate::data_diff`.
+
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -9,8 +13,6 @@ use memmap2::Mmap;
 use crate::hf_url::{RemoteFileSpec, RemoteRepo};
 use crate::xet::{XetReader, XetTerm};
 
-/// Crosshatch fill color for `UnmatchedRegion` / `OneSidedRange` sources —
-/// the diff path uses these to mark one-side-only spans visually.
 mod diff;
 
 pub use diff::DiffFill;

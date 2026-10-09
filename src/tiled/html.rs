@@ -1,3 +1,6 @@
+//! Viewer `index.html` generation: embeds entity metadata, tile-URL template,
+//! and branding into the Leaflet viewer template (single- and multi-scene).
+
 use anyhow::{bail, Context};
 use std::path::{Path, PathBuf};
 

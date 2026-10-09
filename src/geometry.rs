@@ -1,3 +1,6 @@
+//! Hilbert-curve geometry: 2D/3D index↔coordinate mapping, file→tile-rectangle
+//! layout, and the interval/rect helpers behind entity and diff overlays.
+
 use fast_hilbert::h2xy;
 use std::collections::HashMap;
 

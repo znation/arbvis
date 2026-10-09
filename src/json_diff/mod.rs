@@ -509,7 +509,7 @@ mod tests {
         let (sources, total) = build_json_diff_sources(&empty, &nonempty, false)
             .await
             .expect("empty input file must fall back, not error");
-        assert_eq!(total, 0 + nonempty.metadata().unwrap().len());
+        assert_eq!(total, nonempty.metadata().unwrap().len());
         assert!(matches!(
             sources[0].kind,
             SourceKind::UnmatchedRegion { .. }

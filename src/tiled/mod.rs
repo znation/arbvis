@@ -1,3 +1,6 @@
+//! 2D tile pipeline: per-tile rendering, pyramid averaging, and encoding,
+//! plus the `LoadedTile`/`EncodedTile` types shared along the way.
+
 pub mod html;
 pub mod leaf;
 pub mod leaf_renderer;

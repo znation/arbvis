@@ -1,3 +1,6 @@
+//! Pyramid tile accumulation: per-tile RGB-sum accumulators that average
+//! child tiles into parent tiles, drained to a [`TileSink`] at the end.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

@@ -1,3 +1,6 @@
+//! Hugging Face Space deployment: upload a rendered bundle to a bucket repo
+//! and deploy or restart the stateless Space app that serves it.
+
 use std::path::Path;
 
 use anyhow::{bail, Context};

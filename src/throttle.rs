@@ -56,7 +56,7 @@ const BACKOFF_BASE_MS: u64 = 1000;
 const BACKOFF_CAP_MS: u64 = 64_000;
 
 /// Per-process AIMD throttle. Use [`Throttle::global`] in production; tests in
-/// this module instantiate fresh ones with [`Throttle::new_for_test`].
+/// this module instantiate fresh ones with `Throttle::new_for_test`.
 pub struct Throttle {
     max_workers: usize,
     active_limit: AtomicUsize,

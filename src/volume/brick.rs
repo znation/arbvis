@@ -71,7 +71,7 @@ fn pack_page_table(slots: &[u32]) -> Vec<u8> {
 /// the root; each node is 8 child entries (octant `x | y<<1 | z<<2`): `0` = empty
 /// subtree, `LEAF_BIT | id` = a 1-based brick leaf, else a 1-based child-node
 /// index. Shared by the byte→Hilbert [`BrickBuilder`] and the dense-RGBA
-/// [`build_streamed_brick_volume`]; the descent (MSB-first octant bits) matches
+/// `build_streamed_brick_volume`; the descent (MSB-first octant bits) matches
 /// the shader's boundary-compare walk and the test `descend_octree`.
 pub(super) struct Octree {
     pub(super) nodes: Vec<[u32; 8]>,

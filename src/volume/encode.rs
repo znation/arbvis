@@ -260,12 +260,12 @@ pub fn downsample_rgba(full: &[u8], full_extent: [u32; 3], coarse: [u32; 3]) -> 
     out
 }
 
-/// Streaming accumulator that reproduces [`downsample_rgba`] one **brick-aligned
+/// Streaming accumulator that reproduces `downsample_rgba` one **brick-aligned
 /// Z-slab** at a time, so the structured path can build the coarse `volume.bin`
 /// without ever holding the full dense grid. The alpha-weighted color sums and
 /// coverage counters are additive over disjoint voxel subsets, so folding the
 /// slabs that partition `[0, full.z)` yields a buffer byte-identical to a single
-/// [`downsample_rgba`] over the whole grid.
+/// `downsample_rgba` over the whole grid.
 pub struct CoarseAcc {
     full: [u32; 3],
     coarse: [u32; 3],
@@ -278,7 +278,7 @@ pub struct CoarseAcc {
 }
 
 /// Source block `[lo, hi)` covering coarse index `i` on an axis of length f→c.
-/// Shared by [`downsample_rgba`] and [`CoarseAcc`] so both partition identically.
+/// Shared by `downsample_rgba` and [`CoarseAcc`] so both partition identically.
 fn coarse_block(i: u32, c: u32, f: u32) -> (u32, u32) {
     let lo = ((i as u64 * f as u64) / c as u64) as u32;
     let hi = ((((i as u64 + 1) * f as u64).div_ceil(c as u64)) as u32)
@@ -348,7 +348,7 @@ impl CoarseAcc {
     }
 
     /// Finalize to the coarse RGBA8 buffer — same per-cell math as
-    /// [`downsample_rgba`] (alpha-weighted color, coverage-weighted alpha).
+    /// `downsample_rgba` (alpha-weighted color, coverage-weighted alpha).
     pub fn finish(self) -> Vec<u8> {
         let [cx, cy, cz] = self.coarse;
         let mut out = vec![0u8; cx as usize * cy as usize * cz as usize * 4];

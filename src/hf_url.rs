@@ -929,8 +929,6 @@ pub fn bucket_url(repo_id: &str, path: &str) -> String {
     }
 }
 
-/// True iff `s` is an `hf://` URL. Centralises the prefix check so call sites
-/// don't sprinkle `starts_with("hf://")` everywhere.
 /// Convert an `hf://` URL to its Hub web URL, or `None` for non-hf paths and
 /// bucket URLs (which have no web viewer page).
 ///
@@ -1012,14 +1010,6 @@ pub async fn list_repo_as_http_specs(
     Ok(specs)
 }
 
-/// Percent-encode a user-supplied identifier (`repo_id`, `revision`, `filename`,
-/// `space_id`) for interpolation into a Hub URL path. Unreserved characters and
-/// the segment-separating `/` pass through unchanged; everything else —
-/// including `?`, `#`, `%`, whitespace, and control bytes — is percent-encoded,
-/// so the identifier cannot alter the request's path, query, or fragment.
-/// A segment that is exactly `.` or `..` gets its dots encoded, so the URL
-/// parser cannot normalize it into path traversal (harmless interior dots in
-/// real repo or file names keep their literal form).
 /// Hub API URL for a repo: `{base}/api/{api_segment}/{repo_id}`, with the
 /// repo id percent-encoded. Callers append any route suffix (e.g.
 /// `/tree/{rev}?recursive=true`, `/restart`) to the returned string.
@@ -1032,6 +1022,14 @@ pub(crate) fn api_repo_url(base: &str, kind: RepoKind, repo_id: &str) -> String 
     )
 }
 
+/// Percent-encode a user-supplied identifier (`repo_id`, `revision`, `filename`,
+/// `space_id`) for interpolation into a Hub URL path. Unreserved characters and
+/// the segment-separating `/` pass through unchanged; everything else —
+/// including `?`, `#`, `%`, whitespace, and control bytes — is percent-encoded,
+/// so the identifier cannot alter the request's path, query, or fragment.
+/// A segment that is exactly `.` or `..` gets its dots encoded, so the URL
+/// parser cannot normalize it into path traversal (harmless interior dots in
+/// real repo or file names keep their literal form).
 pub fn encode_url_path(s: &str) -> String {
     s.split('/')
         .map(|seg| {

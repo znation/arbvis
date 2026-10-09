@@ -300,11 +300,7 @@ pub(crate) fn derive_bucket_id(space_id: &str) -> anyhow::Result<String> {
     Ok(format!("{namespace}/{repo}_bucket"))
 }
 
-pub(crate) fn write_space_files(
-    dir: &Path,
-    bucket_id: &str,
-    space_id: &str,
-) -> anyhow::Result<()> {
+pub(crate) fn write_space_files(dir: &Path, bucket_id: &str, space_id: &str) -> anyhow::Result<()> {
     let repo_name = space_id.split('/').nth(1).unwrap_or(space_id);
 
     let readme = include_str!("space_template/README.md.tmpl").replace("__REPO_NAME__", repo_name);
@@ -379,7 +375,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         write_space_files(tmp.path(), "ns/repo_bucket", "ns/repo").unwrap();
         let readme = std::fs::read_to_string(tmp.path().join("README.md")).unwrap();
-        assert_eq!(readme, include_str!("space_template/README.md.tmpl").replace("__REPO_NAME__", "repo"));
+        assert_eq!(
+            readme,
+            include_str!("space_template/README.md.tmpl").replace("__REPO_NAME__", "repo")
+        );
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("Dockerfile")).unwrap(),
             include_str!("space_template/Dockerfile")

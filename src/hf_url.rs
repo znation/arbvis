@@ -391,12 +391,23 @@ pub fn read_token() -> Option<String> {
         if !t.is_empty() {
             return Some(t.to_string());
         }
+        log::warn!(
+            "HF_TOKEN is set but empty/whitespace-only; ignoring it and checking HF_TOKEN_PATH"
+        );
     }
     if let Ok(p) = std::env::var("HF_TOKEN_PATH") {
-        if let Ok(s) = std::fs::read_to_string(&p) {
-            let t = s.trim();
-            if !t.is_empty() {
-                return Some(t.to_string());
+        match std::fs::read_to_string(&p) {
+            Ok(s) => {
+                let t = s.trim();
+                if !t.is_empty() {
+                    return Some(t.to_string());
+                }
+                log::warn!(
+                    "HF_TOKEN_PATH={p:?} is empty; ignoring it and checking the default token file"
+                );
+            }
+            Err(e) => {
+                log::warn!("HF_TOKEN_PATH={p:?} could not be read ({e}); ignoring it and checking the default token file");
             }
         }
     }
@@ -1012,6 +1023,58 @@ mod tests {
             parse_endpoint(" https://mirror.example.com/ "),
             "https://mirror.example.com"
         );
+    }
+
+    #[test]
+    fn read_token_warns_and_falls_through_on_blank_hf_token_and_unreadable_path() {
+        // Env is process-global in the test binary; save, mutate, restore.
+        let prev_disable = std::env::var("HF_HUB_DISABLE_IMPLICIT_TOKEN").ok();
+        let prev_token = std::env::var("HF_TOKEN").ok();
+        let prev_path = std::env::var("HF_TOKEN_PATH").ok();
+        let prev_home = std::env::var("HF_HOME").ok();
+        std::env::remove_var("HF_HUB_DISABLE_IMPLICIT_TOKEN");
+        let home = std::env::temp_dir().join(format!("arbvis-token-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("create temp HF_HOME");
+        std::env::set_var("HF_HOME", &home);
+
+        // A blank HF_TOKEN is ignored (with a warning) and resolution falls
+        // through to HF_TOKEN_PATH; an unreadable HF_TOKEN_PATH is likewise
+        // skipped, so with no other source we get None rather than a 401 later.
+        std::env::set_var("HF_TOKEN", "   ");
+        std::env::set_var("HF_TOKEN_PATH", "/nonexistent/arbvis-token-path");
+        assert_eq!(read_token(), None);
+
+        // A readable HF_TOKEN_PATH wins after the blank HF_TOKEN fell through.
+        let token_file = home.join("tok");
+        std::fs::write(&token_file, "  hf_abc123\n").expect("write token file");
+        std::env::set_var("HF_TOKEN_PATH", &token_file);
+        assert_eq!(read_token().as_deref(), Some("hf_abc123"));
+
+        match (prev_disable, prev_token, prev_path, prev_home) {
+            (d, t, p, h) => {
+                if d.is_some() {
+                    std::env::set_var("HF_HUB_DISABLE_IMPLICIT_TOKEN", d.unwrap());
+                } else {
+                    std::env::remove_var("HF_HUB_DISABLE_IMPLICIT_TOKEN");
+                }
+                if t.is_some() {
+                    std::env::set_var("HF_TOKEN", t.unwrap());
+                } else {
+                    std::env::remove_var("HF_TOKEN");
+                }
+                if p.is_some() {
+                    std::env::set_var("HF_TOKEN_PATH", p.unwrap());
+                } else {
+                    std::env::remove_var("HF_TOKEN_PATH");
+                }
+                if h.is_some() {
+                    std::env::set_var("HF_HOME", h.unwrap());
+                } else {
+                    std::env::remove_var("HF_HOME");
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

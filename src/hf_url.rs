@@ -374,6 +374,23 @@ fn parse_endpoint(raw: &str) -> String {
     DEFAULT_ENDPOINT.to_string()
 }
 
+/// Send an authenticated request and await the response, wrapping the two
+/// boilerplate failure points (client construction, transport) in anyhow
+/// contexts labeled with `what` (e.g. `"model_card"` → "HF model_card
+/// request failed"). Status-code handling stays with the caller.
+pub(crate) async fn authed_send(
+    method: reqwest::Method,
+    url: &str,
+    timeout: std::time::Duration,
+    what: &str,
+) -> anyhow::Result<reqwest::Response> {
+    authed_request(method, url, timeout)
+        .context("building reqwest client")?
+        .send()
+        .await
+        .with_context(|| format!("HF {what} request failed"))
+}
+
 /// Build an HTTP request against `url` with a timeout and the HF token's
 /// bearer auth already applied (`read_token()` is consulted here, so callers
 /// must not add it again).
@@ -490,15 +507,13 @@ pub fn require_token() -> anyhow::Result<()> {
 /// own.
 pub async fn fetch_model_card(repo_id: &str) -> anyhow::Result<serde_json::Value> {
     let url = format!("{}/api/models/{}", endpoint(), encode_url_path(repo_id));
-    let resp = authed_request(
+    let resp = authed_send(
         reqwest::Method::GET,
         &url,
         std::time::Duration::from_secs(10),
+        "model_card",
     )
-    .context("building reqwest client")?
-    .send()
-    .await
-    .context("HF model_card request failed")?;
+    .await?;
     let resp = resp
         .error_for_status()
         .context("HF model_card non-2xx status")?;

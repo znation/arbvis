@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::{bail, Context};
 
 use crate::hf_cli;
-use crate::hf_url::authed_request;
+use crate::hf_url::authed_send;
 use crate::hf_url::{self, HfOutputSpec, RepoKind};
 use crate::throttle::with_throttle;
 
@@ -163,8 +163,8 @@ pub async fn deploy_space_app(
     Ok(())
 }
 
-/// Whether a Space repo already exists. Mirrors `hf_url::fetch_model_card`'s
-/// direct-reqwest pattern. A `404` is a clean "does not exist"; `2xx` and the
+/// Whether a Space repo already exists. Uses `hf_url::authed_send` like the
+/// other HTTP helpers. A `404` is a clean "does not exist"; `2xx` and the
 /// gated `401`/`403` both mean it exists (we just may lack read access).
 async fn space_exists(space_id: &str) -> anyhow::Result<bool> {
     let url = format!(
@@ -172,15 +172,13 @@ async fn space_exists(space_id: &str) -> anyhow::Result<bool> {
         hf_url::endpoint(),
         hf_url::encode_url_path(space_id)
     );
-    let resp = authed_request(
+    let resp = authed_send(
         reqwest::Method::GET,
         &url,
         std::time::Duration::from_secs(10),
+        "space_info",
     )
-    .context("building reqwest client")?
-    .send()
-    .await
-    .context("HF space_info request failed")?;
+    .await?;
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         Ok(false)
@@ -202,15 +200,13 @@ async fn restart_space(space_id: &str) -> anyhow::Result<()> {
         hf_url::endpoint(),
         hf_url::encode_url_path(space_id)
     );
-    authed_request(
+    authed_send(
         reqwest::Method::POST,
         &url,
         std::time::Duration::from_secs(30),
+        "restart",
     )
-    .context("building reqwest client")?
-    .send()
-    .await
-    .context("HF restart request failed")?
+    .await?
     .error_for_status()
     .context("HF restart returned non-2xx status")?;
     Ok(())

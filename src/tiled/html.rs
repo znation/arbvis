@@ -988,7 +988,8 @@ pub fn generate_leaflet_content_multi(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_html, build_html_multi, build_info_html, build_labels_json_scenes, json_str, scenes_js_literal, scene_fields, Branding, FileEntity, SceneView,
+        build_html, build_html_multi, build_info_html, build_labels_json_scenes, json_str,
+        scene_fields, scenes_js_literal, Branding, FileEntity, SceneView,
     };
     fn scene(key: &str, world_w: u32, world_h: u32) -> SceneView {
         SceneView {
@@ -1018,8 +1019,16 @@ mod tests {
         let json = scene_fields(&sv, true);
         let js = scene_fields(&sv, false);
         for name in [
-            "key", "label", "world_w", "world_h", "width", "height", "max_zoom", "detail_depth",
-            "leaf_ext", "pyramid_ext",
+            "key",
+            "label",
+            "world_w",
+            "world_h",
+            "width",
+            "height",
+            "max_zoom",
+            "detail_depth",
+            "leaf_ext",
+            "pyramid_ext",
         ] {
             assert!(json.contains(&format!("\"{name}\":")), "JSON key: {json}");
             assert!(js.contains(&format!("{name}:")), "JS key: {js}");

@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use lru::LruCache;
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize};
 
 use crate::hf_url::{self, RemoteFileSpec};
 use crate::throttle::with_throttle;
@@ -186,6 +186,34 @@ fn invalidate_cas_token_cache(api_segment: &str, repo_id: &str, revision: &str) 
     }
 }
 
+/// Authenticated GET that runs under the global throttle, converts non-2xx
+/// responses into reqwest errors via `error_for_status()`, and parses the
+/// response body as JSON. `throttle_key` labels the request to the throttle;
+/// `label` names it in the log line and in the error contexts
+/// ("requesting {label} at {url}", "parsing {label} response from {url}").
+async fn authed_get_json<T: DeserializeOwned>(
+    throttle_key: &str,
+    label: &str,
+    url: &str,
+    bearer: &str,
+) -> anyhow::Result<T> {
+    log::info!("Fetching {label}: {url}");
+    let client = http_client();
+    let resp = with_throttle(throttle_key, || async {
+        client
+            .get(url)
+            .bearer_auth(bearer)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+    })
+    .await
+    .with_context(|| format!("requesting {label} at {url}"))?;
+    resp.json::<T>()
+        .await
+        .with_context(|| format!("parsing {label} response from {url}"))
+}
+
 async fn fetch_cas_token(
     api_segment: &str,
     repo_id: &str,
@@ -215,26 +243,17 @@ async fn fetch_cas_token(
         repo_id,
         revision,
     );
-    log::info!("Requesting xet CAS token for {repo_id}@{revision}");
-    let client = http_client();
-    // `error_for_status()` converts non-2xx into a reqwest::Error carrying the
-    // status code so the throttle's classifier can detect 429/5xx and retry.
-    // Response body detail is lost on error, but the URL and status code are
-    // preserved.
-    let resp = with_throttle(&format!("xet-read-token {repo_id}"), || async {
-        client
-            .get(&url)
-            .bearer_auth(&hf_token)
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-    })
-    .await
-    .with_context(|| format!("requesting xet-read-token at {url}"))?;
-    let parsed: XetReadTokenResponse = resp
-        .json()
-        .await
-        .with_context(|| format!("parsing xet-read-token response from {url}"))?;
+    // `error_for_status()` (inside `authed_get_json`) converts non-2xx into a
+    // reqwest::Error carrying the status code so the throttle's classifier can
+    // detect 429/5xx and retry. Response body detail is lost on error, but the
+    // URL and status code are preserved.
+    let parsed: XetReadTokenResponse = authed_get_json(
+        &format!("xet-read-token {repo_id}"),
+        "xet-read-token",
+        &url,
+        &hf_token,
+    )
+    .await?;
 
     let token = CasToken {
         cas_url: parsed.cas_url.trim_end_matches('/').to_string(),
@@ -254,21 +273,13 @@ async fn fetch_reconstruction_response(
     xet_hash_hex: &str,
 ) -> anyhow::Result<ReconstructionResponse> {
     let url = format!("{}/v2/reconstructions/{}", cas.cas_url, xet_hash_hex);
-    log::info!("Fetching reconstruction terms: {url}");
-    let client = http_client();
-    let resp = with_throttle(&format!("reconstruction {xet_hash_hex}"), || async {
-        client
-            .get(&url)
-            .bearer_auth(&cas.access_token)
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-    })
+    authed_get_json(
+        &format!("reconstruction {xet_hash_hex}"),
+        "reconstruction",
+        &url,
+        &cas.access_token,
+    )
     .await
-    .with_context(|| format!("requesting reconstruction at {url}"))?;
-    resp.json::<ReconstructionResponse>()
-        .await
-        .with_context(|| format!("parsing reconstruction response from {url}"))
 }
 
 async fn fetch_reconstruction_terms(

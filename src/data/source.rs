@@ -251,9 +251,14 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
                 let orig = Arc::clone(&orig);
                 let mod_ = Arc::clone(&mod_);
                 Box::pin(async move {
-                    let a = orig.fetch_range(orig_start + start, len).await?;
-                    let b = mod_.fetch_range(mod_start + start, len).await?;
-                    Ok(diff_bytes_to_color(&a, &b))
+                    // The two sides are independent sources; fetch them
+                    // concurrently so a remote diff pays one round-trip
+                    // latency per range instead of two serialized ones.
+                    let (a, b) = tokio::join!(
+                        orig.fetch_range(orig_start + start, len),
+                        mod_.fetch_range(mod_start + start, len),
+                    );
+                    Ok(diff_bytes_to_color(&a?, &b?))
                 })
             })))
         }
@@ -580,6 +585,34 @@ mod load_source_data_tests {
     /// stale), the snapshot is shorter than `Source::byte_size`; an
     /// out-of-bounds fetch must surface the descriptive `slice_local` error,
     /// not panic on an index.
+    /// A `RangeDiff` source fetches both sides (concurrently) and combines
+    /// them through `diff_bytes_to_color`: equal bytes come back neutral
+    /// gray, a differing byte shows the signed delta at the right offset,
+    /// and each side's own start offset is honored.
+    #[tokio::test]
+    async fn range_diff_fetch_combines_both_sides_at_their_offsets() {
+        let orig = Arc::new(Data::Owned(vec![0, 0, 10, 20]));
+        let mod_ = Arc::new(Data::Owned(vec![10, 20]));
+        let src = Source {
+            file_idx: 0,
+            kind: SourceKind::RangeDiff {
+                orig,
+                mod_,
+                orig_start: 2,
+                mod_start: 0,
+            },
+            byte_size: 2,
+            name_override: None,
+            xet_terms: None,
+            extensions: Default::default(),
+        };
+        let data = load_source_data(&src).unwrap();
+        // orig bytes [10, 20] vs mod bytes [10, 20]: equal → neutral gray.
+        assert_eq!(data.fetch_range(0, 2).await.unwrap(), [127, 127]);
+        // A partial range must slice, not re-read from zero.
+        assert_eq!(data.fetch_range(1, 1).await.unwrap(), [127]);
+    }
+
     #[tokio::test]
     async fn fetch_past_shrunken_snapshot_is_a_clean_out_of_bounds_error() {
         let dir = tempfile::tempdir().unwrap();

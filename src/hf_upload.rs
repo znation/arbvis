@@ -120,3 +120,67 @@ impl TileSink for HfTileSink {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_spec() -> HfOutputSpec {
+        HfOutputSpec {
+            repo_id: "test/repo".to_string(),
+            kind: RepoKind::Model,
+            revision: "main".to_string(),
+            path_prefix: String::new(),
+        }
+    }
+
+    #[test]
+    fn upload_tile_stages_bytes_and_counts() {
+        let sink = HfTileSink::new(test_spec()).expect("sink");
+        sink.upload_tile("tiles/0/0_0.png".to_string(), b"png".to_vec())
+            .expect("staging succeeds");
+        // The staged file lands at the repo path joined onto the tempdir,
+        // with its content intact and no leftover .part staging file.
+        let staged_path = sink.tempdir.path().join("tiles/0/0_0.png");
+        assert_eq!(
+            std::fs::read(&staged_path).expect("read back staged tile"),
+            b"png"
+        );
+        assert!(!staged_path.with_file_name("0_0.png.part").exists());
+        assert_eq!(*sink.staged.lock().unwrap(), 1);
+
+        // A second tile (and a second tile in the same directory) stages
+        // independently and keeps the count in sync.
+        sink.upload_tile("tiles/0/0_1.png".to_string(), b"two".to_vec())
+            .expect("second staging succeeds");
+        assert_eq!(
+            std::fs::read(sink.tempdir.path().join("tiles/0/0_1.png")).expect("read back"),
+            b"two"
+        );
+        assert_eq!(*sink.staged.lock().unwrap(), 2);
+    }
+    #[test]
+    fn upload_tile_overwrites_same_repo_path() {
+        let sink = HfTileSink::new(test_spec()).expect("sink");
+        sink.upload_tile("tiles/t.png".to_string(), b"old".to_vec())
+            .expect("first write");
+        sink.upload_tile("tiles/t.png".to_string(), b"new".to_vec())
+            .expect("second write");
+        assert_eq!(
+            std::fs::read(sink.tempdir.path().join("tiles/t.png")).expect("read back"),
+            b"new"
+        );
+        assert_eq!(*sink.staged.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn commit_without_staged_tiles_skips_upload() {
+        let sink = HfTileSink::new(test_spec()).expect("sink");
+        let tempdir_path = sink.tempdir.path().to_path_buf();
+        // Nothing was staged, so commit must return without invoking the
+        // `hf` CLI (which would fail offline) and still clean up the
+        // staging tempdir.
+        sink.commit("empty run").await.expect("empty commit ok");
+        assert!(!tempdir_path.exists(), "tempdir must be cleaned up");
+    }
+}

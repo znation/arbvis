@@ -113,8 +113,8 @@ impl Data {
     /// use `Deref` for zero-copy slices.
     pub async fn fetch_range(&self, start: u64, len: usize) -> anyhow::Result<Vec<u8>> {
         match self {
-            Data::Mapped(m) => Ok(m[start as usize..start as usize + len].to_vec()),
-            Data::Owned(v) => Ok(v[start as usize..start as usize + len].to_vec()),
+            Data::Mapped(m) => slice_local(m, start, len),
+            Data::Owned(v) => slice_local(v, start, len),
             Data::Http {
                 repo,
                 filename,
@@ -147,6 +147,29 @@ impl Data {
             Data::Http { .. } | Data::Xet(_) | Data::LazyDiff(_) => false,
         }
     }
+}
+
+/// Slice a local byte buffer for `fetch_range`, turning an out-of-bounds
+/// range into a descriptive error instead of a slice-index panic.
+///
+/// A source's `byte_size` is captured by an earlier stat/scan, so the file
+/// can shrink (another writer truncating it, a swapped-in shorter file)
+/// between that scan and the render. Without this guard the render dies
+/// mid-run with a panic; with it, the caller gets a clean `anyhow` error
+/// naming the requested range and the actual length.
+fn slice_local(buf: &[u8], start: u64, len: usize) -> anyhow::Result<Vec<u8>> {
+    let s = start as usize;
+    let end = s
+        .checked_add(len)
+        .ok_or_else(|| anyhow::anyhow!("byte range [start {start}, len {len}) overflows usize"))?;
+    if end > buf.len() {
+        anyhow::bail!(
+            "byte range [{s}, {end}) is out of bounds: source is {} bytes \
+             (file may have shrunk since it was scanned)",
+            buf.len()
+        );
+    }
+    Ok(buf[s..end].to_vec())
 }
 
 /// A `Source` variant supplied by a downstream crate / plugin.
@@ -334,7 +357,6 @@ impl Source {
 #[cfg(test)]
 mod data_fetch_tests {
     use super::Data;
-    use futures::FutureExt;
     use std::sync::Arc;
 
     fn owned(bytes: &[u8]) -> Data {
@@ -350,12 +372,38 @@ mod data_fetch_tests {
     }
 
     #[tokio::test]
-    async fn fetch_range_panics_on_out_of_bounds() {
+    async fn fetch_range_errors_on_out_of_bounds() {
+        // A file that shrinks after the scan (another writer truncating it)
+        // previously panicked with an opaque slice-index message, killing the
+        // whole render; it must be a descriptive error instead.
         let data = owned(b"abc");
-        let result = std::panic::AssertUnwindSafe(data.fetch_range(2, 5))
-            .catch_unwind()
-            .await;
-        assert!(result.is_err(), "start+len past the end should panic");
+        let err = data.fetch_range(2, 5).await.unwrap_err().to_string();
+        assert!(err.contains("out of bounds"), "unexpected: {err}");
+        assert!(err.contains("shrunk"), "unexpected: {err}");
+        // Exact-end ranges (start == len) stay valid, including zero-length.
+        assert_eq!(data.fetch_range(3, 0).await.unwrap(), b"");
+    }
+
+    #[tokio::test]
+    async fn fetch_range_rejects_len_overflow() {
+        let data = owned(b"abc");
+        let err = data
+            .fetch_range(usize::MAX as u64, usize::MAX)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("overflows usize"), "unexpected: {err}");
+    }
+
+    #[tokio::test]
+    async fn offset_slice_fetch_error_names_the_shifted_range() {
+        // base + start past the inner data now surfaces the inner error
+        // instead of panicking.
+        let inner = Arc::new(owned(b"0123456789"));
+        let view = Data::OffsetSlice { inner, base: 8 };
+        assert_eq!(view.fetch_range(0, 2).await.unwrap(), b"89");
+        let err = view.fetch_range(3, 2).await.unwrap_err().to_string();
+        assert!(err.contains("out of bounds"), "unexpected: {err}");
     }
 
     #[tokio::test]

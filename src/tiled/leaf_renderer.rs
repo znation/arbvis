@@ -218,3 +218,151 @@ impl LeafRenderer for HilbertBytesRenderer {
 
 // `ArchRegionsLoader` and `ArchRegionsRenderer` live in `modelweightvis::leaf`.
 // The arbvis default `LeafRegistry` no longer wires them up.
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use image::Rgb;
+
+    use super::*;
+    use crate::layout::hilbert::HilbertLayout;
+    use crate::tiled::LeafMode;
+
+    // `Padding` tiles bypass dispatch entirely — the caller paints the
+    // padding color directly — while the data-carrying variants expose the
+    // id the pipeline resolves a loader+renderer pair under.
+    #[test]
+    fn renderer_id_by_variant() {
+        assert_eq!(
+            LeafTile::Bytes {
+                renderer_id: "hilbert-bytes"
+            }
+            .renderer_id(),
+            Some("hilbert-bytes")
+        );
+        assert_eq!(
+            LeafTile::Regions {
+                renderer_id: "arch"
+            }
+            .renderer_id(),
+            Some("arch")
+        );
+        assert_eq!(LeafTile::Padding.renderer_id(), None);
+    }
+
+    // A stub loader/renderer standing in for a downstream plugin (e.g.
+    // modelweightvis's `"arch"` pair).
+    struct MockLeaf;
+
+    impl LeafLoader for MockLeaf {
+        fn id(&self) -> &'static str {
+            "mock"
+        }
+        fn needs_io(&self, _ctx: &LoadCtx<'_>) -> bool {
+            false
+        }
+        fn load<'a>(
+            &'a self,
+            _ctx: &'a LoadCtx<'a>,
+        ) -> BoxFuture<'a, anyhow::Result<LoadedTile>> {
+            unimplemented!()
+        }
+    }
+
+    impl LeafRenderer for MockLeaf {
+        fn id(&self) -> &'static str {
+            "mock"
+        }
+        fn render(&self, _tile: LoadedTile, _ctx: &RenderCtx<'_>) -> Result<EncodedTile, String> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn register_lookup_and_miss() {
+        let mut reg = LeafRegistry::new();
+        assert!(reg.loader("mock").is_none());
+        assert!(reg.renderer("mock").is_none());
+        reg.register_loader(Arc::new(MockLeaf));
+        reg.register_renderer(Arc::new(MockLeaf));
+        assert_eq!(reg.loader("mock").unwrap().id(), "mock");
+        assert_eq!(reg.renderer("mock").unwrap().id(), "mock");
+        // An unrelated id is a miss on both halves.
+        assert!(reg.loader("other").is_none());
+        assert!(reg.renderer("other").is_none());
+    }
+
+    // Registration is id-keyed: a re-register under the same id replaces the
+    // earlier entry (a downstream overrides a built-in pair this way).
+    #[test]
+    fn re_register_replaces() {
+        let mut reg = LeafRegistry::new();
+        reg.register_loader(Arc::new(MockLeaf));
+        reg.register_loader(Arc::new(MockLeaf));
+        reg.register_renderer(Arc::new(MockLeaf));
+        reg.register_renderer(Arc::new(MockLeaf));
+        assert_eq!(reg.loader("mock").unwrap().id(), "mock");
+        assert_eq!(reg.renderer("mock").unwrap().id(), "mock");
+    }
+
+    #[test]
+    fn clone_shares_entries() {
+        let mut reg = LeafRegistry::new();
+        reg.register_loader(Arc::new(MockLeaf));
+        reg.register_renderer(Arc::new(MockLeaf));
+        let clone = reg.clone();
+        assert!(clone.loader("mock").is_some());
+        assert!(clone.renderer("mock").is_some());
+    }
+
+    // The default registry wires the `"hilbert-bytes"` pair (and nothing else).
+    #[test]
+    fn with_defaults_has_hilbert_bytes_pair() {
+        let reg = LeafRegistry::with_defaults();
+        assert_eq!(reg.loader("hilbert-bytes").unwrap().id(), "hilbert-bytes");
+        assert_eq!(reg.renderer("hilbert-bytes").unwrap().id(), "hilbert-bytes");
+        assert!(reg.loader("arch").is_none());
+        assert!(reg.renderer("arch").is_none());
+    }
+
+    fn plain_mode() -> LeafMode {
+        LeafMode::Plain {
+            pixel_lut: Arc::new(std::array::from_fn(|_| Rgb([0, 0, 0]))),
+        }
+    }
+
+    fn load_ctx<'a>(mode: &'a LeafMode, layout: &'a HilbertLayout) -> LoadCtx<'a> {
+        LoadCtx {
+            tx: 0,
+            ty: 0,
+            zoom: 0,
+            kh: 0,
+            height_tiles: 1,
+            square_pixels: 256,
+            total: 256,
+            mode,
+            layout,
+            source_data: &[],
+            cumulative_offsets: &[],
+        }
+    }
+
+    // The byte-Hilbert loader needs I/O in every mode that exists today, so
+    // the pipeline always fetches source bytes and takes a throttle permit.
+    #[test]
+    fn hilbert_bytes_loader_needs_io() {
+        let mode = plain_mode();
+        let layout = HilbertLayout::from_total(256);
+        let ctx = load_ctx(&mode, &layout);
+        assert!(HilbertBytesLoader.needs_io(&ctx));
+    }
+
+    // The built-in loader resolves its id and the built-in renderer resolves
+    // its id — dispatch keys off the same string on both pipeline halves.
+    #[test]
+    fn builtin_ids_match() {
+        assert_eq!(HilbertBytesLoader.id(), "hilbert-bytes");
+        assert_eq!(HilbertBytesRenderer.id(), "hilbert-bytes");
+    }
+}

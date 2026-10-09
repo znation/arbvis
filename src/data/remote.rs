@@ -226,6 +226,23 @@ pub async fn download_specs_to_paths(
                 async move {
                     let filename = (*spec.filename).clone();
                     let revision = (*spec.revision).clone();
+                    // A repo-level `hf://` URL expands to per-file specs whose
+                    // filenames come from the Hub tree listing, so a hostile
+                    // repo controls `filename` here. Passed positionally, a
+                    // name beginning with `-` would be parsed by the `hf` CLI
+                    // as an option instead of a path (argument injection).
+                    // Such a name already misparses today, so rejecting it
+                    // with a clear error is a strict improvement.
+                    if filename.starts_with('-') {
+                        return (
+                            i,
+                            Err(anyhow::anyhow!(
+                                "refusing `hf download` for {:?}: filename starts with `-` \
+                                 and would be parsed as a CLI flag",
+                                crate::hf_url::sanitize_log_text(&filename),
+                            )),
+                        );
+                    }
                     let label = format!(
                         "hf download {}",
                         crate::hf_url::sanitize_log_text(&filename),
@@ -345,6 +362,7 @@ pub async fn populate_xet_terms(sources: &mut [Source]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hf_url::RepoKind;
     use crate::registry::{FormatPlugin, Registry};
     use futures::future::BoxFuture;
     use std::fs;
@@ -517,4 +535,27 @@ mod tests {
         assert!(sources[0].extensions.get::<Tag>().is_none());
         assert_eq!(total, 3);
     }
+
+    /// `download_specs_to_paths` passes `filename` to the `hf` CLI as a
+    /// positional argument. A repo-level `hf://owner/repo` expands to one
+    /// spec per Hub tree entry, so a hostile repo controls that filename;
+    /// a name starting with `-` must be rejected before the CLI is spawned
+    /// (it would be parsed as a flag, not a path).
+    #[tokio::test]
+    async fn dash_prefixed_filename_is_rejected_before_hf_is_invoked() {
+        let repo = crate::hf_url::remote_repo_for_tests(RepoKind::Model, "evil/repo");
+        let spec = crate::hf_url::RemoteFileSpec {
+            repo,
+            filename: Arc::new("--force-download".to_string()),
+            revision: Arc::new("main".to_string()),
+            size: 1,
+            xet_hash: None,
+        };
+        let err = download_specs_to_paths(&[spec], "test").await.unwrap_err();
+        assert!(
+            err.to_string().contains("starts with `-`"),
+            "expected the dash-filename rejection, got: {err}"
+        );
+    }
 }
+

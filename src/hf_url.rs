@@ -445,6 +445,17 @@ pub fn split_owner_name(repo_id: &str) -> anyhow::Result<(&str, &str)> {
     Ok((&repo_id[..slash], &repo_id[slash + 1..]))
 }
 
+/// Test-only constructor: `RemoteRepo`'s fields are private so non-test code
+/// outside this module can't forge one for range I/O; tests (e.g. hostile-
+/// filename rejection in `data::remote`) build it directly.
+#[cfg(test)]
+pub(crate) fn remote_repo_for_tests(kind: RepoKind, repo_id: &str) -> RemoteRepo {
+    RemoteRepo {
+        kind,
+        repo_id: repo_id.to_string(),
+    }
+}
+
 fn make_remote_repo(hf: &HfUrl) -> anyhow::Result<RemoteRepo> {
     match hf.kind {
         RepoKind::Model | RepoKind::Dataset | RepoKind::Space => Ok(RemoteRepo {

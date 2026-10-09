@@ -357,6 +357,57 @@ impl DescriptorCache {
     }
 }
 
+/// Output sink for the term walk ([`XetReader::append_term_range`]): either
+/// accumulating into a `Vec` ([`XetReader::fetch_range`]) or copying directly
+/// into the caller's buffer ([`XetReader::fetch_range_into`]), which skips the
+/// intermediate allocation and one full-buffer copy per fetch.
+trait RangeSink {
+    fn write(&mut self, bytes: &[u8]) -> anyhow::Result<()>;
+    /// Bytes written so far — what `fetch_range_with_sink` checks at the end.
+    fn written(&self) -> usize;
+}
+
+struct VecSink<'a>(&'a mut Vec<u8>);
+
+impl RangeSink for VecSink<'_> {
+    fn write(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+    fn written(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// Cursor over the caller's destination buffer. `pos` is always the number of
+/// bytes written so far, so [`RangeSink::written`] reads it directly.
+struct DstSink<'a> {
+    dst: &'a mut [u8],
+    pos: usize,
+}
+
+impl RangeSink for DstSink<'_> {
+    fn write(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        let end = self.pos + bytes.len();
+        if end > self.dst.len() {
+            // A well-formed term walk never overshoots: the caller sized the
+            // buffer to the requested length and the walk's total byte count
+            // is checked against that length below. Treat overflow as a bug.
+            anyhow::bail!(
+                "xet term walk wrote past the {}-byte destination at offset {}",
+                self.dst.len(),
+                self.pos
+            );
+        }
+        self.dst[self.pos..end].copy_from_slice(bytes);
+        self.pos = end;
+        Ok(())
+    }
+    fn written(&self) -> usize {
+        self.pos
+    }
+}
+
 /// Direct-CAS byte fetcher for one xet-backed remote file.
 ///
 /// Holds the V2 reconstruction (terms + signed-URL fetch info). The HTTP
@@ -575,6 +626,35 @@ impl XetReader {
     /// fetching + decompressing (cached) and concatenating the requested
     /// slice into `out`.
     pub async fn fetch_range(&self, start: u64, len: usize) -> anyhow::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(len);
+        let mut sink = VecSink(&mut out);
+        self.fetch_range_with_sink(start, len, &mut sink).await?;
+        Ok(out)
+    }
+
+    /// Return bytes `[start, start+len)` written directly into `dst` — the
+    /// [`crate::data::Data::fetch_range_into`] counterpart of
+    /// [`Self::fetch_range`]. Same semantics (including the bounds-checked
+    /// error and the produced-length diagnostic), but the decompressed
+    /// chunks land in the caller's buffer with no intermediate `Vec` and no
+    /// full-buffer copy, saving one 4 MiB-scale allocation + copy per chunk
+    /// on the tile-load hot path.
+    pub async fn fetch_range_into(&self, start: u64, dst: &mut [u8]) -> anyhow::Result<()> {
+        let len = dst.len();
+        let mut sink = DstSink { dst, pos: 0 };
+        self.fetch_range_with_sink(start, len, &mut sink).await
+    }
+
+    /// Shared body of [`Self::fetch_range`] and [`Self::fetch_range_into`]:
+    /// warm the descriptor cache, then walk the terms overlapping
+    /// `[start, start+len)` writing into `sink`. The final produced-length
+    /// check lives here so both callers surface the same diagnostic.
+    async fn fetch_range_with_sink<S: RangeSink>(
+        &self,
+        start: u64,
+        len: usize,
+        sink: &mut S,
+    ) -> anyhow::Result<()> {
         self.ensure_fresh_urls().await?;
         let end = start.saturating_add(len as u64);
         if end > self.file_size {
@@ -599,8 +679,6 @@ impl XetReader {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let mut out = Vec::with_capacity(len);
-
         // Binary search for the first term overlapping `start`.
         let mut term_idx = self
             .terms
@@ -611,21 +689,22 @@ impl XetReader {
             if term.file_offset >= end {
                 break;
             }
-            self.append_term_range(term, start, end, &mut out).await?;
+            self.append_term_range(term, start, end, sink).await?;
             term_idx += 1;
         }
 
-        if out.len() != len {
+        let written = sink.written();
+        if written != len {
             anyhow::bail!(
                 "{}: fetch_range[{},{}) produced {} bytes (expected {})",
                 hf_url::sanitize_log_text(&self.filename),
                 start,
                 end,
-                out.len(),
+                written,
                 len,
             );
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Every `(xorb_hash, descriptor)` overlapping the file-byte range
@@ -670,12 +749,12 @@ impl XetReader {
 
     /// Append the slice of `term`'s data that overlaps `[req_start, req_end)`
     /// (in file-byte coordinates) to `out`.
-    async fn append_term_range(
+    async fn append_term_range<S: RangeSink>(
         &self,
         term: &ReaderTerm,
         req_start: u64,
         req_end: u64,
-        out: &mut Vec<u8>,
+        sink: &mut S,
     ) -> anyhow::Result<()> {
         let term_end = term.file_offset.saturating_add(term.byte_len);
         let need_start = req_start.max(term.file_offset);
@@ -757,7 +836,7 @@ impl XetReader {
                 let copy_hi = local_hi.min(term_hi);
                 let inner_lo = desc_byte_lo + (copy_lo - term_lo);
                 let inner_hi = desc_byte_lo + (copy_hi - term_lo);
-                out.extend_from_slice(&bytes[inner_lo..inner_hi]);
+                sink.write(&bytes[inner_lo..inner_hi])?;
                 local_lo = copy_hi; // monotonically advances
                 if local_lo >= local_hi {
                     return Ok(());
@@ -985,6 +1064,9 @@ impl XetReader {
 }
 
 #[cfg(test)]
+pub(crate) use tests::seeded_test_reader;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1137,6 +1219,21 @@ mod tests {
         }
     }
 
+    /// Build a minimal seeded reader for cross-module tests: one term over
+    /// two 2-byte chunks served from the pre-seeded descriptor cache (data
+    /// `"abcd"`, chunk indices [0,2,4]). No network access.
+    pub(crate) fn seeded_test_reader() -> XetReader {
+        reader_with(
+            vec![term(0, 4, 0, 2)],
+            HashMap::from([(
+                "xorb".to_string(),
+                XorbInfo {
+                    descriptors: vec![desc(0, 2, 0, 4)],
+                },
+            )]),
+        )
+    }
+
     /// The reader's filename comes from a hostile repo's tree listing
     /// (repo-level `hf://owner/repo` inputs expand to per-file specs built
     /// from the Hub tree API), so every error message or log line that
@@ -1204,9 +1301,10 @@ mod tests {
             chunk_end: 3,
         };
         let mut out = Vec::new();
+        let mut sink = VecSink(&mut out);
         let res = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(r.append_term_range(&rt, 0, 4, &mut out));
+            .block_on(r.append_term_range(&rt, 0, 4, &mut sink));
         assert!(res.is_err(), "inverted chunk range must Err, not panic");
     }
 
@@ -1229,9 +1327,10 @@ mod tests {
             chunk_end: 8,
         };
         let mut out = Vec::new();
+        let mut sink = VecSink(&mut out);
         let res = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(r.append_term_range(&rt, 0, 16, &mut out));
+            .block_on(r.append_term_range(&rt, 0, 16, &mut sink));
         assert!(
             res.is_err(),
             "out-of-bounds chunk index must Err, not panic"
@@ -1250,10 +1349,63 @@ mod tests {
         )]);
         let r = reader_with(vec![term(0, 4, 0, 2)], xorbs);
         let mut out = Vec::new();
-        r.append_term_range(&r.terms[0], 0, 4, &mut out)
+        let mut sink = VecSink(&mut out);
+        r.append_term_range(&r.terms[0], 0, 4, &mut sink)
             .await
             .unwrap();
         assert_eq!(out, b"abcd");
+    }
+
+    #[tokio::test]
+    async fn fetch_range_into_matches_fetch_range_across_terms() {
+        // Two terms each spanning two 2-byte chunks, served by two
+        // descriptors; the request covers both terms. The direct-into path
+        // must produce the same bytes as the Vec-accumulating fetch_range.
+        let xorbs = HashMap::from([(
+            "xorb".to_string(),
+            XorbInfo {
+                descriptors: vec![desc(0, 2, 0, 4), desc(2, 4, 4, 8)],
+            },
+        )]);
+        let r = reader_with(vec![term(0, 4, 0, 2), term(4, 4, 2, 4)], xorbs);
+        let via_vec = r.fetch_range(0, 8).await.unwrap();
+        let mut dst = [0u8; 8];
+        r.fetch_range_into(0, &mut dst).await.unwrap();
+        assert_eq!(via_vec, dst);
+        assert_eq!(dst, *b"abcdabcd");
+    }
+
+    #[tokio::test]
+    async fn fetch_range_into_rejects_past_file_size_and_short_walk() {
+        // Same bounds/produced-length diagnostics as fetch_range.
+        let r = XetReader {
+            file_size: 0,
+            ..reader_with(Vec::new(), HashMap::new())
+        };
+        let mut dst = [0u8; 4];
+        let err = r.fetch_range_into(0, &mut dst).await.unwrap_err();
+        assert!(err.to_string().contains("past file size"), "{err}");
+
+        // A term walk that stops short of the requested length must Err with
+        // the same "produced N bytes (expected M)" diagnostic, leaving the
+        // caller's buffer untouched rather than silently zero-padded.
+        let xorbs = HashMap::from([(
+            "xorb".to_string(),
+            XorbInfo {
+                descriptors: vec![desc(0, 2, 0, 4)],
+            },
+        )]);
+        let short = reader_with(vec![term(0, 4, 0, 2)], xorbs);
+        let mut dst = [0u8; 8];
+        let err = short.fetch_range_into(0, &mut dst).await.unwrap_err();
+        assert!(
+            err.to_string().contains("produced 4 bytes (expected 8)"),
+            "{err}"
+        );
+        // The 4 bytes that did walk land in the buffer; the shortfall is
+        // caught by the produced-length check, not silently zero-padded.
+        assert_eq!(&dst[..4], b"abcd");
+        assert_eq!(&dst[4..], &[0u8; 4]);
     }
 
     #[tokio::test]

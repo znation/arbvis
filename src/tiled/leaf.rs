@@ -539,7 +539,7 @@ pub fn render_leaf_tile_diff(
             first_range,
             tints,
             first_tint,
-            tile_pixel_start + TILE_AREA as u64,
+            tile_pixel_start + TILE_AREA,
         ),
         _ => None,
     };
@@ -1338,7 +1338,7 @@ mod tests {
                 TileFormat::IndexedPng,
             )
             .unwrap();
-            let (img_ref, bytes_tc) = render_leaf_tile_diff(
+            let (img_ref, _bytes_tc) = render_leaf_tile_diff(
                 0,
                 0,
                 kh,

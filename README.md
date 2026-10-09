@@ -174,7 +174,13 @@ hf://buckets/owner/bucket[/path]                 # no revision concept
 
 Whole-repo URLs (no `/path`) expand to every file in the repo. Single-file URLs fetch just that file.
 
-Set `ARBVIS_HF_TIMEOUT_SECS` to a positive integer of seconds to kill hung `hf` subprocess calls after that wall-clock limit (unset means no timeout; upload/download is left to finish naturally).
+### Environment variables
+
+- `HF_TOKEN` / `HF_TOKEN_PATH` / `$HF_HOME/token` (`HF_HOME` defaults to `~/.cache/huggingface`) — auth token for arbvis's direct HTTP Hub requests (range reads, model cards, xet), resolved in that order, mirroring the resolution order the `hf` CLI uses internally.
+- `HF_ENDPOINT` — override the Hub endpoint for direct HTTP requests. Must be an `http(s)://` URL; anything else is ignored with a warning and the default (`https://huggingface.co`) is used.
+- `ARBVIS_HF_BIN` — name of the `hf` binary on `$PATH`, for users with the CLI under a non-standard name.
+- `ARBVIS_HF_TIMEOUT_SECS` — positive integer of seconds to kill hung `hf` subprocess calls after that wall-clock limit (unset means no timeout; upload/download is left to finish naturally; a non-numeric or zero value is ignored with a warning).
+- `ARBVIS_PERF_LOG=1` — log a per-second pipeline snapshot (throttle state, direct-CAS request rate and throughput) to help locate stalls. Any other value is ignored with a warning.
 
 ### Streaming (`--stream`)
 

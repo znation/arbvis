@@ -294,7 +294,7 @@ impl OutputDest {
         })
     }
 
-    /// Coarse destination shape for [`SourceCtx`], hiding the tempdir / upload
+    /// Coarse destination shape for [`crate::registry::SourceCtx`], hiding the tempdir / upload
     /// internals so a provider can gate on it without depending on them.
     pub(crate) fn kind(&self) -> DestKind {
         match self {

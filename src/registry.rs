@@ -58,10 +58,19 @@ pub trait FormatPlugin: Send + Sync {
 /// Inputs every [`LayoutPlugin`] (2D) and [`VolumeShapePlugin`] (3D) sees when
 /// deciding whether to apply and how to build.
 pub struct LayoutBuildCtx<'a> {
+    /// The run's byte sources, in input order — the same slice passed to
+    /// `select_layout`/`select_volume_shape`.
     pub sources: &'a [Source],
+    /// Prefix sums: `cumulative_offsets[i]` is the byte offset at which
+    /// `sources[i]` starts in the concatenated stream (one entry per source;
+    /// the grand total is [`LayoutBuildCtx::total_bytes`]).
     pub cumulative_offsets: &'a [u64],
+    /// Total size of the concatenated source stream in bytes.
     pub total_bytes: u64,
+    /// The user-chosen layout strategy for this run. See [`LayoutMode`].
     pub mode: LayoutMode,
+    /// Whether this run renders a `--diff` pair (drives diff LUTs and
+    /// crosshatch overlays in the built-in plugins).
     pub diff_mode: bool,
     /// The `--3d` voxel cube side (a power of two). Only meaningful to a
     /// [`VolumeShapePlugin`]; the 2D tile path sets it to 0 and ignores it.
@@ -90,8 +99,13 @@ pub trait VolumeShapePlugin: Send + Sync {
 
 /// Inputs every [`DiffSourceBuilder`] sees for a file-pair `--diff` run.
 pub struct DiffBuildCtx<'a> {
+    /// Path to the original (left) side of the `--diff` pair.
     pub original: &'a Path,
+    /// Path to the modified (right) side of the `--diff` pair.
     pub modified: &'a Path,
+    /// Whether crosshatch semantics should treat original-only content as a
+    /// finetune artifact (the `--diff` finetune heuristic's verdict). Passed
+    /// through to builders verbatim.
     pub is_finetune: bool,
 }
 
@@ -123,7 +137,9 @@ pub enum DestKind {
 /// direction depend on (original, modified) order — and deliberately neutral:
 /// arbvis core no longer knows or cares whether the two sides are tensors.
 pub struct DiffPair<'a> {
+    /// The pre-existing (left) side, exactly as the user wrote it.
     pub original: &'a str,
+    /// The modified (right) side, exactly as the user wrote it.
     pub modified: &'a str,
 }
 
@@ -234,7 +250,9 @@ pub trait PrepareSourcesExtension: Send + Sync {
 /// [`Registry::branding`] to rebrand the viewer it generates.
 #[derive(Clone, Debug)]
 pub struct Branding {
+    /// Tool name used in the HTML title fallbacks.
     pub name: Cow<'static, str>,
+    /// Repository URL for the title link + leaflet attribution.
     pub repo_url: Cow<'static, str>,
 }
 
@@ -257,7 +275,11 @@ impl Default for Branding {
 /// Plugin slots threaded through [`crate::run`].
 #[derive(Clone, Default)]
 pub struct Registry {
+    /// Byte-format plugins; their `populate_*` hooks fill each `Source`'s
+    /// format-specific metadata. See [`FormatPlugin`].
     pub formats: Vec<Arc<dyn FormatPlugin>>,
+    /// 2D layout plugins, priority-ordered at selection time by
+    /// `crate::layout::select_layout`. See [`LayoutPlugin`].
     pub layouts: Vec<Arc<dyn LayoutPlugin>>,
     /// 3D (`--3d`) layout plugins, the volume analog of `layouts`. `run` picks
     /// the highest-priority applicable one via
@@ -268,7 +290,11 @@ pub struct Registry {
     /// Id-keyed 3D voxel renderers, the volume analog of `leaf`. A structured
     /// `VolumeShape`'s entities dispatch here by `renderer_id`.
     pub voxel: crate::volume::VoxelRegistry,
+    /// Id-keyed 2D leaf-tile renderers/loaders used by the tile pipeline.
+    /// See [`crate::tiled::leaf_renderer::LeafRegistry`].
     pub leaf: LeafRegistry,
+    /// Diff source builders, priority-ordered at selection time by
+    /// `crate::data_diff::build_diff_sources`. See [`DiffSourceBuilder`].
     pub diffs: Vec<Arc<dyn DiffSourceBuilder>>,
     /// Priority-ordered source providers. `run` picks the highest-priority
     /// applicable one. See [`SourceProvider`]; populated with arbvis's two

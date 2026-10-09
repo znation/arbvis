@@ -245,12 +245,7 @@ pub async fn render_single_png(sources: &[Source], total: u64, out: &Path) -> an
     }
 
     let png = encode_indexed_single_png(geom.width, geom.height, &pixels)?;
-
-    // Write to a temp sibling, then rename, so a crash never leaves a
-    // half-written PNG at the requested path.
-    let tmp = out.with_extension("png.tmp");
-    fs::write(&tmp, &png).with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, out).with_context(|| format!("renaming into {}", out.display()))?;
+    write_png_atomic(out, &png)?;
     log::info!(
         "wrote {} ({}x{}, {} bytes of input)",
         out.display(),
@@ -328,9 +323,7 @@ pub async fn render_single_xet_png(
     }
 
     let png = encode_rgb_png(&img)?;
-    let tmp = out.with_extension("png.tmp");
-    fs::write(&tmp, &png).with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, out).with_context(|| format!("renaming into {}", out.display()))?;
+    write_png_atomic(out, &png)?;
     log::info!(
         "wrote {} ({}x{}, xet xorb mode, {} bytes of input)",
         out.display(),
@@ -408,9 +401,7 @@ pub async fn render_single_diff_png(
     }
 
     let png = encode_rgb_png(&img)?;
-    let tmp = out.with_extension("png.tmp");
-    fs::write(&tmp, &png).with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, out).with_context(|| format!("renaming into {}", out.display()))?;
+    write_png_atomic(out, &png)?;
     log::info!(
         "wrote {} ({}x{}, diff mode, {} bytes of input)",
         out.display(),
@@ -419,6 +410,15 @@ pub async fn render_single_diff_png(
         total
     );
     Ok(())
+}
+
+/// Write `bytes` to `out` atomically: stage to a `png.tmp` sibling, then
+/// rename, so a crash never leaves a half-written PNG at the requested path.
+/// Shared by all three single-image renderers (plain, xet, diff).
+fn write_png_atomic(out: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let tmp = out.with_extension("png.tmp");
+    fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, out).with_context(|| format!("renaming into {}", out.display()))
 }
 
 /// Copy a TILE×TILE tile image into the full canvas at raster
@@ -543,6 +543,18 @@ mod tests {
             xet_terms: None,
             extensions: Default::default(),
         }
+    }
+
+    /// write_png_atomic stages to a `png.tmp` sibling, renames it over the
+    /// target, and leaves no `.tmp` residue behind.
+    #[test]
+    fn write_png_atomic_leaves_no_tmp_residue() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let out = dir.path().join("single.png");
+        write_png_atomic(&out, b"PNGDATA")?;
+        assert_eq!(std::fs::read(&out)?, b"PNGDATA");
+        assert!(!dir.path().join("single.png.tmp").exists());
+        Ok(())
     }
 
     #[test]

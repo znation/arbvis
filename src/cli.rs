@@ -354,15 +354,65 @@ pub(crate) fn collect_input_files(
                     .with_context(|| format!("failed to open {}", list_path.display()))?,
             )
         };
+        let mut listed = 0usize;
         for line in BufReader::new(reader).lines() {
             let line = line?;
             let trimmed = line.trim();
             if !trimmed.is_empty() {
                 out.push(PathBuf::from(trimmed));
+                listed += 1;
             }
+        }
+        if listed == 0 {
+            // An empty *input list* means stdin, but an empty *file list* is
+            // a user mistake (typically a typo'd --file-list path resolved by
+            // shell glob, or a list filtered down to nothing). Fail fast
+            // instead of silently visualizing whatever stdin holds — or
+            // blocking forever on an interactive terminal.
+            anyhow::bail!(
+                "--file-list {}: contains no paths (blank lines are ignored)",
+                list_path.display()
+            );
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod file_list_tests {
+    use super::collect_input_files;
+    use std::path::PathBuf;
+
+    #[test]
+    fn file_list_skips_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = dir.path().join("list.txt");
+        std::fs::write(&list, "a.bin\n\n  \nb.bin\n").unwrap();
+        let files = collect_input_files(vec![], Some(list)).unwrap();
+        assert_eq!(
+            files,
+            vec![PathBuf::from("a.bin"), PathBuf::from("b.bin")]
+        );
+    }
+
+    #[test]
+    fn empty_file_list_fails_instead_of_reading_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = dir.path().join("list.txt");
+        std::fs::write(&list, "\n   \n").unwrap();
+        let err = collect_input_files(vec![], Some(list)).unwrap_err();
+        assert!(err.to_string().contains("contains no paths"), "{err}");
+    }
+
+    #[test]
+    fn dash_means_stdin_and_no_list_leaves_files_alone() {
+        // No --file-list: the list is passed through untouched (stdin fallback
+        // happens downstream in prepare_sources, not here).
+        let files = collect_input_files(vec!["x.bin".into()], None).unwrap();
+        assert_eq!(files, vec![PathBuf::from("x.bin")]);
+        // `-` reads stdin directly, so it is exercised only in integration use,
+        // not in unit tests (reading a live stdin would block the suite).
+    }
 }
 
 #[cfg(test)]

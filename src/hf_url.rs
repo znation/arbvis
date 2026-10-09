@@ -502,9 +502,8 @@ pub fn require_token() -> anyhow::Result<()> {
 ///
 /// The interpretation of fields like `cardData.base_model` /
 /// `cardData.base_model_relation` is left to callers — model-specific logic
-/// (e.g. finetune auto-detection) lives in
-/// `crate::finetune::detect_relation`, which the modelweightvis split will
-/// own.
+/// (e.g. finetune auto-detection) is downstream's job: modelweightvis owns
+/// it via its plugins and hooks against this crate's registry.
 pub async fn fetch_model_card(repo_id: &str) -> anyhow::Result<serde_json::Value> {
     let url = api_repo_url(&endpoint(), RepoKind::Model, repo_id);
     let resp = authed_send(
@@ -537,7 +536,6 @@ pub fn split_owner_name(repo_id: &str) -> anyhow::Result<(&str, &str)> {
 /// outside this module can't forge one for range I/O; tests (e.g. hostile-
 /// filename rejection in `data::remote`) build it directly.
 #[cfg(test)]
-/// Marker for [`remote_repo_for_tests`].
 pub(crate) fn remote_repo_for_tests(kind: RepoKind, repo_id: &str) -> RemoteRepo {
     RemoteRepo {
         kind,

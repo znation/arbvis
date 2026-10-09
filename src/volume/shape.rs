@@ -288,20 +288,22 @@ mod tests {
             self.applicable
         }
         fn build(&self, _ctx: &LayoutBuildCtx<'_>) -> Option<Box<dyn VolumeShape>> {
-            self.build_ok.then(|| Box::new(MockShape) as Box<dyn VolumeShape>)
+            self.build_ok
+                .then(|| Box::new(MockShape) as Box<dyn VolumeShape>)
         }
     }
 
     #[test]
     fn higher_priority_plugin_beats_hilbert_floor() {
         let mut registry = Registry::with_defaults();
-        registry
-            .volume_shapes
-            .push(Arc::new(MockPlugin { priority: 10, applicable: true, build_ok: true }));
+        registry.volume_shapes.push(Arc::new(MockPlugin {
+            priority: 10,
+            applicable: true,
+            build_ok: true,
+        }));
 
-        let shape =
-            select_volume_shape(&[], &[], 0, LayoutMode::Hilbert, false, 64, &registry)
-                .expect("a winning plugin must select cleanly");
+        let shape = select_volume_shape(&[], &[], 0, LayoutMode::Hilbert, false, 64, &registry)
+            .expect("a winning plugin must select cleanly");
         assert_eq!(shape.id(), "mock");
         assert_eq!(shape.grid_extent(), [2, 2, 2]);
     }
@@ -309,34 +311,37 @@ mod tests {
     #[test]
     fn forced_id_matching_the_winner_selects_without_fallback() {
         let mut registry = Registry::with_defaults();
-        registry
-            .volume_shapes
-            .push(Arc::new(MockPlugin { priority: 10, applicable: true, build_ok: true }));
+        registry.volume_shapes.push(Arc::new(MockPlugin {
+            priority: 10,
+            applicable: true,
+            build_ok: true,
+        }));
         registry.layout_mode = LayoutMode::Forced("mock");
 
-        let shape =
-            select_volume_shape(&[], &[], 0, registry.layout_mode, false, 64, &registry)
-                .expect("forcing the id of the winning plugin must succeed");
+        let shape = select_volume_shape(&[], &[], 0, registry.layout_mode, false, 64, &registry)
+            .expect("forcing the id of the winning plugin must succeed");
         assert_eq!(shape.id(), "mock");
     }
 
     #[test]
     fn forced_applicable_but_unbuildable_plugin_falls_back_then_errors_strictly() {
         let mut registry = Registry::with_defaults();
-        registry
-            .volume_shapes
-            .push(Arc::new(MockPlugin { priority: 10, applicable: true, build_ok: false }));
+        registry.volume_shapes.push(Arc::new(MockPlugin {
+            priority: 10,
+            applicable: true,
+            build_ok: false,
+        }));
         registry.layout_mode = LayoutMode::Forced("mock");
 
         // Relaxed: the floor plugin wins and the forced id is diagnosed, not fatal.
-        let shape =
-            select_volume_shape(&[], &[], 0, registry.layout_mode, false, 64, &registry)
-                .expect("non-strict mode must fall back when the forced plugin can't build");
+        let shape = select_volume_shape(&[], &[], 0, registry.layout_mode, false, 64, &registry)
+            .expect("non-strict mode must fall back when the forced plugin can't build");
         assert_eq!(shape.id(), "hilbert-bytes");
 
         // Strict: distinguishable reason — the plugin was applicable but returned None.
         registry.strict_layout = true;
-        let err = match select_volume_shape(&[], &[], 0, registry.layout_mode, false, 64, &registry) {
+        let err = match select_volume_shape(&[], &[], 0, registry.layout_mode, false, 64, &registry)
+        {
             Ok(shape) => panic!("strict mode must error, but selected `{}`", shape.id()),
             Err(err) => err,
         };

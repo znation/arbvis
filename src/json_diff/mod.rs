@@ -54,7 +54,13 @@ pub async fn build_json_diff_sources(
             (Ok(o), Ok(m)) => align_documents(&o, &m, 0, 0),
             (orig_r, mod_r) => {
                 log_parse_failures(original, &orig_r, modified, &mod_r);
-                return fallback_byte_diff(original, modified, &orig_bytes, &mod_bytes, is_finetune);
+                return fallback_byte_diff(
+                    original,
+                    modified,
+                    &orig_bytes,
+                    &mod_bytes,
+                    is_finetune,
+                );
             }
         }
     };

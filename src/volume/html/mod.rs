@@ -36,10 +36,9 @@ mod build_tests {
     /// pull the JSON back out and parse it.
     fn config_blob(html: &str) -> serde_json::Value {
         let marker = "const CFG = ";
-        let start = html
-            .find(marker)
-            .unwrap_or_else(|| panic!("template no longer declares `const CFG = __CONFIG_JSON__;`"))
-            + marker.len();
+        let start = html.find(marker).unwrap_or_else(|| {
+            panic!("template no longer declares `const CFG = __CONFIG_JSON__;`")
+        }) + marker.len();
         let line = &html[start..html[start..].find('\n').expect("CFG line unterminated") + start];
         let line = line.strip_suffix(';').unwrap_or(line);
         serde_json::from_str(line).expect("injected config blob must be valid JSON")
@@ -48,7 +47,11 @@ mod build_tests {
     #[test]
     fn config_carries_title_inputs_and_branding() {
         let branding = Branding::new("mwv", "https://example.com/mwv");
-        let html = build_volume_html("my title", &["a.bin".to_string(), "b.bin".to_string()], &branding);
+        let html = build_volume_html(
+            "my title",
+            &["a.bin".to_string(), "b.bin".to_string()],
+            &branding,
+        );
         let cfg = config_blob(&html);
         assert_eq!(cfg["title"], "my title");
         assert_eq!(cfg["brandName"], "mwv");

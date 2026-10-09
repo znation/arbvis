@@ -304,7 +304,9 @@ mod collect_recursive_tests {
             );
             assert!(
                 names.contains(&"nested.bin".to_string())
-                    && files.iter().any(|p| p.starts_with(dir.path().join("sublink"))),
+                    && files
+                        .iter()
+                        .any(|p| p.starts_with(dir.path().join("sublink"))),
                 "a symlink pointing at a directory must be recursed into"
             );
             assert!(

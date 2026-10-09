@@ -8,7 +8,11 @@ unclear-invariant).
 
 ## Open
 
-### `cargo fmt --check` fails on main (pre-existing drift, not from the Space-app tick)
+_None yet._
+
+## Fixed
+
+### `cargo fmt --check` fails on main (pre-existing drift, not from the Space-app tick) — fixed 2026-10-09 by bugfix
 
 **Found by improve 2026-10-09.** `cargo fmt --check` reports rustfmt diffs in
 `src/data/source.rs` (~line 304, a boolean `&&` chain in a test assert) and
@@ -21,9 +25,14 @@ no behavior change. Not done in the originating tick because it touched only
 
 _Reproduce:_ `cargo fmt --check 2>&1 | grep '^Diff in'`.
 
-_None yet._
+**Fixed 2026-10-09 by bugfix:** ran `cargo fmt` over the tree; the drift had
+spread beyond the two reported files, also touching `src/json_diff/mod.rs` and
+`src/volume/shape.rs` (all formatting-only: line-wrapping of long call/assert
+chains, no token changes). `git diff` reviewed — whitespace/line-breaks only —
+and `cargo fmt --check` now exits clean.
 
-## Fixed
+**Validation gap:** none — the existing check (`cargo fmt --check`) reproduced
+it directly; nothing was missing.
 
 ### `src/volume/html/mod.rs` (1889 lines before the split) exceeds the one-sitting readability budget — fixed 2026-10-09 by bugfix
 

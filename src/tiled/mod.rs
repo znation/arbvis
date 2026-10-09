@@ -1053,15 +1053,117 @@ pub async fn run_tiles(
     // zoom levels, a different leaf grid, even a different tile format (png vs
     // avif) at the same coords. None of that gets overwritten by this run, so it
     // lingers and can surface as black/garbage tiles at some zoom levels (e.g.
-    // when a stale `index.html` with a higher `maxNativeZoom` is cached). Wiping
-    // the whole tile tree keeps each run self-consistent; `index.html` /
-    // `labels.json` are regenerated below regardless.
+    // when a stale `index.html` with a higher `maxNativeZoom` is cached). The
+    // whole tile tree is replaced so each run stays self-consistent; `index.html`
+    // / `labels.json` are regenerated below regardless.
+    //
+    // The old tree is *renamed aside* rather than deleted up front: deleting
+    // first means a run that fails halfway (bad input, full disk) leaves the
+    // bundle without any tiles while `index.html` / `labels.json` still point
+    // at the old pyramid — a working bundle destroyed by a failed re-render.
+    // The rename is atomic, so even a process killed between rename and render
+    // leaves the previous tiles recoverable as `tiles.stale-<pid>`; on success
+    // the backup is deleted, on failure it is restored. Leftover backups from
+    // runs killed mid-render are cleared at the start of each run (concurrent
+    // renders into one directory were already unsupported: the old code raced
+    // its `remove_dir_all` the same way).
     let tiles_root = tile_dir.join("tiles");
-    if tiles_root.exists() {
-        std::fs::remove_dir_all(&tiles_root)
-            .with_context(|| format!("clearing stale tiles in {}", tiles_root.display()))?;
-    }
+    remove_stale_tile_backups(&tile_dir)?;
+    let trash = if tiles_root.exists() {
+        let backup = tile_dir.join(format!("tiles.stale-{}", std::process::id()));
+        std::fs::rename(&tiles_root, &backup)
+            .with_context(|| format!("setting aside stale tiles in {}", tiles_root.display()))?;
+        Some(backup)
+    } else {
+        None
+    };
 
+    let res = run_tiles_inner(
+        sources,
+        total,
+        tile_dir.clone(),
+        diff_mode,
+        title,
+        inputs,
+        show_xet_xorbs,
+        leaf_format,
+        pyramid_format,
+        layout_mode,
+        registry,
+    )
+    .await;
+    match res {
+        Ok(()) => {
+            if let Some(ref backup) = trash {
+                if let Err(e) = std::fs::remove_dir_all(backup) {
+                    log::warn!(
+                        "could not remove stale tile backup {}: {e}",
+                        backup.display()
+                    );
+                }
+            }
+            Ok(())
+        }
+        Err(err) => {
+            if let Some(ref backup) = trash {
+                if !tiles_root.exists() {
+                    match std::fs::rename(backup, &tiles_root) {
+                        Ok(()) => log::warn!(
+                            "render failed; restored previous tiles from {}",
+                            backup.display()
+                        ),
+                        Err(e) => log::warn!(
+                            "render failed and previous tiles could not be restored \
+                             from {} to {}: {e}",
+                            backup.display(),
+                            tiles_root.display()
+                        ),
+                    }
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Delete `tiles.stale-*` backup directories left in `tile_dir` by earlier
+/// runs that were killed between setting aside the old tile tree and cleaning
+/// it up.
+fn remove_stale_tile_backups(tile_dir: &Path) -> anyhow::Result<()> {
+    // A fresh render targets a tile_dir that does not exist yet; there is
+    // nothing to sweep there.
+    let entries = match std::fs::read_dir(tile_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("listing {}", tile_dir.display())),
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("listing {}", tile_dir.display()))?;
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with("tiles.stale-") {
+            std::fs::remove_dir_all(entry.path()).with_context(|| {
+                format!("clearing stale tile backup {}", entry.path().display())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Render the tile pyramid and viewer HTML into `tile_dir` (see [`run_tiles`]).
+/// Assumes any stale `tiles/` tree has already been set aside by the caller.
+async fn run_tiles_inner(
+    sources: Vec<Source>,
+    total: u64,
+    tile_dir: PathBuf,
+    diff_mode: bool,
+    title: &str,
+    inputs: &[String],
+    show_xet_xorbs: bool,
+    leaf_format: TileFormat,
+    pyramid_format: TileFormat,
+    layout_mode: LayoutMode,
+    registry: &crate::registry::Registry,
+) -> anyhow::Result<()> {
     let scenes = partition_scenes(sources, total);
     let mut views: Vec<html::SceneView> = Vec::with_capacity(scenes.len());
     for group in scenes {
@@ -1242,6 +1344,125 @@ async fn render_scene_to_disk(
 
 #[cfg(test)]
 mod scene_tests {
+    use crate::data::{Source, SourceKind};
+
+    fn file_source(path: &std::path::Path, len: u64) -> Source {
+        Source {
+            file_idx: 0,
+            kind: SourceKind::File(path.to_path_buf()),
+            byte_size: len,
+            name_override: None,
+            xet_terms: None,
+            extensions: Default::default(),
+        }
+    }
+
+    /// A failed re-render into an existing bundle must not destroy the old
+    /// pyramid: the stale tree is set aside by rename and restored on error.
+    #[tokio::test]
+    async fn failed_run_tiles_restores_previous_tiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let leaf = dir.path().join("tiles/0/0/0.png");
+        std::fs::create_dir_all(leaf.parent().unwrap()).unwrap();
+        std::fs::write(&leaf, b"OLD").unwrap();
+
+        let sources = vec![file_source(&dir.path().join("does-not-exist.bin"), 64)];
+        let err = crate::tiled::run_tiles(
+            sources,
+            64,
+            dir.path().to_path_buf(),
+            false,
+            "t",
+            &[],
+            false,
+            crate::tiled::TileFormat::IndexedPng,
+            crate::tiled::TileFormat::IndexedPng,
+            crate::layout::LayoutMode::Auto,
+            &crate::registry::Registry::with_defaults(),
+        )
+        .await;
+        assert!(err.is_err(), "expected the render to fail");
+        assert_eq!(
+            std::fs::read(&leaf).unwrap(),
+            b"OLD",
+            "old tiles must survive a failed re-render"
+        );
+        assert!(dir.path().read_dir().unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("tiles.stale-")));
+    }
+
+    /// A successful re-render into an existing bundle replaces the old tree
+    /// and leaves no backup directory behind.
+    #[tokio::test]
+    async fn successful_run_tiles_replaces_previous_tiles_without_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let leaf = dir.path().join("tiles/0/0/0.png");
+        std::fs::create_dir_all(leaf.parent().unwrap()).unwrap();
+        std::fs::write(&leaf, b"OLD").unwrap();
+
+        let mut bytes = vec![0u8; 64];
+        bytes.extend(std::iter::repeat_n(0x41u8, 64));
+        let keep = dir.path().join("input.bin");
+        std::fs::write(&keep, &bytes).unwrap();
+        let len = bytes.len() as u64;
+        crate::tiled::run_tiles(
+            vec![file_source(&keep, len)],
+            len,
+            dir.path().to_path_buf(),
+            false,
+            "t",
+            &[],
+            false,
+            crate::tiled::TileFormat::IndexedPng,
+            crate::tiled::TileFormat::IndexedPng,
+            crate::layout::LayoutMode::Auto,
+            &crate::registry::Registry::with_defaults(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            std::fs::read(&leaf).unwrap() != b"OLD",
+            "tiles must be replaced"
+        );
+        assert!(dir.path().read_dir().unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("tiles.stale-")));
+        assert!(dir.path().join("index.html").is_file());
+    }
+
+    /// A fresh render into a tile_dir that does not exist yet must succeed:
+    /// the stale-backup sweep treats a missing directory as nothing to do.
+    #[tokio::test]
+    async fn fresh_run_tiles_into_missing_directory_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = vec![0u8; 64];
+        bytes.extend(std::iter::repeat_n(0x41u8, 64));
+        let keep = dir.path().join("input.bin");
+        std::fs::write(&keep, &bytes).unwrap();
+        let len = bytes.len() as u64;
+        crate::tiled::run_tiles(
+            vec![file_source(&keep, len)],
+            len,
+            dir.path().join("out").to_path_buf(),
+            false,
+            "t",
+            &[],
+            false,
+            crate::tiled::TileFormat::IndexedPng,
+            crate::tiled::TileFormat::IndexedPng,
+            crate::layout::LayoutMode::Auto,
+            &crate::registry::Registry::with_defaults(),
+        )
+        .await
+        .unwrap();
+        assert!(dir.path().join("out/index.html").is_file());
+    }
+
     #[test]
     fn regen_html_missing_labels_json_says_the_dir_must_be_a_viewer_bundle() {
         let dir = tempfile::tempdir().unwrap();

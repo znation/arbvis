@@ -100,6 +100,44 @@ mod tests {
     }
 
     #[test]
+    fn diff_lut_no_change_is_black_non_finite_is_white() {
+        let lut = build_diff_signed_lut();
+        assert_eq!(lut[127], Rgb([0, 0, 0]));
+        assert_eq!(lut[255], Rgb([255, 255, 255]));
+    }
+
+    #[test]
+    fn diff_lut_grew_is_pure_green_shrank_is_pure_red() {
+        let lut = build_diff_signed_lut();
+        for v in 128..=254 {
+            let c = lut[v as usize];
+            assert!(c[1] > 0, "v={v} must brighten green");
+            assert_eq!((c[0], c[2]), (0, 0), "v={v} must be green-only");
+        }
+        for v in 0..127 {
+            let c = lut[v as usize];
+            assert!(c[0] > 0, "v={v} must brighten red");
+            assert_eq!((c[1], c[2]), (0, 0), "v={v} must be red-only");
+        }
+    }
+
+    #[test]
+    fn diff_lut_brightness_spans_full_range_symmetrically() {
+        let lut = build_diff_signed_lut();
+        // Endpoints saturate: maximal shrink and maximal growth are both full
+        // brightness, and the smallest one-step deltas are near-invisible.
+        assert_eq!(lut[0][0], 255);
+        assert_eq!(lut[126][0], 2);
+        assert_eq!(lut[254][1], 255);
+        assert_eq!(lut[128][1], 2);
+        // Equal-magnitude shrink and growth render at equal brightness, so a
+        // symmetric change reads the same in both directions (hue aside).
+        for k in 1..127u32 {
+            assert_eq!(lut[127 - k as usize][0], lut[127 + k as usize][1]);
+        }
+    }
+
+    #[test]
     fn lut_has_256_entries() {
         let lut = build_pixel_lut();
         assert_eq!(lut.len(), 256);

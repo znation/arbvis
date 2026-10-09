@@ -39,26 +39,8 @@ use encode::VolumeMeta;
 
 pub(crate) use aggregate::box_focus;
 
-pub(crate) use crate::fsutil::{part_path, seal_part};
+pub(crate) use crate::fsutil::{part_path, seal_part, write_atomic};
 
-/// Write `bytes` to `path` atomically: stage to `<file>.part` in the same
-/// directory, then rename over `path`. A process killed mid-write leaves the
-/// previous file — or none — instead of a truncated artifact: the viewer
-/// bundle is read back by `regen_html` and served verbatim by the deployed
-/// Space, so a half-written `meta.json` or `bricks.bin` would be served as
-/// if complete.
-fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let part = part_path(path);
-    std::fs::write(&part, bytes)
-        .with_context(|| format!("writing {}", path.display()))
-        .inspect_err(|_| {
-            // Best effort: don't leave a stale partial staging file behind — a
-            // later `hf upload` of the bundle directory would push it to the
-            // Hub, and it is indistinguishable from an in-progress staging file.
-            let _ = std::fs::remove_file(&part);
-        })?;
-    seal_part(&part, path)
-}
 /// The dense `volume.bin` (coarse fallback LOD + CPU pick/histogram buffer) is
 /// capped at this side so the mandatory up-front download stays small and fixed
 /// (256³·4 ≈ 64 MiB for a full cube; far smaller for the thin, aspect-preserving

@@ -1,5 +1,6 @@
 //! Small filesystem staging helpers shared across modules.
 
+use anyhow::Context;
 use std::path::{Path, PathBuf};
 
 /// Stage path for an artifact being written atomically: `bricks.bin` is
@@ -33,6 +34,28 @@ pub(crate) fn seal_part(part: &Path, final_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Write `bytes` to `path` atomically: stage to `<file>.part` in the same
+/// directory, then rename over `path`. A process killed mid-write leaves the
+/// previous file — or none — instead of a truncated artifact that the viewer
+/// serves or a later `hf upload` pushes as if complete.
+///
+/// Callers: `volume`'s bundle writer (`volume.bin`, `bricks.bin`, `tree.bin`,
+/// `pagetable.bin`, `meta.json`, the 3D viewer's `index.html`) and the tile
+/// writer in `tiled::pyramid_accum` (local-disk and HF staging sinks), which
+/// create parent directories before calling this.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let part = part_path(path);
+    std::fs::write(&part, bytes)
+        .with_context(|| format!("writing {}", path.display()))
+        .inspect_err(|_| {
+            // Best effort: don't leave a stale partial staging file behind — a
+            // later `hf upload` of the bundle directory would push it to the
+            // Hub, and it is indistinguishable from an in-progress staging file.
+            let _ = std::fs::remove_file(&part);
+        })?;
+    seal_part(&part, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,6 +86,22 @@ mod tests {
     fn file_name_falls_back_to_empty_for_root() {
         // Paths with no file name (e.g. "/") stage a dotfile next to them.
         assert_eq!(part_path(Path::new("/")), PathBuf::from("/.part"));
+    }
+
+    #[test]
+    fn write_atomic_replaces_and_cleans_up_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact.bin");
+        write_atomic(&path, b"first").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        // No `.part` staging file lingers next to the finished artifact.
+        assert!(!dir.path().join("artifact.bin.part").exists());
+
+        // A failed staged write (staging location is a directory) must not
+        // clobber the previous artifact nor leave the staged file behind.
+        std::fs::create_dir(dir.path().join("artifact.bin.part")).unwrap();
+        assert!(write_atomic(&path, b"replacement").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
     }
 
     #[test]

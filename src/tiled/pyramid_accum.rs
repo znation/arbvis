@@ -64,14 +64,7 @@ pub fn write_tile_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating tile dir {}", parent.display()))?;
     }
-    let part = crate::fsutil::part_path(path);
-    if let Err(e) = std::fs::write(&part, bytes) {
-        // Best effort: don't leave a stale partial staging file behind.
-        let _ = std::fs::remove_file(&part);
-        return Err(e).with_context(|| format!("writing tile {}", part.display()));
-    }
-    crate::fsutil::seal_part(&part, path)
-        .map_err(|e| e.context(format!("sealing tile {}", path.display())))
+    crate::fsutil::write_atomic(path, bytes)
 }
 
 /// Writes encoded tile bytes to a local filesystem path, creating parent

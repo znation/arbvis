@@ -1,4 +1,5 @@
-use std::path::Path;
+use anyhow::{Context, bail};
+use std::path::{Path, PathBuf};
 
 use crate::registry::Branding;
 
@@ -71,8 +72,6 @@ pub fn write_leaflet_html(
     branding: &Branding,
 ) -> anyhow::Result<()> {
     let entities_json = build_labels_json(entities, max_zoom, detail_depth);
-    std::fs::write(dir.join("labels.json"), &entities_json)?;
-
     let html = build_html(
         world_w,
         world_h,
@@ -87,8 +86,54 @@ pub fn write_leaflet_html(
         pyramid_ext,
         branding,
     );
-    std::fs::write(dir.join("index.html"), html)?;
-    Ok(())
+    write_viewer_pair(dir, html.as_bytes(), entities_json.as_bytes())
+}
+
+/// Write the viewer's `index.html` and `labels.json` as a pair.
+///
+/// Both artifacts are staged to `<name>.part` siblings first, then renamed
+/// into place, so a process killed mid-write (or an ENOSPC partway through)
+/// leaves the previous complete pair instead of a truncated file that the
+/// generated viewer serves as if complete. If either target path cannot be
+/// replaced (it exists as a directory), the write fails before anything is
+/// staged or sealed, leaving the previous pair untouched.
+fn write_viewer_pair(dir: &Path, html: &[u8], labels: &[u8]) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating viewer dir {}", dir.display()))?;
+    let index = dir.join("index.html");
+    let labels_path = dir.join("labels.json");
+    for target in [&index, &labels_path] {
+        if target.is_dir() {
+            bail!(
+                "cannot write viewer artifact {}: path exists as a directory",
+                target.display()
+            );
+        }
+    }
+    let part = |p: &Path| -> PathBuf {
+        let mut name = p.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+        name.push(".part");
+        p.with_file_name(name)
+    };
+    let index_part = part(&index);
+    let labels_part = part(&labels_path);
+
+    let res: anyhow::Result<()> = (|| {
+        std::fs::write(&index_part, html)
+            .with_context(|| format!("staging {}", index_part.display()))?;
+        std::fs::write(&labels_part, labels)
+            .with_context(|| format!("staging {}", labels_part.display()))?;
+        std::fs::rename(&index_part, &index)
+            .with_context(|| format!("sealing {}", index.display()))?;
+        std::fs::rename(&labels_part, &labels_path)
+            .with_context(|| format!("sealing {}", labels_path.display()))?;
+        Ok(())
+    })();
+    if res.is_err() {
+        // Best effort: don't leave stale staging files behind.
+        let _ = std::fs::remove_file(&index_part);
+        let _ = std::fs::remove_file(&labels_part);
+    }
+    res
 }
 
 fn entities_to_json(entities: &[FileEntity]) -> String {
@@ -913,12 +958,11 @@ pub fn write_leaflet_html_multi(
     inputs: &[String],
     branding: &Branding,
 ) -> anyhow::Result<()> {
-    std::fs::write(dir.join("labels.json"), build_labels_json_scenes(scenes))?;
-    std::fs::write(
-        dir.join("index.html"),
-        build_html_multi(scenes, title, inputs, branding),
-    )?;
-    Ok(())
+    write_viewer_pair(
+        dir,
+        build_html_multi(scenes, title, inputs, branding).as_bytes(),
+        build_labels_json_scenes(scenes).as_bytes(),
+    )
 }
 
 /// Multi-scene equivalent of [`generate_leaflet_content`] for the streaming
@@ -975,6 +1019,26 @@ mod tests {
             html.contains("image-rendering: pixelated"),
             "leaf tiles must upscale crisply past max_zoom",
         );
+    }
+
+    use super::write_leaflet_html_multi;
+    use std::fs;
+    use tempfile::tempdir;
+
+    /// A failure while writing the viewer pair (here: `index.html` exists as a
+    /// directory, so it cannot be replaced) must fail loudly without replacing
+    /// labels.json — the previous pair stays intact, with no .part residue.
+    #[test]
+    fn failed_viewer_write_leaves_previous_pair_intact() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("labels.json"), b"OLD").unwrap();
+        fs::create_dir(dir.path().join("index.html")).unwrap();
+        let scenes = [scene("s", 256, 256)];
+        let res = write_leaflet_html_multi(dir.path(), &scenes, "t", &[], &Branding::default());
+        assert!(res.is_err(), "write into a directory path must fail loudly");
+        assert_eq!(fs::read(dir.path().join("labels.json")).unwrap(), b"OLD");
+        assert!(!dir.path().join("labels.json.part").exists());
+        assert!(!dir.path().join("index.html.part").exists());
     }
 
     /// Non-square canvas (8:1 tall) → the viewer allows zooming out past the

@@ -19,6 +19,13 @@ fn sniff_ext_in(dir: &std::path::Path) -> Option<String> {
             e.path()
                 .extension()
                 .and_then(|s| s.to_str())
+                // Only plain alphanumeric extensions (png/avif) are accepted:
+                // the sniffed extension is interpolated into single-quoted JS
+                // string literals in the generated viewer (getTileUrl), so a
+                // hostile bundle tile named e.g. `0_0.png';alert(1);'` must
+                // not supply its whole suffix as the "extension". Non-alnum
+                // candidates are skipped so the caller's fallback applies.
+                .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()))
                 .map(|s| s.to_string())
         })
 }
@@ -341,6 +348,34 @@ mod tests {
         assert!(
             index.contains("base scene"),
             "scene label must reach the HTML"
+        );
+    }
+
+    #[test]
+    fn regen_hostile_tile_filename_extension_is_not_injected_into_the_viewer() {
+        let dir = tempfile::tempdir().unwrap();
+        // A hostile bundle names its only tile so that the raw suffix after
+        // the last dot is a JS string-breakout payload. The sniffer must
+        // reject it and fall back to a safe extension rather than
+        // interpolating it into the viewer's single-quoted JS literals.
+        let leaf = dir.path().join("tiles").join("0").join("0");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(leaf.join("0.png';alert(1);'"), b"x").unwrap();
+        let labels: serde_json::Value = serde_json::json!([
+            {"name": "a.bin", "x": 0, "y": 0, "size": 4}
+        ]);
+        std::fs::write(dir.path().join("labels.json"), labels.to_string()).unwrap();
+        let branding = crate::registry::Branding::default();
+        regen_html(dir.path(), &branding).unwrap();
+        let index = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
+        assert!(
+            !index.contains("alert(1)"),
+            "hostile tile-filename suffix must not reach the generated viewer JS"
+        );
+        // The sniffer fell back to `png`, which still reaches the template.
+        assert!(
+            index.contains("? 'png'"),
+            "fallback extension must reach the HTML"
         );
     }
 

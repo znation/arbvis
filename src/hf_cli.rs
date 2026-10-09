@@ -96,6 +96,10 @@ pub enum HfCliError {
         stderr_excerpt: String,
         source: serde_json::Error,
     },
+    TimedOut {
+        argv: String,
+        seconds: u64,
+    },
 }
 
 impl std::fmt::Display for HfCliError {
@@ -114,6 +118,12 @@ impl std::fmt::Display for HfCliError {
                     "decoding `hf {argv}` JSON output failed: {source}\nstderr tail: {stderr_excerpt}"
                 )
             }
+            HfCliError::TimedOut { argv, seconds } => {
+                write!(
+                    f,
+                    "`hf {argv}` did not exit within {seconds}s (ARBVIS_HF_TIMEOUT_SECS) and was killed"
+                )
+            }
         }
     }
 }
@@ -124,6 +134,7 @@ impl std::error::Error for HfCliError {
             HfCliError::Spawn(e) => Some(e),
             HfCliError::Exit { .. } => None,
             HfCliError::JsonDecode { source, .. } => Some(source),
+            HfCliError::TimedOut { .. } => None,
         }
     }
 }
@@ -162,6 +173,9 @@ impl ErrorClassify for HfCliError {
                     Outcome::Permanent
                 }
             }
+            // A killed child is indistinguishable from a network stall from
+            // the caller's point of view — let the retry budget decide.
+            HfCliError::TimedOut { .. } => Outcome::Timeout,
         }
     }
 }
@@ -211,6 +225,26 @@ where
     cmd
 }
 
+/// Overall wall-clock budget for a single `hf` invocation, opt-in via
+/// `ARBVIS_HF_TIMEOUT_SECS`. Unset or non-numeric means no timeout: uploads
+/// of large checkpoints can legitimately run for hours, so arbvis never
+/// kills a healthy child by default. When set, a child that exceeds the
+/// budget is killed and the call fails loudly (classify → `Timeout`, so the
+/// AIMD throttle treats it like any other stall).
+fn hf_timeout_secs() -> Option<u64> {
+    match std::env::var("ARBVIS_HF_TIMEOUT_SECS") {
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => Some(secs),
+            Ok(_) => None,
+            Err(_) => {
+                log::warn!("ARBVIS_HF_TIMEOUT_SECS={s:?} is not a positive integer; ignoring");
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
+
 /// Spawn `hf <args>` and return (exit status, captured stdout, captured stderr tail).
 ///
 /// stderr is forwarded to the parent process's stderr line-by-line as it
@@ -221,7 +255,7 @@ where
     I: IntoIterator<Item = S> + Clone,
     S: AsRef<OsStr>,
 {
-    let mut cmd = build_cmd(args);
+    let mut cmd = build_cmd(args.clone());
     let mut child = cmd.spawn().map_err(HfCliError::Spawn)?;
 
     let stdout = child.stdout.take().expect("stdout piped");
@@ -265,7 +299,26 @@ where
         buf
     });
 
-    let status = child.wait().await.map_err(HfCliError::Spawn)?;
+    let timeout_secs = hf_timeout_secs();
+    let status = match timeout_secs {
+        Some(secs) => {
+            let budget = std::time::Duration::from_secs(secs);
+            match tokio::time::timeout(budget, child.wait()).await {
+                Ok(status) => status.map_err(HfCliError::Spawn)?,
+                Err(_) => {
+                    // kill_on_drop(true) reaps on scope exit, but kill
+                    // explicitly so the pipe readers below see EOF now.
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    return Err(HfCliError::TimedOut {
+                        argv: argv_for_display(args),
+                        seconds: secs,
+                    });
+                }
+            }
+        }
+        None => child.wait().await.map_err(HfCliError::Spawn)?,
+    };
 
     let stdout = stdout_task.await.unwrap_or_default();
     let _ = stderr_task.await;
@@ -430,6 +483,67 @@ mod tests {
         };
         // Substring " 503 " requires a leading + trailing space.
         assert_eq!(err.classify(), Outcome::Timeout);
+    }
+
+    #[test]
+    fn classify_timed_out_is_timeout() {
+        let err = HfCliError::TimedOut {
+            argv: "download foo/bar".into(),
+            seconds: 30,
+        };
+        assert_eq!(err.classify(), Outcome::Timeout);
+    }
+
+    /// Injects a hung child: ARBVIS_HF_BIN points at a script that never
+    /// exits. Without the ARBVIS_HF_TIMEOUT_SECS kill this test would hang
+    /// until the harness timeout; with it, the call must fail loudly with
+    /// `TimedOut` well before the child's own sleep elapses.
+    #[tokio::test]
+    async fn hung_child_is_killed_at_optin_timeout() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("arbvis-hf-hang-{}.sh", std::process::id()));
+        std::fs::write(&path, "#!/bin/sh\nsleep 300\n").expect("write fake hf script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake hf script");
+        }
+        let prev_bin = std::env::var("ARBVIS_HF_BIN").ok();
+        let prev_timeout = std::env::var("ARBVIS_HF_TIMEOUT_SECS").ok();
+        std::env::set_var("ARBVIS_HF_BIN", &path);
+        std::env::set_var("ARBVIS_HF_TIMEOUT_SECS", "1");
+
+        let start = std::time::Instant::now();
+        let result = check_hf_available().await;
+
+        // Restore env before assertions so failures don't poison siblings.
+        match (prev_bin, prev_timeout) {
+            (Some(b), Some(t)) => {
+                std::env::set_var("ARBVIS_HF_BIN", b);
+                std::env::set_var("ARBVIS_HF_TIMEOUT_SECS", t);
+            }
+            (Some(b), None) => {
+                std::env::set_var("ARBVIS_HF_BIN", b);
+                std::env::remove_var("ARBVIS_HF_TIMEOUT_SECS");
+            }
+            (None, Some(t)) => {
+                std::env::remove_var("ARBVIS_HF_BIN");
+                std::env::set_var("ARBVIS_HF_TIMEOUT_SECS", t);
+            }
+            (None, None) => {
+                std::env::remove_var("ARBVIS_HF_BIN");
+                std::env::remove_var("ARBVIS_HF_TIMEOUT_SECS");
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+
+        let err = result.expect_err("hung child must fail, not hang");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(60),
+            "timeout did not fire promptly: {:?}",
+            start.elapsed()
+        );
+        assert!(matches!(err, HfCliError::TimedOut { seconds: 1, .. }));
     }
 
     #[test]

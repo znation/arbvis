@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use crate::cli::{
-    collect_input_files, default_title, ignored_3d_flags, validate_grid, validate_volume_res, Args,
-    OutputDest,
+    collect_input_files, default_title, ignored_3d_flags, validate_grid, validate_volume_res,
+    volume_res_ignored_warning, Args, OutputDest,
 };
 use crate::data::Source;
 use crate::deploy;
@@ -72,6 +72,9 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
     if args.three_d {
         validate_grid(args.grid)?;
         validate_volume_res(args.volume_res)?;
+        if let Some(msg) = volume_res_ignored_warning(args.grid, args.volume_res) {
+            log::warn!("{msg}");
+        }
         if args.show_xet_xorbs {
             log::warn!("--show-xet-xorbs has no effect in --3d mode; ignoring");
         }

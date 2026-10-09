@@ -325,6 +325,22 @@ pub(crate) fn validate_volume_res(res: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Warning text for `--volume-res` set to a value that cannot stream: the
+/// sparse brick pool only exists when `--volume-res` is strictly above
+/// `--grid` (see `aggregate`'s `order_v` gate), so an at-or-below value builds
+/// a dense grid at `--grid` and silently drops the streamed detail the flag
+/// asked for. Returns `None` when the setting is usable (0, or above `--grid`).
+pub(crate) fn volume_res_ignored_warning(grid: u32, volume_res: u32) -> Option<String> {
+    if volume_res == 0 || volume_res > grid {
+        return None;
+    }
+    Some(format!(
+        "--volume-res {volume_res} is not above --grid {grid}; the streamed brick pool only \
+         exists when --volume-res > --grid, so this run builds a dense grid at --grid with no \
+         streamed detail. Pass a power of two above {grid}, or 0 to derive the split automatically."
+    ))
+}
+
 /// Names of 3D-only flags whose values differ from their defaults and would
 /// therefore be silently ignored without `--3d`.
 pub(crate) fn ignored_3d_flags(grid: u32, volume_res: u32) -> Vec<&'static str> {
@@ -480,7 +496,7 @@ mod title_tests {
 
 #[cfg(test)]
 mod grid_validation_tests {
-    use super::{ignored_3d_flags, validate_grid, validate_volume_res};
+    use super::{ignored_3d_flags, validate_grid, validate_volume_res, volume_res_ignored_warning};
 
     #[test]
     fn grid_cap_raised_to_16384() {
@@ -500,6 +516,17 @@ mod grid_validation_tests {
     }
 
     #[test]
+    fn volume_res_ignored_warning_only_fires_at_or_below_grid() {
+        assert!(volume_res_ignored_warning(1024, 0).is_none()); // derive
+        assert!(volume_res_ignored_warning(1024, 2048).is_none()); // streams
+        let msg = volume_res_ignored_warning(1024, 512).expect("below grid should warn");
+        assert!(msg.contains("--volume-res 512"));
+        assert!(msg.contains("--grid 1024"));
+        assert!(volume_res_ignored_warning(1024, 1024)
+            .expect("equal to grid cannot stream either")
+            .contains("no streamed detail"));
+    }
+
     fn ignored_3d_flags_only_names_non_defaults() {
         assert!(ignored_3d_flags(1024, 0).is_empty()); // both defaults
         assert_eq!(ignored_3d_flags(512, 0), vec!["--grid"]);

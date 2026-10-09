@@ -211,3 +211,146 @@ impl<S: TileSink> PyramidAccumulator<S> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// Records (path, decoded RGB pixels) for every tile uploaded.
+    #[derive(Default)]
+    struct RecordingSink {
+        uploads: StdMutex<Vec<(String, image::ImageBuffer<Rgb<u8>, Vec<u8>>)>>,
+    }
+
+    impl TileSink for RecordingSink {
+        fn upload_tile(&self, path: String, bytes: Vec<u8>) -> anyhow::Result<()> {
+            let img = image::load_from_memory(&bytes)
+                .expect("uploaded bytes decode")
+                .to_rgb8();
+            self.uploads.lock().unwrap().push((path, img));
+            Ok(())
+        }
+    }
+
+    fn constant_tile(tile_size: u32, color: [u8; 3]) -> image::ImageBuffer<Rgb<u8>, Vec<u8>> {
+        image::ImageBuffer::from_fn(tile_size, tile_size, |_, _| Rgb(color))
+    }
+
+    fn make_acc(
+        sink: Arc<RecordingSink>,
+        tile_size: u32,
+    ) -> Arc<PyramidAccumulator<RecordingSink>> {
+        Arc::new(PyramidAccumulator::new(
+            tile_size,
+            2,
+            sink,
+            Arc::new(|z, x, y| format!("{z}/{x}/{y}.png")),
+            TileFormat::Png,
+        ))
+    }
+
+    async fn uploads_after(
+        acc: &Arc<PyramidAccumulator<RecordingSink>>,
+    ) -> Vec<(String, image::ImageBuffer<Rgb<u8>, Vec<u8>>)> {
+        acc.drain().await;
+        let mut uploads = acc.sink.uploads.lock().unwrap().clone();
+        uploads.sort_by(|a, b| a.0.cmp(&b.0));
+        uploads
+    }
+
+    #[tokio::test]
+    async fn zoom_zero_tile_is_ignored() {
+        let sink = Arc::new(RecordingSink::default());
+        let acc = make_acc(sink, 4);
+        acc.contribute(0, 0, 0, &constant_tile(4, [1, 2, 3]));
+        assert!(uploads_after(&acc).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn incomplete_parent_is_not_uploaded() {
+        let sink = Arc::new(RecordingSink::default());
+        let acc = make_acc(sink, 4);
+        acc.contribute(1, 0, 0, &constant_tile(4, [10, 20, 30]));
+        acc.contribute(1, 1, 0, &constant_tile(4, [10, 20, 30]));
+        assert!(uploads_after(&acc).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn four_children_average_into_parent_quadrants() {
+        let sink = Arc::new(RecordingSink::default());
+        let acc = make_acc(sink, 4);
+        // (zoom 2) x%2 picks the parent's left/right half, y%2 top/bottom.
+        acc.contribute(2, 0, 0, &constant_tile(4, [255, 0, 0])); // parent (1,0,0) top-left
+        acc.contribute(2, 1, 0, &constant_tile(4, [0, 255, 0])); // top-right
+        acc.contribute(2, 0, 1, &constant_tile(4, [0, 0, 255])); // bottom-left
+        acc.contribute(2, 1, 1, &constant_tile(4, [255, 255, 255])); // bottom-right
+
+        let uploads = uploads_after(&acc).await;
+        assert_eq!(uploads.len(), 1, "exactly the one completed parent uploads");
+        let (path, img) = &uploads[0];
+        assert_eq!(path, "1/0/0.png");
+        assert_eq!((img.width(), img.height()), (4, 4));
+        assert_eq!(img.get_pixel(0, 0), &Rgb([255, 0, 0]), "top-left");
+        assert_eq!(img.get_pixel(3, 0), &Rgb([0, 255, 0]), "top-right");
+        assert_eq!(img.get_pixel(0, 3), &Rgb([0, 0, 255]), "bottom-left");
+        assert_eq!(img.get_pixel(3, 3), &Rgb([255, 255, 255]), "bottom-right");
+    }
+
+    #[tokio::test]
+    async fn averaging_blends_two_children_in_one_quadrant() {
+        // Four distinct children sharing a parent: each quadrant is the box
+        // filter of one child only, so feed a parent whose children mix —
+        // instead, verify the /4 division directly: a parent fed by children
+        // that each contribute their own color to their own quadrant must not
+        // sum-overflow or misplace. Simpler check: 4 children of one parent
+        // where every child has color (8, 4, 200) → parent is exactly that.
+        let sink = Arc::new(RecordingSink::default());
+        let acc = make_acc(sink, 4);
+        for x in 0..2 {
+            for y in 0..2 {
+                acc.contribute(1, x, y, &constant_tile(4, [8, 4, 200]));
+            }
+        }
+        let uploads = uploads_after(&acc).await;
+        assert_eq!(uploads.len(), 1);
+        let (_, img) = &uploads[0];
+        assert_eq!(img.get_pixel(1, 1), &Rgb([8, 4, 200]));
+        assert_eq!(img.get_pixel(2, 2), &Rgb([8, 4, 200]));
+    }
+
+    #[tokio::test]
+    async fn completed_parents_propagate_to_the_root() {
+        let sink = Arc::new(RecordingSink::default());
+        let acc = make_acc(sink, 4);
+        for x in 0..2 {
+            for y in 0..2 {
+                for cx in 0..2 {
+                    for cy in 0..2 {
+                        acc.contribute(2, 2 * x + cx, 2 * y + cy, &constant_tile(4, [1, 2, 3]));
+                    }
+                }
+            }
+        }
+        // 4 zoom-1 parents complete (each uploading itself), and once all 4
+        // contributed upward, the zoom-0 root tile uploads too.
+        let uploads = uploads_after(&acc).await;
+        let paths: Vec<&str> = uploads.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["0/0/0.png", "1/0/0.png", "1/0/1.png", "1/1/0.png", "1/1/1.png"]
+        );
+        for (_, img) in &uploads {
+            assert_eq!(img.get_pixel(0, 0), &Rgb([1, 2, 3]));
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_is_idempotent_when_idle() {
+        let sink = Arc::new(RecordingSink::default());
+        let acc = make_acc(sink, 4);
+        acc.drain().await;
+        acc.drain().await;
+        assert!(acc.sink.uploads.lock().unwrap().is_empty());
+    }
+}

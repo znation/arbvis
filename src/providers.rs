@@ -265,6 +265,78 @@ mod provider_selection_tests {
 
     // A higher-priority provider shadows the byte-diff built-in when it
     // applies, but the floor still wins when it doesn't.
+    // An empty registry (downstream hasn't registered anything, or cleared
+    // `providers`) selects nothing rather than panicking.
+    #[test]
+    fn empty_registry_selects_none() {
+        let reg = Registry::default();
+        let inputs = vec![PathBuf::from("a.bin")];
+        assert!(select_provider(&reg.providers, &ctx(&reg, &inputs, None)).is_none());
+    }
+
+    // Equal-priority providers resolve by registration order: the earlier
+    // entry wins the tie, deterministically.
+    #[test]
+    fn equal_priority_first_registered_wins() {
+        struct TieA;
+        struct TieB;
+        #[async_trait(?Send)]
+        impl SourceProvider for TieA {
+            fn id(&self) -> &'static str {
+                "tie-a"
+            }
+            fn priority(&self) -> i32 {
+                100
+            }
+            fn applicable(&self, _ctx: &SourceCtx<'_>) -> bool {
+                true
+            }
+            async fn prepare(
+                &self,
+                _ctx: &SourceCtx<'_>,
+            ) -> anyhow::Result<(Vec<crate::data::Source>, u64, RenderHints)> {
+                Ok((Vec::new(), 0, RenderHints::default()))
+            }
+        }
+        #[async_trait(?Send)]
+        impl SourceProvider for TieB {
+            fn id(&self) -> &'static str {
+                "tie-b"
+            }
+            fn priority(&self) -> i32 {
+                100
+            }
+            fn applicable(&self, _ctx: &SourceCtx<'_>) -> bool {
+                true
+            }
+            async fn prepare(
+                &self,
+                _ctx: &SourceCtx<'_>,
+            ) -> anyhow::Result<(Vec<crate::data::Source>, u64, RenderHints)> {
+                Ok((Vec::new(), 0, RenderHints::default()))
+            }
+        }
+        let mut reg = Registry::default();
+        reg.providers.push(Arc::new(TieA));
+        reg.providers.push(Arc::new(TieB));
+        let inputs = vec![PathBuf::from("a.bin")];
+        assert_eq!(
+            select_provider(&reg.providers, &ctx(&reg, &inputs, None))
+                .unwrap()
+                .id(),
+            "tie-a"
+        );
+        // Registration order decides, not id order: swapping entries flips
+        // the winner.
+        let reversed = [reg.providers[1].clone(), reg.providers[0].clone()];
+        assert_eq!(
+            select_provider(&reversed, &ctx(&reg, &inputs, None))
+                .unwrap()
+                .id(),
+            "tie-b"
+        );
+    }
+
     #[test]
     fn higher_priority_shadows_then_falls_through() {
         let mut reg = Registry::with_defaults();

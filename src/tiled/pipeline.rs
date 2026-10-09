@@ -322,6 +322,7 @@ async fn render_scene_to_disk(
 #[cfg(test)]
 mod tests {
     use crate::data::{Source, SourceKind};
+    use std::path::PathBuf;
 
     fn file_source(path: &std::path::Path, len: u64) -> Source {
         Source {
@@ -334,6 +335,48 @@ mod tests {
         }
     }
 
+    /// Call `run_tiles` with the fixed defaults every test uses; only the
+    /// output dir, sources, and total vary across the three pipeline tests.
+    async fn default_run_tiles(
+        tile_dir: PathBuf,
+        sources: Vec<Source>,
+        total: u64,
+    ) -> anyhow::Result<()> {
+        crate::tiled::run_tiles(
+            sources,
+            total,
+            tile_dir,
+            false,
+            "t",
+            &[],
+            false,
+            crate::tiled::TileFormat::IndexedPng,
+            crate::tiled::TileFormat::IndexedPng,
+            crate::layout::LayoutMode::Auto,
+            &crate::registry::Registry::with_defaults(),
+        )
+        .await
+    }
+
+    /// Write the shared test input (64 zero bytes + 64 `'A'` bytes) under
+    /// `dir`, returning its path and length.
+    fn write_test_input(dir: &std::path::Path) -> (PathBuf, u64) {
+        let mut bytes = vec![0u8; 64];
+        bytes.extend(std::iter::repeat_n(0x41u8, 64));
+        let path = dir.join("input.bin");
+        std::fs::write(&path, &bytes).unwrap();
+        (path, bytes.len() as u64)
+    }
+
+    /// Assert no `tiles.stale-*` backup directories remain in `dir`.
+    fn assert_no_stale_backups(dir: &std::path::Path) {
+        assert!(dir.read_dir().unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("tiles.stale-")));
+    }
+
     /// A failed re-render into an existing bundle must not destroy the old
     /// pyramid: the stale tree is set aside by rename and restored on error.
     #[tokio::test]
@@ -344,31 +387,14 @@ mod tests {
         std::fs::write(&leaf, b"OLD").unwrap();
 
         let sources = vec![file_source(&dir.path().join("does-not-exist.bin"), 64)];
-        let err = crate::tiled::run_tiles(
-            sources,
-            64,
-            dir.path().to_path_buf(),
-            false,
-            "t",
-            &[],
-            false,
-            crate::tiled::TileFormat::IndexedPng,
-            crate::tiled::TileFormat::IndexedPng,
-            crate::layout::LayoutMode::Auto,
-            &crate::registry::Registry::with_defaults(),
-        )
-        .await;
+        let err = default_run_tiles(dir.path().to_path_buf(), sources, 64).await;
         assert!(err.is_err(), "expected the render to fail");
         assert_eq!(
             std::fs::read(&leaf).unwrap(),
             b"OLD",
             "old tiles must survive a failed re-render"
         );
-        assert!(dir.path().read_dir().unwrap().all(|e| !e
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with("tiles.stale-")));
+        assert_no_stale_backups(dir.path());
     }
 
     /// A successful re-render into an existing bundle replaces the old tree
@@ -380,35 +406,15 @@ mod tests {
         std::fs::create_dir_all(leaf.parent().unwrap()).unwrap();
         std::fs::write(&leaf, b"OLD").unwrap();
 
-        let mut bytes = vec![0u8; 64];
-        bytes.extend(std::iter::repeat_n(0x41u8, 64));
-        let keep = dir.path().join("input.bin");
-        std::fs::write(&keep, &bytes).unwrap();
-        let len = bytes.len() as u64;
-        crate::tiled::run_tiles(
-            vec![file_source(&keep, len)],
-            len,
-            dir.path().to_path_buf(),
-            false,
-            "t",
-            &[],
-            false,
-            crate::tiled::TileFormat::IndexedPng,
-            crate::tiled::TileFormat::IndexedPng,
-            crate::layout::LayoutMode::Auto,
-            &crate::registry::Registry::with_defaults(),
-        )
-        .await
-        .unwrap();
+        let (keep, len) = write_test_input(dir.path());
+        default_run_tiles(dir.path().to_path_buf(), vec![file_source(&keep, len)], len)
+            .await
+            .unwrap();
         assert!(
             std::fs::read(&leaf).unwrap() != b"OLD",
             "tiles must be replaced"
         );
-        assert!(dir.path().read_dir().unwrap().all(|e| !e
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with("tiles.stale-")));
+        assert_no_stale_backups(dir.path());
         assert!(dir.path().join("index.html").is_file());
     }
 
@@ -417,23 +423,11 @@ mod tests {
     #[tokio::test]
     async fn fresh_run_tiles_into_missing_directory_succeeds() {
         let dir = tempfile::tempdir().unwrap();
-        let mut bytes = vec![0u8; 64];
-        bytes.extend(std::iter::repeat_n(0x41u8, 64));
-        let keep = dir.path().join("input.bin");
-        std::fs::write(&keep, &bytes).unwrap();
-        let len = bytes.len() as u64;
-        crate::tiled::run_tiles(
+        let (keep, len) = write_test_input(dir.path());
+        default_run_tiles(
+            dir.path().join("out").to_path_buf(),
             vec![file_source(&keep, len)],
             len,
-            dir.path().join("out").to_path_buf(),
-            false,
-            "t",
-            &[],
-            false,
-            crate::tiled::TileFormat::IndexedPng,
-            crate::tiled::TileFormat::IndexedPng,
-            crate::layout::LayoutMode::Auto,
-            &crate::registry::Registry::with_defaults(),
         )
         .await
         .unwrap();

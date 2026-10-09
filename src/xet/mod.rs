@@ -938,6 +938,36 @@ mod tests {
     }
 
     #[test]
+    fn xorbmap_skips_none_and_zero_length_sources() {
+        let t0 = [t(0, 10, "A")];
+        // None source and a Some-but-empty source contribute nothing; the
+        // zero-length term is skipped too, so only "A" colors bytes 0..10.
+        let empty: [XetTerm; 0] = [];
+        let zero = [t(5, 0, "B")];
+        let fresh = [t(0, 1, "C")];
+        let m = XorbMap::build(vec![
+            (None, 0),
+            (Some(&empty[..]), 100),
+            (Some(&zero[..]), 0),
+            (Some(&t0[..]), 0),
+            (Some(&fresh[..]), 20),
+        ]);
+        assert!(!m.is_empty());
+        assert_eq!(m.color_idx_at(9), Some(0));
+        assert_eq!(m.color_idx_at(10), None);
+        // "B" never got a color slot: fresh "C" takes the next idx, 1.
+        assert_eq!(m.color_idx_at(20), Some(1));
+        assert_eq!(m.color_idx_at(21), None);
+    }
+
+    #[test]
+    fn xorbmap_is_empty_and_lookup_on_empty_map() {
+        let m = XorbMap::build(Vec::<(Option<&[XetTerm]>, u64)>::new());
+        assert!(m.is_empty());
+        assert_eq!(m.color_idx_at(0), None);
+    }
+
+    #[test]
     fn xorbmap_shared_xorb_across_sources_gets_same_color() {
         let a = [t(0, 10, "shared")];
         let b = [t(0, 5, "shared")];

@@ -772,6 +772,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn diff_png_matches_reference_tiles_multi_square() {
+        // kw > kh case: TILE is 512, so total must exceed 2^18 = 262144 to
+        // force s=19: kh=9 (height 512, one tile row) and kw=10 (width 1024,
+        // two tile columns) — two squares side by side, the geometry the
+        // single-square reference test never reaches.
+        const PAIR_BYTES: usize = 262_200;
+        let orig = vec![0x10u8; PAIR_BYTES];
+        let mod_ = (0u32..PAIR_BYTES as u32)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<u8>>();
+        let (o_path, m_path) = temp_input_pair(&orig, &mod_).unwrap();
+        use crate::data::{Source, SourceKind};
+        let sources = vec![Source {
+            file_idx: 0,
+            kind: SourceKind::Diff {
+                original: o_path,
+                modified: m_path,
+            },
+            byte_size: PAIR_BYTES as u64,
+            name_override: Some("pair".to_string()),
+            xet_terms: None,
+            extensions: Default::default(),
+        }];
+        let total = PAIR_BYTES as u64;
+        let out_dir = tempfile::tempdir().unwrap();
+        let out = out_dir.path().join("diff.png");
+        render_single_diff_png(&sources, total, &out).await.unwrap();
+
+        let file = std::io::BufReader::new(std::fs::File::open(&out).unwrap());
+        let mut decoder = png::Decoder::new(file);
+        decoder.set_transformations(png::Transformations::empty());
+        let mut reader = decoder.read_info().unwrap();
+        assert_eq!(reader.info().width, 1024);
+        assert_eq!(reader.info().height, 512);
+        let mut buf = vec![0u8; reader.output_buffer_size().expect("buffer size known")];
+        let frame = reader.next_frame(&mut buf).unwrap();
+        assert_eq!(frame.width, 1024);
+        assert_eq!(frame.height, 512);
+
+        use crate::tiled::leaf::{load_tile_bytes, render_leaf_tile_diff, TileFormat};
+        use crate::tiled::{diff_leaf_mode, LeafMode};
+        let LeafMode::Diff {
+            pixel_lut,
+            plain_lut,
+            fills,
+            tints,
+        } = diff_leaf_mode(&sources)
+        else {
+            unreachable!()
+        };
+        let source_data: Vec<Data> = sources
+            .iter()
+            .map(crate::data::load_source_data)
+            .collect::<anyhow::Result<Vec<_>>>()
+            .unwrap();
+        let mut cumulative = Vec::new();
+        let mut off = 0u64;
+        for s in &sources {
+            cumulative.push(off);
+            off += s.byte_size;
+        }
+        let geom = single_geometry(total);
+        assert!(
+            geom.kw > geom.kh,
+            "test must exercise the multi-square case"
+        );
+        let (ht, wt) = (geom.height / TILE, geom.width / TILE);
+        let mut reference =
+            image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::new(geom.width, geom.height);
+        for ty in 0..ht {
+            for tx in 0..wt {
+                let tile_buf = load_tile_bytes(
+                    tx,
+                    ty,
+                    geom.kh,
+                    ht,
+                    geom.square_pixels,
+                    total,
+                    &source_data,
+                    &cumulative,
+                )
+                .await
+                .unwrap();
+                let (tile_img, _) = render_leaf_tile_diff(
+                    tx,
+                    ty,
+                    geom.kh,
+                    ht,
+                    geom.square_pixels,
+                    total,
+                    &tile_buf,
+                    &pixel_lut,
+                    &plain_lut,
+                    &fills,
+                    &tints,
+                    TileFormat::Png,
+                )
+                .map_err(|e| anyhow::anyhow!(e))
+                .unwrap();
+                for py in 0..TILE {
+                    for px in 0..TILE {
+                        reference.put_pixel(tx * TILE + px, ty * TILE + py, tile_img[(px, py)]);
+                    }
+                }
+            }
+        }
+        for y in 0..geom.height {
+            for x in 0..geom.width {
+                let i = (y * geom.width + x) as usize;
+                let px = &buf[i * 3..i * 3 + 3];
+                assert_eq!(px, &reference[(x, y)].0, "pixel ({x},{y})");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn diff_leaf_mode_matches_build_tile_plan() {
         let (sources, total) = diff_sources().unwrap();
         // Source isn't Clone; build the same fabricated list twice so the

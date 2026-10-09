@@ -131,7 +131,7 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
     // Collect positional inputs (no stdin fallback here — the byte provider
     // reads stdin when its input list is empty). `--diff` sides are kept as an
     // ordered pair in the neutral `SourceCtx`.
-    let files = collect_input_files(args.files, args.file_list)?;
+    let files = collect_input_files(args.files, args.file_list, std::io::stdin().is_terminal())?;
     // Guard the stdin fallback: with no files, the byte provider reads stdin
     // to EOF, which blocks forever on an interactive terminal (see
     // `check_bare_run_inputs`). Piped/redirected stdin is unaffected.

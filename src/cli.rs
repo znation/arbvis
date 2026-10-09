@@ -394,10 +394,23 @@ pub(crate) fn check_bare_run_inputs(
 pub(crate) fn collect_input_files(
     files: Vec<PathBuf>,
     file_list: Option<PathBuf>,
+    stdin_is_terminal: bool,
 ) -> anyhow::Result<Vec<PathBuf>> {
     let mut out = files;
     if let Some(list_path) = file_list {
         let reader: Box<dyn Read> = if list_path.as_os_str() == "-" {
+            // `-` means "read the list from stdin"; on an interactive terminal
+            // that blocks forever (same hang as the bare-run stdin fallback,
+            // but *inside* this function — the later `check_bare_run_inputs`
+            // guard never gets a chance to fire). Fail with usage guidance
+            // instead; piped/redirected stdin still falls through.
+            if stdin_is_terminal {
+                anyhow::bail!(
+                    "--file-list - reads the file list from stdin, which is a terminal — \
+                     pipe the list on stdin (e.g. `ls *.bin | arbvis --file-list - --out dir`), \
+                     or pass a list file path"
+                );
+            }
             Box::new(io::stdin())
         } else {
             Box::new(
@@ -440,7 +453,7 @@ mod file_list_tests {
         let dir = tempfile::tempdir().unwrap();
         let list = dir.path().join("list.txt");
         std::fs::write(&list, "a.bin\n\n  \nb.bin\n").unwrap();
-        let files = collect_input_files(vec![], Some(list)).unwrap();
+        let files = collect_input_files(vec![], Some(list), false).unwrap();
         assert_eq!(files, vec![PathBuf::from("a.bin"), PathBuf::from("b.bin")]);
     }
 
@@ -449,8 +462,20 @@ mod file_list_tests {
         let dir = tempfile::tempdir().unwrap();
         let list = dir.path().join("list.txt");
         std::fs::write(&list, "\n   \n").unwrap();
-        let err = collect_input_files(vec![], Some(list)).unwrap_err();
+        let err = collect_input_files(vec![], Some(list), false).unwrap_err();
         assert!(err.to_string().contains("contains no paths"), "{err}");
+    }
+
+    #[test]
+    fn file_list_stdin_on_terminal_fails_instead_of_hanging() {
+        let err = collect_input_files(vec![], Some(PathBuf::from("-")), true).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--file-list -"), "{msg}");
+        assert!(msg.contains("terminal"), "{msg}");
+        // Non-terminal stdin (the piped case) must still fall through to the
+        // read — verified in file_list_skips_blank_lines for a file path; here
+        // only the guard itself is asserted, since a unit test cannot safely
+        // block on a real terminal stdin.
     }
 
     #[test]
@@ -488,7 +513,7 @@ mod file_list_tests {
     fn dash_means_stdin_and_no_list_leaves_files_alone() {
         // No --file-list: the list is passed through untouched (stdin fallback
         // happens downstream in prepare_sources, not here).
-        let files = collect_input_files(vec!["x.bin".into()], None).unwrap();
+        let files = collect_input_files(vec!["x.bin".into()], None, false).unwrap();
         assert_eq!(files, vec![PathBuf::from("x.bin")]);
         // `-` reads stdin directly, so it is exercised only in integration use,
         // not in unit tests (reading a live stdin would block the suite).

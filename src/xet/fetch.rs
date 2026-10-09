@@ -250,7 +250,8 @@ mod tests {
     fn v1_response_without_xorbs_field_defaults_to_empty() {
         // V1 responses omit `xorbs`; `#[serde(default)]` must turn that into
         // an empty map rather than a parse error.
-        let json = r#"{"terms": [{"hash": "h", "unpacked_length": 1, "range": {"start": 0, "end": 0}}]}"#;
+        let json =
+            r#"{"terms": [{"hash": "h", "unpacked_length": 1, "range": {"start": 0, "end": 0}}]}"#;
         let resp: ReconstructionResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.terms.len(), 1);
         assert!(resp.xorbs.is_empty());

@@ -1052,29 +1052,26 @@ mod tests {
         std::env::set_var("HF_TOKEN_PATH", &token_file);
         assert_eq!(read_token().as_deref(), Some("hf_abc123"));
 
-        match (prev_disable, prev_token, prev_path, prev_home) {
-            (d, t, p, h) => {
-                if d.is_some() {
-                    std::env::set_var("HF_HUB_DISABLE_IMPLICIT_TOKEN", d.unwrap());
-                } else {
-                    std::env::remove_var("HF_HUB_DISABLE_IMPLICIT_TOKEN");
-                }
-                if t.is_some() {
-                    std::env::set_var("HF_TOKEN", t.unwrap());
-                } else {
-                    std::env::remove_var("HF_TOKEN");
-                }
-                if p.is_some() {
-                    std::env::set_var("HF_TOKEN_PATH", p.unwrap());
-                } else {
-                    std::env::remove_var("HF_TOKEN_PATH");
-                }
-                if h.is_some() {
-                    std::env::set_var("HF_HOME", h.unwrap());
-                } else {
-                    std::env::remove_var("HF_HOME");
-                }
-            }
+        let (d, t, p, h) = (prev_disable, prev_token, prev_path, prev_home);
+        if let Some(v) = d {
+            std::env::set_var("HF_HUB_DISABLE_IMPLICIT_TOKEN", v);
+        } else {
+            std::env::remove_var("HF_HUB_DISABLE_IMPLICIT_TOKEN");
+        }
+        if let Some(v) = t {
+            std::env::set_var("HF_TOKEN", v);
+        } else {
+            std::env::remove_var("HF_TOKEN");
+        }
+        if let Some(v) = p {
+            std::env::set_var("HF_TOKEN_PATH", v);
+        } else {
+            std::env::remove_var("HF_TOKEN_PATH");
+        }
+        if let Some(v) = h {
+            std::env::set_var("HF_HOME", v);
+        } else {
+            std::env::remove_var("HF_HOME");
         }
         let _ = std::fs::remove_dir_all(&home);
     }

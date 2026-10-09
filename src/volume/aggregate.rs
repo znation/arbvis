@@ -8,6 +8,7 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::Context;
+use futures::StreamExt as _;
 use image::Rgb;
 
 use super::{brick, encode, part_path, BuildResult, COARSE_CAP, SLAB_BUDGET_BYTES};
@@ -393,13 +394,17 @@ pub(super) fn aggregate_entities(
     })
 }
 
-/// Fetch an entity's `[byte_start, +byte_len)` span (chunked, on the blocking
-/// pool via `rt.block_on`). Peak transient RAM is the entity's own span.
+/// Fetch an entity's `[byte_start, +byte_len)` span (via `rt.block_on`).
+/// Chunks are issued `FETCH_CONCURRENCY` at a time so remote round-trips
+/// (HTTP range requests, xet CAS GETs, LazyDiff fetches) overlap instead of
+/// serializing one 4 MiB window per network RTT. Peak transient RAM is
+/// `FETCH_CONCURRENCY` in-flight chunks plus the entity's own span.
 pub(super) fn fetch_entity_bytes(
     sources: &[Source],
     ent: &VolumeEntity,
     rt: &tokio::runtime::Handle,
 ) -> anyhow::Result<Vec<u8>> {
+    const FETCH_CONCURRENCY: usize = 8;
     let src = sources.get(ent.source_idx).ok_or_else(|| {
         anyhow::anyhow!(
             "entity source_idx {} out of range ({} sources)",
@@ -408,14 +413,29 @@ pub(super) fn fetch_entity_bytes(
         )
     })?;
     let data = load_source_data(src)?;
+    let data = &data;
     let mut bytes = vec![0u8; ent.byte_len as usize];
-    let mut off = 0u64;
-    while off < ent.byte_len {
-        let len = (ent.byte_len - off).min(CHUNK) as usize;
-        let chunk = rt.block_on(data.fetch_range(ent.byte_start + off, len))?;
-        bytes[off as usize..off as usize + len].copy_from_slice(&chunk);
-        off += len as u64;
-    }
+    rt.block_on(async {
+        let n_chunks = ent.byte_len.div_ceil(CHUNK);
+        let mut chunks = futures::stream::iter((0..n_chunks).map(|c| {
+            let off = c * CHUNK;
+            let len = (ent.byte_len - off).min(CHUNK) as usize;
+            async move { data.fetch_range(ent.byte_start + off, len).await }
+        }))
+        .buffered(FETCH_CONCURRENCY);
+        let mut written = 0u64;
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk?;
+            bytes[written as usize..written as usize + chunk.len()].copy_from_slice(&chunk);
+            written += chunk.len() as u64;
+        }
+        anyhow::ensure!(
+            written == ent.byte_len,
+            "entity span filled {written} of {} bytes",
+            ent.byte_len
+        );
+        anyhow::Ok(())
+    })?;
     Ok(bytes)
 }
 
@@ -706,5 +726,71 @@ mod tests {
 
         assert_eq!(*rec.lock().unwrap(), expected);
         assert_eq!(pipelined.volume_rgba, local.volume_rgba);
+    }
+
+    /// `fetch_entity_bytes` must keep `FETCH_CONCURRENCY` chunk fetches in
+    /// flight (not await one chunk at a time): a `LazyDiff` source whose
+    /// futures count concurrent in-flight calls reports a peak equal to the
+    /// entity's chunk count, and the assembled span matches a plain fill.
+    #[test]
+    fn fetch_entity_bytes_overlaps_chunk_fetches() {
+        use crate::data::{Data, DiffFill, SourceKind};
+        use crate::volume::shape::VoxelBox;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let in_flight = std::sync::Arc::new(AtomicUsize::new(0));
+        let fetcher: crate::data::LazyFetcher = {
+            let peak = std::sync::Arc::clone(&peak);
+            let in_flight = std::sync::Arc::clone(&in_flight);
+            std::sync::Arc::new(move |_start: u64, len: usize| {
+                let peak = std::sync::Arc::clone(&peak);
+                let in_flight = std::sync::Arc::clone(&in_flight);
+                Box::pin(async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    // Yield once so the caller can start the next chunk's
+                    // future before this one completes — otherwise every
+                    // future would run to completion on its first poll and
+                    // even a pipelined caller would measure a peak of 1.
+                    tokio::task::yield_now().await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    Ok(vec![0u8; len])
+                })
+            })
+        };
+        let src = Source {
+            file_idx: 0,
+            kind: SourceKind::OneSidedRange {
+                data: std::sync::Arc::new(Data::LazyDiff(fetcher)),
+                start: 0,
+                fill: DiffFill::Grey,
+            },
+            byte_size: 3 * CHUNK,
+            name_override: None,
+            xet_terms: None,
+            extensions: Default::default(),
+        };
+        let ent = VolumeEntity {
+            source_idx: 0,
+            byte_start: 0,
+            byte_len: 2 * CHUNK + 1000, // 3 chunk windows
+            bbox: VoxelBox {
+                x0: 0,
+                y0: 0,
+                z0: 0,
+                x1: 1,
+                y1: 1,
+                z1: 1,
+            },
+            renderer_id: "bytes",
+            extra: Box::new(()),
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bytes = fetch_entity_bytes(&[src], &ent, rt.handle()).unwrap();
+        assert_eq!(bytes.len(), ent.byte_len as usize);
+        assert!(bytes.iter().all(|&b| b == 0));
+        // All three chunk windows were in flight at once.
+        assert_eq!(peak.load(Ordering::SeqCst), 3);
     }
 }

@@ -617,10 +617,7 @@ mod tests {
         let (sources, total) = prepare_diff_sources(&o, &m, false, &registry)
             .await
             .unwrap();
-        assert!(
-            !sources.is_empty(),
-            "json pair should produce span sources"
-        );
+        assert!(!sources.is_empty(), "json pair should produce span sources");
         assert_eq!(
             total,
             sources.iter().map(|s| s.byte_size).sum::<u64>(),
@@ -634,12 +631,10 @@ mod tests {
             "plain whole-file byte diff must not be emitted for a json pair"
         );
         assert!(
-            sources
-                .iter()
-                .any(|s| matches!(
-                    s.kind,
-                    SourceKind::RangeDiff { .. } | SourceKind::OneSidedRange { .. }
-                )),
+            sources.iter().any(|s| matches!(
+                s.kind,
+                SourceKind::RangeDiff { .. } | SourceKind::OneSidedRange { .. }
+            )),
             "expected structure-aware span sources, got {:?}",
             sources
                 .iter()
@@ -689,9 +684,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sources.len(), 1);
-        assert!(matches!(
-            sources[0].kind,
-            SourceKind::Diff { .. }
-        ));
+        assert!(matches!(sources[0].kind, SourceKind::Diff { .. }));
     }
 }

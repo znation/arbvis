@@ -526,6 +526,26 @@ pub fn render_leaf_tile_diff(
     let first_range = fills.partition_point(|r| r.1 <= tile_pixel_start);
     let first_tint = tints.partition_point(|r| r.1 <= tile_pixel_start);
 
+    // Indexed fast path: derive the palette from the LUTs and the fills
+    // overlapping this tile instead of scanning all 16384 painted pixels
+    // through `encode_indexed_png`'s hash map. `None` means the tile can't
+    // fit a 256-color palette (tints present, or too many fill colors on top
+    // of the LUT palette), so the encode skips the doomed scan and goes
+    // straight to truecolor PNG.
+    let fast = match fmt {
+        TileFormat::IndexedPng => diff_indexed_plan(
+            pixel_lut,
+            fills,
+            first_range,
+            tints,
+            first_tint,
+            tile_pixel_start + TILE_AREA as u64,
+        ),
+        _ => None,
+    };
+    let mut indexed = fast.as_ref().map(|_| vec![0u8; TILE_AREA as usize]);
+    let black_idx = fast.as_ref().map_or(0, |p| p.base.2);
+
     let (swap, cx, cy) = tile_curve_frame(tx % height_tiles, ty, kh);
     let xy_lut = local_curve_to_xy();
     let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
@@ -547,8 +567,8 @@ pub fn render_leaf_tile_diff(
         } else {
             (a ^ cx, b ^ cy)
         };
-        let color = if pixel_idx >= total {
-            Rgb([0u8, 0, 0])
+        let (color, pal_idx) = if pixel_idx >= total {
+            (Rgb([0u8, 0, 0]), black_idx)
         } else {
             while fill_cur < fills.len() && fills[fill_cur].1 <= pixel_idx {
                 fill_cur += 1;
@@ -556,25 +576,127 @@ pub fn render_leaf_tile_diff(
             let byte = tile_buf[curve as usize];
             if fill_cur < fills.len() && fills[fill_cur].0 <= pixel_idx {
                 let (stripe, base_c) = fills[fill_cur].2.colors();
-                if is_crosshatch_stripe(px, py) {
-                    stripe
-                } else {
-                    base_c
-                }
+                let on_stripe = is_crosshatch_stripe(px, py);
+                let pal_idx = fast
+                    .as_ref()
+                    .map(|p| {
+                        let (si, bi) = p.fill_idx[fill_cur - first_range];
+                        if on_stripe {
+                            si
+                        } else {
+                            bi
+                        }
+                    })
+                    .unwrap_or(0);
+                (if on_stripe { stripe } else { base_c }, pal_idx)
             } else {
                 while tint_cur < tints.len() && tints[tint_cur].1 <= pixel_idx {
                     tint_cur += 1;
                 }
                 if tint_cur < tints.len() && tints[tint_cur].0 <= pixel_idx {
-                    blend_with_tint(plain_lut[byte as usize], tints[tint_cur].2)
+                    // Only reachable without an indexed plan: tinted pixels
+                    // blend `plain_lut` colors the plan's palette can't hold.
+                    (
+                        blend_with_tint(plain_lut[byte as usize], tints[tint_cur].2),
+                        0,
+                    )
                 } else {
-                    pixel_lut[byte as usize]
+                    let pal_idx = fast.as_ref().map_or(0, |p| p.base.1[byte as usize]);
+                    (pixel_lut[byte as usize], pal_idx)
                 }
             }
         };
         img.put_pixel(px, py, color);
+        if let Some(idx) = indexed.as_mut() {
+            idx[py as usize * TILE as usize + px as usize] = pal_idx;
+        }
     }
-    encode_tile(img, fmt)
+    match (fast, indexed) {
+        (Some(plan), Some(idx)) => {
+            let bytes = encode_png(TILE, TILE, &idx, Some(&plan.palette_bytes))
+                .map_err(|e| e.to_string())?;
+            Ok((img, bytes))
+        }
+        // Indexed requested but the plan said the palette can't fit: encode
+        // truecolor directly. Same encoder (and bytes) as the generic
+        // `encode_indexed_png → None → truecolor` fallback, minus the wasted
+        // per-pixel hash-map scan.
+        (None, _) if matches!(fmt, TileFormat::IndexedPng) => {
+            let bytes = encode_truecolor_png(&img)?;
+            Ok((img, bytes))
+        }
+        _ => encode_tile(img, fmt),
+    }
+}
+
+/// Precomputed indexed-encoding plan for one diff-mode tile: the memoized
+/// byte-LUT tables (`palette`/`remap`/`black_idx`), the tile's full palette
+/// (LUT colors plus each overlapping fill's stripe/base, flattened to bytes),
+/// and the `(stripe_idx, base_idx)` palette pair per overlapping fill, in
+/// `fills[first_fill..]` order. `None` from [`diff_indexed_plan`] means the
+/// tile's distinct colors cannot fit a 256-entry palette (tints blend up to
+/// 256 `plain_lut` colors per fill, and the diff LUT's own palette is already
+/// 256 distinct colors), so the
+/// caller encodes truecolor directly instead of paying the generic
+/// RGB→palette pixel scan that would fail anyway.
+struct DiffIndexedPlan {
+    base: Arc<IndexedPalette>,
+    palette_bytes: Vec<u8>,
+    fill_idx: Vec<(u8, u8)>,
+}
+
+/// Append `c` to `palette` unless present; `None` when the palette is full.
+fn push_unique_color(palette: &mut Vec<[u8; 3]>, c: Rgb<u8>) -> Option<u8> {
+    if let Some(i) = palette.iter().position(|&p| p == c.0) {
+        return Some(i as u8);
+    }
+    if palette.len() >= 256 {
+        return None;
+    }
+    palette.push(c.0);
+    Some((palette.len() - 1) as u8)
+}
+
+/// Derive the indexed-encoding plan for a diff-mode tile from its LUTs and
+/// the fills/tints overlapping the tile's pixel range (callers pass the
+/// partition-point cursors that skip ranges ending at or before the tile's
+/// start), or `None` when a
+/// 256-color palette cannot hold every color the tile may paint.
+///
+/// Feasibility is decided up front from the overlapping ranges (tints sorted
+/// by start and non-overlapping, like `fills`), never from the pixels: any
+/// overlapping tint disqualifies the tile (blended colors are unbounded), and
+/// each overlapping fill needs room for its stripe and base colors (deduped
+/// against the LUT palette). Bytes beyond `total` paint black, which the
+/// LUT palette already carries via `black_idx`.
+fn diff_indexed_plan(
+    pixel_lut: &[Rgb<u8>; 256],
+    fills: &[(u64, u64, DiffFill)],
+    first_fill: usize,
+    tints: &[(u64, u64, DiffFill)],
+    first_tint: usize,
+    tile_end: u64,
+) -> Option<DiffIndexedPlan> {
+    if first_tint < tints.len() && tints[first_tint].0 < tile_end {
+        return None;
+    }
+    let base = indexed_palette_from_lut_cached(pixel_lut)?;
+    let mut palette = base.0.clone();
+    let mut fill_idx = Vec::new();
+    let mut i = first_fill;
+    while i < fills.len() && fills[i].0 < tile_end {
+        let (stripe, base_c) = fills[i].2.colors();
+        let si = push_unique_color(&mut palette, stripe)?;
+        let bi = push_unique_color(&mut palette, base_c)?;
+        fill_idx.push((si, bi));
+        i += 1;
+    }
+    let palette_bytes = palette.iter().flatten().copied().collect();
+    Some(DiffIndexedPlan {
+        base,
+        palette_bytes,
+        fill_idx,
+    })
 }
 
 /// 50/50 blend of a byte-LUT color with a `DiffFill`'s base crosshatch color.
@@ -1173,5 +1295,162 @@ mod tests {
                 check_tile(tx, ty, kh);
             }
         }
+    }
+
+    /// A diff tile whose colors fit a 256-entry palette must encode as
+    /// indexed PNG via the LUT-derived plan, with palette indices decoding to
+    /// exactly the truecolor render's pixels. Case (a) is an aligned-region
+    /// tile (no fills/tints) under the real diff LUT; case (b) adds one
+    /// fill's stripe/base colors under a synthetic LUT with palette headroom.
+    #[test]
+    fn diff_indexed_png_matches_truecolor_pixels() {
+        let kh = 11u8;
+        let height_tiles = 1u32 << (kh - TILE_LOG2);
+        let square_pixels = 1u64 << (2 * kh);
+        let total = square_pixels * 3 / 4; // tail of tile (0,0) renders black
+        let mut tile_buf = Box::new([0u8; TILE_PIXELS]);
+        for (i, b) in tile_buf.iter_mut().enumerate() {
+            *b = (i * 2654435761 % 256) as u8;
+        }
+        let diff_lut = crate::color::build_diff_signed_lut();
+        let plain_lut = crate::color::build_pixel_lut();
+        let synthetic_lut: [Rgb<u8>; 256] = core::array::from_fn(|i| Rgb([(i / 2) as u8, 0, 0])); // 128 distinct
+        let no_fills: Vec<(u64, u64, DiffFill)> = Vec::new();
+        let no_tints: Vec<(u64, u64, DiffFill)> = Vec::new();
+        let one_fill = vec![(0, square_pixels / 4, DiffFill::Grey)];
+        let cases = [
+            (&diff_lut, &no_fills, "aligned-region tile"),
+            (&synthetic_lut, &one_fill, "one fill under headroom LUT"),
+        ];
+        for (pixel_lut, fills, case) in cases {
+            let (img_tc, bytes_ix) = render_leaf_tile_diff(
+                0,
+                0,
+                kh,
+                height_tiles,
+                square_pixels,
+                total,
+                &tile_buf,
+                pixel_lut,
+                &plain_lut,
+                fills,
+                &no_tints,
+                TileFormat::IndexedPng,
+            )
+            .unwrap();
+            let (img_ref, bytes_tc) = render_leaf_tile_diff(
+                0,
+                0,
+                kh,
+                height_tiles,
+                square_pixels,
+                total,
+                &tile_buf,
+                pixel_lut,
+                &plain_lut,
+                fills,
+                &no_tints,
+                TileFormat::Png,
+            )
+            .unwrap();
+            assert_eq!(img_tc.as_raw(), img_ref.as_raw(), "RGB buffers match");
+
+            let mut decoder = png::Decoder::new(Cursor::new(&bytes_ix[..]));
+            decoder.set_transformations(png::Transformations::IDENTITY);
+            let mut reader = decoder.read_info().unwrap();
+            assert_eq!(reader.info().color_type, png::ColorType::Indexed);
+            let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
+            let _info = reader.next_frame(&mut buf).unwrap();
+            let palette = reader
+                .info()
+                .palette
+                .as_ref()
+                .expect("indexed PNG carries a palette");
+            assert_eq!(buf.len(), img_tc.as_raw().len() / 3);
+            for (i, &idx) in buf.iter().enumerate() {
+                assert!((idx as usize) * 3 + 3 <= palette.len());
+                assert_eq!(
+                    &palette[idx as usize * 3..idx as usize * 3 + 3],
+                    &img_tc.as_raw()[i * 3..i * 3 + 3],
+                    "{case}: pixel {i}"
+                );
+            }
+        }
+    }
+
+    /// A diff tile that cannot fit a 256-color palette (an overlapping tint
+    /// blends up to 256 `plain_lut` colors per fill; the diff LUT's palette
+    /// alone already uses all 256 slots, so any fill color overflows) must
+    /// skip the generic pixel-scan indexed encoder entirely and emit a
+    /// truecolor PNG whose decoded pixels equal the explicit-`Png` render.
+    #[test]
+    fn diff_indexed_falls_back_to_truecolor_without_pixel_scan() {
+        let kh = 11u8;
+        let height_tiles = 1u32 << (kh - TILE_LOG2);
+        let square_pixels = 1u64 << (2 * kh);
+        let total = square_pixels * 3 / 4;
+        let mut tile_buf = Box::new([0u8; TILE_PIXELS]);
+        for (i, b) in tile_buf.iter_mut().enumerate() {
+            *b = (i * 2654435761 % 256) as u8;
+        }
+        let pixel_lut = crate::color::build_diff_signed_lut();
+        let plain_lut = crate::color::build_pixel_lut();
+        let check = |fills: &[(u64, u64, DiffFill)], tints: &[(u64, u64, DiffFill)], case: &str| {
+            let (img_ix, bytes_ix) = render_leaf_tile_diff(
+                0,
+                0,
+                kh,
+                height_tiles,
+                square_pixels,
+                total,
+                &tile_buf,
+                &pixel_lut,
+                &plain_lut,
+                fills,
+                tints,
+                TileFormat::IndexedPng,
+            )
+            .unwrap();
+            let (img_ref, _) = render_leaf_tile_diff(
+                0,
+                0,
+                kh,
+                height_tiles,
+                square_pixels,
+                total,
+                &tile_buf,
+                &pixel_lut,
+                &plain_lut,
+                fills,
+                tints,
+                TileFormat::Png,
+            )
+            .unwrap();
+            assert_eq!(img_ix.as_raw(), img_ref.as_raw(), "{case}: RGB buffers");
+            let mut decoder = png::Decoder::new(Cursor::new(&bytes_ix[..]));
+            decoder.set_transformations(png::Transformations::IDENTITY);
+            let reader = decoder.read_info().unwrap();
+            assert_eq!(
+                reader.info().color_type,
+                png::ColorType::Rgb,
+                "{case}: must be truecolor, not indexed"
+            );
+        };
+        // Tint overlapping tile (0,0): blended colors never fit the budget.
+        check(
+            &[(0, square_pixels / 4, DiffFill::Grey)],
+            &[(0, square_pixels / 2, DiffFill::Green)],
+            "tint overlap",
+        );
+        // One fill: the diff LUT palette already fills all 256 slots, so the
+        // fill's stripe/base colors can never fit.
+        check(
+            &[
+                (0, square_pixels / 8, DiffFill::Grey),
+                (square_pixels / 8, square_pixels / 4, DiffFill::Green),
+            ],
+            &[],
+            "two fills",
+        );
     }
 }

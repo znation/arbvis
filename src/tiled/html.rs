@@ -520,17 +520,24 @@ fn build_html(
         }}
         redraw();
         map.on('zoomend moveend', redraw);
-      }}
-      .catch(function (e) {{
-        // A missing or malformed labels.json must not fail silently: surface
-        // it in the info panel so a hand-edited or truncated bundle is debuggable.
-        console.warn('labels.json failed to load; file labels unavailable', e);
+      }})
+      .catch(function(e) {{
+        // A missing/corrupt labels.json (network blip, partial upload,
+        // non-JSON body) must fail loudly: without this the rejection is
+        // unhandled and the label overlay silently never renders. Surface it
+        // both in the info panel (debuggable bundle) and as a loud banner.
+        console.error('labels.json failed to load; file labels unavailable', e);
         var info = document.getElementById('arbvis-info');
         if (info) {{
           var note = document.createElement('div');
           note.textContent = 'labels.json missing or invalid — file labels unavailable';
           info.appendChild(note);
         }}
+        var warn = document.createElement('div');
+        warn.textContent = 'labels.json failed to load or parse: ' + e;
+        warn.style.cssText = 'position:fixed;bottom:8px;left:8px;z-index:9999;'
+          + 'background:#a00;color:#fff;padding:4px 8px;font:12px sans-serif;';
+        document.body.appendChild(warn);
       }});
   </script>
 </body>
@@ -982,16 +989,23 @@ const TEMPLATE_MULTI: &str = r#"<!DOCTYPE html>
         updateLabels();
         map.on('zoomend moveend', updateLabels);
       })
-      .catch(function (e) {
-        // Same as the single-scene viewer: a missing or malformed labels.json
-        // must not fail silently.
-        console.warn('labels.json failed to load; file labels unavailable', e);
+      .catch(function(e) {
+        // Same loud-failure contract as the single-scene viewer: a missing or
+        // malformed labels.json must show an error, not silently drop the
+        // per-scene label overlays. Surface it in the info panel and as a
+        // loud banner.
+        console.error('labels.json failed to load; file labels unavailable', e);
         var info = document.getElementById('arbvis-info');
         if (info) {
           var note = document.createElement('div');
           note.textContent = 'labels.json missing or invalid — file labels unavailable';
           info.appendChild(note);
         }
+        var warn = document.createElement('div');
+        warn.textContent = 'labels.json failed to load or parse: ' + e;
+        warn.style.cssText = 'position:fixed;bottom:8px;left:8px;z-index:9999;'
+          + 'background:#a00;color:#fff;padding:4px 8px;font:12px sans-serif;';
+        document.body.appendChild(warn);
       });
   </script>
 </body>
@@ -1472,6 +1486,50 @@ mod tests {
     /// An hf:// input string containing `"` must not break out of the href
     /// attribute in the sources panel - the URL is built from the raw input,
     /// so it must be attribute-escaped before interpolation.
+    /// The labels.json fetch chain must end in a `.catch` in both the
+    /// single- and multi-scene viewers: a missing, truncated, or non-JSON
+    /// labels.json otherwise leaves an unhandled promise rejection and the
+    /// label overlays silently never render (no error anywhere).
+    #[test]
+    fn labels_fetch_has_loud_failure_handler() {
+        let branding = Branding::default();
+        let single = build_html(
+            560,
+            64,
+            2,
+            0,
+            64,
+            560,
+            512,
+            "t",
+            &[],
+            "png",
+            "avif",
+            &branding,
+        );
+        let multi = build_html_multi(&[scene("summary", 560, 64)], "t", &[], &branding);
+        for html in [&single, &multi] {
+            let start = html
+                .find("fetch('labels.json')")
+                .expect("labels fetch must be present");
+            let tail = &html[start..];
+            assert!(
+                tail.contains(".catch(function(e) {"),
+                "labels.json fetch chain must end in a .catch: {html}"
+            );
+            assert!(
+                tail.contains("labels.json failed to load or parse"),
+                "the .catch must surface a visible error message: {html}"
+            );
+            // The catch must attach to this chain, not some later script: the
+            // closing </script> must come after the catch block.
+            assert!(
+                tail.find(".catch(function(e) {").unwrap() < tail.find("</script>").unwrap(),
+                "the .catch must be part of the labels.json fetch chain"
+            );
+        }
+    }
+
     #[test]
     fn hf_source_url_is_attribute_escaped() {
         let html = build_info_html(

@@ -31,11 +31,17 @@ use crate::registry::{LayoutBuildCtx, Registry, VolumeShapePlugin};
 /// `0..grid_extent()[a]`). The upper bounds are exclusive.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct VoxelBox {
+    /// Inclusive minimum corner along x.
     pub x0: u32,
+    /// Inclusive minimum corner along y.
     pub y0: u32,
+    /// Inclusive minimum corner along z.
     pub z0: u32,
+    /// Exclusive maximum along x.
     pub x1: u32,
+    /// Exclusive maximum along y.
     pub y1: u32,
+    /// Exclusive maximum along z.
     pub z1: u32,
 }
 
@@ -62,6 +68,7 @@ pub struct VolumeEntity {
     pub source_idx: usize,
     /// Byte offset *within that source* (not the concatenated stream).
     pub byte_start: u64,
+    /// Number of bytes the entity covers (`byte_start .. byte_start + byte_len`).
     pub byte_len: u64,
     /// Target box in the bounded grid.
     pub bbox: VoxelBox,

@@ -8,12 +8,22 @@ use crate::registry::Branding;
 
 /// Metadata for one file entity in the Leaflet viewer.
 pub struct FileEntity {
+    /// Display name shown on the viewer's label.
     pub name: String,
+    /// Label anchor x in canvas pixels (rects centroid; curve midpoint when
+    /// the rects are empty).
     pub pixel_x: u32,
+    /// Label anchor y in canvas pixels (file-rect centroid).
     pub pixel_y: u32,
+    /// Stable label hue derived from the name (`name_hue`, 0..360).
     pub hue: u16,
+    /// Bytes this entity covers in the source stream.
     pub byte_size: u64,
+    /// Bounding box over all the entity's rects, `(x0, y0, x1, y1)` in canvas
+    /// pixels; `(0, 0, 0, 0)` for an entity with no rects.
     pub bbox: (u32, u32, u32, u32),
+    /// Disjoint sub-rects the entity covers (canvas pixels) — a file whose
+    /// Hilbert image is split by its neighbors yields several segments.
     pub segments: Vec<(u32, u32, u32, u32)>,
 }
 
@@ -550,16 +560,27 @@ pub struct SceneView {
     /// `Some(key)` → tiles live under `tiles/<key>/`; `None` → legacy `tiles/`
     /// (only used for the lone implicit default scene).
     pub key: Option<String>,
+    /// Human-readable scene name shown in the viewer's tab / layer switcher.
     pub label: String,
+    /// Tab ordering; the lowest-`order` scene is the default-active layer.
     pub order: u32,
+    /// Leaflet world width at zoom 0.
     pub world_w: u32,
+    /// Leaflet world height at zoom 0 (one `TILE` for the collapsed axis).
     pub world_h: u32,
+    /// Deepest pyramid zoom level the tile grid serves.
     pub max_zoom: u32,
+    /// Extra sparse detail zoom levels past `max_zoom` (0 for Hilbert).
     pub detail_depth: u32,
+    /// Canvas height in pixels (power of two for Hilbert).
     pub height: u32,
+    /// Canvas width in pixels (power of two for Hilbert).
     pub width: u32,
+    /// File extension of the leaf tiles (`leaf_format.extension()`).
     pub leaf_ext: String,
+    /// File extension of the downsampled pyramid tiles.
     pub pyramid_ext: String,
+    /// Overlay entities written to this scene's `labels.json`.
     pub entities: Vec<FileEntity>,
 }
 

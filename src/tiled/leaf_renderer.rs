@@ -53,18 +53,29 @@ impl LeafTile {
 /// All fields are borrows so the call site can build a `LoadCtx` per
 /// `(tx, ty)` inside the worker loop without copying its captured arcs.
 pub struct LoadCtx<'a> {
+    /// Tile x coordinate at the current zoom.
     pub tx: u32,
+    /// Tile y coordinate at the current zoom.
     pub ty: u32,
     /// Pyramid zoom of the current pass. Hilbert ignores; arch uses it to
     /// scale the per-tensor display footprint.
     pub zoom: u32,
+    /// Hilbert order in y (0 for non-Hilbert layouts).
     pub kh: u8,
+    /// Tile-grid height at `max_zoom` (canvas height / `TILE`).
     pub height_tiles: u32,
+    /// Pixel count of one Hilbert square (see `CanvasGeom::square_pixels`).
     pub square_pixels: u64,
+    /// Total pixels the canvas covers (the byte budget).
     pub total: u64,
+    /// Which leaf render is running (plain / diff / xet).
     pub mode: &'a LeafMode,
+    /// The layout that produced the plan.
     pub layout: &'a dyn LayoutShape,
+    /// The run's sources, in canvas order.
     pub source_data: &'a [Data],
+    /// Cumulative byte offset of each source in the concatenated stream
+    /// (same length as `source_data`).
     pub cumulative_offsets: &'a [u64],
 }
 
@@ -74,11 +85,17 @@ pub struct LoadCtx<'a> {
 /// `square_pixels`, `total`); architectural renderers ignore them. Kept as
 /// one shared struct so the trait signature is identical across renderers.
 pub struct RenderCtx<'a> {
+    /// Which leaf render is running (plain / diff / xet).
     pub mode: &'a LeafMode,
+    /// Encoding format the produced tile must use.
     pub fmt: TileFormat,
+    /// Hilbert order in y (0 for non-Hilbert layouts).
     pub kh: u8,
+    /// Tile-grid height at `max_zoom` (canvas height / `TILE`).
     pub height_tiles: u32,
+    /// Pixel count of one Hilbert square (see `CanvasGeom::square_pixels`).
     pub square_pixels: u64,
+    /// Total pixels the canvas covers (the byte budget).
     pub total: u64,
 }
 

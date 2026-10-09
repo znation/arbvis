@@ -108,8 +108,12 @@ pub(crate) struct BuildResult {
     /// structured path streams (the full detail lives in `bricks`, and `volume.bin`
     /// is a small aspect-preserving downsample for the fallback LOD + CPU pick).
     pub(crate) grid_extent: [u32; 3],
+    /// Largest per-voxel byte count; copied into `VolumeMeta::max_count`.
     pub(crate) max_count: u64,
+    /// Camera framing of the occupied region; copied into the meta fields of
+    /// the same names.
     pub(crate) focus_center: [f32; 3],
+    /// Half-extent (world-space radius) of the occupied region.
     pub(crate) focus_radius: f32,
     /// Sparse brick pool built at a higher virtual resolution (byte floor with
     /// `--volume-res`, or the streamed structured path); `None` ⇒ `render_volume`

@@ -83,6 +83,7 @@ pub fn write_tile_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 /// Writes encoded tile bytes to a local filesystem path, creating parent
 /// directories as needed. Used by the local `run_tiles` output path.
 pub struct LocalFileSink {
+    /// Directory tiles are written under (relative tile paths resolve into it).
     pub root: PathBuf,
 }
 

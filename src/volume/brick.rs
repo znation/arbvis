@@ -220,6 +220,7 @@ pub struct BrickVolume {
     /// the fine data is a tiny Hilbert-prefix corner, so coarse framing would
     /// point the camera at empty space. `(origin, 0.5)` for the non-streamed path.
     pub focus_center: [f32; 3],
+    /// World-space radius (half-extent) of that occupied region.
     pub focus_radius: f32,
 }
 

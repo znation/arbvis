@@ -164,7 +164,9 @@ impl TileCoords {
 /// `pub(super)` because the `leaf_renderer` submodule's `LeafRenderer` impls
 /// consume one of these and dispatch to the right `render_one*` function.
 pub struct LoadedTile {
+    /// Tile x coordinate at the current zoom.
     pub tx: u32,
+    /// Tile y coordinate at the current zoom.
     pub ty: u32,
     /// `Some` for the byte-Hilbert loader; a fixed 256 KiB buffer painted
     /// 1 byte → 1 pixel by the byte-LUT renderer.
@@ -179,9 +181,13 @@ pub struct LoadedTile {
 /// A fully rendered leaf tile: its pyramid coordinates, decoded RGB pixels,
 /// and the encoded PNG bytes handed to the tile sink.
 pub struct EncodedTile {
+    /// Tile x coordinate at the current zoom.
     pub tx: u32,
+    /// Tile y coordinate at the current zoom.
     pub ty: u32,
+    /// Decoded RGB pixels of the tile.
     pub image: image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+    /// Encoded tile bytes handed to the sink.
     pub bytes: Vec<u8>,
 }
 

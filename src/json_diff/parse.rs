@@ -27,9 +27,13 @@ pub enum NodeKind {
 /// so [`Node::range`] locates the value's full span for diff alignment.
 #[derive(Debug)]
 pub struct Node {
+    /// Which JSON value kind this node wraps.
     pub kind: NodeKind,
+    /// Inclusive start offset of the value's source text.
     pub byte_start: u64,
+    /// Exclusive end offset of the value's source text.
     pub byte_end: u64,
+    /// Object members / array elements in source order (empty for scalars).
     pub children: Vec<Child>,
 }
 
@@ -64,8 +68,11 @@ pub enum Child {
 /// value, with all spans referring to the original source bytes.
 #[derive(Debug)]
 pub struct Document {
+    /// Whitespace (and comments, for JSONC) before the root value.
     pub leading_ws: Range<u64>,
+    /// The document's root value.
     pub root: Node,
+    /// Whitespace after the root value.
     pub trailing_ws: Range<u64>,
 }
 
@@ -73,7 +80,9 @@ pub struct Document {
 /// human-readable message.
 #[derive(Debug)]
 pub struct ParseError {
+    /// Byte offset where the failure was detected.
     pub byte_offset: u64,
+    /// Human-readable description of the failure.
     pub msg: String,
 }
 

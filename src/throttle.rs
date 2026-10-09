@@ -84,11 +84,17 @@ pub struct Throttle {
 /// perf monitor.
 #[derive(Clone, Copy, Debug)]
 pub struct ThrottleStats {
+    /// Requests currently executing under the throttle.
     pub in_flight: usize,
+    /// Current AIMD concurrency limit.
     pub active_limit: usize,
+    /// Peak `active_limit` reached this run.
     pub max_workers: usize,
+    /// Tasks currently sleeping in a retry backoff.
     pub in_backoff: usize,
+    /// Cumulative 429 rate-limit responses seen.
     pub total_rate_limits: u64,
+    /// Cumulative request timeouts seen.
     pub total_timeouts: u64,
 }
 

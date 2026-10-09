@@ -24,23 +24,30 @@ pub struct VoxelAcc {
 /// renderer.
 #[derive(Serialize)]
 pub struct VolumeMeta {
+    /// Viewer page title, echoed from the run.
     pub title: String,
+    /// Branding tool name ([`crate::registry::Branding::name`]) shown in the
+    /// viewer's attribution.
     pub brand_name: String,
+    /// Branded repo URL for the viewer's attribution link.
     pub repo_url: String,
     /// Grid box `[x, y, z]` in voxels; `volume.bin` holds `x*y*z` RGBA8 texels
     /// in x-fastest, then y, then z order. The byte path emits a cube (equal
     /// power-of-two sides); a structured path may emit an anisotropic box.
     pub grid_extent: [u32; 3],
+    /// Total bytes across all rendered sources.
     pub total_bytes: u64,
     /// Largest per-voxel byte count, used to normalize the "fill density"
     /// opacity channel back to a count on the client if desired.
     pub max_count: u64,
+    /// `true` ⇒ diff coloring (the signed-delta byte LUT).
     pub diff_mode: bool,
     /// How the viewer colors voxels: `"lut"` (byte path — R indexes the
     /// shader LUT below) or `"rgb"` (structured path — RGB is baked final
     /// color, A is the opacity/occupancy weight). Absent in pre-seam bundles;
     /// the viewer defaults to `"lut"`.
     pub color_mode: String,
+    /// Input paths echoed to the viewer for provenance.
     pub inputs: Vec<String>,
     /// Center of the occupied region in viewer world space (the box is centered
     /// at the origin; its longest axis spans `[-0.5, 0.5]`), so the viewer can

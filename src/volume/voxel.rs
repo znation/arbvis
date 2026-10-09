@@ -24,9 +24,13 @@ use super::shape::VolumeEntity;
 /// empty voxel and is never rendered.
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct VoxelCell {
+    /// Red channel (baked color in `"rgb"` mode; unused in `"lut"` mode).
     pub r: u8,
+    /// Green channel.
     pub g: u8,
+    /// Blue channel.
     pub b: u8,
+    /// Opacity / occupancy weight; `0` marks an empty (never rendered) voxel.
     pub a: u8,
 }
 
@@ -93,12 +97,15 @@ impl<'a> VoxelGridMut<'a> {
 /// What a [`VoxelRenderer::render`] call gets: one entity, its (already-fetched)
 /// byte span, the grid box dimensions, and the diff-mode flag.
 pub struct VoxelRenderCtx<'a> {
+    /// The entity being rendered (its `bbox` is the box to fill; `extra` is
+    /// the opaque payload the renderer downcasts).
     pub entity: &'a VolumeEntity,
     /// The entity's bytes — `[byte_start, byte_start + byte_len)` of its source,
     /// fetched by arbvis before dispatch. The renderer decodes/samples within.
     pub bytes: &'a [u8],
     /// The full grid box `[x, y, z]` the entity's `bbox` lives inside.
     pub extent: [u32; 3],
+    /// `true` ⇒ this is a diff run (renderers pick their diff coloring).
     pub diff_mode: bool,
 }
 

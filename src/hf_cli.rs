@@ -50,14 +50,19 @@ const STDERR_CAPTURE_LIMIT: usize = 4 * 1024;
 /// `xet_hash` / `lfs`. Unknown fields are ignored by serde's default.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HfTreeEntry {
+    /// Path relative to the repo root.
     pub path: String,
+    /// Serialized file size in bytes, omitted by the API for directories.
     #[serde(default)]
     pub size: Option<u64>,
     #[serde(default)]
+    /// Git blob SHA-256 of the file, when the API reports it.
     pub blob_id: Option<String>,
     #[serde(default)]
+    /// Xet chunk hash backing the file, when storage is xet-backed.
     pub xet_hash: Option<String>,
     #[serde(default)]
+    /// Present when the file is stored via LFS or xet (see [`HfTreeLfs`]).
     pub lfs: Option<HfTreeLfs>,
 }
 
@@ -74,10 +79,13 @@ impl HfTreeEntry {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HfTreeLfs {
     #[serde(default)]
+    /// SHA-256 of the LFS object contents.
     pub sha256: Option<String>,
     #[serde(default)]
+    /// Size of the stored object in bytes.
     pub size: Option<u64>,
     #[serde(default)]
+    /// Size of the LFS pointer file itself, when applicable.
     pub pointer_size: Option<u64>,
 }
 

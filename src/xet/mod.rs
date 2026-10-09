@@ -88,8 +88,11 @@ static CAS_BYTES: AtomicU64 = AtomicU64::new(0);
 /// statics above), for the perf monitor.
 #[derive(Clone, Copy, Debug)]
 pub struct CasStats {
+    /// CAS requests currently executing.
     pub in_flight: usize,
+    /// Cumulative CAS requests completed.
     pub completed: u64,
+    /// Cumulative CAS bytes fetched.
     pub bytes: u64,
 }
 
@@ -109,8 +112,12 @@ pub fn cas_stats() -> CasStats {
 /// `xorb_hash` is the hex Merkle hash of the xorb the bytes came from.
 #[derive(Clone, Debug)]
 pub struct XetTerm {
+    /// Offset of these bytes in the reconstructed file (cumulative sum of
+    /// the preceding terms' `byte_len`s).
     pub file_offset: u64,
+    /// Length of this term's span in bytes.
     pub byte_len: u64,
+    /// Hex Merkle hash of the xorb these bytes come from.
     pub xorb_hash: String,
 }
 
@@ -163,6 +170,8 @@ pub const TABLEAU_20: [[u8; 3]; 20] = [
 /// source's local file offsets by its cumulative offset in the concatenated
 /// stream. Sorted by `start`, no overlaps.
 pub struct XorbMap {
+    /// Per byte range in the concatenated stream: `(start, end, palette
+    /// index)`. Sorted by `start`, non-overlapping.
     pub global_ranges: Vec<(u64, u64, u8)>,
 }
 

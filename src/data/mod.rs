@@ -360,8 +360,12 @@ pub struct SceneTag {
 
 /// Metadata and storage descriptor for one input.
 pub struct Source {
+    /// Index into the run's file list; `SourceKind::File` resolves relative to
+    /// it.
     pub file_idx: usize,
+    /// How this source's bytes are stored (buffered, on disk, diff, …).
     pub kind: SourceKind,
+    /// Byte count this source occupies on the canvas.
     pub byte_size: u64,
     /// Override the display name (used when kind is Buffered but has a real filename).
     pub name_override: Option<String>,

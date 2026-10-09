@@ -915,6 +915,8 @@ pub fn web_url(raw: &str) -> Option<String> {
     ))
 }
 
+/// True iff `s` is an `hf://` Hub URL (used to route local paths and Hub URLs
+/// to different fetch paths).
 pub fn is_hf_url(s: &str) -> bool {
     s.starts_with("hf://")
 }

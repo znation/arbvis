@@ -6,8 +6,13 @@ use rustc_hash::FxHashMap;
 
 use crate::data::{Data, DiffFill};
 
+/// Edge length in pixels of one leaf tile (so a tile covers `TILE²` bytes in
+/// plain mode). Every tile pyramid geometry derives from this constant.
 pub const TILE: u32 = 512;
+/// `log2(TILE)` — the curve order of one tile's Hilbert frame.
 pub const TILE_LOG2: u8 = TILE.trailing_zeros() as u8;
+/// Bytes covered by one leaf tile (`TILE²`); the size of a plain-mode
+/// `tile_buf`.
 pub const TILE_PIXELS: usize = (TILE as usize) * (TILE as usize);
 const TILE_AREA: u64 = TILE_PIXELS as u64;
 
@@ -290,6 +295,11 @@ fn tile_local_curve_idx(frame: (bool, u32, u32), px: u32, py: u32) -> u64 {
     local_curve_lut()[((b << TILE_LOG2) | a) as usize] as u64
 }
 
+/// Render one plain-mode leaf tile from a pre-loaded `tile_buf` of
+/// `TILE_PIXELS` curve-ordered bytes, mapping each byte through `pixel_lut`
+/// and encoding to `fmt`. Bytes beyond `total` (the final partial tile) render
+/// black. This is the bytes-per-pixel counterpart of
+/// [`render_leaf_tile_xet_from_buf`].
 pub fn render_leaf_tile_from_buf(
     tx: u32,
     ty: u32,

@@ -1,10 +1,11 @@
 use fast_hilbert::h2xy;
 use std::collections::HashMap;
 
-// Hilbert sub-quadrant state table.
-// CHILD_TABLE[state][i] = (dx, dy, child_state) where (dx,dy) ∈ {0,1}²
-// give the child quadrant's position within the parent (units of child_side).
-// Derived from fast_hilbert's order-1 LUT.
+/// Hilbert sub-quadrant state table.
+///
+/// `CHILD_TABLE[state][i] = (dx, dy, child_state)` where `(dx,dy) ∈ {0,1}²`
+/// give the child quadrant's position within the parent (units of child_side).
+/// Derived from fast_hilbert's order-1 LUT.
 pub const CHILD_TABLE: [[(u32, u32, u8); 4]; 4] = [
     [(0, 0, 1), (0, 1, 0), (1, 1, 0), (1, 0, 2)], // state 0
     [(0, 0, 0), (1, 0, 1), (1, 1, 1), (0, 1, 3)], // state 1

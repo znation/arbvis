@@ -996,7 +996,20 @@ mod tests {
     /// through the `escHtml` helper rather than interpolate the raw name.
     #[test]
     fn entity_labels_are_html_escaped_in_both_viewers() {
-        let html = build_html(256, 256, 2, 0, 256, 256, 256, "t", &[], "png", "avif", &Branding::default());
+        let html = build_html(
+            256,
+            256,
+            2,
+            0,
+            256,
+            256,
+            256,
+            "t",
+            &[],
+            "png",
+            "avif",
+            &Branding::default(),
+        );
         assert!(
             html.contains("var escHtml = function"),
             "single-scene viewer must define the escHtml helper"

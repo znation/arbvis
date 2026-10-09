@@ -131,6 +131,9 @@ pub async fn reconstruction_for(spec: &RemoteFileSpec) -> anyhow::Result<Vec<Xet
     fetch_reconstruction_terms(&cas, hash).await
 }
 
+/// The 20-color Tableau palette used for xet-mode coloring: hue = xorb ID
+/// (color index comes from `xorb_color_idx` in `crate::tiled::leaf`),
+/// intensity = byte value, so each xorb's byte range tints its slice of the file.
 pub const TABLEAU_20: [[u8; 3]; 20] = [
     [0x4c, 0x78, 0xa8], // blue
     [0xf5, 0x8a, 0x3b], // orange

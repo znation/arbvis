@@ -18,6 +18,8 @@ use crate::progress::{counter_style, multi};
 
 use super::{Data, Extensions, Source, SourceKind};
 
+/// Recursively collect the files under `root` as sorted, full `PathBuf`s.
+/// Unreadable directories are logged and skipped.
 pub fn collect_files_recursive(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     collect_recursive(root, &mut files);

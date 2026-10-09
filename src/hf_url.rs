@@ -268,7 +268,18 @@ pub fn parse(raw: &str) -> anyhow::Result<HfUrl> {
 
     let repo_id = format!("{owner}/{repo_name}");
     let path_in_repo = if segs.len() >= 3 {
-        segs[2..].join("/")
+        let path = segs[2..].join("/");
+        // Reject `.`/`..` path segments: this path is later joined onto local
+        // roots (e.g. the bucket-cache tempdir in `resolve_bucket`), and a
+        // traversal segment would let a hostile URL escape that directory.
+        // `.` and `..` are never meaningful in an HF repo path, so parsing
+        // rejects them outright rather than hoping every join site checks.
+        if segs[2..].iter().any(|seg| *seg == "." || *seg == "..") {
+            anyhow::bail!(
+                "hf:// URL path segment `.` or `..` is not allowed: {raw:?}"
+            );
+        }
+        path
     } else {
         String::new()
     };
@@ -864,6 +875,22 @@ mod tests {
         assert_eq!(p("hf://datasets/a/b").unwrap().kind, RepoKind::Dataset);
         assert_eq!(p("hf://spaces/a/b").unwrap().kind, RepoKind::Space);
         assert_eq!(p("hf://buckets/a/b").unwrap().kind, RepoKind::Bucket);
+    }
+
+    #[test]
+    fn parse_rejects_traversal_segments() {
+        // `..` in the path would escape local roots when the path is joined
+        // onto a download directory (e.g. resolve_bucket's tempdir).
+        for url in [
+            "hf://buckets/alice/repo/../../../etc/passwd",
+            "hf://alice/repo/../secret",
+            "hf://alice/repo/a/./b",
+            "hf://alice/repo/..",
+        ] {
+            assert!(p(url).is_err(), "expected rejection of {url}");
+        }
+        // A segment merely containing dots is fine.
+        assert_eq!(p("hf://alice/repo/file.model.bin").unwrap().path_in_repo, "file.model.bin");
     }
 
     #[test]

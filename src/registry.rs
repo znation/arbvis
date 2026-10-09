@@ -319,3 +319,83 @@ impl Registry {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_defaults_installs_all_byte_builtins() {
+        let reg = Registry::with_defaults();
+        assert_eq!(
+            reg.layouts.iter().map(|p| p.id()).collect::<Vec<_>>(),
+            vec!["hilbert-bytes"]
+        );
+        assert_eq!(
+            reg.volume_shapes.iter().map(|p| p.id()).collect::<Vec<_>>(),
+            vec!["hilbert-bytes"]
+        );
+        assert_eq!(
+            reg.diffs.iter().map(|p| p.id()).collect::<Vec<_>>(),
+            vec!["json", "plain-bytes"]
+        );
+        assert_eq!(
+            reg.providers.iter().map(|p| p.id()).collect::<Vec<_>>(),
+            vec!["byte-diff", "normal-bytes"]
+        );
+        assert!(reg.formats.is_empty());
+        assert!(reg.prepare_sources_extension.is_none());
+    }
+
+    #[test]
+    fn with_defaults_provider_floor_guarantees_selection() {
+        // The floor provider (NormalBytesProvider at i32::MIN) must always be
+        // applicable so the provider iteration in `run` always terminates.
+        let reg = Registry::with_defaults();
+        let empty: Vec<PathBuf> = Vec::new();
+        let ctx = SourceCtx {
+            inputs: &empty,
+            diff: None,
+            dest_kind: DestKind::Bundle,
+            three_d: false,
+            stream: false,
+            show_xet_xorbs: false,
+            registry: &reg,
+        };
+        // By descending priority, the diff provider comes first but only
+        // applies when `--diff` is set; the floor takes over otherwise.
+        assert_eq!(reg.providers[0].priority(), 100);
+        assert_eq!(reg.providers[1].priority(), i32::MIN);
+        assert!(!reg.providers[0].applicable(&ctx));
+        assert!(reg.providers[1].applicable(&ctx));
+    }
+
+    #[test]
+    fn with_defaults_wires_default_leaf_and_voxel_renderers() {
+        let reg = Registry::with_defaults();
+        assert_eq!(reg.leaf.loader("hilbert-bytes").unwrap().id(), "hilbert-bytes");
+        assert_eq!(
+            reg.leaf.renderer("hilbert-bytes").unwrap().id(),
+            "hilbert-bytes"
+        );
+        // No built-in voxel renderer: the byte floor colors in-shader via the LUT.
+        assert!(reg.voxel.renderer("anything").is_none());
+    }
+
+    #[test]
+    fn with_defaults_run_flags_default_to_auto_lenient() {
+        let reg = Registry::with_defaults();
+        assert_eq!(reg.layout_mode, LayoutMode::Auto);
+        assert!(!reg.strict_layout);
+    }
+
+    #[test]
+    fn branding_default_is_arbvis_identity() {
+        let b = Branding::default();
+        assert_eq!(b.name, "arbvis");
+        assert_eq!(b.repo_url, "https://github.com/znation/arbvis");
+        let custom = Branding::new("mwv", "https://example.com/mwv");
+        assert_eq!(custom.name, "mwv");
+        assert_eq!(custom.repo_url, "https://example.com/mwv");
+    }
+}

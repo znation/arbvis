@@ -406,7 +406,6 @@ mod data_fetch_tests {
 #[cfg(test)]
 mod source_name_tests {
     use super::{Extensions, Source, SourceKind};
-    use std::path::PathBuf;
 
     fn source(kind: SourceKind) -> Source {
         Source {

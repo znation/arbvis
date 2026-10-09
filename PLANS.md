@@ -5,7 +5,25 @@ Each plan: goal, approach, files touched, acceptance criteria. Move finished pla
 
 ## Planned
 
-_None yet._
+### Xet-mode single-image PNG export (`--png FILE` with `--show-xet-xorbs`) — _Plan written 2026-10-09._
+
+**Goal:** let `arbvis --show-xet-xorbs <hf-file> --png out.png` write the xorb-colored render as one PNG — the last remaining `--png` conflict (diff-mode PNG already shipped; `--3d`/`--space`/`--regen-html` conflicts stay, since PNG is a 2D single-image export).
+
+**Approach:**
+- `src/cli.rs`: remove `"show_xet_xorbs"` from the `--png` `conflicts_with_all` list (~line 162) and from the `png_conflicts_with_3d_space_regen_and_xorbs` test's flag list (`mod png_flag_tests` ~line 608) — the test then asserts `--png` still conflicts with `--3d`, `--space`, `--regen-html` and composes with `--show-xet-xorbs`. Update the `--png` help text (the `///` doc on the field) to mention xorb mode.
+- `src/tiled/mod.rs`: factor the XorbMap construction out of `build_tile_plan` (the `let xorb_map = if show_xet_xorbs { XorbMap::build(...) }` block around lines 386–394) into `pub(super) fn xet_xorb_ranges(sources: &[Source], cumulative_offsets: &[u64]) -> XorbMap` — same shape as the existing `diff_leaf_mode` helper. `build_tile_plan` calls it; the new renderer calls it too. Note the Tableau palette for the renderer is already module-level (`TABLEAU_20` → `tableau` at ~line 401); expose or reuse it rather than duplicating.
+- `src/tiled/single.rs`: add `pub async fn render_single_xet_png(sources: &[Source], total: u64, out: &Path) -> anyhow::Result<()>`, mirroring `render_single_diff_png` (same `single_geometry` + `open_sources` + `load_tile_bytes` tile loop + `blit_tile` + `encode_rgb_png` + tmp-then-rename) but rendering each tile with `leaf::render_leaf_tile_xet_from_buf(tx, ty, geom.kh, height_tiles, geom.square_pixels, total, &tile_buf, &pixel_lut, &xorb_ranges, &tableau, TileFormat::Png)` (`src/tiled/leaf.rs` ~line 554). `pixel_lut` is `color::build_pixel_lut()` — check the exact name via the `render_single_png`/diff-path imports. Output is truecolor RGB (xet scales Tableau colors per byte, so no 256-entry palette) → `encode_rgb_png`, not the indexed encoder.
+- `src/pipeline.rs`: in the `--png` routing block (~lines 193–208), add a branch ahead of the plain branch: when `hints.show_xet_xorbs`, call `render_single_xet_png`. If the built `XorbMap` is empty (no source had xet terms — e.g. a local file), log the same kind of warning the `--3d` path already emits (~line 82) and fall back to `render_single_png`. Sources' `xet_terms` are already populated before this point: `chosen.prepare(&ctx)` (which calls `data::populate_xet_terms`, `src/providers.rs` ~line 172) runs before the PNG routing.
+
+**Files touched:** `src/cli.rs`, `src/pipeline.rs`, `src/tiled/mod.rs` (helper extraction only), `src/tiled/single.rs`. No new module, no new dependency.
+
+**Acceptance criteria:**
+- `cargo test` passes, including a new test in `src/tiled/single.rs`'s `#[cfg(test)]` module: render an xet PNG for fabricated sources with synthetic `xet_terms` (the `XorbMap::build` tests in `src/xet/mod.rs` ~line 929 show the term-fabrication pattern), decode it with the `png` crate, and assert sampled pixels match the Tableau-scaled colors computed directly from `render_leaf_tile_xet_from_buf`'s per-tile output blitted at `(tx*TILE, ty*TILE)`.
+- The extraction of `xet_xorb_ranges` keeps `build_tile_plan`'s existing tests green unmodified (same guard style as the diff refactor).
+- A `src/cli.rs` test asserts `--png` + `--show-xet-xorbs` parses without conflict and `--png` still conflicts with `--3d`, `--space`, `--regen-html`.
+- Manual check documented in the run summary: `arbvis <local file> --show-xet-xorbs --png out.png` warns and writes the plain indexed PNG; a remote hf source with xet terms writes a valid truecolor PNG (or, if remote fetch is impractical in the run, note that and rely on the fabricated-terms test).
+
+**Sizing:** ~150–200 lines across four existing files plus tests — one run. With this landed, `--png` conflicts shrink to `--3d`, `--space`, `--regen-html`.
 
 ## Done
 

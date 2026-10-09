@@ -483,7 +483,7 @@ fn build_html(
           activeOverlays.addLayer(L.marker([lat, lng], {{
             icon: L.divIcon({{
               className: 'file-label',
-              html: l.name,
+              html: escHtml(l.name),
               iconSize: [tw, th],
               iconAnchor: [pt.x - lx, pt.y - ly]
             }}),
@@ -493,6 +493,14 @@ fn build_html(
       }}
     }}
 
+    // Entity names come from the visualized files (e.g. filenames listed in a
+    // hostile Hub repo) and Leaflet's divIcon injects its `html:` value as
+    // innerHTML — escape every name before it reaches one.
+    var escHtml = function (s) {{
+      return String(s).replace(/[&<>"']/g, function (c) {{
+        return {{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }}[c];
+      }});
+    }};
     fetch('labels.json')
       .then(function(r) {{ return r.json(); }})
       .then(function(data) {{
@@ -870,7 +878,7 @@ const TEMPLATE_MULTI: &str = r#"<!DOCTYPE html>
           activeOverlays.addLayer(L.marker([lat, lng], {
             icon: L.divIcon({
               className: 'file-label',
-              html: l.name,
+              html: escHtml(l.name),
               iconSize: [tw, th],
               iconAnchor: [pt.x - lx, pt.y - ly]
             }),
@@ -891,6 +899,14 @@ const TEMPLATE_MULTI: &str = r#"<!DOCTYPE html>
       updateLabels();
     });
 
+    // Entity names come from the visualized files (e.g. filenames listed in a
+    // hostile Hub repo) and Leaflet's divIcon injects its `html:` value as
+    // innerHTML — escape every name before it reaches one.
+    var escHtml = function (s) {
+      return String(s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+      });
+    };
     fetch('labels.json')
       .then(function(r) { return r.json(); })
       .then(function(data) {
@@ -971,6 +987,42 @@ mod tests {
         assert!(
             html.contains("image-rendering: pixelated"),
             "leaf tiles must upscale crisply past max_zoom",
+        );
+    }
+
+    /// Entity names derive from the visualized files' filenames (repo-fetched
+    /// names for `hf://` inputs) and Leaflet's divIcon injects its `html:`
+    /// value as innerHTML — so the emitted viewer must route every label
+    /// through the `escHtml` helper rather than interpolate the raw name.
+    #[test]
+    fn entity_labels_are_html_escaped_in_both_viewers() {
+        let html = build_html(256, 256, 2, 0, 256, 256, 256, "t", &[], "png", "avif", &Branding::default());
+        assert!(
+            html.contains("var escHtml = function"),
+            "single-scene viewer must define the escHtml helper"
+        );
+        assert!(
+            html.contains("html: escHtml(l.name)"),
+            "single-scene viewer must escape entity names before divIcon html"
+        );
+        assert!(
+            !html.contains("html: l.name"),
+            "no raw entity-name interpolation may remain in the single-scene viewer"
+        );
+
+        let scenes = [scene("s", 256, 256)];
+        let multi = build_html_multi(&scenes, "t", &[], &Branding::default());
+        assert!(
+            multi.contains("var escHtml = function"),
+            "multi-scene viewer must define the escHtml helper"
+        );
+        assert!(
+            multi.contains("html: escHtml(l.name)"),
+            "multi-scene viewer must escape entity names before divIcon html"
+        );
+        assert!(
+            !multi.contains("html: l.name"),
+            "no raw entity-name interpolation may remain in the multi-scene viewer"
         );
     }
 

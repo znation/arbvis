@@ -154,11 +154,7 @@ fn entities_to_json(entities: &[FileEntity]) -> String {
     let entries: Vec<String> = entities
         .iter()
         .map(|e| {
-            let escaped = e
-                .name
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"")
-                .replace("</", "<\\/");
+            let escaped = json_escape_body(&e.name);
             let segs: Vec<String> = e
                 .segments
                 .iter()
@@ -584,17 +580,39 @@ pub struct SceneView {
     pub entities: Vec<FileEntity>,
 }
 
-/// Quote + escape a string for embedding in JSON / JS source. Neutralizes
-/// `</` so a hostile value like `</script>` cannot prematurely close an
-/// inline `<script>` block (same treatment as the 3D viewer's config JSON);
-/// `<\/` is a valid JSON/JS escape for `/`.
 fn json_str(s: &str) -> String {
-    format!(
-        "\"{}\"",
-        s.replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace("</", "<\\/")
-    )
+    format!("\"{}\"", json_escape_body(s))
+}
+
+/// Escape a string body for embedding in JSON / JS source. Neutralizes `</`
+/// so a hostile value like `</script>` cannot prematurely close an inline
+/// `<script>` block (same treatment as the 3D viewer's config JSON; `<\/` is
+/// a valid JSON/JS escape for `/`), and `\u00XX`-escapes every control
+/// character, which JSON forbids raw inside strings — a raw byte like
+/// U+000B from a hostile labels.json key would otherwise make the emitted
+/// labels.json invalid and the viewer's inline script a SyntaxError.
+fn json_escape_body(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '<' if chars.peek() == Some(&'/') => {
+                out.push_str("<\\/");
+                chars.next();
+            }
+            c if (c as u32) < 0x20 => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let v = c as u32;
+                out.push_str("\\u00");
+                out.push(HEX[((v >> 4) & 0xf) as usize] as char);
+                out.push(HEX[(v & 0xf) as usize] as char);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Scene-keyed labels JSON:
@@ -988,7 +1006,7 @@ pub fn generate_leaflet_content_multi(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_html, build_html_multi, build_info_html, build_labels_json_scenes, json_str,
+        build_html, build_html_multi, build_info_html, build_labels_json, build_labels_json_scenes, json_str,
         scene_fields, scenes_js_literal, Branding, FileEntity, SceneView,
     };
     fn scene(key: &str, world_w: u32, world_h: u32) -> SceneView {
@@ -1340,6 +1358,60 @@ mod tests {
             html.contains("<\\/script>"),
             "`</` must be neutralized to `<\\/`: {html}"
         );
+    }
+
+    /// A scene key containing a raw control character (JSON forbids bytes
+    /// U+0000–U+001F inside strings) must be \u00XX-escaped so the emitted
+    /// labels.json stays valid JSON and the inline `var SCENES = …` script
+    /// still parses. Such keys can come from a hostile labels.json via regen.
+    #[test]
+    fn hostile_scene_key_control_chars_are_escaped() {
+        let evil = "a\u{000b}b\u{0001}c";
+        let html = build_html_multi(
+            &[SceneView {
+                key: Some(evil.to_string()),
+                label: evil.to_string(),
+                order: 0,
+                world_w: 560,
+                world_h: 64,
+                max_zoom: 2,
+                detail_depth: 0,
+                height: 64,
+                width: 560,
+                leaf_ext: "png".to_string(),
+                pyramid_ext: "avif".to_string(),
+                entities: Vec::new(),
+            }],
+            "t",
+            &[],
+            &Branding::default(),
+        );
+        assert!(
+            html.contains("\\u000b"),
+            "control char must be \\u00XX-escaped in the script literal: {html}"
+        );
+        assert!(
+            !html.chars().any(|c| c == '\u{000b}' || c == '\u{0001}'),
+            "no raw control character may survive into the HTML: {html}"
+        );
+    }
+
+    /// The labels.json produced from hostile entity names must itself parse
+    /// as JSON even when names carry control characters.
+    #[test]
+    fn labels_json_with_control_chars_is_valid_json() {
+        let entities = vec![FileEntity {
+            name: "x\u{0002}y\u{001f}z".to_string(),
+            pixel_x: 1,
+            pixel_y: 2,
+            hue: 180,
+            byte_size: 3,
+            bbox: (0, 0, 1, 1),
+            segments: Vec::new(),
+        }];
+        let json = build_labels_json(&entities, 2, 0);
+        serde_json::from_str::<serde_json::Value>(&json)
+            .expect("labels.json with control-char names must be valid JSON");
     }
 
     /// An hf:// input string containing `"` must not break out of the href

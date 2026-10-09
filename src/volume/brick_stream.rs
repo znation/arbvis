@@ -28,6 +28,25 @@ use crate::geometry::{hilbert3d_node_origin, hilbert_d2xyz};
 /// `apron` is `0` (nearest filtering): the flat block layout can't carry
 /// neighbour borders. Framing uses the occupied-brick bbox via
 /// [`super::box_focus`].
+
+/// Fold one occupied brick at voxel-space `origin` (side `brick`) into the
+/// occupied-region framing stats shared by [`StreamBrickAgg`] and
+/// [`BrickBuilder`]: a running bbox min/max plus a centroid sum that weights
+/// each brick at its voxel-space center (`origin + brick/2`).
+fn track_occupied_brick(
+    origin: [u32; 3],
+    brick: u32,
+    fmin: &mut [u32; 3],
+    fmax: &mut [u32; 3],
+    fsum: &mut [f64; 3],
+) {
+    for a in 0..3 {
+        fmin[a] = fmin[a].min(origin[a]);
+        fmax[a] = fmax[a].max(origin[a] + brick - 1);
+        fsum[a] += (origin[a] + brick / 2) as f64;
+    }
+}
+
 pub struct StreamBrickAgg {
     extent: [u32; 3],
     brick: u32,
@@ -118,12 +137,13 @@ impl StreamBrickAgg {
                     self.octree.insert([bx, by, bz], self.occupied);
                     writer.write_all(&scratch)?;
                     // Track the occupied region in voxels (brick origin → +brick-1).
-                    let origin = [bx * brick, by * brick, bz * brick];
-                    for (a, &o) in origin.iter().enumerate() {
-                        self.fmin[a] = self.fmin[a].min(o);
-                        self.fmax[a] = self.fmax[a].max(o + brick - 1);
-                        self.fsum[a] += (o + brick / 2) as f64;
-                    }
+                    track_occupied_brick(
+                        [bx * brick, by * brick, bz * brick],
+                        brick,
+                        &mut self.fmin,
+                        &mut self.fmax,
+                        &mut self.fsum,
+                    );
                 }
             }
         }
@@ -324,11 +344,13 @@ impl<W: Write> BrickBuilder<W> {
             self.cur_origin[2] / bk,
         ];
         // Track the occupied region (in voxels) for fine-data camera framing.
-        for a in 0..3 {
-            self.fmin[a] = self.fmin[a].min(self.cur_origin[a]);
-            self.fmax[a] = self.fmax[a].max(self.cur_origin[a] + bk - 1);
-            self.fsum[a] += (self.cur_origin[a] + bk / 2) as f64;
-        }
+        track_occupied_brick(
+            self.cur_origin,
+            bk,
+            &mut self.fmin,
+            &mut self.fmax,
+            &mut self.fsum,
+        );
         self.octree.insert(cell, self.occupied);
         // Stage the brick into brick_buf. B holds the RAW per-voxel count
         // (clamped to 255); the global density rescale is deferred to the shader

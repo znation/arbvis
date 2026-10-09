@@ -204,7 +204,16 @@ pub fn regen_html(tile_dir: &Path, branding: &Branding) -> anyhow::Result<()> {
     // arch: max_zoom = log2(min(w_p2, h_p2))). Multiplying back up by TILE
     // gives geo extents. For square Hilbert this collapses to `world_h = TILE,
     // world_w = TILE * 2^(kw-kh)` — the historical formula.
-    let two_pow_mz = 1u32 << max_zoom;
+    // `max_zoom` is read back from persisted state (labels.json, or a zoom
+    // dir name when that field is absent), so it is not trusted: an out-of-
+    // range value would make the shift below overflow and panic the whole
+    // regen run. Fail with a descriptive error instead.
+    let two_pow_mz = 1u32.checked_shl(max_zoom).ok_or_else(|| {
+        anyhow::anyhow!(
+            "labels.json max_zoom {max_zoom} is out of range (0–31); \
+             the bundle's labels.json or zoom directories look corrupt"
+        )
+    })?;
     let world_w = (width_tiles / two_pow_mz.max(1)).max(1) * TILE;
     let world_h = (height_tiles / two_pow_mz.max(1)).max(1) * TILE;
 
@@ -232,4 +241,30 @@ pub fn regen_html(tile_dir: &Path, branding: &Branding) -> anyhow::Result<()> {
         tile_dir.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A corrupt labels.json (`max_zoom` out of the representable shift
+    /// range) with a matching zoom directory must produce a descriptive
+    /// error, not a shift-overflow panic that kills the run.
+    #[test]
+    fn regen_html_errors_on_out_of_range_max_zoom() {
+        let dir = tempfile::tempdir().unwrap();
+        let zoom_dir = dir.path().join("tiles").join("34").join("0");
+        std::fs::create_dir_all(&zoom_dir).unwrap();
+        std::fs::write(
+            dir.path().join("labels.json"),
+            r#"{"max_zoom": 34, "files": []}"#,
+        )
+        .unwrap();
+        let branding = crate::registry::Branding::default();
+        let err = regen_html(dir.path(), &branding).unwrap_err();
+        assert!(
+            err.to_string().contains("max_zoom 34 is out of range"),
+            "unexpected error: {err:#}"
+        );
+    }
 }

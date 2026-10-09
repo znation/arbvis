@@ -1259,11 +1259,31 @@ pub(super) struct SceneGroup {
     pub(super) total: u64,
 }
 
+/// Reduce a plugin-supplied scene key to a path-safe slug: the key ends up as
+/// `tiles/<key>/` in both the on-disk output tree and the Hub repo path, so a
+/// key holding `/`, `..`, or an absolute path would make the tiler create or
+/// write outside the tile root (and outside the intended repo subdirectory).
+/// Everything outside `A-Za-z0-9_-` collapses to `_`; a key that sanitizes to
+/// nothing (or to `.`/`..` shapes) falls back to `scene`.
+pub(super) fn sanitize_scene_key(key: &str) -> String {
+    let slug: String = key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let slug = slug.trim_matches('_');
+    if slug.is_empty() {
+        "scene".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
 /// Group sources into scenes by their [`SceneTag`]. With no tags present, the
 /// whole input is one implicit default scene (`key: None`) carrying the
 /// caller's original `total` — preserving the exact legacy single-pyramid path.
-/// With tags present, sources are bucketed by `key` (first-seen order, then
-/// sorted by `order`); each scene's `total` is the sum of its source sizes.
+/// With tags present, sources are bucketed by their sanitized `key`
+/// (first-seen order, then sorted by `order`); each scene's `total` is the sum
+/// of its source sizes.
 pub(super) fn partition_scenes(sources: Vec<Source>, total: u64) -> Vec<SceneGroup> {
     let any_tagged = sources
         .iter()
@@ -1282,7 +1302,7 @@ pub(super) fn partition_scenes(sources: Vec<Source>, total: u64) -> Vec<SceneGro
     let mut buckets: HashMap<String, (String, u32, Vec<Source>)> = HashMap::new();
     for s in sources {
         let (key, label, order) = match s.extensions.get::<SceneTag>() {
-            Some(t) => (t.key.clone(), t.label.clone(), t.order),
+            Some(t) => (sanitize_scene_key(&t.key), t.label.clone(), t.order),
             // Untagged source in an otherwise-tagged run: bucket it into a
             // sensible default scene rather than dropping it.
             None => ("main".to_string(), "Main".to_string(), u32::MAX),
@@ -1573,5 +1593,37 @@ mod scene_tests {
         assert_eq!(groups[1].key.as_deref(), Some("cka"));
         assert_eq!(groups[1].total, 8);
         assert_eq!(groups[1].sources.len(), 2);
+    }
+
+    #[test]
+    fn hostile_scene_keys_are_reduced_to_path_safe_slugs() {
+        // The key is interpolated into `tiles/{key}/` for on-disk joins and Hub
+        // repo paths, so traversal and separator characters must not survive.
+        for (key, want) in [
+            ("../../evil", "evil"),
+            ("/abs/path", "abs_path"),
+            ("a/b\\c", "a_b_c"),
+            ("..", "scene"),
+            (".hidden", "hidden"),
+            ("", "scene"),
+            ("summary", "summary"), // well-formed keys pass through untouched
+        ] {
+            let groups = partition_scenes(vec![src(1, Some((key, 0)))], 0);
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].key.as_deref(), Some(want), "key {key:?}");
+        }
+    }
+
+    #[test]
+    fn distinct_keys_sanitizing_to_the_same_slug_share_one_scene() {
+        // Grouping happens on the sanitized key so a run cannot end up with
+        // two scenes writing into the same `tiles/<slug>/` directory.
+        let groups = partition_scenes(
+            vec![src(1, Some(("a/b", 0))), src(2, Some(("a_b", 0))), src(4, Some(("cka", 1)))],
+            0,
+        );
+        assert_eq!(groups.len(), 2);
+        let merged: Option<&super::SceneGroup> = groups.iter().find(|g| g.key.as_deref() == Some("a_b"));
+        assert_eq!(merged.unwrap().sources.len(), 2);
     }
 }

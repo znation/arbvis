@@ -17,9 +17,10 @@ use crate::tiled::html::{generate_leaflet_content, generate_leaflet_content_mult
 use crate::tiled::leaf::{TileFormat, TILE};
 use crate::tiled::pyramid_accum::{PyramidAccumulator, TileSink};
 
+use super::scenes::{partition_scenes, SceneGroup};
 use super::{
-    build_tile_plan, derive_leaf_format, drive_pipeline, partition_scenes, render_detail_levels,
-    EncodedTile, SceneGroup, TileCoords,
+    build_tile_plan, derive_leaf_format, drive_pipeline, render_detail_levels, EncodedTile,
+    TileCoords,
 };
 use crate::data::Source;
 

@@ -28,6 +28,15 @@ the tile pipeline's geometry constants are spread across ~490–591. Suggested d
 cohesive units opportunistically (e.g. `regen_html`/`regen_html_multi` regeneration path from the
 render pipeline), one split per tick, with tests moved alongside. Do not refactor for refactoring's sake.
 
+**Split 3 landed 2026-10-09 by feature:** the scene-grouping path (`SceneGroup`,
+`sanitize_scene_key`, `partition_scenes`, and the four scene tests) moved to new
+`src/tiled/scenes.rs` (191 lines); `tiled/mod.rs` now imports `partition_scenes`/`SceneGroup`
+from `scenes` (`use scenes::{…}`) and `tiled/streaming.rs` imports them via
+`super::scenes::{…}`. `sanitize_scene_key` became module-private in `scenes.rs` (its only
+caller is `partition_scenes`). No callers outside `crate::tiled` use these items.
+`tiled/mod.rs` is now 1255 lines — still over budget; next split candidates: phases out of
+`drive_pipeline`, or `render_scene_to_disk` out of `run_tiles`.
+
 **Split 2 landed 2026-10-09 by feature:** the regeneration path (`regen_html`, `regen_html_multi`,
 `file_entity_from_json`, `sniff_ext_in`, `sniff_ext_for_zoom`) moved to new `src/tiled/regen.rs`
 (234 lines); `tiled/mod.rs` re-exports `regen_html`, so external callers (`pipeline.rs`) and docs

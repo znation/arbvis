@@ -360,8 +360,13 @@ pub fn regen_html(tile_dir: &Path, branding: &crate::registry::Branding) -> anyh
     // detail levels — without that, the deepest *detail* zoom dir would be
     // mistaken for the overview leaf and corrupt every derived dimension.
     let labels_path = tile_dir.join("labels.json");
-    let json_str = std::fs::read_to_string(&labels_path)
-        .with_context(|| format!("cannot read {}", labels_path.display()))?;
+    let json_str = std::fs::read_to_string(&labels_path).with_context(|| {
+        format!(
+            "cannot read {} (--regen-html expects a viewer bundle directory \
+             rendered with --out; a --3d bundle is regenerated only with --3d)",
+            labels_path.display()
+        )
+    })?;
     let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
     // Multi-scene outputs carry per-scene geometry in labels.json and live
     // under `tiles/<key>/…`, so they regenerate without any dir scan.
@@ -1595,6 +1600,7 @@ mod scene_tests {
         assert_eq!(groups[1].sources.len(), 2);
     }
 
+
     #[test]
     fn hostile_scene_keys_are_reduced_to_path_safe_slugs() {
         // The key is interpolated into `tiles/{key}/` for on-disk joins and Hub
@@ -1625,5 +1631,15 @@ mod scene_tests {
         assert_eq!(groups.len(), 2);
         let merged: Option<&super::SceneGroup> = groups.iter().find(|g| g.key.as_deref() == Some("a_b"));
         assert_eq!(merged.unwrap().sources.len(), 2);
+    }
+
+    #[test]
+    fn regen_html_missing_labels_json_says_the_dir_must_be_a_viewer_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = crate::tiled::regen_html(dir.path(), &crate::registry::Branding::default()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("labels.json"), "unexpected message: {msg}");
+        assert!(msg.contains("viewer bundle"), "unexpected message: {msg}");
+        assert!(msg.contains("--3d"), "unexpected message: {msg}");
     }
 }

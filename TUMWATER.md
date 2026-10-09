@@ -13,5 +13,6 @@ Visualize arbitrary binary files in a way that makes structure visible at a glan
 ## Status
 
 <!-- tumwater:status:start -->
-_No status yet. The readme loop keeps this section up to date._
+- arbvis 0.1.0: byte-level 2D Hilbert tile viewer and streamed 3D voxel volume viewer, with HF Hub input/output, Space deploy, JSON structure-aware diff, xet-xorb coloring, and a plugin registry for downstream specializations (e.g. modelweightvis).
+- Open work is tracked in [PLANS.md](PLANS.md), [BUGS.md](BUGS.md), and [QUESTIONS.md](QUESTIONS.md).
 <!-- tumwater:status:end -->

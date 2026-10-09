@@ -178,3 +178,201 @@ pub fn queue_style() -> ProgressStyle {
 pub fn status_style() -> ProgressStyle {
     ProgressStyle::with_template("{msg}  ({elapsed_precise})").expect("status_style template parse")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use indicatif::{ProgressBar, TermLike};
+    use std::fmt::Debug;
+    use std::sync::{Arc, Mutex};
+
+    type IoResult = std::io::Result<()>;
+
+    /// A fake terminal that records every rendered line so tests can assert
+    /// on what `SmartEta::write` actually produced.
+    #[derive(Default)]
+    struct CapturingTerm {
+        lines: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Clone for CapturingTerm {
+        fn clone(&self) -> Self {
+            CapturingTerm {
+                lines: Arc::clone(&self.lines),
+            }
+        }
+    }
+
+    impl CapturingTerm {
+        fn lines(&self) -> Vec<String> {
+            self.lines.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+    }
+
+    impl Debug for CapturingTerm {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("CapturingTerm")
+        }
+    }
+
+    impl TermLike for CapturingTerm {
+        fn width(&self) -> u16 {
+            200
+        }
+        fn move_cursor_up(&self, _: usize) -> IoResult {
+            Ok(())
+        }
+        fn move_cursor_down(&self, _: usize) -> IoResult {
+            Ok(())
+        }
+        fn move_cursor_right(&self, _: usize) -> IoResult {
+            Ok(())
+        }
+        fn move_cursor_left(&self, _: usize) -> IoResult {
+            Ok(())
+        }
+        fn write_line(&self, s: &str) -> IoResult {
+            self.lines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(s.to_owned());
+            Ok(())
+        }
+        fn write_str(&self, s: &str) -> IoResult {
+            self.lines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(s.to_owned());
+            Ok(())
+        }
+        fn clear_line(&self) -> IoResult {
+            Ok(())
+        }
+        fn flush(&self) -> IoResult {
+            Ok(())
+        }
+    }
+
+    fn bar_with_capture() -> (ProgressBar, CapturingTerm) {
+        let term = CapturingTerm::default();
+        let pb = ProgressBar::with_draw_target(
+            None,
+            ProgressDrawTarget::term_like(Box::new(term.clone())),
+        );
+        pb.set_length(1000);
+        pb.set_style(counter_style());
+        (pb, term)
+    }
+
+    /// The most recent non-blank rendered line — indicatif redraws the same
+    /// bar each tick, so this is the current render.
+    fn last_render(term: &CapturingTerm) -> String {
+        term.lines()
+            .into_iter()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .expect("no lines rendered")
+    }
+
+    fn assert_rendered(term: &CapturingTerm, needle: &str, want: bool) {
+        let text = last_render(term);
+        assert_eq!(
+            text.contains(needle),
+            want,
+            "expected {} in: {:?}",
+            if want { "presence of" } else { "absence of" },
+            text
+        );
+    }
+
+    /// Assert that every ETA occurrence in the render is exactly the bare
+    /// `--` placeholder — i.e. neither the smoothed-rate nor the lifetime
+    /// fallback path produced a duration.
+    fn assert_only_placeholder_eta(term: &CapturingTerm) {
+        for tail in last_render(term).split("ETA ").skip(1) {
+            assert!(
+                tail.starts_with("--"),
+                "expected bare `--` ETA, got: {:?}",
+                tail
+            );
+        }
+    }
+
+    #[test]
+    fn duration_within_cap_accepts_only_finite_in_range_values() {
+        assert_eq!(duration_within_cap(60.0), Some(Duration::from_secs(60)));
+        assert_eq!(duration_within_cap(0.0), Some(Duration::ZERO));
+        // Exactly at the cap is still allowed.
+        assert_eq!(
+            duration_within_cap(ETA_DISPLAY_CAP.as_secs_f64()),
+            Some(ETA_DISPLAY_CAP)
+        );
+        // Just past the cap is not.
+        assert_eq!(
+            duration_within_cap(ETA_DISPLAY_CAP.as_secs_f64() + 0.001),
+            None
+        );
+        // NaN, negative, and infinity would each panic Duration::from_secs_f64.
+        assert_eq!(duration_within_cap(f64::NAN), None);
+        assert_eq!(duration_within_cap(-1.0), None);
+        assert_eq!(duration_within_cap(f64::INFINITY), None);
+        // Finite but overflows Duration's range.
+        assert_eq!(duration_within_cap(1e30), None);
+    }
+
+    #[test]
+    fn eta_renders_placeholder_before_any_samples() {
+        let (pb, term) = bar_with_capture();
+        pb.tick();
+        // No samples yet: smart_eta has no rate to extrapolate from.
+        assert_rendered(&term, "ETA --", true);
+        pb.finish();
+    }
+
+    #[test]
+    fn eta_falls_back_to_lifetime_estimate_marker() {
+        let (pb, term) = bar_with_capture();
+        pb.set_position(100);
+        pb.tick();
+        // A second sample at the same position (dt > 0, no progress) drives
+        // the smoothed rate to zero, so the writer must use the
+        // lifetime-average fallback, marked with `~`.
+        std::thread::sleep(Duration::from_millis(60));
+        pb.tick();
+        assert_rendered(&term, "ETA ~", true);
+        pb.finish();
+    }
+
+    #[test]
+    fn eta_suppressed_when_pos_reaches_len() {
+        let (pb, term) = bar_with_capture();
+        pb.tick();
+        std::thread::sleep(Duration::from_millis(60));
+        pb.set_position(100);
+        pb.tick();
+        std::thread::sleep(Duration::from_millis(60));
+        // Completed bars render only the bare `--` placeholder: write() never
+        // emits a duration when len <= pos.
+        pb.set_position(1000);
+        pb.tick();
+        assert_only_placeholder_eta(&term);
+        pb.finish();
+    }
+
+    #[test]
+    fn eta_recovers_after_reset() {
+        let (pb, term) = bar_with_capture();
+        pb.tick();
+        std::thread::sleep(Duration::from_millis(60));
+        pb.set_position(100);
+        pb.tick();
+        // Reset clears the estimator; the next render must go back to the
+        // placeholder, not carry the stale rate forward.
+        pb.reset();
+        pb.set_position(50);
+        std::thread::sleep(Duration::from_millis(60));
+        pb.tick();
+        assert_rendered(&term, "ETA ~", true);
+        pb.finish();
+    }
+}

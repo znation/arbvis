@@ -3,6 +3,7 @@ import os
 import re
 import tempfile
 import threading
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from huggingface_hub import HfFileSystem
@@ -66,7 +67,16 @@ _HUB_SEM = threading.Semaphore(3)
 _mirror_lock = threading.Lock()
 _mirror_started = set()  # rest-paths whose one-time background download has begun
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Front-load the brick pool while the user is still watching the coarse
+    # volume load, so the mirror is (partly) ready by the time bricks stream.
+    for rest in _MIRROR_ASSETS:
+        _start_mirror(rest)
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 _fs = None
 # Per-process cache of file sizes. Every Range request needs the file size (to
 # resolve open-ended/suffix ranges and emit Content-Range), but the sizes never
@@ -134,14 +144,6 @@ def _start_mirror(rest):
                 _mirror_started.discard(rest)
 
     threading.Thread(target=_run, daemon=True).start()
-
-
-@app.on_event("startup")
-def _prime_mirror():
-    # Front-load the brick pool while the user is still watching the coarse
-    # volume load, so the mirror is (partly) ready by the time bricks stream.
-    for rest in _MIRROR_ASSETS:
-        _start_mirror(rest)
 
 
 @app.get("/")

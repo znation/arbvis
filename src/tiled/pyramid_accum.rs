@@ -47,12 +47,29 @@ pub trait TileSink: Send + Sync + 'static {
 /// Writes tile bytes to `path`, creating its parent directory first.
 /// Shared by the local-disk output path and the HF staging sink, which both
 /// persist tiles with exactly this sequence.
+///
+/// The write is staged to `<file>.part` in the same directory, then renamed
+/// over `path`, so a process killed mid-write (or an ENOSPC partway through)
+/// leaves the previous tile — or none — instead of a truncated tile that the
+/// generated viewer serves as if complete.
 pub fn write_tile_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating tile dir {}", parent.display()))?;
     }
-    std::fs::write(path, bytes).with_context(|| format!("writing tile {}", path.display()))?;
+    let mut part_name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    part_name.push(".part");
+    let part = path.with_file_name(part_name);
+    let res = std::fs::write(&part, bytes);
+    if res.is_err() {
+        // Best effort: don't leave a stale partial staging file behind.
+        let _ = std::fs::remove_file(&part);
+    }
+    res.with_context(|| format!("writing tile {}", part.display()))?;
+    std::fs::rename(&part, path).with_context(|| format!("sealing tile {}", path.display()))?;
     Ok(())
 }
 
@@ -226,6 +243,28 @@ mod tests {
         let path = dir.path().join("a/b/c/tile.png");
         write_tile_file(&path, b"bytes").expect("write succeeds");
         assert_eq!(std::fs::read(&path).expect("read back"), b"bytes");
+        // The staged file must not linger next to the finished tile.
+        assert!(!path.with_file_name("tile.png.part").exists());
+    }
+
+    #[test]
+    fn write_tile_file_failure_leaves_previous_tile_intact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tile.png");
+        write_tile_file(&path, b"original").expect("first write succeeds");
+
+        // Simulate a failure partway through the staged write: make the
+        // staging location unwritable by putting a directory in its place.
+        std::fs::create_dir(dir.path().join("tile.png.part")).expect("mkdir");
+        assert!(write_tile_file(&path, b"replacement").is_err());
+
+        // The previously written tile is untouched — a truncated or failed
+        // write must never clobber it with garbage.
+        assert_eq!(
+            std::fs::read(&path).expect("read back"),
+            b"original",
+            "failed write must not clobber the existing tile"
+        );
     }
 
     /// Records (path, decoded RGB pixels) for every tile uploaded.

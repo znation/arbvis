@@ -6,13 +6,11 @@
 //! mixed local/remote spec path and the Hub download plumbing live in
 //! [`super::remote`], the diff builders in [`super::diff`].
 
-use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use indicatif::ProgressBar;
-use memmap2::Mmap;
 
 use crate::progress::{counter_style, multi};
 
@@ -193,15 +191,23 @@ pub fn prepare_sources(
 pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
     match &s.kind {
         SourceKind::File(p) => {
-            let f = File::open(p)?;
-            Ok(Data::Mapped(unsafe { Mmap::map(&f) }?))
+            // Read the whole file into memory instead of mmapping it: another
+            // process can truncate the file between this read and the render,
+            // and a live mmap over a shrunken file faults with SIGBUS the
+            // moment the renderer touches the vacated pages — an abort the
+            // bounds-checked `slice_local` error path can never reach. A
+            // snapshot decouples the render from the file's later fate.
+            // Renderers read every byte to color the image, so this costs no
+            // extra I/O over the mmap it replaces.
+            Ok(Data::Mapped(std::fs::read(p)?.into()))
         }
         SourceKind::Buffered(v) => Ok(Data::Owned(v.clone())),
         SourceKind::Diff { original, modified } => {
-            let f_o = File::open(original)?;
-            let f_m = File::open(modified)?;
-            let m_o = Arc::new(unsafe { Mmap::map(&f_o) }?);
-            let m_m = Arc::new(unsafe { Mmap::map(&f_m) }?);
+            // Same snapshot reasoning as the single-file branch above: a
+            // mmap over a side that is truncated mid-render faults SIGBUS
+            // inside the closure, where no bounds check can help.
+            let m_o: Arc<[u8]> = std::fs::read(original)?.into();
+            let m_m: Arc<[u8]> = std::fs::read(modified)?.into();
             Ok(Data::LazyDiff(Arc::new(move |start: u64, len: usize| {
                 let m_o = Arc::clone(&m_o);
                 let m_m = Arc::clone(&m_m);
@@ -209,7 +215,7 @@ pub fn load_source_data(s: &Source) -> anyhow::Result<Data> {
                     // Zero-pad reads beyond either side's length so that
                     // same-name files with different sizes can share one diff
                     // source. The longer side's tail diffs against zero.
-                    let read_padded = |m: &Mmap| -> Vec<u8> {
+                    let read_padded = |m: &[u8]| -> Vec<u8> {
                         let s = start as usize;
                         let mlen = m.len();
                         let mut buf = vec![0u8; len];
@@ -412,5 +418,69 @@ mod diff_bytes_to_color_tests {
         // Mid-magnitude delta: 128/255 of the way from 127 toward the pole.
         assert_eq!(diff_bytes_to_color(&[0], &[128]), [191]);
         assert_eq!(diff_bytes_to_color(&[128], &[0]), [63]);
+    }
+}
+
+#[cfg(test)]
+mod load_source_data_tests {
+    use super::*;
+
+    /// A file can be truncated by another process between `load_source_data`
+    /// (which snapshots the bytes) and the render, whose request ranges come
+    /// from the earlier stat. The snapshot must serve the original bytes
+    /// without touching the file again — with the previous mmap backing,
+    /// reading the vacated pages faulted SIGBUS and aborted the whole
+    /// process before any error or result could be produced. A range truly
+    /// beyond the snapshot still gets the bounds-checked `slice_local` error
+    /// rather than a panic.
+    #[tokio::test]
+    async fn file_truncated_after_load_yields_clean_error_not_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f.bin");
+        let bytes = vec![0x41u8; 8192];
+        std::fs::write(&p, &bytes).unwrap();
+
+        let src = Source {
+            file_idx: 0,
+            kind: SourceKind::File(p.clone()),
+            byte_size: bytes.len() as u64,
+            name_override: None,
+            xet_terms: None,
+            extensions: Default::default(),
+        };
+        let data = load_source_data(&src).unwrap();
+
+        // Another writer truncates the file after the snapshot was taken.
+        std::fs::write(&p, b"tiny").unwrap();
+
+        // A render pass asks for the source's tail using the earlier stat:
+        // must serve the original bytes from the snapshot, not fault.
+        let got = data.fetch_range(4096, 4096).await.unwrap();
+        assert!(got.iter().all(|&b| b == 0x41));
+        assert_eq!(data.fetch_range(0, 4).await.unwrap(), b"AAAA");
+    }
+
+    /// When the file shrinks *before* load (or the scan's stat was already
+    /// stale), the snapshot is shorter than `Source::byte_size`; an
+    /// out-of-bounds fetch must surface the descriptive `slice_local` error,
+    /// not panic on an index.
+    #[tokio::test]
+    async fn fetch_past_shrunken_snapshot_is_a_clean_out_of_bounds_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("g.bin");
+        std::fs::write(&p, b"short").unwrap();
+
+        let src = Source {
+            file_idx: 0,
+            kind: SourceKind::File(p),
+            byte_size: 8192,
+            name_override: None,
+            xet_terms: None,
+            extensions: Default::default(),
+        };
+        let data = load_source_data(&src).unwrap();
+
+        let err = data.fetch_range(8190, 16).await.unwrap_err();
+        assert!(err.to_string().contains("out of bounds"), "{err}");
     }
 }

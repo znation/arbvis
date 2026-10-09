@@ -17,7 +17,6 @@ indicatif = "0.17"
 # Routes log::* output through indicatif's MultiProgress so log lines and
 # progress bars never overwrite each other.
 indicatif-log-bridge = "0.2"
-memmap2 = "0.9"
 rayon = "1"
 # Fast non-cryptographic hasher for the indexed-PNG palette map, which does one
 # lookup per pixel. SipHash (the std default) showed up as ~2.8% of CPU in the

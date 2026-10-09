@@ -352,9 +352,9 @@ pub(super) async fn build_tile_plan(
         }
     }
 
-    // Open all source Data handles. `load_source_data` is sync (mmap for
-    // local, lightweight handle clone for HTTP/LazyDiff) so a plain loop is
-    // fine.
+    // Open all source Data handles. `load_source_data` is sync (in-memory
+    // snapshot for local, lightweight handle clone for HTTP/LazyDiff) so a
+    // plain loop is fine.
     let source_data: Vec<Data> = {
         let mut v = Vec::with_capacity(sources.len());
         for s in &sources {

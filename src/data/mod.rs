@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use memmap2::Mmap;
 
 use crate::hf_url::{RemoteFileSpec, RemoteRepo};
 use crate::xet::{XetReader, XetTerm};
@@ -51,11 +50,16 @@ pub(crate) fn is_json_path(p: &Path) -> bool {
     )
 }
 
-/// The backing storage for a file's bytes: a local memory map, an owned
-/// buffer, or one of the remote readers (HTTP range requests against the
-/// Hub, or the direct xet CAS decoder).
+/// The backing storage for a file's bytes: a local in-memory snapshot, an
+/// owned buffer, or one of the remote readers (HTTP range requests against
+/// the Hub, or the direct xet CAS decoder).
 pub enum Data {
-    Mapped(Mmap),
+    /// A snapshot of a local file's bytes, taken at load time. Deliberately
+    /// not an mmap: another process can truncate the file after the load,
+    /// and a live mmap over a shrunken file faults with SIGBUS when the
+    /// renderer touches the vacated pages — an abort the bounds-checked
+    /// `slice_local` error path can never reach.
+    Mapped(Arc<[u8]>),
     Owned(Vec<u8>),
     /// Remote file accessed via HF Hub range requests — never loaded locally.
     Http {

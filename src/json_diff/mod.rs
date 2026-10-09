@@ -16,8 +16,6 @@ pub mod source;
 use std::path::Path;
 use std::sync::Arc;
 
-use memmap2::Mmap;
-
 use crate::data::{Data, DiffFill, Extensions, Source, SourceKind};
 
 use align::{align_documents, coalesce, AlignmentSpan};
@@ -77,14 +75,14 @@ pub async fn build_json_diff_sources(
         return fallback_byte_diff(original, modified, &orig_bytes, &mod_bytes, is_finetune);
     }
 
-    // Mmap each file for the per-tile RangeDiff / OneSidedRange path. Even
-    // though we already have the bytes in `orig_bytes`/`mod_bytes`, the
+    // Snapshot each file for the per-tile RangeDiff / OneSidedRange path.
+    // Even though we already have the bytes in `orig_bytes`/`mod_bytes`, the
     // existing diff machinery expects `Arc<Data>` handles, and reusing the
-    // mmap path keeps the lazy-fetch semantics for free. Built only after the
-    // fallback decision: a zero-length file (e.g. crash-truncated output)
-    // cannot be mmap'd, and the fallback path handles it without needing one.
-    let orig_data = open_mmap_data(original)?;
-    let mod_data = open_mmap_data(modified)?;
+    // local-file path keeps the lazy-fetch semantics for free. Built only
+    // after the fallback decision: a zero-length file (e.g. crash-truncated
+    // output) is served from memory instead of failing the whole diff.
+    let orig_data = open_local_data(original)?;
+    let mod_data = open_local_data(modified)?;
 
     let (sources, total) = source::spans_to_sources(
         &spans,
@@ -238,15 +236,20 @@ fn strip_trailing_newline(s: &[u8]) -> (&[u8], u64) {
     (s, 0)
 }
 
-fn open_mmap_data(path: &Path) -> anyhow::Result<Arc<Data>> {
-    let f = std::fs::File::open(path).with_context(format!("opening {}", path.display()))?;
-    // memmap2 refuses to map a zero-length file, so serve one from memory
-    // instead of failing the whole diff over a readable-if-empty input.
-    if f.metadata()?.len() == 0 {
+fn open_local_data(path: &Path) -> anyhow::Result<Arc<Data>> {
+    // Read the whole file into a snapshot instead of mmapping it: a side of
+    // the diff can be truncated by another process after this load, and a
+    // live mmap over a shrunken file serves zeros or faults SIGBUS when the
+    // closure indexes the vacated pages. A snapshot also makes the
+    // zero-length case below unreachable-by-construction, but it is kept as
+    // a cheap early return.
+    let bytes: std::sync::Arc<[u8]> = std::fs::read(path)
+        .with_context(format!("reading {}", path.display()))?
+        .into();
+    if bytes.is_empty() {
         return Ok(Arc::new(Data::Owned(Vec::new())));
     }
-    let mmap = unsafe { Mmap::map(&f)? };
-    Ok(Arc::new(Data::Mapped(mmap)))
+    Ok(Arc::new(Data::Mapped(bytes)))
 }
 
 fn filename_label(p: &Path) -> String {

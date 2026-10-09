@@ -185,7 +185,8 @@ pub fn tile_pixel_start(tx: u32, ty: u32, kh: u8, height_tiles: u32, square_pixe
 ///
 /// Walks the per-tile Hilbert byte range across source boundaries and issues
 /// one async `fetch_range` per source overlap (≤ 2 in practice). Local sources
-/// (`Data::Mapped` / `Data::Owned`) resolve via a memcpy off the mmap; HTTP
+/// (`Data::Mapped` / `Data::Owned`) resolve via an in-memory copy of the
+/// snapshot; HTTP
 /// sources await an actual HTTP request, throttled by
 /// [`crate::throttle::Throttle::global`].
 pub async fn load_tile_bytes(

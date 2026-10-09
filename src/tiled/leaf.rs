@@ -309,7 +309,9 @@ pub(super) fn local_curve_to_xy() -> &'static [u32] {
 
 /// Curve offset of tile-local pixel `(px, py)` within its tile's byte range
 /// (i.e. the `tile_buf` index), via the tile's precomputed Hilbert frame.
-#[inline]
+/// Used by the `tile_curve_frame_identity` test as the forward direction of
+/// the frame/LUT transform the render loops consume via `local_curve_to_xy`.
+#[cfg(test)]
 fn tile_local_curve_idx(frame: (bool, u32, u32), px: u32, py: u32) -> u64 {
     let (swap, cx, cy) = frame;
     let (a, b) = if swap {
@@ -325,6 +327,43 @@ fn tile_local_curve_idx(frame: (bool, u32, u32), px: u32, py: u32) -> u64 {
 /// and encoding to `fmt`. Bytes beyond `total` (the final partial tile) render
 /// black. This is the bytes-per-pixel counterpart of
 /// [`render_leaf_tile_xet_from_buf`].
+/// Indexed-encoding tables for a plain-mode tile: the distinct colors of
+/// `pixel_lut` (plus pure black, for out-of-range bytes) as an RGB palette in
+/// first-encounter order, and `remap[byte]` = that byte color's palette
+/// index. `black_idx` is the palette index for the black out-of-range color.
+/// Returns `None` if the distinct palette would exceed 256 entries (caller
+/// falls back to the generic RGB→palette encoder).
+fn indexed_palette_from_lut(lut: &[Rgb<u8>; 256]) -> Option<(Vec<[u8; 3]>, [u8; 256], u8)> {
+    let mut palette: Vec<[u8; 3]> = Vec::with_capacity(256);
+    let mut remap = [0u8; 256];
+    for (b, color) in lut.iter().enumerate() {
+        let c = color.0;
+        let idx = match palette.iter().position(|&p| p == c) {
+            Some(i) => i,
+            None => {
+                if palette.len() >= 256 {
+                    return None;
+                }
+                palette.push(c);
+                palette.len() - 1
+            }
+        };
+        remap[b] = idx as u8;
+    }
+    let black = [0u8, 0, 0];
+    let black_idx = match palette.iter().position(|&p| p == black) {
+        Some(i) => i as u8,
+        None => {
+            if palette.len() >= 256 {
+                return None;
+            }
+            palette.push(black);
+            (palette.len() - 1) as u8
+        }
+    };
+    Some((palette, remap, black_idx))
+}
+
 pub fn render_leaf_tile_from_buf(
     tx: u32,
     ty: u32,
@@ -337,22 +376,61 @@ pub fn render_leaf_tile_from_buf(
     fmt: TileFormat,
 ) -> TileResult {
     let tile_pixel_start = tile_pixel_start(tx, ty, kh, height_tiles, square_pixels);
-    let frame = tile_curve_frame(tx % height_tiles, ty, kh);
+    let (swap, cx, cy) = tile_curve_frame(tx % height_tiles, ty, kh);
+    let xy_lut = local_curve_to_xy();
+
+    // Indexed fast path: the tile's palette is derivable from `pixel_lut`
+    // alone (256-entry dedup, done per call — negligible next to the pixel
+    // loop), so the indexed stream is one array remap per pixel instead of a
+    // hash-map lookup per RGB pixel in `encode_indexed_png`.
+    let fast = match fmt {
+        TileFormat::IndexedPng => indexed_palette_from_lut(pixel_lut),
+        _ => None,
+    };
+    let mut indexed = fast.as_ref().map(|_| vec![0u8; TILE_AREA as usize]);
+    let (remap, black_idx) = match &fast {
+        Some((_, remap, black_idx)) => (Some(remap), *black_idx),
+        None => (None, 0u8),
+    };
 
     let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
-    for py in 0..TILE {
-        for px in 0..TILE {
-            let local_idx = tile_local_curve_idx(frame, px, py);
-            let pixel_idx = tile_pixel_start + local_idx;
-            let color = if pixel_idx < total {
-                pixel_lut[tile_buf[local_idx as usize] as usize]
-            } else {
-                Rgb([0u8, 0, 0])
+    // Visit pixels in curve order so both the byte index and the palette index
+    // advance monotonically; scatter to raster coordinates by undoing the
+    // tile's Hilbert frame (same inverse transform as the xet renderer).
+    for curve in 0..TILE_AREA {
+        let packed = xy_lut[curve as usize];
+        let (a, b) = (packed & (TILE - 1), packed >> TILE_LOG2);
+        let (px, py) = if swap {
+            (b ^ cx, a ^ cy)
+        } else {
+            (a ^ cx, b ^ cy)
+        };
+        let pixel_idx = tile_pixel_start + curve;
+        let (color, pal_idx) = if pixel_idx >= total {
+            (Rgb([0u8, 0, 0]), black_idx)
+        } else {
+            let byte = tile_buf[curve as usize] as usize;
+            let pal_idx = match remap {
+                Some(r) => r[byte],
+                None => 0,
             };
-            img.put_pixel(px, py, color);
+            (pixel_lut[byte], pal_idx)
+        };
+        img.put_pixel(px, py, color);
+        if let Some(idx) = indexed.as_mut() {
+            idx[py as usize * TILE as usize + px as usize] = pal_idx;
         }
     }
-    encode_tile(img, fmt)
+
+    match (fast, indexed) {
+        (Some((palette, _, _)), Some(idx_pixels)) => {
+            let flat: Vec<u8> = palette.iter().flat_map(|c| c.iter().copied()).collect();
+            let bytes =
+                encode_png(TILE, TILE, &idx_pixels, Some(&flat)).map_err(|e| e.to_string())?;
+            Ok((img, bytes))
+        }
+        _ => encode_tile(img, fmt),
+    }
 }
 
 /// Whether a tile's pixel-screen position falls on a crosshatch stripe.
@@ -605,6 +683,72 @@ mod tests {
                         "tile ({tx},{ty}) pixel ({px},{py})"
                     );
                 }
+            }
+        }
+    }
+
+    /// The `IndexedPng` fast path must decode to exactly the pixels the
+    /// truecolor render produces: the LUT-derived palette covers every
+    /// palette index in the stream, including pure black for out-of-range
+    /// (past-`total`) bytes.
+    #[test]
+    fn render_leaf_tile_indexed_png_decodes_to_truecolor_pixels() {
+        let kh = 13u8;
+        let height_tiles = 1u32 << (kh - TILE_LOG2);
+        let square_pixels = 1u64 << (2 * kh as u32);
+        let mut tile_buf = Box::new([0u8; TILE_PIXELS]);
+        for (i, b) in tile_buf.iter_mut().enumerate() {
+            *b = (i * 2654435761 % 256) as u8;
+        }
+        let pixel_lut = crate::color::build_pixel_lut();
+        // (0, 0) with a small `total` exercises the black out-of-range tail;
+        // (1, 2) with a large `total` is a fully populated tile.
+        for &(tx, ty, total) in &[(0u32, 0u32, 1000u64), (1u32, 2u32, square_pixels * 3)] {
+            let (img_tc, _) = render_leaf_tile_from_buf(
+                tx,
+                ty,
+                kh,
+                height_tiles,
+                square_pixels,
+                total,
+                &tile_buf,
+                &pixel_lut,
+                TileFormat::Png,
+            )
+            .unwrap();
+            let (img_ix, bytes) = render_leaf_tile_from_buf(
+                tx,
+                ty,
+                kh,
+                height_tiles,
+                square_pixels,
+                total,
+                &tile_buf,
+                &pixel_lut,
+                TileFormat::IndexedPng,
+            )
+            .unwrap();
+            assert_eq!(img_tc.as_raw(), img_ix.as_raw(), "tile ({tx},{ty}) RGB");
+
+            let mut decoder = png::Decoder::new(Cursor::new(&bytes[..]));
+            decoder.set_transformations(png::Transformations::IDENTITY);
+            let mut reader = decoder.read_info().unwrap();
+            assert_eq!(reader.info().color_type, png::ColorType::Indexed);
+            let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
+            let _info = reader.next_frame(&mut buf).unwrap();
+            let palette = reader
+                .info()
+                .palette
+                .as_ref()
+                .expect("indexed PNG carries a palette");
+            assert_eq!(buf.len(), img_tc.as_raw().len() / 3);
+            for (i, &idx) in buf.iter().enumerate() {
+                assert!((idx as usize) * 3 + 3 <= palette.len());
+                assert_eq!(
+                    &palette[idx as usize * 3..idx as usize * 3 + 3],
+                    &img_tc.as_raw()[i * 3..i * 3 + 3],
+                    "tile ({tx},{ty}) pixel {i}"
+                );
             }
         }
     }

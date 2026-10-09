@@ -10,8 +10,8 @@ use anyhow::Context;
 
 use crate::cli::{
     check_bare_run_inputs, collect_input_files, default_title, ignored_3d_flags,
-    ignored_3d_flags_warning, validate_grid, validate_volume_res, volume_res_ignored_warning, Args,
-    OutputDest,
+    ignored_3d_flags_warning, validate_grid, validate_title, validate_volume_res,
+    volume_res_ignored_warning, Args, OutputDest,
 };
 use crate::data::Source;
 use crate::deploy;
@@ -60,6 +60,7 @@ struct RenderConfig {
 /// parsed args and picks the highest-priority applicable provider (the
 /// `i32::MIN` floor always applies).
 pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()> {
+    validate_title(args.title.as_deref())?;
     if let Some(ref dir) = args.regen_html {
         return if args.three_d {
             volume::regen_html(dir, &registry.branding, args.title.as_deref())

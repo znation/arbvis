@@ -333,6 +333,21 @@ pub(crate) fn validate_volume_res(res: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Validate `--title`: an explicit title that is empty or whitespace-only
+/// would render an empty `<title>` and an empty info-panel heading in the
+/// viewer. Fail fast with usage guidance instead of emitting a blank title.
+pub(crate) fn validate_title(title: Option<&str>) -> anyhow::Result<()> {
+    if let Some(t) = title {
+        if t.trim().is_empty() {
+            anyhow::bail!(
+                "--title must be a non-empty title, got {t:?}; omit the flag to use \
+                           the default title (the brand name, optionally suffixed by mode)"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Warning text for `--volume-res` set to a value that cannot stream: the
 /// sparse brick pool only exists when `--volume-res` is strictly above
 /// `--grid` (see `aggregate`'s `order_v` gate), so an at-or-below value builds
@@ -563,6 +578,27 @@ mod title_tests {
             default_title(Some("custom".to_string()), "arbvis", "moe"),
             "custom"
         );
+    }
+}
+
+#[cfg(test)]
+mod title_validation_tests {
+    use super::validate_title;
+
+    #[test]
+    fn absent_or_real_title_is_ok() {
+        assert!(validate_title(None).is_ok());
+        assert!(validate_title(Some("my vis")).is_ok());
+        assert!(validate_title(Some("  padded  ")).is_ok()); // inner content, not blank
+    }
+
+    #[test]
+    fn empty_or_whitespace_title_fails() {
+        assert!(validate_title(Some("")).is_err());
+        assert!(validate_title(Some("   ")).is_err());
+        let msg = validate_title(Some("\t\n")).unwrap_err().to_string();
+        assert!(msg.contains("--title"));
+        assert!(msg.contains("non-empty"));
     }
 }
 

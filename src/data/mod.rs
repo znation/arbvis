@@ -593,6 +593,37 @@ mod data_fetch_tests {
         let err = view.fetch_range_into(8, &mut dst).await.unwrap_err();
         assert!(err.to_string().contains("out of bounds"));
     }
+
+    #[tokio::test]
+    async fn mapped_variant_fetches_slices_and_derefs() {
+        // Data::Mapped is the mmap-backed local variant; it shares the
+        // slice_local / copy_local / Deref paths with Owned but no test
+        // constructed it before.
+        let data = Data::Mapped(b"hello world".to_vec().into());
+        assert!(data.is_local());
+        assert_eq!(&*data, b"hello world");
+        assert_eq!(data.fetch_range(0, 5).await.unwrap(), b"hello");
+        let err = data.fetch_range(2, 20).await.unwrap_err().to_string();
+        assert!(err.contains("out of bounds"), "unexpected: {err}");
+        let mut dst = [0u8; 5];
+        data.fetch_range_into(6, &mut dst).await.unwrap();
+        assert_eq!(&dst, b"world");
+    }
+
+    #[tokio::test]
+    async fn fetch_range_into_rejects_len_overflow() {
+        // copy_local mirrors slice_local's checked-add guard: a start of
+        // usize::MAX with a non-empty dst overflows usize and must error
+        // instead of wrapping.
+        let data = owned(b"abc");
+        let mut dst = [0u8; 1];
+        let err = data
+            .fetch_range_into(usize::MAX as u64, &mut dst)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("overflows usize"), "unexpected: {err}");
+    }
 }
 
 #[cfg(test)]

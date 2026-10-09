@@ -18,8 +18,8 @@
 mod fetch;
 
 use fetch::{
-    fetch_cas_token, fetch_reconstruction_response, fetch_reconstruction_terms,
-    invalidate_cas_token_cache,
+    cas_context, fetch_cas_token, fetch_reconstruction_response, invalidate_cas_token_cache,
+    reconstruction_response_at, reconstruction_terms_at,
 };
 
 use std::collections::HashMap;
@@ -134,8 +134,8 @@ pub async fn reconstruction_for(spec: &RemoteFileSpec) -> anyhow::Result<Vec<Xet
         );
         return Ok(Vec::new());
     };
-    let cas = fetch_cas_token(spec.repo.api_segment(), spec.repo.repo_id(), &spec.revision).await?;
-    fetch_reconstruction_terms(&cas, hash).await
+    let ctx = cas_context(spec.repo.api_segment(), spec.repo.repo_id(), &spec.revision)?;
+    reconstruction_terms_at(&ctx, hash).await
 }
 
 /// The 20-color Tableau palette used for xet-mode coloring: hue = xorb ID
@@ -447,8 +447,8 @@ impl XetReader {
         let api_segment = spec.repo.api_segment().to_string();
         let repo_id = spec.repo.repo_id().to_string();
         let revision: String = (*spec.revision).clone();
-        let cas = fetch_cas_token(&api_segment, &repo_id, &revision).await?;
-        let raw = fetch_reconstruction_response(&cas, hash).await?;
+        let ctx = cas_context(&api_segment, &repo_id, &revision)?;
+        let raw = reconstruction_response_at(&ctx, hash).await?;
 
         // Build the per-xorb descriptor lookup (sorted by chunk_start). Track
         // the earliest URL expiry so the reader knows when to refresh; if any

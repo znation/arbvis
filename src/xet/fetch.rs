@@ -152,19 +152,52 @@ async fn authed_get_json<T: DeserializeOwned>(
         .with_context(|| format!("parsing {label} response from {url}"))
 }
 
-/// Fetches (or returns from `CAS_TOKEN_CACHE`) a CAS token for reading
-/// `repo_id` at `revision`. Requires an HF token (`HF_TOKEN` or `hf auth
-/// login`) to call the Hub's xet-read-token endpoint. The returned token's
-/// `cas_url` is trimmed of trailing slashes so URL joins are safe.
-pub(super) async fn fetch_cas_token(
+/// Everything needed to mint a CAS token for one repo/revision: the Hub
+/// endpoint, the repo coordinates, and the Hub bearer token. Owns its strings
+/// so callers (including tests, which point `endpoint` at a stub server) can
+/// build it once and pass it around.
+#[derive(Clone)]
+pub(super) struct CasContext {
+    /// Hub base URL (`hf_url::endpoint()` in production; `http://127.0.0.1` in
+    /// tests). Trailing slashes must be stripped before storing.
+    pub(super) endpoint: String,
+    /// Repo kind's API segment (e.g. `models`).
+    pub(super) api_segment: String,
+    /// `owner/name` repo id.
+    pub(super) repo_id: String,
+    /// Revision (branch/tag/commit).
+    pub(super) revision: String,
+    /// Hub bearer token sent to the `xet-read-token` endpoint.
+    pub(super) bearer: String,
+}
+
+/// Builds a [`CasContext`] from the production Hub endpoint and the user's HF
+/// token. Errors when no HF token is available.
+pub(super) fn cas_context(
     api_segment: &str,
     repo_id: &str,
     revision: &str,
-) -> anyhow::Result<CasToken> {
+) -> anyhow::Result<CasContext> {
+    Ok(CasContext {
+        endpoint: hf_url::endpoint(),
+        api_segment: api_segment.to_string(),
+        repo_id: repo_id.to_string(),
+        revision: revision.to_string(),
+        bearer: hf_url::read_token().ok_or_else(|| {
+            anyhow!("HF token required for xet reconstruction; set HF_TOKEN or run `hf auth login`")
+        })?,
+    })
+}
+
+/// Fetches (or returns from `CAS_TOKEN_CACHE`) a CAS token for reading
+/// `repo_id` at `revision` via the context's endpoint and bearer token. The
+/// returned token's `cas_url` is trimmed of trailing slashes so URL joins are
+/// safe.
+pub(super) async fn fetch_cas_token_at(ctx: &CasContext) -> anyhow::Result<CasToken> {
     let key = (
-        api_segment.to_string(),
-        repo_id.to_string(),
-        revision.to_string(),
+        ctx.api_segment.clone(),
+        ctx.repo_id.clone(),
+        ctx.revision.clone(),
     );
     {
         let mut guard = CAS_TOKEN_CACHE.lock().unwrap();
@@ -174,26 +207,19 @@ pub(super) async fn fetch_cas_token(
         }
     }
 
-    let hf_token = hf_url::read_token().ok_or_else(|| {
-        anyhow!("HF token required for xet reconstruction; set HF_TOKEN or run `hf auth login`")
-    })?;
-
     let url = format!(
         "{}/api/{}/{}/xet-read-token/{}",
-        hf_url::endpoint(),
-        api_segment,
-        repo_id,
-        revision,
+        ctx.endpoint, ctx.api_segment, ctx.repo_id, ctx.revision,
     );
     // `error_for_status()` (inside `authed_get_json`) converts non-2xx into a
     // reqwest::Error carrying the status code so the throttle's classifier can
     // detect 429/5xx and retry. Response body detail is lost on error, but the
     // URL and status code are preserved.
     let parsed: XetReadTokenResponse = authed_get_json(
-        &format!("xet-read-token {repo_id}"),
+        &format!("xet-read-token {}", ctx.repo_id),
         "xet-read-token",
         &url,
-        &hf_token,
+        &ctx.bearer,
     )
     .await?;
 
@@ -208,6 +234,82 @@ pub(super) async fn fetch_cas_token(
             .insert(key, token.clone());
     }
     Ok(token)
+}
+
+/// True when the error chain carries a reqwest 401/403 — i.e. the CAS service
+/// rejected the bearer token (expired or revoked), not a network/parse
+/// failure.
+fn is_auth_error(e: &anyhow::Error) -> bool {
+    use reqwest::StatusCode;
+    e.chain().any(|c| {
+        c.downcast_ref::<reqwest::Error>().is_some_and(|r| {
+            matches!(
+                r.status(),
+                Some(StatusCode::UNAUTHORIZED) | Some(StatusCode::FORBIDDEN)
+            )
+        })
+    })
+}
+
+/// Runs `op(cas_token)` with the cached CAS token; on a 401/403 from the CAS
+/// service, invalidates the token cache, mints a fresh token, and retries
+/// exactly once. Short-lived CAS tokens outlive a typical run, but a long-
+/// running process (a large multi-source render) can cross an expiry boundary;
+/// without this, the stale token stays cached and every later call fails with
+/// an opaque 401 for the rest of the run.
+async fn reconstruction_response_reminted(
+    ctx: &CasContext,
+    xet_hash_hex: &str,
+) -> anyhow::Result<ReconstructionResponse> {
+    let cas = fetch_cas_token_at(ctx).await?;
+    match fetch_reconstruction_response(&cas, xet_hash_hex).await {
+        Ok(resp) => Ok(resp),
+        Err(e) if is_auth_error(&e) => {
+            log::warn!(
+                "CAS rejected the cached token (auth error); re-minting once for {}/{}/{}",
+                ctx.api_segment,
+                ctx.repo_id,
+                ctx.revision
+            );
+            invalidate_cas_token_cache(&ctx.api_segment, &ctx.repo_id, &ctx.revision);
+            let fresh = fetch_cas_token_at(ctx).await?;
+            fetch_reconstruction_response(&fresh, xet_hash_hex).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Flattens the V2 reconstruction for `xet_hash_hex` into [`XetTerm`]s,
+/// re-minting the CAS token once on a 401/403 (see
+/// [`reconstruction_response_reminted`]). Used by the initial xet-terms path.
+pub(super) async fn reconstruction_terms_at(
+    ctx: &CasContext,
+    xet_hash_hex: &str,
+) -> anyhow::Result<Vec<XetTerm>> {
+    let parsed = reconstruction_response_reminted(ctx, xet_hash_hex).await?;
+    Ok(flatten_terms(parsed))
+}
+
+/// Fetches the full V2 reconstruction for `xet_hash_hex` (terms + signed-URL
+/// descriptors), re-minting the CAS token once on a 401/403. Used by
+/// `XetReader::new`.
+pub(super) async fn reconstruction_response_at(
+    ctx: &CasContext,
+    xet_hash_hex: &str,
+) -> anyhow::Result<ReconstructionResponse> {
+    reconstruction_response_reminted(ctx, xet_hash_hex).await
+}
+
+/// Production wrapper: mints a CAS token via [`cas_context`] (Hub endpoint +
+/// user's HF token). Kept for the URL-refresh path in `mod.rs`, which
+/// invalidates the cache itself before calling.
+pub(super) async fn fetch_cas_token(
+    api_segment: &str,
+    repo_id: &str,
+    revision: &str,
+) -> anyhow::Result<CasToken> {
+    let ctx = cas_context(api_segment, repo_id, revision)?;
+    fetch_cas_token_at(&ctx).await
 }
 
 /// GETs the V2 reconstruction for `xet_hash_hex` from `cas`'s CAS service,
@@ -230,12 +332,10 @@ pub(super) async fn fetch_reconstruction_response(
 /// `XetTerm`s: one per non-empty term, with `file_offset` accumulated from
 /// the `unpacked_length`s. Zero-length terms are skipped and contribute no
 /// offset.
-pub(super) async fn fetch_reconstruction_terms(
-    cas: &CasToken,
-    xet_hash_hex: &str,
-) -> anyhow::Result<Vec<XetTerm>> {
-    let parsed = fetch_reconstruction_response(cas, xet_hash_hex).await?;
-
+/// Flattens a V2 reconstruction into `XetTerm`s: one per non-empty term, with
+/// `file_offset` accumulated from the `unpacked_length`s. Zero-length terms
+/// are skipped and contribute no offset.
+fn flatten_terms(parsed: ReconstructionResponse) -> Vec<XetTerm> {
     let mut offset: u64 = 0;
     let mut out = Vec::with_capacity(parsed.terms.len());
     for t in parsed.terms {
@@ -249,12 +349,14 @@ pub(super) async fn fetch_reconstruction_terms(
         });
         offset += t.unpacked_length;
     }
-    Ok(out)
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn parses_v2_reconstruction_response_wire_fields() {
@@ -324,5 +426,142 @@ mod tests {
         // Unknown key on an initialized cache is a no-op removal.
         invalidate_cas_token_cache("api", "owner/other", "dev");
         invalidate_cas_token_cache("api", "owner/repo", "main");
+    }
+
+    // --- stale-CAS-token remint tests ----------------------------------------
+    // A cached CAS bearer token can expire mid-run (they are short-lived); the
+    // initial reconstruction request then 401s and, without a re-mint, every
+    // later call in the process fails with the same opaque auth error. The
+    // stub server below serves the two endpoints: `/xet-read-token/...`
+    // (tokens tok1, tok2, ...) and `/v2/reconstructions/...` (401 first or
+    // always, then the reconstruction JSON).
+
+    struct StubCas {
+        addr: std::net::SocketAddr,
+        token_hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        recon_hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        recon_bearers: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn spawn_cas_stub(recon_always_401: bool) -> StubCas {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token_hits = Arc::new(AtomicUsize::new(0));
+        let recon_hits = Arc::new(AtomicUsize::new(0));
+        let recon_bearers = Arc::new(Mutex::new(Vec::new()));
+        let th = token_hits.clone();
+        let rh = recon_hits.clone();
+        let rb = recon_bearers.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                // One request per connection (we answer Connection: close).
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match sock.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).to_lowercase();
+                let bearer = head
+                    .lines()
+                    .find(|l| l.starts_with("authorization:"))
+                    .and_then(|l| l.split_whitespace().last())
+                    .unwrap_or("")
+                    .to_string();
+                let path = head.lines().next().unwrap_or("");
+                let resp = if path.contains("/xet-read-token/") {
+                    let n = th.fetch_add(1, Ordering::Relaxed) + 1;
+                    let body = format!(r#"{{"accessToken":"tok{n}","casUrl":"http://{addr}"}}"#);
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else if path.contains("/v2/reconstructions/") {
+                    rb.lock().unwrap().push(bearer);
+                    let hits = rh.fetch_add(1, Ordering::Relaxed) + 1;
+                    if recon_always_401 || hits == 1 {
+                        "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    } else {
+                        let body = r#"{"terms":[{"hash":"x/1","unpacked_length":8,"range":{"start":0,"end":1}}],"xorbs":{}}"#;
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                } else {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        StubCas {
+            addr,
+            token_hits,
+            recon_hits,
+            recon_bearers,
+        }
+    }
+
+    fn stub_ctx(addr: std::net::SocketAddr, repo_id: &str) -> CasContext {
+        CasContext {
+            endpoint: format!("http://{addr}"),
+            api_segment: "models".to_string(),
+            repo_id: repo_id.to_string(),
+            revision: "main".to_string(),
+            bearer: "hub-token".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_cached_cas_token_is_reminted_once_on_401() {
+        invalidate_cas_token_cache("models", "stub/retry-ok", "main");
+        let cas = spawn_cas_stub(false).await;
+        let ctx = stub_ctx(cas.addr, "stub/retry-ok");
+        let terms = reconstruction_terms_at(&ctx, "abc123").await.expect(
+            "a 401 on the first reconstruction must trigger exactly one token re-mint and succeed",
+        );
+        assert_eq!(terms.len(), 1);
+        assert_eq!(terms[0].xorb_hash, "x/1");
+        assert_eq!(terms[0].file_offset, 0);
+        assert_eq!(terms[0].byte_len, 8);
+        // The token endpoint was hit twice (original + re-mint) and the retry
+        // carried the freshly minted token, not the rejected one.
+        assert_eq!(cas.token_hits.load(Ordering::Relaxed), 2);
+        assert_eq!(cas.recon_hits.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            cas.recon_bearers.lock().unwrap().as_slice(),
+            ["tok1", "tok2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_auth_error_surfaces_after_one_remint() {
+        invalidate_cas_token_cache("models", "stub/retry-fail", "main");
+        let cas = spawn_cas_stub(true).await;
+        let ctx = stub_ctx(cas.addr, "stub/retry-fail");
+        let err = reconstruction_terms_at(&ctx, "abc123")
+            .await
+            .expect_err("a persistently rejecting CAS must surface an error, not loop");
+        assert!(
+            err.chain()
+                .any(|c| c.downcast_ref::<reqwest::Error>().is_some()),
+            "expected the reqwest auth error to surface, got: {err:#}"
+        );
+        // Bounded: exactly one re-mint, then give up.
+        assert_eq!(cas.token_hits.load(Ordering::Relaxed), 2);
+        assert_eq!(cas.recon_hits.load(Ordering::Relaxed), 2);
     }
 }

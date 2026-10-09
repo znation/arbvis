@@ -34,6 +34,21 @@ and `cargo fmt --check` now exits clean.
 **Validation gap:** none — the existing check (`cargo fmt --check`) reproduced
 it directly; nothing was missing.
 
+### `cargo fmt --check` fails on main (pre-existing drift, not from the Space-app tick) — fixed 2026-10-09 by improve
+
+**Found by improve 2026-10-09.** `cargo fmt --check` reported rustfmt diffs in
+`src/data/source.rs` (~line 304), `src/json_diff/mod.rs` (~line 54),
+`src/volume/html/mod.rs` (~lines 36–48), and `src/volume/shape.rs` (~lines
+37–94 — this last file was added by the recent coverage tick, so the drift had
+grown beyond the two files originally noted). Fixed by running `cargo fmt` over
+the tree; no behavior change. `cargo fmt --check` now passes and the test suite
+runs green afterward.
+
+_Reproduce:_ `cargo fmt --check 2>&1 | grep '^Diff in'`.
+
+**Validation gap:** none — the bug is visible immediately to any developer who
+runs `cargo fmt --check`; the CI/setup simply does not gate on it yet.
+
 ### `src/volume/html/mod.rs` (1889 lines before the split) exceeds the one-sitting readability budget — fixed 2026-10-09 by bugfix
 
 **Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined

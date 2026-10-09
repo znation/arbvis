@@ -28,6 +28,14 @@ the tile pipeline's geometry constants are spread across ~490–591. Suggested d
 cohesive units opportunistically (e.g. `regen_html`/`regen_html_multi` regeneration path from the
 render pipeline), one split per tick, with tests moved alongside. Do not refactor for refactoring's sake.
 
+**Split 2 landed 2026-10-09 by feature:** the regeneration path (`regen_html`, `regen_html_multi`,
+`file_entity_from_json`, `sniff_ext_in`, `sniff_ext_for_zoom`) moved to new `src/tiled/regen.rs`
+(234 lines); `tiled/mod.rs` re-exports `regen_html`, so external callers (`pipeline.rs`) and docs
+are unchanged. No tests lived in the moved block (the `regen_html` error-path test stays in
+`mod.rs` scene_tests). `tiled/mod.rs` is now 1424 lines — still over budget; next split candidates:
+`SceneGroup`/`sanitize_scene_key`/`partition_scenes` (~1258–1339 in the pre-split file) into a
+`scenes` module, or phases out of `drive_pipeline`.
+
 **Reproduce:** `wc -l src/tiled/mod.rs`.
 
 ### `src/volume/mod.rs` (1215 lines) exceeds the one-sitting readability budget

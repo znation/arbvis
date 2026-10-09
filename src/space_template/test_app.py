@@ -169,11 +169,20 @@ class RangeStreamingTest(unittest.TestCase):
         # assets, joined onto local disk paths). Dot segments must never
         # reach those sinks: percent-encoded or literal, they get a 404.
         for p in ("/%2e%2e/other-bucket/file", "/..%2F..%2Fetc/passwd",
-                  "/tiles/%2e/tile.avif", "/..%5C..%5Cfile", "/%2e/x"):
+                  "/tiles/%2e/tile.avif", "/..%5C..%5Cfile", "/%2e/x",
+                  # `rest` is a Starlette `:path` param, so an encoded leading
+                  # slash decodes to a leading `/`; `os.path.join(_MIRROR_DIR,
+                  # rest)` then discards the mirror directory. Must 404, and
+                  # must not leave anything on disk outside the mirror.
+                  "/%2Ftmp%2Fevil-pwn", "/%2Ftmp%2F%2e%2e%2Fevil"):
             r = self.client.get(p)
             self.assertEqual(r.status_code, 404, f"{p} must be rejected")
         # No Hub fetch was attempted for any of them (the fake FS serves
-        # anything, so reaching it would return 200/206 instead).
+        # anything, so reaching it would return 200/206 instead), and the
+        # absolute-rest attempts left nothing on disk outside the mirror.
+        self.assertFalse(os.path.exists("/tmp/evil-pwn"))
+        self.assertFalse(os.path.exists("/tmp/evil-pwn.part"))
+
 
     def test_traversal_free_asset_paths_still_served(self):
         r = self.client.get("/tiles/0/0/0.avif")

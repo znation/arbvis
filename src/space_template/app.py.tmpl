@@ -173,13 +173,16 @@ _MEDIA_TYPES = {
 def asset(rest: str, request: Request):
     if not rest or rest == "index.html":
         return FileResponse("index.html")
-    # Reject `.`/`..` (and backslash) segments before `rest` reaches any path
-    # sink. It is interpolated into `hf://buckets/{BUCKET_ID}/{rest}`, resolved
-    # with the Space's HF_TOKEN, and joined onto local paths if the mirror
-    # asset set ever grows — a traversal segment would escape the deployed
-    # bundle's bucket / directory. The viewer only ever requests bundle asset
-    # names, which contain neither, so this never blocks legitimate use.
-    if rest.startswith(".") or "/." in rest or "\\" in rest:
+    # Reject absolute, `.`/`..`, and backslash segments before `rest` reaches
+    # any path sink. It is interpolated into `hf://buckets/{BUCKET_ID}/{rest}`,
+    # resolved with the Space's HF_TOKEN, and joined onto local paths if the
+    # mirror asset set ever grows. `rest` is a Starlette `:path` param, so a
+    # `%2F`-encoded leading slash decodes to a leading `/` — an absolute rest
+    # would make `os.path.join(_MIRROR_DIR, rest)` discard the mirror
+    # directory entirely and write outside it. The viewer only ever requests
+    # bundle asset names, which contain neither, so this never blocks
+    # legitimate use.
+    if rest.startswith((".", "/")) or "/." in rest or "\\" in rest:
         return Response(status_code=404)
     path = f"hf://buckets/{BUCKET_ID}/{rest}"
     ext = rest.rsplit(".", 1)[-1].lower() if "." in rest else ""

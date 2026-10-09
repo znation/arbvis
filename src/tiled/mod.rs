@@ -409,12 +409,12 @@ pub(super) async fn build_tile_plan(
                 square_pixels,
                 num_squares,
                 height,
-                kh as u8,
+                kh,
             );
             let (pixel_x, pixel_y) = rects_centroid(&rects).unwrap_or_else(|| {
                 let mid = data_start + (data_end - data_start) / 2;
                 let sq = mid / square_pixels;
-                let (lx, ly) = hilbert_to_xy_u64(mid % square_pixels, kh as u8);
+                let (lx, ly) = hilbert_to_xy_u64(mid % square_pixels, kh);
                 (sq as u32 * height + lx, ly)
             });
             let hue = name_hue(&name);

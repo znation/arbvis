@@ -24,6 +24,10 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: cargo doc (deny warnings)
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   test:
     runs-on: ubuntu-latest

@@ -21,7 +21,7 @@ const RESOLVE_CONCURRENCY: usize = 16;
 
 /// Byte/JSON diff over a `--diff` pair (priority 100). Resolves both sides
 /// (local path or single-file `hf://`) and dispatches through the file-pair
-/// builder cascade or [`byte_directory_diff`](crate::data_diff::byte_directory_diff).
+/// builder cascade or [`crate::data_diff::byte_directory_diff`].
 pub(crate) struct ByteDiffProvider;
 
 #[async_trait(?Send)]

@@ -48,7 +48,7 @@ pub struct SingleGeom {
 }
 
 /// Derive the single-image canvas geometry from the byte `total`, via
-/// `hilbert_canvas`: `s` starts at
+/// [`hilbert_canvas`]: `s` starts at
 /// `2 * TILE_LOG2` (the smallest canvas a tile pyramid would build) and grows
 /// until `2^s >= total`; the image is `(1<<kw) × (1<<kh)`.
 pub fn single_geometry(total: u64) -> SingleGeom {

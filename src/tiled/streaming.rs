@@ -106,7 +106,7 @@ pub async fn run_tiles_hf_streaming(
 
 /// Render one scene's full pyramid (overview + detail) and stream it to the Hub
 /// under `[<prefix>/]tiles/[<scene>/]…`, returning its [`SceneView`]. The
-/// streaming analogue of `render_scene_to_disk`; `scene = None` is the
+/// streaming analogue of `super::pipeline::render_scene_to_disk`; `scene = None` is the
 /// legacy lone-pyramid layout. Shares `sink` with its siblings — every clone it
 /// takes is dropped before it returns, so the caller can still `Arc::try_unwrap`.
 #[allow(clippy::too_many_arguments)]

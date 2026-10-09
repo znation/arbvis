@@ -75,7 +75,7 @@ pub fn http_client() -> &'static reqwest::Client {
 
 /// In-flight direct-CAS HTTP requests across all `XetReader`s.
 ///
-/// These bypass the AIMD throttle (xet.rs `load_descriptor`), so the AIMD
+/// These bypass the AIMD throttle (xet/mod.rs `load_descriptor`), so the AIMD
 /// counters miss them. The perf monitor reads this directly to see whether a
 /// stall is really a stall or just CAS requests still in flight.
 static CAS_INFLIGHT: AtomicUsize = AtomicUsize::new(0);

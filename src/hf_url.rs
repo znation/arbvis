@@ -275,9 +275,7 @@ pub fn parse(raw: &str) -> anyhow::Result<HfUrl> {
         // `.` and `..` are never meaningful in an HF repo path, so parsing
         // rejects them outright rather than hoping every join site checks.
         if segs[2..].iter().any(|seg| *seg == "." || *seg == "..") {
-            anyhow::bail!(
-                "hf:// URL path segment `.` or `..` is not allowed: {raw:?}"
-            );
+            anyhow::bail!("hf:// URL path segment `.` or `..` is not allowed: {raw:?}");
         }
         path
     } else {
@@ -294,7 +292,7 @@ pub fn parse(raw: &str) -> anyhow::Result<HfUrl> {
 
 /// The HF endpoint (`HF_ENDPOINT` env override, else `https://huggingface.co`).
 /// Trailing slashes stripped. Used by the direct-HTTP paths that bypass the
-/// `hf` CLI (`fetch_range`, `fetch_model_card`, and `xet.rs`).
+/// `hf` CLI (`fetch_range`, `fetch_model_card`, and `xet/mod.rs`).
 pub fn endpoint() -> String {
     let raw = std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
     raw.trim_end_matches('/').to_string()
@@ -303,7 +301,7 @@ pub fn endpoint() -> String {
 /// Resolve the HF auth token, returning `None` if no token is available.
 ///
 /// Mirrors the resolution order the `hf` CLI uses internally so the direct
-/// HTTP paths (`fetch_range`, `fetch_model_card`, `xet.rs`) sign their
+/// HTTP paths (`fetch_range`, `fetch_model_card`, `xet/mod.rs`) sign their
 /// requests with the same token the CLI would.
 ///
 /// Precedence: `HF_TOKEN` env → `HF_TOKEN_PATH` file → `$HF_HOME/token` file (with
@@ -890,7 +888,10 @@ mod tests {
             assert!(p(url).is_err(), "expected rejection of {url}");
         }
         // A segment merely containing dots is fine.
-        assert_eq!(p("hf://alice/repo/file.model.bin").unwrap().path_in_repo, "file.model.bin");
+        assert_eq!(
+            p("hf://alice/repo/file.model.bin").unwrap().path_in_repo,
+            "file.model.bin"
+        );
     }
 
     #[test]

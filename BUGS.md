@@ -11,7 +11,7 @@ unclear-invariant).
 ### `src/volume/html.rs` (1889 lines) exceeds the one-sitting readability budget
 
 **Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
-"several modules" entry; siblings: tiled/mod.rs, volume/mod.rs, volume/brick.rs, xet.rs, data/mod.rs).
+"several modules" entry; siblings: tiled/mod.rs, volume/mod.rs, volume/brick.rs, xet/mod.rs, data/mod.rs).
 Caveat recorded on inspection: the file is ~15 lines of Rust plus a ~1860-line embedded
 Three.js template string, so a Rust-module split has poor ROI — treat as opportunistic work if a
 feature loop already touches the viewer, e.g. extracting the JS shader/uniform blocks behind named
@@ -22,7 +22,7 @@ const segments. Do not refactor for refactoring's sake.
 ### `src/tiled/mod.rs` (1575 lines) exceeds the one-sitting readability budget
 
 **Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
-"several modules" entry; siblings: volume/html.rs, volume/mod.rs, volume/brick.rs, xet.rs, data/mod.rs).
+"several modules" entry; siblings: volume/html.rs, volume/mod.rs, volume/brick.rs, xet/mod.rs, data/mod.rs).
 Symptom: tile pipeline orchestration, progress plumbing, and Leaflet-regeneration glue share one file;
 the tile pipeline's geometry constants are spread across ~490–591. Suggested direction: split
 cohesive units opportunistically (e.g. `regen_html`/`regen_html_multi` regeneration path from the
@@ -50,7 +50,7 @@ are unchanged. No tests lived in the moved block (the `regen_html` error-path te
 ### `src/volume/mod.rs` (1215 lines) exceeds the one-sitting readability budget
 
 **Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
-"several modules" entry; siblings: volume/html.rs, tiled/mod.rs, volume/brick.rs, xet.rs, data/mod.rs).
+"several modules" entry; siblings: volume/html.rs, tiled/mod.rs, volume/brick.rs, xet/mod.rs, data/mod.rs).
 Suggested direction: split cohesive units opportunistically, one split per tick, with tests moved
 alongside. Do not refactor for refactoring's sake.
 
@@ -59,7 +59,7 @@ alongside. Do not refactor for refactoring's sake.
 ### `src/volume/brick.rs` (1172 lines) exceeds the one-sitting readability budget
 
 **Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
-"several modules" entry; siblings: volume/html.rs, tiled/mod.rs, volume/mod.rs, xet.rs, data/mod.rs).
+"several modules" entry; siblings: volume/html.rs, tiled/mod.rs, volume/mod.rs, xet/mod.rs, data/mod.rs).
 Suggested direction: split cohesive units opportunistically, one split per tick, with tests moved
 alongside. Do not refactor for refactoring's sake.
 
@@ -69,7 +69,7 @@ alongside. Do not refactor for refactoring's sake.
 
 **Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
 "several modules" entry; siblings: volume/html.rs, tiled/mod.rs, volume/mod.rs, volume/brick.rs,
-xet.rs). Already reduced by the diff-subsystem extraction (see Fixed 2026-10-09); remainder is the
+xet/mod.rs). Already reduced by the diff-subsystem extraction (see Fixed 2026-10-09); remainder is the
 source/IO half (Data, SourceKind, Source, prepare_sources). Suggested direction: opportunistic
 splits only. Do not refactor for refactoring's sake.
 
@@ -105,7 +105,7 @@ driving the `pub(super)` markings).
 
 **Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
 "several modules" entry; siblings: volume/html.rs, tiled/mod.rs, volume/mod.rs, volume/brick.rs,
-xet.rs). Fixed in two ticks: first the diff subsystem was extracted into `src/data/diff.rs` (see
+xet/mod.rs). Fixed in two ticks: first the diff subsystem was extracted into `src/data/diff.rs` (see
 the earlier Fixed entry); this tick split the remainder into `src/data/source.rs` (local source
 construction: `collect_files_recursive`, `prepare_sources`, `load_source_data`, and the
 `prepare_sources_tests` moved alongside) and `src/data/remote.rs` (Hub plumbing:

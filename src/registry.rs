@@ -373,7 +373,10 @@ mod tests {
     #[test]
     fn with_defaults_wires_default_leaf_and_voxel_renderers() {
         let reg = Registry::with_defaults();
-        assert_eq!(reg.leaf.loader("hilbert-bytes").unwrap().id(), "hilbert-bytes");
+        assert_eq!(
+            reg.leaf.loader("hilbert-bytes").unwrap().id(),
+            "hilbert-bytes"
+        );
         assert_eq!(
             reg.leaf.renderer("hilbert-bytes").unwrap().id(),
             "hilbert-bytes"

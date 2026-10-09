@@ -109,5 +109,4 @@ mod tests {
         // the test only checks the handle contract, not the loop internals.
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-
 }

@@ -1,7 +1,7 @@
 //! Thin subprocess wrapper around the official Python `hf` CLI.
 //!
 //! Every Hub I/O operation other than direct-HTTP byte ranges (which stay in
-//! `xet.rs` and `hf_url::fetch_range`) goes through here. The CLI bundles
+//! `xet/mod.rs` and `hf_url::fetch_range`) goes through here. The CLI bundles
 //! `hf-xet` internally, so whole-file downloads keep xet dedup wire-speedup
 //! for free without arbvis pulling in xet's per-call stream-group rebuild.
 //!

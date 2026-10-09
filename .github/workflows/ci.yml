@@ -34,3 +34,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo test
         run: cargo test --all-features
+
+  # The deployed Space app (src/space_template/app.py.tmpl) is Python, outside
+  # the cargo suite. Its HTTP Range tests (src/space_template/test_app.py) skip
+  # themselves when their deps are missing, so without this job they never run
+  # anywhere and can rot silently. fastapi + huggingface_hub come from
+  # src/space_template/requirements.txt; httpx is the additional test-only dep
+  # of starlette's TestClient.
+  space-app:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install fastapi httpx huggingface_hub
+      - run: python3 src/space_template/test_app.py

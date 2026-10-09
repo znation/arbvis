@@ -273,7 +273,7 @@ pub async fn run_deploy_bundle(dir: &Path, space_id: &str) -> anyhow::Result<()>
     deploy_space_app(space_id, bucket_id, index_html).await
 }
 
-fn validate_tiles_dir(dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn validate_tiles_dir(dir: &Path) -> anyhow::Result<()> {
     for name in ["index.html", "labels.json"] {
         let p = dir.join(name);
         if !p.exists() {
@@ -287,7 +287,7 @@ fn validate_tiles_dir(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn derive_bucket_id(space_id: &str) -> anyhow::Result<String> {
+pub(crate) fn derive_bucket_id(space_id: &str) -> anyhow::Result<String> {
     let (namespace, repo) = hf_url::split_owner_name(space_id)
         .with_context(|| format!("--space must be namespace/repo, got {space_id:?}"))?;
     if repo.ends_with("_bucket") {
@@ -300,7 +300,11 @@ fn derive_bucket_id(space_id: &str) -> anyhow::Result<String> {
     Ok(format!("{namespace}/{repo}_bucket"))
 }
 
-fn write_space_files(dir: &Path, bucket_id: &str, space_id: &str) -> anyhow::Result<()> {
+pub(crate) fn write_space_files(
+    dir: &Path,
+    bucket_id: &str,
+    space_id: &str,
+) -> anyhow::Result<()> {
     let repo_name = space_id.split('/').nth(1).unwrap_or(space_id);
 
     let readme = include_str!("space_template/README.md.tmpl").replace("__REPO_NAME__", repo_name);
@@ -320,4 +324,90 @@ fn write_space_files(dir: &Path, bucket_id: &str, space_id: &str) -> anyhow::Res
     std::fs::write(dir.join("app.py"), app_py)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_tiles_dir_accepts_complete_layout() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("index.html"), "<html></html>").unwrap();
+        std::fs::write(tmp.path().join("labels.json"), "{}").unwrap();
+        std::fs::create_dir(tmp.path().join("tiles")).unwrap();
+        assert!(validate_tiles_dir(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn validate_tiles_dir_rejects_missing_files_and_tiles_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Nothing present at all: the first missing file is reported.
+        let err = validate_tiles_dir(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("index.html not found"), "got: {err}");
+
+        std::fs::write(tmp.path().join("index.html"), "<html></html>").unwrap();
+        let err = validate_tiles_dir(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("labels.json not found"), "got: {err}");
+
+        std::fs::write(tmp.path().join("labels.json"), "{}").unwrap();
+        let err = validate_tiles_dir(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("tiles/ directory not found"), "got: {err}");
+
+        // A file named `tiles` is not a directory.
+        std::fs::write(tmp.path().join("tiles"), "x").unwrap();
+        let err = validate_tiles_dir(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("tiles/ directory not found"), "got: {err}");
+    }
+
+    #[test]
+    fn derive_bucket_id_appends_bucket_suffix() {
+        assert_eq!(derive_bucket_id("ns/repo").unwrap(), "ns/repo_bucket");
+    }
+
+    #[test]
+    fn derive_bucket_id_rejects_missing_owner_and_double_suffix() {
+        let err = derive_bucket_id("no-owner").unwrap_err().to_string();
+        assert!(err.contains("namespace/repo"), "got: {err}");
+
+        let err = derive_bucket_id("ns/repo_bucket").unwrap_err().to_string();
+        assert!(err.contains("_bucket"), "got: {err}");
+    }
+
+    #[test]
+    fn write_space_files_writes_templates_with_substitutions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_space_files(tmp.path(), "ns/repo_bucket", "ns/repo").unwrap();
+        let readme = std::fs::read_to_string(tmp.path().join("README.md")).unwrap();
+        assert_eq!(readme, include_str!("space_template/README.md.tmpl").replace("__REPO_NAME__", "repo"));
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("Dockerfile")).unwrap(),
+            include_str!("space_template/Dockerfile")
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("requirements.txt")).unwrap(),
+            include_str!("space_template/requirements.txt")
+        );
+        let app_py = std::fs::read_to_string(tmp.path().join("app.py")).unwrap();
+        assert!(app_py.contains("ns/repo_bucket"));
+        assert!(!app_py.contains("__BUCKET_ID__"));
+    }
+
+    #[test]
+    fn write_space_files_falls_back_to_full_space_id_for_repo_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_space_files(tmp.path(), "ns/repo_bucket", "only-repo-name").unwrap();
+        let readme = std::fs::read_to_string(tmp.path().join("README.md")).unwrap();
+        assert!(readme.contains("only-repo-name"));
+    }
+
+    #[tokio::test]
+    async fn run_deploy_bundle_fails_before_network_when_index_html_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = run_deploy_bundle(tmp.path(), "ns/repo")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("index.html not found"), "got: {err}");
+    }
 }

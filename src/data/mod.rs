@@ -172,17 +172,18 @@ fn slice_local(buf: &[u8], start: u64, len: usize) -> anyhow::Result<Vec<u8>> {
     Ok(buf[s..end].to_vec())
 }
 
-/// A `Source` variant supplied by a downstream crate / plugin.
-///
-/// Today the only impl is `TensorDiffSource` (per-tensor diff buffer, was
-/// `SourceKind::TensorDiff`). When `modelweightvis` splits out it'll bring
-/// its tensor-diff impls along; the arbvis core just dispatches by trait.
+/// A `Source` variant supplied by a downstream crate / plugin. arbvis core
+/// ships no impls today; downstream crates (e.g. modelweightvis's tensor-diff
+/// sources, formerly `SourceKind::TensorDiff`) supply them, and the core just
+/// dispatches by trait.
 pub trait CustomSource: Send + Sync {
     /// Stable identifier for diagnostic logs and runtime predicates (e.g.
     /// "is this a tensor-diff source?"). Format: kebab-case.
     fn id(&self) -> &'static str;
-    /// Byte size of the synthetic stream this source exposes. Drives canvas
-    /// layout (Hilbert + arch both read it).
+    /// Byte size of the synthetic stream this source exposes. arbvis's own
+    /// pipeline never calls this today — canvas layout reads the
+    /// `Source::byte_size` field, which the impl sets when it constructs the
+    /// `Source` — but it stays part of the plugin contract for downstream.
     #[allow(dead_code)]
     fn byte_size(&self) -> u64;
     /// Open the source for the render pipeline. Returns a `Data` handle the
@@ -229,9 +230,11 @@ pub enum SourceKind {
         fill: DiffFill,
     },
     /// Source supplied by a [`CustomSource`] impl. The arbvis pipeline only
-    /// touches its `open` / `byte_size` / `id`; everything else is up to the
-    /// impl. Today this carries `TensorDiffSource` for per-tensor `--diff`
-    /// runs.
+    /// touches `open` (and `id` for diagnostics); the canvas size comes from
+    /// the `Source::byte_size` field the impl sets when it constructs the
+    /// `Source`, and everything else is up to the impl. arbvis constructs no
+    /// `Custom` sources today; downstream crates supply them (formerly
+    /// `SourceKind::TensorDiff`) for tensor-aware `--diff` runs.
     Custom(Box<dyn CustomSource>),
 }
 

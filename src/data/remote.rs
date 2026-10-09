@@ -206,9 +206,9 @@ pub async fn materialize_http_sources(sources: &mut [Source]) -> anyhow::Result<
 /// existing retry/backoff path.
 ///
 /// Shared by every disk-backed materialisation path:
-/// [`materialize_http_sources`] (normal flow's `SourceKind::Http` swap) and
-/// `materialize_remote_arcs` (the `Arc<Data>`s buried inside
-/// `SourceKind::TensorDiff` for `--diff`).
+/// [`materialize_http_sources`] (normal flow's `SourceKind::Http` swap) and,
+/// downstream, any plugin that materialises remote sources to local paths
+/// before rendering.
 pub async fn download_specs_to_paths(
     specs: &[RemoteFileSpec],
     progress_label: &str,

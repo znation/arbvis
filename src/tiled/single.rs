@@ -205,7 +205,7 @@ mod tests {
     /// Write a temp file: `fill` bytes of 0x00 followed by a 0x41 run.
     fn temp_input(zeros: usize, a_run: usize) -> anyhow::Result<(PathBuf, PathBuf)> {
         let mut buf = vec![0u8; zeros];
-        buf.extend(std::iter::repeat(0x41u8).take(a_run));
+        buf.extend(std::iter::repeat_n(0x41u8, a_run));
         let mut f = tempfile::NamedTempFile::new()?;
         f.write_all(&buf)?;
         let path = f.into_temp_path().keep()?;

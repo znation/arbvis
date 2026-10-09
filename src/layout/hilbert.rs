@@ -51,3 +51,62 @@ impl HilbertLayout {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smallest_canvas_fits_default_square() {
+        // Anything up to the initial 2^18 canvas keeps the base 512x512
+        // single-tile square: s stays at 2*TILE_LOG2 = 18.
+        for total in [0u64, 1, 2, 262_143, 262_144] {
+            let l = HilbertLayout::from_total(total);
+            assert_eq!(l.kh, 9);
+            assert_eq!(l.width_tiles, 1);
+            assert_eq!(l.height_tiles, 1);
+            assert_eq!(l.height, 512);
+            assert_eq!(l.world_w, 512);
+            assert_eq!(l.max_zoom, 0);
+            assert_eq!(l.total_tiles, 1);
+            assert_eq!(l.square_pixels, 512 * 512);
+            assert_eq!(l.total, total);
+        }
+    }
+
+    #[test]
+    fn exact_power_of_two_boundary_grows_canvas() {
+        // One byte past the base square forces s to 19: an odd exponent,
+        // so the curve is one tile wider than it is tall.
+        let l = HilbertLayout::from_total(262_145);
+        assert_eq!(l.kh, 9);
+        assert_eq!(l.height, 512);
+        assert_eq!(l.width_tiles, 2);
+        assert_eq!(l.height_tiles, 1);
+        assert_eq!(l.total_tiles, 2);
+        assert_eq!(l.world_w, 1024);
+        assert_eq!(l.max_zoom, 0);
+        assert_eq!(l.square_pixels, 512 * 512);
+    }
+
+    #[test]
+    fn even_exponent_keeps_square_and_grows_zoom() {
+        // 2^20 bytes: s = 20, a perfect square canvas two tiles per side.
+        let l = HilbertLayout::from_total(1 << 20);
+        assert_eq!(l.kh, 10);
+        assert_eq!(l.width_tiles, 2);
+        assert_eq!(l.height_tiles, 2);
+        assert_eq!(l.height, 1024);
+        assert_eq!(l.world_w, 512);
+        assert_eq!(l.max_zoom, 1);
+        assert_eq!(l.total_tiles, 4);
+        assert_eq!(l.square_pixels, 1024 * 1024);
+    }
+
+    #[test]
+    fn total_field_round_trips() {
+        for total in [1u64, 500_000, 1 << 40] {
+            assert_eq!(HilbertLayout::from_total(total).total, total);
+        }
+    }
+}

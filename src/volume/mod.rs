@@ -402,13 +402,13 @@ pub fn regen_html(dir: &Path, branding: &Branding, title: Option<&str>) -> anyho
     Ok(())
 }
 
-/// Write the 3D viewer's `index.html` into `dir`, staged to a `.part` sibling
-/// and then renamed into place, so a process killed mid-write (or an ENOSPC
-/// partway through) leaves the previous complete file instead of a truncated
-/// one that the deployed viewer serves as if complete. If the target path
-/// cannot be replaced (it exists as a directory), the write fails before
-/// anything is staged, leaving the previous file untouched. Mirrors the 2D
-/// viewer pair write in `crate::tiled::html::write_viewer_pair`.
+/// Write the 3D viewer's `index.html` into `dir` via [`write_atomic`] (a
+/// `.part` sibling renamed into place, so a process killed mid-write or an
+/// ENOSPC partway through leaves the previous complete file instead of a
+/// truncated one that the deployed viewer serves as if complete). If the
+/// target path cannot be replaced (it exists as a directory), the write fails
+/// before anything is staged, leaving the previous file untouched. Mirrors the
+/// 2D viewer pair write in `crate::tiled::html::write_viewer_pair`.
 fn write_index_html_atomic(dir: &Path, html: &[u8]) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating viewer dir {}", dir.display()))?;
@@ -419,15 +419,7 @@ fn write_index_html_atomic(dir: &Path, html: &[u8]) -> anyhow::Result<()> {
             index.display()
         );
     }
-    let part = dir.join("index.html.part");
-    let res = std::fs::write(&part, html)
-        .and_then(|()| std::fs::rename(&part, &index))
-        .with_context(|| format!("writing {}", index.display()));
-    if res.is_err() {
-        // Best effort: don't leave stale staging files behind.
-        let _ = std::fs::remove_file(&part);
-    }
-    res
+    write_atomic(&index, html)
 }
 
 #[cfg(test)]

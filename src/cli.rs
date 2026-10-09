@@ -24,7 +24,7 @@ use crate::TileFormat;
 /// AVIF is the default: ~30-50% smaller than PNG and supported in every
 /// modern browser. Pick `png` only for byte-for-byte regression checks or
 /// for the rare audience without AVIF support.
-#[derive(Clone, Copy, Debug, ValueEnum, Default)]
+#[derive(Clone, Copy, Debug, ValueEnum, Default, PartialEq, Eq)]
 pub(crate) enum TileFormatArg {
     #[default]
     Avif,
@@ -162,9 +162,12 @@ pub struct Args {
     pub(crate) png: Option<PathBuf>,
 
     /// Tile output format. AVIF (default) is ~30-50% smaller than PNG over
-    /// the wire; PNG is the universal fallback.
-    #[arg(long, value_enum, default_value_t = TileFormatArg::Avif)]
-    pub(crate) tile_format: TileFormatArg,
+    /// the wire; PNG is the universal fallback. Only consumed by the 2D
+    /// tiled viewer; the 3D volume path encodes its own brick textures, so
+    /// an explicitly-set value there is reported as ignored.
+    /// `None` means the flag was not passed (the default applies).
+    #[arg(long, value_enum)]
+    pub(crate) tile_format: Option<TileFormatArg>,
 
     /// Opt in to streaming I/O. Keeps `hf://` inputs remote (per-tile range
     /// fetches instead of an up-front download) and — when combined with an
@@ -587,8 +590,16 @@ mod grid_validation_tests {
 
 #[cfg(test)]
 mod png_flag_tests {
-    use super::{check_bare_run_inputs, Args};
+    use super::{check_bare_run_inputs, Args, TileFormatArg};
     use clap::Parser;
+
+    #[test]
+    fn tile_format_none_by_default_and_some_when_passed() {
+        let default = Args::parse_from(["arbvis", "a.bin"]);
+        assert_eq!(default.tile_format, None);
+        let explicit = Args::parse_from(["arbvis", "a.bin", "--tile-format", "png"]);
+        assert_eq!(explicit.tile_format, Some(TileFormatArg::Png));
+    }
 
     #[test]
     fn png_conflicts_with_3d_space_regen_and_xorbs() {

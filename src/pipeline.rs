@@ -73,6 +73,9 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
     if args.three_d {
         validate_grid(args.grid)?;
         validate_volume_res(args.volume_res)?;
+        if args.tile_format.is_some() {
+            log::warn!("--tile-format only affects the 2D tiled viewer; ignoring it in --3d mode");
+        }
         if let Some(msg) = volume_res_ignored_warning(args.grid, args.volume_res) {
             log::warn!("{msg}");
         }
@@ -98,7 +101,7 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
         Some(OutputDest::from_args(&args)?)
     };
 
-    let (leaf_format, pyramid_format) = args.tile_format.split();
+    let (leaf_format, pyramid_format) = args.tile_format.unwrap_or_default().split();
     let stream = args.stream;
     let show_xet_xorbs = args.show_xet_xorbs;
 

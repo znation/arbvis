@@ -188,4 +188,95 @@ mod tests {
         sink.commit("empty run").await.expect("empty commit ok");
         assert!(!tempdir_path.exists(), "tempdir must be cleaned up");
     }
+
+    use crate::hf_cli::tests::{ENV_LOCK, FakeHfBinGuard};
+
+    /// Script asserting it was invoked as `hf sync <localdir> <dest> --delete`,
+    /// that `<localdir>` actually holds the staged tile, and exiting 0.
+    fn bucket_sync_script(expect_dest: &str) -> String {
+        format!(
+            "#!/bin/sh\n\
+if [ \"$1\" = sync ] && [ \"$4\" = --delete ] && [ \"$3\" = {expect_dest} ] && \
+[ -f \"$2/tiles/0/0_0.png\" ]; then exit 0; fi\n\
+printf 'unexpected argv: %s\\n' \"$*\" >&2; exit 9\n",
+            expect_dest = expect_dest
+        )
+    }
+
+    #[tokio::test]
+    async fn commit_bucket_uploads_with_sync_delete() {
+        let _env = ENV_LOCK.lock().await;
+        let _guard = FakeHfBinGuard::with_script(&bucket_sync_script(
+            "hf://buckets/test/repo/tiles",
+        ));
+        let spec = HfOutputSpec {
+            repo_id: "test/repo".to_string(),
+            kind: RepoKind::Bucket,
+            revision: "main".to_string(),
+            path_prefix: "tiles".to_string(),
+        };
+        let sink = HfTileSink::new(spec).expect("sink");
+        sink.upload_tile("tiles/0/0_0.png".to_string(), b"png".to_vec())
+            .expect("staging succeeds");
+        let tempdir_path = sink.tempdir.path().to_path_buf();
+        sink.commit("summary ignored").await.expect("bucket commit");
+        assert!(!tempdir_path.exists(), "tempdir must be cleaned up");
+    }
+
+    #[tokio::test]
+    async fn commit_repo_uploads_large_folder() {
+        let _env = ENV_LOCK.lock().await;
+        // Argv must be: upload-large-folder --repo-type <type> --revision
+        // <rev> <repo_id> <localdir>, with the staged tile under <localdir>.
+        let _guard = FakeHfBinGuard::with_script(
+            "#!/bin/sh\n\
+if [ \"$1\" = upload-large-folder ] && [ \"$2\" = --repo-type ] \
+&& [ \"$3\" = dataset ] && [ \"$4\" = --revision ] && [ \"$5\" = rev-7 ] \
+&& [ \"$6\" = test/repo ] && [ -f \"$7/tiles/0/0_0.png\" ]; then exit 0; fi\n\
+printf 'unexpected argv: %s\\n' \"$*\" >&2; exit 9\n",
+        );
+        let spec = HfOutputSpec {
+            repo_id: "test/repo".to_string(),
+            kind: RepoKind::Dataset,
+            revision: "rev-7".to_string(),
+            path_prefix: String::new(),
+        };
+        let sink = HfTileSink::new(spec).expect("sink");
+        sink.upload_tile("tiles/0/0_0.png".to_string(), b"png".to_vec())
+            .expect("staging succeeds");
+        sink.commit("summary ignored").await.expect("repo commit");
+    }
+
+    #[tokio::test]
+    async fn commit_propagates_cli_failure_with_context() {
+        let _env = ENV_LOCK.lock().await;
+        let _guard = FakeHfBinGuard::with_script(
+            bucket_sync_script("hf://buckets/test/repo/tiles")
+                .replace("exit 0; fi", "exit 7; fi")
+                .as_str(),
+        );
+        let spec = HfOutputSpec {
+            repo_id: "test/repo".to_string(),
+            kind: RepoKind::Bucket,
+            revision: "main".to_string(),
+            path_prefix: "tiles".to_string(),
+        };
+        let sink = HfTileSink::new(spec).expect("sink");
+        sink.upload_tile("tiles/0/0_0.png".to_string(), b"png".to_vec())
+            .expect("staging succeeds");
+        let err = sink.commit("summary")
+            .await
+            .expect_err("failed sync must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("syncing tiles to hf://buckets/test/repo/tiles"),
+            "error should carry the sync context, got: {msg}"
+        );
+        // The CLI's own exit status lives one level down the context chain.
+        let cause = err.root_cause().to_string();
+        assert!(
+            cause.contains("exit status: 7"),
+            "error should carry the CLI exit status, got: {cause}"
+        );
+    }
 }

@@ -517,7 +517,7 @@ pub async fn check_hf_available() -> Result<String, HfCliError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Reader that serves a few bytes, then fails: simulates a pipe error
@@ -724,18 +724,19 @@ mod tests {
 
     // The fake-binary tests mutate the process-global ARBVIS_HF_BIN env var;
     // cargo runs tests on parallel threads, so they serialize on this lock.
-    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(crate) static ENV_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
     /// Writes a fake `hf` executable to a temp path, points `ARBVIS_HF_BIN`
     /// at it, and restores the previous env value on drop so failures don't
     /// poison sibling tests.
-    struct FakeHfBinGuard {
+    pub(crate) struct FakeHfBinGuard {
         path: std::path::PathBuf,
         prev: Option<String>,
     }
 
     impl FakeHfBinGuard {
-        fn with_script(script: &str) -> Self {
+        pub(crate) fn with_script(script: &str) -> Self {
             let mut path = std::env::temp_dir();
             path.push(format!(
                 "arbvis-hf-fake-{}-{}.sh",
@@ -763,7 +764,7 @@ mod tests {
     }
 
     // Distinguishes concurrently-alive temp scripts from each other.
-    fn uuid_like_suffix() -> u64 {
+    pub(crate) fn uuid_like_suffix() -> u64 {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         N.fetch_add(1, Ordering::Relaxed)

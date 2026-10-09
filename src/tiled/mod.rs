@@ -1496,3 +1496,177 @@ mod scene_tests {
         assert!(msg.contains("--3d"), "unexpected message: {msg}");
     }
 }
+
+#[cfg(test)]
+mod render_one_tests {
+    use super::*;
+    use crate::data::{DiffFill, SourceKind};
+    use crate::tiled::leaf::{TileFormat, TILE_PIXELS};
+    use crate::xet::XetTerm;
+
+    fn source(kind: SourceKind, byte_size: u64) -> Source {
+        Source {
+            file_idx: 0,
+            kind,
+            byte_size,
+            name_override: None,
+            xet_terms: None,
+            extensions: Default::default(),
+        }
+    }
+
+    // kh=11 (4×4 tile grid): the minimum geometry render_one's tile math
+    // accepts with height_tiles=4.
+    const KH: u8 = 11;
+    const HEIGHT_TILES: u32 = 4;
+    const SQUARE_PIXELS: u64 = 1 << (2 * KH);
+
+    fn loaded_tile(tx: u32, ty: u32, fill: u8) -> LoadedTile {
+        LoadedTile {
+            tx,
+            ty,
+            tile_buf: Some(Box::new([fill; TILE_PIXELS])),
+            extra: None,
+        }
+    }
+
+    fn plain_mode() -> LeafMode {
+        LeafMode::Plain {
+            pixel_lut: Arc::new(build_pixel_lut()),
+        }
+    }
+
+    #[test]
+    fn render_one_plain_mode_maps_bytes_and_preserves_tile_coords() {
+        let t = loaded_tile(3, 3, 0x40);
+        let out = render_one(t, &plain_mode(), KH, HEIGHT_TILES, SQUARE_PIXELS, SQUARE_PIXELS, TileFormat::IndexedPng)
+            .expect("plain render should succeed");
+        assert_eq!((out.tx, out.ty), (3, 3));
+        assert_eq!(out.image.dimensions(), (leaf::TILE, leaf::TILE));
+        // Every tile byte is 0x40, so the LUT color for 0x40 must appear.
+        let expected = build_pixel_lut()[0x40];
+        assert!(out
+            .image
+            .pixels()
+            .all(|p| p.0[0] == expected.0[0] && p.0[1] == expected.0[1] && p.0[2] == expected.0[2]));
+        assert!(!out.bytes.is_empty(), "encoded bytes must not be empty");
+    }
+
+    #[test]
+    fn render_one_xet_mode_renders_from_tile_buf() {
+        let mode = LeafMode::Xet {
+            pixel_lut: Arc::new(build_pixel_lut()),
+            xorb_ranges: Arc::new(vec![]),
+            tableau: Arc::new(tableau_palette()),
+        };
+        let out = render_one(
+            loaded_tile(0, 0, 0x7f),
+            &mode,
+            KH,
+            HEIGHT_TILES,
+            SQUARE_PIXELS,
+            SQUARE_PIXELS,
+            TileFormat::IndexedPng,
+        )
+        .expect("xet render should succeed");
+        assert_eq!(out.image.dimensions(), (leaf::TILE, leaf::TILE));
+        let expected = build_pixel_lut()[0x7f];
+        assert!(out
+            .image
+            .pixels()
+            .all(|p| p.0[0] == expected.0[0] && p.0[1] == expected.0[1] && p.0[2] == expected.0[2]));
+    }
+
+    #[test]
+    fn render_one_diff_mode_renders_from_tile_buf() {
+        let mode = LeafMode::Diff {
+            pixel_lut: Arc::new(build_diff_signed_lut()),
+            plain_lut: Arc::new(build_pixel_lut()),
+            fills: Arc::new(vec![]),
+            tints: Arc::new(vec![]),
+        };
+        let out = render_one(
+            loaded_tile(1, 0, 0x00),
+            &mode,
+            KH,
+            HEIGHT_TILES,
+            SQUARE_PIXELS,
+            SQUARE_PIXELS,
+            TileFormat::IndexedPng,
+        )
+        .expect("diff render should succeed");
+        assert_eq!(out.image.dimensions(), (leaf::TILE, leaf::TILE));
+        assert!(!out.bytes.is_empty());
+    }
+
+    #[test]
+    fn render_one_panics_when_mode_needs_bytes_but_tile_buf_is_none() {
+        let modes = [
+            plain_mode(),
+            LeafMode::Xet {
+                pixel_lut: Arc::new(build_pixel_lut()),
+                xorb_ranges: Arc::new(vec![]),
+                tableau: Arc::new(tableau_palette()),
+            },
+            LeafMode::Diff {
+                pixel_lut: Arc::new(build_diff_signed_lut()),
+                plain_lut: Arc::new(build_pixel_lut()),
+                fills: Arc::new(vec![]),
+                tints: Arc::new(vec![]),
+            },
+        ];
+        for mode in modes {
+            let tile = LoadedTile {
+                tx: 0,
+                ty: 0,
+                tile_buf: None,
+                extra: None,
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = render_one(tile, &mode, KH, HEIGHT_TILES, SQUARE_PIXELS, SQUARE_PIXELS, TileFormat::IndexedPng);
+            }));
+            assert!(result.is_err(), "expected panic");
+        }
+    }
+
+    #[test]
+    fn xet_xorb_ranges_shifts_terms_by_cumulative_offset() {
+        let terms = vec![XetTerm {
+            file_offset: 0,
+            byte_len: 10,
+            xorb_hash: "aa".into(),
+        }];
+        let later = vec![XetTerm {
+            file_offset: 5,
+            byte_len: 3,
+            xorb_hash: "bb".into(),
+        }];
+        let sources = vec![
+            source(SourceKind::Buffered(vec![]), 10),
+            source(SourceKind::Buffered(vec![]), 8),
+        ];
+        let map = xet_xorb_ranges(
+            &sources
+                .into_iter()
+                .enumerate()
+                .map(|(i, mut s)| {
+                    s.xet_terms = Some(if i == 0 { terms.clone() } else { later.clone() });
+                    s
+                })
+                .collect::<Vec<_>>(),
+            &[0, 10],
+        );
+        assert_eq!(map.global_ranges, vec![(0, 10, 0), (15, 18, 1)]);
+    }
+
+    #[test]
+    fn xet_xorb_ranges_is_empty_without_xet_terms() {
+        let sources = vec![
+            source(SourceKind::Buffered(vec![]), 10),
+            source(SourceKind::UnmatchedRegion { fill: DiffFill::Grey }, 4),
+        ];
+        let map = xet_xorb_ranges(&sources, &[0, 10]);
+        assert!(map.is_empty());
+    }
+}
+

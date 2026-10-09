@@ -28,7 +28,7 @@ use crate::tiled::leaf::TILE;
 /// to the priority floor when no registered layout with that id applies.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutMode {
-    /// Auto-select: the highest-priority applicable [`LayoutPlugin`] wins,
+    /// Auto-select: the highest-priority applicable [`crate::registry::LayoutPlugin`] wins,
     /// falling back to the byte-Hilbert floor.
     #[default]
     Auto,

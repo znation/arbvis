@@ -196,7 +196,7 @@ pub async fn materialize_http_sources(sources: &mut [Source]) -> anyhow::Result<
 
 /// Download a batch of [`RemoteFileSpec`]s to the local HF cache and return
 /// the local paths in the same order. Drives the AIMD throttle through
-/// [`crate::throttle::with_throttle`] and reports progress via a one-shot
+/// `crate::throttle::with_throttle` and reports progress via a one-shot
 /// `setup_progress` bar.
 ///
 /// Each download is a fresh `hf download <repo> <file>` subprocess. The CLI

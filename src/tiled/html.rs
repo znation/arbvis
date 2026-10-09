@@ -936,9 +936,7 @@ pub fn generate_leaflet_content_multi(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_html, build_html_multi, build_info_html, Branding, SceneView,
-    };
+    use super::{build_html, build_html_multi, build_info_html, Branding, SceneView};
     fn scene(key: &str, world_w: u32, world_h: u32) -> SceneView {
         SceneView {
             key: Some(key.to_string()),

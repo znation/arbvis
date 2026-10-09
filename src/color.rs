@@ -3,7 +3,7 @@ use image::Rgb;
 /// Map a byte to a color based on value range.
 ///
 /// Color scheme from
-/// https://stairwell.com/resources/hilbert-curves-visualizing-binary-files-with-color-and-patterns/
+/// <https://stairwell.com/resources/hilbert-curves-visualizing-binary-files-with-color-and-patterns/>
 pub fn byte_to_pixel(v: u8) -> Rgb<u8> {
     match v {
         0 => Rgb([0, 0, 0]),

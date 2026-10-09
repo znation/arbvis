@@ -210,7 +210,7 @@ pub enum SourceKind {
     },
     /// Byte-for-byte signed diff over a sub-range of two whole-file Data
     /// sources. Identical rendering semantics to `SourceKind::Diff` (signed
-    /// byte delta) but parameterised over (Arc<Data>, start_offset) so each
+    /// byte delta) but parameterised over `(Arc<Data>, start_offset)` so each
     /// structurally-aligned span emitted by the JSON / JSONL aligner becomes
     /// one Source over its byte range.
     RangeDiff {

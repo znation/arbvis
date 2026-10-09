@@ -78,7 +78,7 @@ pub trait LayoutPlugin: Send + Sync {
 
 /// Builds a 3D volume layout for the given sources, when applicable. The 3D
 /// analog of [`LayoutPlugin`]; selected by
-/// [`crate::volume::select_volume_shape`] with the same descending-priority /
+/// `crate::volume::select_volume_shape` with the same descending-priority /
 /// `i32::MIN`-floor rules. A downstream gates on [`LayoutBuildCtx::mode`] in
 /// `applicable` exactly as the 2D arch layout does.
 pub trait VolumeShapePlugin: Send + Sync {
@@ -261,7 +261,7 @@ pub struct Registry {
     pub layouts: Vec<Arc<dyn LayoutPlugin>>,
     /// 3D (`--3d`) layout plugins, the volume analog of `layouts`. `run` picks
     /// the highest-priority applicable one via
-    /// [`crate::volume::select_volume_shape`]; the `i32::MIN`
+    /// `crate::volume::select_volume_shape`; the `i32::MIN`
     /// `HilbertVolumePlugin` floor (installed by [`Registry::with_defaults`])
     /// always applies.
     pub volume_shapes: Vec<Arc<dyn VolumeShapePlugin>>,
@@ -282,7 +282,7 @@ pub struct Registry {
     /// this (e.g. [`LayoutMode::Forced`] with one of its layout ids).
     pub layout_mode: LayoutMode,
     /// When `true`, a forced [`LayoutMode::Forced`] layout that can't build for
-    /// the inputs becomes a hard error in [`crate::layout::select_layout`]
+    /// the inputs becomes a hard error in `crate::layout::select_layout`
     /// instead of a warning + silent fallback. Downstreams that map a
     /// `--strict-layout` flag set this alongside `layout_mode`. No effect under
     /// [`LayoutMode::Auto`]/[`LayoutMode::Hilbert`] (neither can fall back).

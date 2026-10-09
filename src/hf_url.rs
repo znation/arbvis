@@ -53,7 +53,7 @@ impl RepoKind {
 ///
 /// Buckets are intentionally not constructable here: the bucket HTTP surface
 /// has no public range-read primitive, so any caller building a `RemoteRepo`
-/// for range I/O is rejected upstream (see [`make_remote_repo`]). The Hub I/O
+/// for range I/O is rejected upstream (see `make_remote_repo`). The Hub I/O
 /// that flows through the `hf` CLI uses the [`RepoKind`] + repo-id pair
 /// directly and doesn't need this struct.
 #[derive(Clone, Debug)]
@@ -213,12 +213,12 @@ pub fn sanitize_log_text(s: &str) -> String {
 /// Parse an `hf://` URL into its components.
 ///
 /// Supported forms:
-///   hf://{owner}/{repo}[@{rev}]            → model (default), repo-level
-///   hf://{owner}/{repo}[@{rev}]/{path}     → model (default), single file
-///   hf://models/{owner}/{repo}[@{rev}][/{path}]   → model
-///   hf://datasets/{owner}/{repo}[@{rev}][/{path}] → dataset
-///   hf://spaces/{owner}/{repo}[@{rev}][/{path}]   → space
-///   hf://buckets/{owner}/{bucket}[/{path}]         → bucket (no revision concept)
+///   `hf://{owner}/{repo}[@{rev}]`                  → model (default), repo-level
+///   `hf://{owner}/{repo}[@{rev}]/{path}`           → model (default), single file
+///   `hf://models/{owner}/{repo}[@{rev}][/{path}]`  → model
+///   `hf://datasets/{owner}/{repo}[@{rev}][/{path}]` → dataset
+///   `hf://spaces/{owner}/{repo}[@{rev}][/{path}]`  → space
+///   `hf://buckets/{owner}/{bucket}[/{path}]`       → bucket (no revision concept)
 ///
 /// Empty path segments — including a trailing slash — are stripped so that
 /// `hf://owner/repo/path/` parses with `path_in_repo = "path"`, not `"path/"`.
@@ -360,7 +360,7 @@ pub fn require_token() -> anyhow::Result<()> {
 /// The interpretation of fields like `cardData.base_model` /
 /// `cardData.base_model_relation` is left to callers — model-specific logic
 /// (e.g. finetune auto-detection) lives in
-/// [`crate::finetune::detect_relation`], which the modelweightvis split will
+/// `crate::finetune::detect_relation`, which the modelweightvis split will
 /// own.
 pub async fn fetch_model_card(repo_id: &str) -> anyhow::Result<serde_json::Value> {
     let url = format!("{}/api/models/{}", endpoint(), encode_url_path(repo_id));
@@ -783,7 +783,11 @@ pub fn web_url(raw: &str) -> Option<String> {
         .map(|rest| rest.ends_with('/'))
         .unwrap_or(false);
     let verb = if tree { "tree" } else { "blob" };
-    Some(format!("{base}/{verb}/{}/{path}", hf.revision, path = hf.path_in_repo))
+    Some(format!(
+        "{base}/{verb}/{}/{path}",
+        hf.revision,
+        path = hf.path_in_repo
+    ))
 }
 
 pub fn is_hf_url(s: &str) -> bool {
@@ -1049,7 +1053,10 @@ mod tests {
 
     #[test]
     fn web_url_bare_model_repo() {
-        assert_eq!(web_url("hf://owner/repo"), Some("https://huggingface.co/owner/repo".to_string()));
+        assert_eq!(
+            web_url("hf://owner/repo"),
+            Some("https://huggingface.co/owner/repo".to_string())
+        );
     }
 
     #[test]

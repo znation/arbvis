@@ -97,7 +97,7 @@ pub struct Args {
     pub(crate) three_d: bool,
 
     /// 3D target detail resolution: the voxel grid side (a power of two,
-    /// 2–16384, default 1024). Higher is more detailed. Above `COARSE_CAP` (128)
+    /// 2–16384, default 1024). Higher is more detailed. Above `COARSE_CAP` (256)
     /// the up-front download stays small and fixed — a coarse `COARSE_CAP`³
     /// fallback plus a sparse octree — while the fine detail streams on demand
     /// from a brick pool as you pan/zoom. The octree page structure is

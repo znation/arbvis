@@ -5,7 +5,32 @@ Each plan: goal, approach, files touched, acceptance criteria. Move finished pla
 
 ## Planned
 
-_None yet._
+### Diff-mode single-image PNG export (`--png FILE` with `--diff`) — found by plan loop 2026-10-09
+
+**Verified 2026-10-09:** the single-image PNG path shipped (`src/tiled/single.rs`, routed in `src/pipeline.rs` ~line 184) deliberately excludes diff: `src/cli.rs` `--png` has `conflicts_with_all = ["three_d", "diff", "space", "regen_html", "show_xet_xorbs"]` (~line 159), and no diff-rendering code exists in `single.rs`. `render_single_png` uses only the plain byte LUT.
+
+**Goal:** let `arbvis --diff ORIGINAL MODIFIED --png out.png` write the diff visualization as one PNG, so diff output can be embedded in docs/PRs without serving a web bundle (same motivation as the original `--png` plan).
+
+**Approach:**
+- `src/cli.rs`: remove `"diff"` from the `--png` `conflicts_with_all` list; keep the other conflicts. Update the `png_conflicts_with_3d_diff_space_regen_and_xorbs` test (rename/adjust to drop the `--diff` case and add an assertion that `--png` + `--diff` is now accepted).
+- `src/tiled/mod.rs`: factor the diff-mode `LeafMode::Diff { pixel_lut, plain_lut, fills, tints }` construction out of `build_tile_plan` (the `build_diff_signed_lut()` branch ~line 303 and the crosshatch fills/tints collection ~lines 409–451) into a `pub(super)` helper, e.g. `fn diff_leaf_mode(sources: &[Source], total: u64) -> LeafMode`. `build_tile_plan` calls it in place of the inline code; the new renderer calls it too.
+- `src/tiled/single.rs`: add `pub async fn render_single_diff_png(sources: &[Source], total: u64, fills/tints (or the LeafMode), out: &Path) -> anyhow::Result<()>`:
+  - Geometry via the existing `single_geometry(total)` and the tile scatter helpers already in this file — the tile grid is identical in diff mode.
+  - For each tile `(tx, ty)`: load the signed-delta tile buffer with `tiled::leaf::load_tile_bytes` (async, handles local mmap and remote `Data` variants — same loading path the diff pyramid uses via `HilbertBytesLoader`), then render with `tiled::leaf::render_leaf_tile_diff(tx, ty, kh, height_tiles, square_pixels, total, &tile_buf, &pixel_lut, &plain_lut, &fills, &tints, ...)`. That returns a `TileResult` carrying a `TILE×TILE` RGB image; blit it into a full `ImageBuffer<Rgb<u8>, Vec<u8>>` at raster `(tx*TILE, ty*TILE)`.
+  - Encode as a truecolor RGB PNG, not indexed: diff output mixes signed-delta LUT colors, one-sided-source tints, and crosshatch fills, so the palette is not 256 entries. Add a small `encode_rgb_png(width, height, &img)` alongside the existing `encode_indexed_single_png` (the `png` crate is already a dependency).
+  - Reuse `png_output_path` and the write-to-temp-then-rename pattern of `render_single_png`.
+- `src/pipeline.rs`: in the `--png` routing block (~line 184), when `hints.diff_mode` is true call `render_single_diff_png` instead of `render_single_png`; the sources/total from `chosen.prepare` already carry the diff pair. The existing `total == 0` bail stays.
+
+**Files touched:** `src/cli.rs`, `src/pipeline.rs`, `src/tiled/mod.rs` (helper extraction only), `src/tiled/single.rs`. No new module, no new dependency.
+
+**Acceptance criteria:**
+- `cargo test` passes, including new tests in `src/tiled/single.rs`'s `#[cfg(test)]` module: (1) render a diff PNG for a small known original/modified pair with a fabricated fill/tint list, decode it with the `png` crate, and assert sampled pixels match a reference computed directly from `render_leaf_tile_diff`'s per-tile output placed at `(tx*TILE, ty*TILE)`; (2) the factored-out `diff_leaf_mode` helper produces the same `LeafMode::Diff` fills/tints `build_tile_plan` produced before the extraction (guard the refactor with the existing `build_tile_plan` tests, which must stay green unmodified).
+- A `src/cli.rs` test asserts `--png` + `--diff` parses without conflict and `--png` still conflicts with `--3d`, `--space`, `--regen-html`, `--show-xet-xorbs`.
+- `arbvis --diff orig mod --png out.png` produces a valid PNG for a small real pair (manual check documented in the run summary, not a committed fixture).
+
+**Sizing:** ~150–200 lines across four existing files plus tests — one run. `--png` for `--show-xet-xorbs` remains a separate possible follow-up; do not attempt it here.
+
+_Plan written 2026-10-09._
 
 ## Done
 

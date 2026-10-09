@@ -492,4 +492,86 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_outer_segments_single_rect() {
+        // One rect yields exactly its four boundary edges.
+        let segs = outer_segments(&[(2, 3, 5, 7)]);
+        assert_eq!(segs.len(), 4);
+        assert!(segs.contains(&(2, 3, 2, 7)));
+        assert!(segs.contains(&(5, 3, 5, 7)));
+        assert!(segs.contains(&(2, 3, 5, 3)));
+        assert!(segs.contains(&(2, 7, 5, 7)));
+    }
+
+    #[test]
+    fn test_outer_segments_adjacent_rects_cancel_interior() {
+        // Two rects tiling a 2x1 region: the interior vertical edge at x=1
+        // cancels; horizontal boundary edges stay (possibly split per rect).
+        let segs = outer_segments(&[(0, 0, 1, 1), (1, 0, 2, 1)]);
+        // No vertical edge at x=1.
+        assert!(!segs.iter().any(|&(x0, _, x1, _)| x0 == 1 && x1 == 1));
+        // Outer boundary edges are present.
+        assert!(segs.contains(&(0, 0, 0, 1)));
+        assert!(segs.contains(&(2, 0, 2, 1)));
+        assert!(segs.contains(&(0, 0, 1, 0)));
+        assert!(segs.contains(&(1, 0, 2, 0)));
+        assert!(segs.contains(&(0, 1, 1, 1)));
+        assert!(segs.contains(&(1, 1, 2, 1)));
+    }
+
+    #[test]
+    fn test_outer_segments_empty_and_degenerate() {
+        assert!(outer_segments(&[]).is_empty());
+        // Zero-area rects contribute no edges (xor_intervals drops empty intervals).
+        assert!(outer_segments(&[(1, 1, 1, 1)]).is_empty());
+    }
+
+    #[test]
+    fn test_file_rects_empty_and_clamped() {
+        // Empty range: byte_end <= byte_start.
+        assert!(file_rects(5, 5, 16, 16, 1, 4, 2).is_empty());
+        assert!(file_rects(5, 3, 16, 16, 1, 4, 2).is_empty());
+        // byte_end is clamped to total_pixels.
+        let rects = file_rects(4, 100, 16, 16, 1, 4, 2);
+        let total: u64 = rects
+            .iter()
+            .map(|&(x0, y0, x1, y1)| {
+                (x1 - x0) as u64 * (y1 - y0) as u64
+            })
+            .sum();
+        assert_eq!(total, 16 - 4);
+    }
+
+    #[test]
+    fn test_file_rects_covered_area_matches_range() {
+        // For a range within one square, the dyadic rects cover exactly the range.
+        let height: u32 = 16;
+        let square_pixels = (height as u64) * (height as u64);
+        for (a, b) in [(0u64, 256u64), (0, 1), (3, 70), (255, 256), (5, 250)] {
+            let rects = file_rects(a, b, square_pixels, square_pixels, 1, height, 8);
+            let total: u64 = rects
+                .iter()
+                .map(|&(x0, y0, x1, y1)| {
+                    (x1 - x0) as u64 * (y1 - y0) as u64
+                })
+                .sum();
+            assert_eq!(total, b - a, "range [{a},{b})");
+        }
+    }
+
+    #[test]
+    fn test_file_rects_multi_square_split() {
+        // A range spanning two squares is decomposed per-square.
+        let height: u32 = 2;
+        let square_pixels = (height as u64) * (height as u64);
+        let rects = file_rects(3, 6, 8, square_pixels, 2, height, 2);
+        let total: u64 = rects
+            .iter()
+            .map(|&(x0, y0, x1, y1)| (x1 - x0) as u64 * (y1 - y0) as u64)
+            .sum();
+        assert_eq!(total, 3);
+        // Second square's rects are offset by height on the x axis.
+        assert!(rects.iter().any(|&(x0, _, _, _)| x0 >= height));
+    }
 }

@@ -56,15 +56,6 @@ alongside. Do not refactor for refactoring's sake.
 
 **Reproduce:** `wc -l src/volume/brick.rs`.
 
-### `src/xet.rs` (1121 lines) exceeds the one-sitting readability budget
-
-**Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
-"several modules" entry; siblings: volume/html.rs, tiled/mod.rs, volume/mod.rs, volume/brick.rs,
-data/mod.rs). Suggested direction: split cohesive units opportunistically, one split per tick, with
-tests moved alongside. Do not refactor for refactoring's sake.
-
-**Reproduce:** `wc -l src/xet.rs`.
-
 ### `src/data/mod.rs` (853 lines) exceeds the one-sitting readability budget
 
 **Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
@@ -79,6 +70,27 @@ Note: the original combined entry also listed `lib.rs` at 1131 lines, which was 
 `lib.rs` is 134 lines and in budget.
 
 ## Fixed
+
+### `src/xet/mod.rs` (1121 lines before the fetch split) exceeds the one-sitting readability budget — fixed 2026-10-09 by bugfix
+
+**Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
+"several modules" entry; siblings: volume/html.rs, tiled/mod.rs, volume/mod.rs, volume/brick.rs,
+data/mod.rs). Split 1 landed 2026-10-09 by bugfix: the protocol unit — wire types
+(`XetReadTokenResponse`, `WireRange`, `ReconstructionTerm`, `WireXorbRangeDescriptor`,
+`WireXorbMultiRangeFetch`, `ReconstructionResponse`, `CasToken`) plus the CAS-token cache and fetch
+helpers (`authed_get_json`, `fetch_cas_token`, `fetch_reconstruction_response`,
+`fetch_reconstruction_terms`, `invalidate_cas_token_cache`) — moved verbatim to new `src/xet/fetch.rs`
+(211 lines), with the moved items marked `pub(super)` so the `crate::xet` public surface
+(`XetTerm`, `reconstruction_for`, `XetReader`, `XorbMap`, `TABLEAU_20`, `CasStats`, `http_client`)
+is unchanged; `lib.rs` untouched. `src/xet/mod.rs` is now 946 lines — still over budget; next split
+candidate: the `XetReader` impl + its cache/refresh support into a sibling reader module.
+
+**Reproduce (was):** `wc -l src/xet/mod.rs` (1121 lines before the split; the module was single-file then). Now: mod.rs 946, fetch.rs 211 lines.
+
+**Validation gap:** unclear-invariant — the split is a pure code move, so a passing suite could not
+distinguish a faithful move from one that silently changed visibility or the public API; had to
+reconstruct the `crate::xet` surface contract first (grep over external callers, cargo build errors
+driving the `pub(super)` markings).
 
 ### `src/data/mod.rs` (853 lines) exceeds the one-sitting readability budget — fixed 2026-10-09 by bugfix
 

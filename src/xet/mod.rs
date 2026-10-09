@@ -15,6 +15,13 @@
 //! dedup for per-tile range reads (`--stream` and `--show-xet-xorbs`) we
 //! talk to these two endpoints directly with `reqwest`.
 
+mod fetch;
+
+use fetch::{
+    fetch_cas_token, fetch_reconstruction_response, fetch_reconstruction_terms,
+    invalidate_cas_token_cache,
+};
+
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -23,10 +30,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use lru::LruCache;
-use serde::{de::DeserializeOwned, Deserialize};
 
 use crate::hf_url::{self, RemoteFileSpec};
-use crate::throttle::with_throttle;
 
 /// Shared HTTP client used by every xet endpoint (token, reconstruction,
 /// direct-CAS range fetches).
@@ -109,201 +114,6 @@ pub struct XetTerm {
     pub xorb_hash: String,
 }
 
-#[derive(Deserialize)]
-struct XetReadTokenResponse {
-    #[serde(rename = "accessToken")]
-    access_token: String,
-    #[serde(rename = "casUrl")]
-    cas_url: String,
-}
-
-/// JSON wire form of `ChunkRange`/`HttpRange`/`FileRange` from xet-client's
-/// `cas_types::Range<Idx, Kind>` — the `_marker` field is `#[serde(skip)]`
-/// so only `start`/`end` go on the wire.
-#[derive(Deserialize, Clone, Copy)]
-struct WireRange<T> {
-    start: T,
-    end: T,
-}
-
-#[derive(Deserialize)]
-struct ReconstructionTerm {
-    hash: String,
-    #[serde(rename = "unpacked_length")]
-    unpacked_length: u64,
-    /// Chunk index `[start, end)` within the xorb. Captured so the reader can
-    /// map a file-byte range to the exact chunks it spans (vs. approximating
-    /// from term boundaries alone).
-    range: WireRange<u32>,
-}
-
-/// Per-xorb byte range fetch instructions: one signed URL covers some chunks,
-/// described by `chunks` (chunk index range) and `bytes` (packed-byte range
-/// inside the xorb, *inclusive end* — `HttpRange` semantics).
-#[derive(Deserialize)]
-struct WireXorbRangeDescriptor {
-    chunks: WireRange<u32>,
-    bytes: WireRange<u64>,
-}
-
-#[derive(Deserialize)]
-struct WireXorbMultiRangeFetch {
-    url: String,
-    ranges: Vec<WireXorbRangeDescriptor>,
-}
-
-#[derive(Deserialize)]
-struct ReconstructionResponse {
-    terms: Vec<ReconstructionTerm>,
-    /// V2-only: per-xorb signed-URL fetch info. Absent on V1 responses; we
-    /// require V2 for the direct-CAS reader path, so callers that need it
-    /// should error if this field is missing.
-    #[serde(default)]
-    xorbs: HashMap<String, Vec<WireXorbMultiRangeFetch>>,
-}
-
-#[derive(Clone)]
-struct CasToken {
-    cas_url: String,
-    access_token: String,
-}
-
-/// Per-process cache of CAS tokens, keyed by `(api_segment, repo_id, revision)`.
-/// Tokens expire (the response includes an `exp` field) but for arbvis runs
-/// they live well within the expiration window of a single visualization.
-static CAS_TOKEN_CACHE: Mutex<Option<HashMap<(String, String, String), CasToken>>> =
-    Mutex::new(None);
-
-fn invalidate_cas_token_cache(api_segment: &str, repo_id: &str, revision: &str) {
-    let key = (
-        api_segment.to_string(),
-        repo_id.to_string(),
-        revision.to_string(),
-    );
-    let mut guard = CAS_TOKEN_CACHE.lock().unwrap();
-    if let Some(cache) = guard.as_mut() {
-        cache.remove(&key);
-    }
-}
-
-/// Authenticated GET that runs under the global throttle, converts non-2xx
-/// responses into reqwest errors via `error_for_status()`, and parses the
-/// response body as JSON. `throttle_key` labels the request to the throttle;
-/// `label` names it in the log line and in the error contexts
-/// ("requesting {label} at {url}", "parsing {label} response from {url}").
-async fn authed_get_json<T: DeserializeOwned>(
-    throttle_key: &str,
-    label: &str,
-    url: &str,
-    bearer: &str,
-) -> anyhow::Result<T> {
-    log::info!("Fetching {label}: {url}");
-    let client = http_client();
-    let resp = with_throttle(throttle_key, || async {
-        client
-            .get(url)
-            .bearer_auth(bearer)
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-    })
-    .await
-    .with_context(|| format!("requesting {label} at {url}"))?;
-    resp.json::<T>()
-        .await
-        .with_context(|| format!("parsing {label} response from {url}"))
-}
-
-async fn fetch_cas_token(
-    api_segment: &str,
-    repo_id: &str,
-    revision: &str,
-) -> anyhow::Result<CasToken> {
-    let key = (
-        api_segment.to_string(),
-        repo_id.to_string(),
-        revision.to_string(),
-    );
-    {
-        let mut guard = CAS_TOKEN_CACHE.lock().unwrap();
-        let cache = guard.get_or_insert_with(HashMap::new);
-        if let Some(t) = cache.get(&key) {
-            return Ok(t.clone());
-        }
-    }
-
-    let hf_token = hf_url::read_token().ok_or_else(|| {
-        anyhow!("HF token required for xet reconstruction; set HF_TOKEN or run `hf auth login`")
-    })?;
-
-    let url = format!(
-        "{}/api/{}/{}/xet-read-token/{}",
-        hf_url::endpoint(),
-        api_segment,
-        repo_id,
-        revision,
-    );
-    // `error_for_status()` (inside `authed_get_json`) converts non-2xx into a
-    // reqwest::Error carrying the status code so the throttle's classifier can
-    // detect 429/5xx and retry. Response body detail is lost on error, but the
-    // URL and status code are preserved.
-    let parsed: XetReadTokenResponse = authed_get_json(
-        &format!("xet-read-token {repo_id}"),
-        "xet-read-token",
-        &url,
-        &hf_token,
-    )
-    .await?;
-
-    let token = CasToken {
-        cas_url: parsed.cas_url.trim_end_matches('/').to_string(),
-        access_token: parsed.access_token,
-    };
-    {
-        let mut guard = CAS_TOKEN_CACHE.lock().unwrap();
-        guard
-            .get_or_insert_with(HashMap::new)
-            .insert(key, token.clone());
-    }
-    Ok(token)
-}
-
-async fn fetch_reconstruction_response(
-    cas: &CasToken,
-    xet_hash_hex: &str,
-) -> anyhow::Result<ReconstructionResponse> {
-    let url = format!("{}/v2/reconstructions/{}", cas.cas_url, xet_hash_hex);
-    authed_get_json(
-        &format!("reconstruction {xet_hash_hex}"),
-        "reconstruction",
-        &url,
-        &cas.access_token,
-    )
-    .await
-}
-
-async fn fetch_reconstruction_terms(
-    cas: &CasToken,
-    xet_hash_hex: &str,
-) -> anyhow::Result<Vec<XetTerm>> {
-    let parsed = fetch_reconstruction_response(cas, xet_hash_hex).await?;
-
-    let mut offset: u64 = 0;
-    let mut out = Vec::with_capacity(parsed.terms.len());
-    for t in parsed.terms {
-        if t.unpacked_length == 0 {
-            continue;
-        }
-        out.push(XetTerm {
-            file_offset: offset,
-            byte_len: t.unpacked_length,
-            xorb_hash: t.hash,
-        });
-        offset += t.unpacked_length;
-    }
-    Ok(out)
-}
-
 /// Fetch reconstruction terms for a remote xet-backed file.
 ///
 /// Returns `Ok(vec![])` if the file has no xet hash (e.g. plain LFS or
@@ -321,7 +131,6 @@ pub async fn reconstruction_for(spec: &RemoteFileSpec) -> anyhow::Result<Vec<Xet
     fetch_reconstruction_terms(&cas, hash).await
 }
 
-/// Tableau-20 palette, https://vega.github.io/vega/docs/schemes/#tableau20
 pub const TABLEAU_20: [[u8; 3]; 20] = [
     [0x4c, 0x78, 0xa8], // blue
     [0xf5, 0x8a, 0x3b], // orange

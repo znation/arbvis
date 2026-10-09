@@ -341,3 +341,180 @@ pub async fn populate_xet_terms(sources: &mut [Source]) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::{FormatPlugin, Registry};
+    use futures::future::BoxFuture;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Marker type a fake format plugin stuffs into `Extensions` so tests can
+    /// observe which plugin ran.
+    struct Tag(String);
+
+    /// Minimal format plugin: matches by extension suffix, optionally fails
+    /// in `populate_local`, and tags the extensions map so tests can verify
+    /// first-plugin-wins and failure-fallback behaviour.
+    struct FakePlugin {
+        ext: &'static str,
+        tag: &'static str,
+        fail: bool,
+    }
+
+    impl FormatPlugin for FakePlugin {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        fn detects_path(&self, path: &Path) -> bool {
+            path.extension().and_then(|e| e.to_str()) == Some(self.ext)
+        }
+        fn populate_local(
+            &self,
+            _path: &Path,
+            _file_size: u64,
+            exts: &mut Extensions,
+        ) -> anyhow::Result<()> {
+            if self.fail {
+                anyhow::bail!("fake plugin parse failure");
+            }
+            exts.insert(Tag(self.tag.to_string()));
+            Ok(())
+        }
+        fn populate_remote<'a>(
+            &'a self,
+            _data: &'a Data,
+            _byte_size: u64,
+            _exts: &'a mut Extensions,
+        ) -> BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn local_spec(p: &Path) -> InputSpec {
+        InputSpec::Local(p.to_path_buf())
+    }
+
+    #[tokio::test]
+    async fn dir_spec_expands_to_one_source_per_file_recursively() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("b.bin"), b"12345").unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("sub").join("a.txt"), b"123").unwrap();
+        fs::create_dir(tmp.path().join("sub").join("deep")).unwrap();
+        fs::write(tmp.path().join("sub").join("deep").join("c"), b"1").unwrap();
+
+        let (sources, total) =
+            prepare_sources_from_specs(&[local_spec(tmp.path())], &Registry::default())
+                .await
+                .unwrap();
+
+        // collect_files_recursive sorts full paths, so b.bin < sub/a.txt <
+        // sub/deep/c at this temp path.
+        let names: Vec<String> = sources
+            .iter()
+            .map(|s| match &s.kind {
+                SourceKind::File(p) => p.file_name().unwrap().to_string_lossy().into_owned(),
+                _ => panic!("expected File source"),
+            })
+            .collect();
+        assert_eq!(names, vec!["b.bin", "a.txt", "c"]);
+        assert_eq!(total, 3 + 5 + 1);
+        for (i, s) in sources.iter().enumerate() {
+            assert_eq!(s.file_idx, i);
+            assert_eq!(
+                s.byte_size,
+                match i {
+                    0 => 5,
+                    1 => 3,
+                    _ => 1,
+                }
+            );
+            assert!(matches!(s.kind, SourceKind::File(_)));
+            assert!(s.name_override.is_none());
+            assert!(s.xet_terms.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_local_file_is_skipped_not_fatal() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("nope.bin");
+        fs::write(tmp.path().join("real.bin"), b"xy").unwrap();
+
+        let (sources, total) = prepare_sources_from_specs(
+            &[
+                local_spec(&missing),
+                local_spec(&tmp.path().join("real.bin")),
+            ],
+            &Registry::default(),
+        )
+        .await
+        .unwrap();
+
+        // The missing spec is dropped with a warning; the real file keeps the
+        // only slot and file_idx stays contiguous (0).
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].byte_size, 2);
+        assert_eq!(sources[0].file_idx, 0);
+        assert_eq!(total, 2);
+    }
+
+    #[tokio::test]
+    async fn first_matching_format_plugin_wins_and_fills_extensions() {
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("model.foo");
+        fs::write(&f, b"abc").unwrap();
+
+        let registry = Registry {
+            formats: vec![
+                Arc::new(FakePlugin {
+                    ext: "foo",
+                    tag: "first",
+                    fail: false,
+                }),
+                Arc::new(FakePlugin {
+                    ext: "foo",
+                    tag: "second",
+                    fail: false,
+                }),
+            ],
+            ..Registry::default()
+        };
+
+        let (sources, _) = prepare_sources_from_specs(&[local_spec(&f)], &registry)
+            .await
+            .unwrap();
+
+        assert_eq!(sources.len(), 1);
+        let tag = sources[0].extensions.get::<Tag>().unwrap();
+        assert_eq!(tag.0, "first");
+    }
+
+    #[tokio::test]
+    async fn failing_format_plugin_is_non_fatal_plain_binary() {
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("broken.foo");
+        fs::write(&f, b"abc").unwrap();
+
+        let registry = Registry {
+            formats: vec![Arc::new(FakePlugin {
+                ext: "foo",
+                tag: "never",
+                fail: true,
+            })],
+            ..Registry::default()
+        };
+
+        let (sources, total) = prepare_sources_from_specs(&[local_spec(&f)], &registry)
+            .await
+            .unwrap();
+
+        // The failure degrades to plain binary: source still produced, no tag
+        // attached, size still counted.
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].extensions.get::<Tag>().is_none());
+        assert_eq!(total, 3);
+    }
+}

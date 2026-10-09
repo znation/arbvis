@@ -13,10 +13,16 @@ use crate::tiled::leaf::{TILE, TILE_LOG2};
 /// `tiled::single_geometry`, which each derived this inline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanvasGeom {
+    /// Hilbert order in x (`width = 1 << kw`, `kw = s.div_ceil(2)`).
     pub kw: u8,
+    /// Hilbert order in y (`height = 1 << kh`, `kh = s / 2`). Odd canvas
+    /// exponents make `kw = kh + 1`, so the curve is one square wider than tall.
     pub kh: u8,
+    /// Canvas width in pixels: `1 << kw`.
     pub width: u32,
+    /// Canvas height in pixels: `1 << kh`.
     pub height: u32,
+    /// Side of one Hilbert square in pixels (`height * height`).
     pub square_pixels: u64,
 }
 
@@ -45,13 +51,23 @@ pub fn hilbert_canvas(total: u64) -> CanvasGeom {
 /// [`HilbertLayout::from_total`] and consumed by the tile pipeline.
 #[derive(Debug, Clone, Copy)]
 pub struct HilbertLayout {
+    /// Hilbert order in y (`height = 1 << kh`).
     pub kh: u8,
+    /// Tile-grid width at `max_zoom` (`1 << kw` pixels / `TILE`).
     pub width_tiles: u32,
+    /// Tile-grid height at `max_zoom` (`1 << kh` pixels / `TILE`).
     pub height_tiles: u32,
+    /// Leaflet world width at zoom 0 (`TILE << (kw - kh)`); the height
+    /// collapses to one `TILE`.
     pub world_w: u32,
+    /// Canvas height in pixels: `1 << kh`.
     pub height: u32,
+    /// Deepest pyramid zoom level (`kh - TILE_LOG2`); each level below the
+    /// base square adds one.
     pub max_zoom: u32,
+    /// Total tile count at `max_zoom` (`width_tiles * height_tiles`).
     pub total_tiles: u64,
+    /// Side of one Hilbert square in pixels (`height * height`).
     pub square_pixels: u64,
     /// Total bytes the curve covers. Pixels with index `>= total` paint black.
     pub total: u64,

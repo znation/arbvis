@@ -59,15 +59,23 @@ pub struct CanvasGeom {
     /// Hilbert order in y (`height = 1 << kh`). Zero for non-Hilbert layouts
     /// — those paths don't index into the curve.
     pub kh: u8,
+    /// Leaflet tile-grid width at `max_zoom` (canvas width / `TILE`).
     pub width_tiles: u32,
+    /// Leaflet tile-grid height at `max_zoom` (canvas height / `TILE`).
     pub height_tiles: u32,
     /// World extent in leaflet coordinates at zoom 0 (one of the two axes
     /// always collapses to one tile).
     pub world_w: u32,
+    /// Leaflet world height at zoom 0; the axis not carrying the curve
+    /// collapses to one tile (`TILE` for Hilbert).
     pub world_h: u32,
+    /// Canvas width in pixels (power of two for Hilbert).
     pub width: u32,
+    /// Canvas height in pixels (power of two for Hilbert).
     pub height: u32,
+    /// Deepest pyramid zoom level the tile grid serves.
     pub max_zoom: u32,
+    /// Total tile count at `max_zoom` (`width_tiles * height_tiles`).
     pub total_tiles: u64,
     /// Pixel count of one Hilbert "square" (`height * height` for Hilbert,
     /// `1` for arch — the arch path doesn't divide by this value).

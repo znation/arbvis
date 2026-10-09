@@ -676,4 +676,83 @@ mod tests {
         handle.await.unwrap();
         assert_eq!(t.in_flight(), 1);
     }
+
+    /// A controllable error for driving `with_throttle` through each
+    /// `Outcome` branch without needing a real HTTP client.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum TestError {
+        RateLimited,
+        TimedOut,
+        Fatal,
+    }
+
+    impl ErrorClassify for TestError {
+        fn classify(&self) -> Outcome {
+            match self {
+                TestError::RateLimited => Outcome::RateLimit,
+                TestError::TimedOut => Outcome::Timeout,
+                TestError::Fatal => Outcome::Permanent,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn with_throttle_returns_ok_and_counts_success() {
+        let mut calls = 0;
+        let out = with_throttle("test", || {
+            calls += 1;
+            async { Ok::<_, TestError>(42u32) }
+        })
+        .await;
+        assert_eq!(out, Ok(42));
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn with_throttle_returns_permanent_error_without_retrying() {
+        let mut calls = 0;
+        let out: Result<(), TestError> = with_throttle("test", || {
+            calls += 1;
+            async { Err(TestError::Fatal) }
+        })
+        .await;
+        assert_eq!(out, Err(TestError::Fatal));
+        assert_eq!(calls, 1, "a permanent error must not be retried");
+    }
+
+    #[tokio::test]
+    async fn with_throttle_retries_rate_limit_then_succeeds() {
+        let mut calls = 0;
+        let out: Result<u32, TestError> = with_throttle("test", || {
+            calls += 1;
+            async move {
+                if calls == 1 {
+                    Err(TestError::RateLimited)
+                } else {
+                    Ok(7)
+                }
+            }
+        })
+        .await;
+        assert_eq!(out, Ok(7));
+        assert_eq!(calls, 2, "one 429 failure, then the retried success");
+    }
+
+    #[tokio::test]
+    async fn with_throttle_retries_timeout_then_succeeds() {
+        let mut calls = 0;
+        let out: Result<u32, TestError> = with_throttle("test", || {
+            calls += 1;
+            async move {
+                if calls == 1 {
+                    Err(TestError::TimedOut)
+                } else {
+                    Ok(9)
+                }
+            }
+        })
+        .await;
+        assert_eq!(out, Ok(9));
+        assert_eq!(calls, 2, "one transient failure, then the retried success");
+    }
 }

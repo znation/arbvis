@@ -1255,7 +1255,18 @@ function loadBrickBlock(bs, blk, group) {
         brickBackoff(bs);
         return null;
       }
-      if (!res.ok) { console.error('brick block failed', res.status); return null; }
+      if (!res.ok) {
+        // Any other failure (404 missing file, 403 auth, …) must also requeue:
+        // dropping the group here would leave the affected bricks permanently
+        // un-fetched — the view never sharpens and the HUD reports zero
+        // outstanding work, as if the load had succeeded. Retry through the
+        // same backoff window the throttle path uses, so a persistent failure
+        // retries slowly and shows up in the HUD as 'retrying in ~…'.
+        console.error('brick block failed', res.status, '- requeueing for retry');
+        for (const [, tl] of group) requeueBrick(bs, tl);
+        brickBackoff(bs);
+        return null;
+      }
       return res.arrayBuffer().then((ab) => {
         brickFetchOk(bs);
         bs.stats.bytes += ab.byteLength; // "total downloaded" (network + browser-cache hits)

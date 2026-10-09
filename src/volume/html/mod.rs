@@ -120,4 +120,38 @@ mod template_tests {
         assert!(TEMPLATE.trim_end().ends_with("</html>"));
         assert!(!TEMPLATE.contains("</script><script>"));
     }
+
+    /// A brick block fetch that fails with anything other than 429/5xx (a 404
+    /// on a renamed/moved atlas, a 403 auth rejection) must requeue the block's
+    /// bricks and open a backoff window, like the throttle path does. Dropping
+    /// the group on such a status silently strands those bricks forever: the
+    /// view never sharpens and the HUD shows zero outstanding work, as if the
+    /// load had succeeded.
+    #[test]
+    fn brick_block_other_http_errors_requeue_instead_of_dropping() {
+        // Locate the loadBrickBlock body (up to the pump function) and check
+        // that its !res.ok branch routes through requeueBrick + brickBackoff.
+        const FN: &str = "function loadBrickBlock(";
+        let start = TEMPLATE.find(FN).expect("loadBrickBlock must exist");
+        let body = &TEMPLATE[start
+            ..TEMPLATE[start..]
+                .find("function pumpBrickFetches")
+                .expect("pumpBrickFetches must follow loadBrickBlock")
+                + start];
+        let bad = body
+            .find("if (!res.ok)")
+            .expect("!res.ok branch must exist");
+        // Bound the check to the !res.ok branch itself (up to this function's
+        // own .catch, which is a separate handler): the 429/5xx branch above it
+        // and the .catch below it already requeue.
+        let tail = &body[bad..body[bad..].find(".catch").expect("catch must follow") + bad];
+        assert!(
+            tail.contains("for (const [, tl] of group) requeueBrick(bs, tl);"),
+            "!res.ok branch must requeue the block's bricks: {tail}"
+        );
+        assert!(
+            tail.contains("brickBackoff(bs)"),
+            "!res.ok branch must open a backoff window: {tail}"
+        );
+    }
 }

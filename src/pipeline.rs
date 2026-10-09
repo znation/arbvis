@@ -190,7 +190,7 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
     // signed-delta LUT + crosshatch (truecolor); plain mode is indexed.
     if let Some(ref png) = args.png {
         if total == 0 {
-            anyhow::bail!("--png requires non-empty input");
+            anyhow::bail!("{}", empty_png_input_error(&sources));
         }
         let out_path = tiled::single::png_output_path(png, args.out.as_deref())?;
         if let Some(parent) = out_path.parent() {
@@ -219,6 +219,48 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
         // PNG mode returned earlier; nothing else runs without a destination.
         None => Ok(()),
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn buffered_source() -> Source {
+        Source {
+            file_idx: 0,
+            kind: crate::data::SourceKind::Buffered(vec![]),
+            byte_size: 0,
+            name_override: None,
+            xet_terms: None,
+            extensions: Default::default(),
+        }
+    }
+
+    #[test]
+    fn empty_png_error_names_every_source_and_suggests_the_fallback() {
+        let mut a = buffered_source();
+        a.name_override = Some("a.bin".to_string());
+        let b = buffered_source();
+        let msg = empty_png_input_error(&[a, b]);
+        assert!(msg.starts_with("--png requires non-empty input"), "{msg}");
+        assert!(msg.contains("2 source(s)"), "{msg}");
+        assert!(msg.contains("a.bin") && msg.contains("stdin"), "{msg}");
+        assert!(msg.contains("viewer bundle"), "{msg}");
+    }
+}
+
+/// The error reported when every source is empty and `--png` was requested.
+/// Names the sources so a typo'd path (the usual cause of an empty input)
+/// is obvious from the message alone.
+fn empty_png_input_error(sources: &[Source]) -> String {
+    let names: Vec<String> = sources.iter().map(|s| s.name()).collect();
+    format!(
+        "--png requires non-empty input: all {} source(s) have 0 bytes ({}). \
+         An empty file has no bytes to color — pass a non-empty file, or drop \
+         --png to render a viewer bundle instead.",
+        sources.len(),
+        names.join(", ")
+    )
 }
 
 /// Drive the renderer for one of the four output destinations, optionally

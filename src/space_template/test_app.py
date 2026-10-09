@@ -15,6 +15,7 @@ import builtins
 import importlib.util
 import os
 import tempfile
+import threading
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -61,6 +62,18 @@ class TrackingReader:
         data = self._f.read(n)
         self._reads.append(len(data))
         return data
+
+
+class CountingSemaphore(threading.Semaphore):
+    """Semaphore that records acquire calls so tests can assert pacing."""
+
+    def __init__(self, value):
+        super().__init__(value)
+        self.acquires = 0
+
+    def acquire(self, *a, **k):
+        self.acquires += 1
+        return super().acquire(*a, **k)
 
 
 @unittest.skipUnless(_DEPS_OK, "needs fastapi + httpx")
@@ -150,6 +163,45 @@ class RangeStreamingTest(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.content, self.data)
 
+    def test_no_range_serves_local_mirror_when_ready(self):
+        # The mirror file is present (setUp wrote it), so a no-Range GET of
+        # bricks.bin must come off local disk and never touch the Hub.
+        opens = []
+
+        class CountingFS(self._FakeFS):
+            def open(self, *a, **k):
+                opens.append(a[0])
+                return super().open(*a, **k)
+
+        self.mod._fs = CountingFS(self.data)
+        r = self.client.get("/bricks.bin")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.content, self.data)
+        self.assertEqual(opens, [], "no-Range GET must serve the local mirror, not the Hub")
+
+    def test_no_range_paces_hub_read_and_releases_semaphore(self):
+        # Mirror absent: the no-Range GET must pace the Hub read through
+        # _HUB_SEM and release the slot once the stream drains.
+        self.mod._start_mirror = lambda rest: None
+        os.remove(os.path.join(self.mirror, "bricks.bin"))
+        self.mod._HUB_SEM = CountingSemaphore(3)
+        r = self.client.get("/bricks.bin")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.content, self.data)
+        self.assertEqual(self.mod._HUB_SEM.acquires, 1)
+        self.assertEqual(self.mod._HUB_SEM._value, 3)
+
+    def test_no_range_kicks_mirror_download_when_not_ready(self):
+        # Mirror absent: the no-Range GET must start the one-time background
+        # mirror download, so repeated plain GETs do not keep the Space
+        # hub-bound forever.
+        os.remove(os.path.join(self.mirror, "bricks.bin"))
+        kicks = []
+        self.mod._start_mirror = lambda rest: kicks.append(rest)
+        r = self.client.get("/bricks.bin")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(kicks, ["bricks.bin"])
+
     def test_no_range_missing_file_gets_404_not_500(self):
         # cached_size succeeded (the size cache is pre-seeded in setUp), so a
         # FileNotFoundError can only come from the open itself (asset vanished
@@ -165,7 +217,8 @@ class RangeStreamingTest(unittest.TestCase):
 
         vfs = self
         self.mod._fs = VanishedFS()
-        self.mod._fs = VanishedFS()
+        self.mod._start_mirror = lambda rest: None
+        os.remove(os.path.join(self.mirror, "bricks.bin"))  # force the Hub path
         client = TestClient(self.mod.app, raise_server_exceptions=False)
         r = client.get("/bricks.bin")
         self.assertEqual(r.status_code, 404)

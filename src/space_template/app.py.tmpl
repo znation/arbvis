@@ -307,18 +307,45 @@ def asset(rest: str, request: Request):
     # Open up front, inside the request, so a vanished asset answers 404 —
     # otherwise the error escapes the generator after the 200 headers are
     # already sent and the client sees a truncated, error-terminated stream.
+    # Mirrored assets (bricks.bin) behave like the Range path here too: serve
+    # the local mirror once it has landed, and until then pace the Hub read
+    # through `_HUB_SEM` (released when the stream generator is closed,
+    # including on client disconnect) and keep the one-time mirror download
+    # going — without this, a plain no-Range GET of bricks.bin opens an
+    # unpaced Hub stream and re-downloads multi-GB content on every request.
+    local = _mirror_ready(rest) if rest in _MIRROR_ASSETS else None
+    hub_sem_held = False
     try:
-        fobj = fs().open(path, "rb", block_size=0)
+        if local is not None:
+            fobj = open(local, "rb")
+        elif rest in _MIRROR_ASSETS:
+            _start_mirror(rest)
+            _HUB_SEM.acquire()
+            hub_sem_held = True
+            try:
+                fobj = fs().open(path, "rb")
+            except BaseException:
+                hub_sem_held = False
+                _HUB_SEM.release()
+                raise
+        else:
+            fobj = fs().open(path, "rb", block_size=0)
     except (FileNotFoundError, EntryNotFoundError):
+        # the Hub branch above already released its semaphore slot
         return Response(status_code=404)
 
     def body():
-        with fobj:
-            while True:
-                chunk = fobj.read(_CHUNK)
-                if not chunk:
-                    break
-                yield chunk
+        try:
+            with fobj:
+                while True:
+                    chunk = fobj.read(_CHUNK)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            if hub_sem_held:
+                _HUB_SEM.release()
+
 
     return StreamingResponse(
         body(),

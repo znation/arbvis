@@ -198,6 +198,80 @@ pub async fn load_tile_bytes(
 }
 
 /// CPU-only render from a pre-filled tile buffer.
+/// Row-major LUT of the order-`TILE_LOG2` Hilbert index for tile-local pixel
+/// coordinates: `LOCAL_CURVE_LUT[(py << TILE_LOG2) | px] == xy2h(px, py,
+/// TILE_LOG2)`. Built once per process (~1 MiB) so the per-pixel render loops
+/// replace a full order-`kh` Hilbert computation with one table lookup.
+static LOCAL_CURVE_LUT: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+
+fn local_curve_lut() -> &'static [u32] {
+    LOCAL_CURVE_LUT.get_or_init(|| {
+        (0u32..TILE_AREA as u32)
+            .map(|i| xy2h_u64((i & (TILE - 1)) as u64, (i >> TILE_LOG2) as u64, TILE_LOG2) as u32)
+            .collect()
+    })
+}
+
+/// The per-tile Hilbert frame.
+///
+/// The order-`kh` Hilbert sub-curve covering leaf tile `(tx, ty)` is the
+/// order-`TILE_LOG2` curve under one of eight dihedral transforms (coordinate
+/// swap + per-axis complement), determined by the tile's position in the
+/// coarse curve. Returns `(swap, cx, cy)` such that, for every tile-local
+/// pixel `(px, py)`, with `base` the tile's starting curve index:
+///
+/// ```text
+/// xy2h(tx*TILE + px, ty*TILE + py, kh) - base
+///     == LOCAL_CURVE_LUT[frame(px, py)]
+/// ```
+/// where `frame(px, py)` swaps the coordinates when `swap` and XORs them with
+/// `(cx, cy)` respectively (complement within a TILE-sized axis is XOR with
+/// `TILE - 1`).
+///
+/// Computed by running the classic bitwise Hilbert rotation over the coarse
+/// levels only (side length ≥ TILE): each level's quadrant bits are constant
+/// across the tile, so the composition acting on the low `TILE_LOG2` bits is
+/// a fixed affine map — swap parity `m` plus complements folded into the
+/// constants. O(kh) per tile, replacing an O(kh) computation per pixel.
+fn tile_curve_frame(tx: u32, ty: u32, kh: u8) -> (bool, u32, u32) {
+    debug_assert!(kh >= TILE_LOG2, "leaf tiles need kh ≥ TILE_LOG2");
+    let mut x = (tx as u64) << TILE_LOG2;
+    let mut y = (ty as u64) << TILE_LOG2;
+    let mut m = 0u32;
+    let mut side = 1u64 << (kh - 1);
+    let tile_side = TILE as u64;
+    while side >= tile_side {
+        let rx = (x & side) > 0;
+        let ry = (y & side) > 0;
+        if !ry {
+            if rx {
+                // Complement the remaining (lower) coordinates; bits above the
+                // current level are already consumed and never read again.
+                x = !x;
+                y = !y;
+            }
+            std::mem::swap(&mut x, &mut y);
+            m += 1;
+        }
+        side >>= 1;
+    }
+    let mask = (TILE - 1) as u64;
+    ((m & 1) == 1, (x & mask) as u32, (y & mask) as u32)
+}
+
+/// Curve offset of tile-local pixel `(px, py)` within its tile's byte range
+/// (i.e. the `tile_buf` index), via the tile's precomputed Hilbert frame.
+#[inline]
+fn tile_local_curve_idx(frame: (bool, u32, u32), px: u32, py: u32) -> u64 {
+    let (swap, cx, cy) = frame;
+    let (a, b) = if swap {
+        (py ^ cy, px ^ cx)
+    } else {
+        (px ^ cx, py ^ cy)
+    };
+    local_curve_lut()[((b << TILE_LOG2) | a) as usize] as u64
+}
+
 pub fn render_leaf_tile_from_buf(
     tx: u32,
     ty: u32,
@@ -214,16 +288,15 @@ pub fn render_leaf_tile_from_buf(
     let local_tx = tx % height_tiles;
     let tile_order = kh - TILE_LOG2;
     let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
+    let frame = tile_curve_frame(local_tx, ty, kh);
 
     let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
     for py in 0..TILE {
-        let ly = ty * TILE + py;
         for px in 0..TILE {
-            let lx = local_tx * TILE + px;
-            let local_idx = xy2h_u64(lx as u64, ly as u64, kh);
-            let pixel_idx = sq_off + local_idx;
+            let local_idx = tile_local_curve_idx(frame, px, py);
+            let pixel_idx = sq_off + base + local_idx;
             let color = if pixel_idx < total {
-                pixel_lut[tile_buf[(local_idx - base) as usize] as usize]
+                pixel_lut[tile_buf[local_idx as usize] as usize]
             } else {
                 Rgb([0u8, 0, 0])
             };
@@ -299,17 +372,16 @@ pub fn render_leaf_tile_diff(
         .copied()
         .collect();
 
+    let frame = tile_curve_frame(local_tx, ty, kh);
     let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
     for py in 0..TILE {
-        let ly = ty * TILE + py;
         for px in 0..TILE {
-            let lx = local_tx * TILE + px;
-            let local_idx = xy2h_u64(lx as u64, ly as u64, kh);
-            let pixel_idx = sq_off + local_idx;
+            let local_idx = tile_local_curve_idx(frame, px, py);
+            let pixel_idx = sq_off + base + local_idx;
             let color = if pixel_idx >= total {
                 Rgb([0u8, 0, 0])
             } else {
-                let byte = tile_buf[(local_idx - base) as usize];
+                let byte = tile_buf[local_idx as usize];
                 let mut fill: Option<DiffFill> = None;
                 for &(start, end, f) in &local_fills {
                     if pixel_idx >= start && pixel_idx < end {
@@ -381,15 +453,14 @@ pub fn render_leaf_tile_xet_from_buf(
     let tile_order = kh - TILE_LOG2;
     let base = xy2h_u64(local_tx as u64, ty as u64, tile_order) * TILE_AREA;
 
+    let frame = tile_curve_frame(local_tx, ty, kh);
     let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
     for py in 0..TILE {
-        let ly = ty * TILE + py;
         for px in 0..TILE {
-            let lx = local_tx * TILE + px;
-            let local_idx = xy2h_u64(lx as u64, ly as u64, kh);
-            let pixel_idx = sq_off + local_idx;
+            let local_idx = tile_local_curve_idx(frame, px, py);
+            let pixel_idx = sq_off + base + local_idx;
             let color = if pixel_idx < total {
-                let byte = tile_buf[(local_idx - base) as usize];
+                let byte = tile_buf[local_idx as usize];
                 match xorb_color_idx(xorb_ranges, pixel_idx) {
                     Some(idx) => {
                         let t = tableau[idx as usize];
@@ -451,5 +522,117 @@ mod tests {
         let h = xy2h_u64(3, 4, 8);
         let (x, y) = crate::geometry::hilbert_to_xy_u64(h, 8);
         assert_eq!((x, y), (3, 4));
+    }
+
+    /// End-to-end: `render_leaf_tile_from_buf` must produce the same pixels
+    /// as a direct reference implementation that computes every pixel's
+    /// Hilbert index with `xy2h_u64`.
+    #[test]
+    fn render_leaf_tile_matches_xy2h_reference() {
+        let kh = 13u8;
+        let height_tiles = 1u32 << (kh - TILE_LOG2);
+        let square_pixels = 1u64 << (2 * kh as u32);
+        let total = square_pixels * 3;
+        let mut tile_buf = Box::new([0u8; TILE_PIXELS]);
+        for (i, b) in tile_buf.iter_mut().enumerate() {
+            *b = (i * 2654435761 % 256) as u8;
+        }
+        let pixel_lut: [Rgb<u8>; 256] =
+            std::array::from_fn(|i| Rgb([(i * 7) as u8, (i * 13) as u8, (i * 29) as u8]));
+        for &(tx, ty) in &[(0u32, 0u32), (1, 2), (3, 3), (7, 5)] {
+            let (img, _) = render_leaf_tile_from_buf(
+                tx,
+                ty,
+                kh,
+                height_tiles,
+                square_pixels,
+                total,
+                &tile_buf,
+                &pixel_lut,
+                TileFormat::Png,
+            )
+            .unwrap();
+            let sq = (tx / height_tiles) as u64;
+            let sq_off = sq * square_pixels;
+            let local_tx = tx % height_tiles;
+            let base = xy2h_u64(local_tx as u64, ty as u64, kh - TILE_LOG2) * TILE_AREA;
+            for py in 0..TILE {
+                for px in 0..TILE {
+                    let lx = ((local_tx as u64) << TILE_LOG2) | px as u64;
+                    let ly = ((ty as u64) << TILE_LOG2) | py as u64;
+                    let local_idx = xy2h_u64(lx, ly, kh);
+                    let pixel_idx = sq_off + local_idx;
+                    let expected = if pixel_idx < total {
+                        pixel_lut[tile_buf[(local_idx - base) as usize] as usize]
+                    } else {
+                        Rgb([0u8, 0, 0])
+                    };
+                    assert_eq!(
+                        img.get_pixel(px, py),
+                        &expected,
+                        "tile ({tx},{ty}) pixel ({px},{py})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `tile_curve_frame` + `tile_local_curve_idx` must reproduce
+    /// `xy2h(lx, ly, kh) - base` exactly: the frame/LUT fast path is only
+    /// valid if it is the identity on the real Hilbert indexing.
+    #[test]
+    fn tile_curve_frame_identity() {
+        let check_tile = |tx: u32, ty: u32, kh: u8, pixels: &[(u32, u32)]| {
+            let tile_order = kh - TILE_LOG2;
+            let base = xy2h_u64(tx as u64, ty as u64, tile_order) * TILE_AREA;
+            let frame = tile_curve_frame(tx, ty, kh);
+            for &(px, py) in pixels {
+                let lx = ((tx as u64) << TILE_LOG2) | px as u64;
+                let ly = ((ty as u64) << TILE_LOG2) | py as u64;
+                let expected = xy2h_u64(lx, ly, kh) - base;
+                assert_eq!(
+                    tile_local_curve_idx(frame, px, py),
+                    expected,
+                    "tile ({tx},{ty}) kh={kh} pixel ({px},{py})"
+                );
+            }
+        };
+        // All pixels of the four kh=10 tiles (covers one orientation state).
+        let all_pixels: Vec<(u32, u32)> = (0..TILE)
+            .flat_map(|px| (0..TILE).map(move |py| (px, py)))
+            .collect();
+        for ty in 0..2u32 {
+            for tx in 0..2u32 {
+                check_tile(tx, ty, 10, &all_pixels);
+            }
+        }
+        // Sampled pixels across tiles of several orders — spans all eight
+        // dihedral states (swap parity and complements vary with the tile's
+        // coarse position and the order's parity).
+        let samples: Vec<(u32, u32)> = [
+            (0, 0),
+            (1, 0),
+            (0, 1),
+            (1, 1),
+            (511, 511),
+            (300, 17),
+            (256, 256),
+            (7, 509),
+            (510, 1),
+            (100, 400),
+            (3, 3),
+            (511, 0),
+        ]
+        .to_vec();
+        for kh in [11u8, 12, 13, 16, 21, 24] {
+            let t = kh - TILE_LOG2;
+            let tiles = 1u64 << (2 * t);
+            let step = (tiles / 512).max(1);
+            for tile_i in (0..tiles).step_by(step as usize) {
+                let tx = (tile_i % (1 << t)) as u32;
+                let ty = (tile_i / (1 << t)) as u32;
+                check_tile(tx, ty, kh, &samples);
+            }
+        }
     }
 }

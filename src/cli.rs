@@ -105,7 +105,7 @@ pub struct Args {
     #[arg(long, default_value_t = 1024)]
     pub(crate) grid: u32,
 
-    /// Advanced 3D override (power of two, 8–8192): hand-tune the coarse/detail
+    /// Advanced 3D override (power of two, 8–16384): hand-tune the coarse/detail
     /// split. When set, the dense coarse grid is built at `--grid` and the
     /// streamed brick pool at `--volume-res` (so the volume can exceed the
     /// coarse grid for sparse data). `0` (default) derives the split from
@@ -479,7 +479,7 @@ mod title_tests {
 
 #[cfg(test)]
 mod grid_validation_tests {
-    use super::{ignored_3d_flags, validate_grid};
+    use super::{ignored_3d_flags, validate_grid, validate_volume_res};
 
     #[test]
     fn grid_cap_raised_to_16384() {
@@ -487,6 +487,15 @@ mod grid_validation_tests {
         assert!(validate_grid(1024).is_ok()); // the default
         assert!(validate_grid(32768).is_err()); // above the cap
         assert!(validate_grid(768).is_err()); // not a power of two
+    }
+
+    #[test]
+    fn volume_res_cap_raised_to_16384() {
+        assert!(validate_volume_res(0).is_ok()); // derive from --grid
+        assert!(validate_volume_res(16384).is_ok());
+        assert!(validate_volume_res(8192).is_ok());
+        assert!(validate_volume_res(32768).is_err()); // above the cap
+        assert!(validate_volume_res(1000).is_err()); // not a power of two
     }
 
     #[test]

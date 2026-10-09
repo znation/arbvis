@@ -309,8 +309,8 @@ impl Registry {
                 Arc::new(crate::data::PlainBytesDiffBuilder),
             ],
             providers: vec![
-                Arc::new(crate::ByteDiffProvider),
-                Arc::new(crate::NormalBytesProvider),
+                Arc::new(crate::providers::ByteDiffProvider),
+                Arc::new(crate::providers::NormalBytesProvider),
             ],
             prepare_sources_extension: None,
             layout_mode: LayoutMode::Auto,

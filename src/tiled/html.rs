@@ -725,6 +725,18 @@ const TEMPLATE_MULTI: &str = r#"<!DOCTYPE html>
     var TILE = /*__TILE__*/;
     var TRANSPARENT = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 
+    // Scene labels and entity names come from the visualized files (e.g. a
+    // labels.json carried in a hostile Hub repo, or plugin-supplied scene
+    // tags) and reach HTML sinks: Leaflet's divIcon and Control.Layers both
+    // inject their text as innerHTML — escape every label before it reaches
+    // one. Defined before the layers control is built so it is initialized
+    // when first called.
+    var escHtml = function (s) {
+      return String(s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+      });
+    };
+
     var map = L.map('map', {
       crs: L.CRS.Simple,
       minZoom: /*__VMIN__*/,
@@ -778,12 +790,12 @@ const TEMPLATE_MULTI: &str = r#"<!DOCTYPE html>
     var layerToScene = [];
     for (var i = 0; i < SCENES.length; i++) {
       var grp = makeBaseLayer(SCENES[i]);
-      baseLayers[SCENES[i].label] = grp;
+      baseLayers[escHtml(SCENES[i].label)] = grp;
       layerToScene.push({ layer: grp, scene: SCENES[i] });
     }
 
     var activeScene = SCENES[0];
-    baseLayers[activeScene.label].addTo(map);
+    baseLayers[escHtml(activeScene.label)].addTo(map);
     L.control.layers(baseLayers, null, { collapsed: false }).addTo(map);
 
     function fitScene(s) {
@@ -899,14 +911,6 @@ const TEMPLATE_MULTI: &str = r#"<!DOCTYPE html>
       updateLabels();
     });
 
-    // Entity names come from the visualized files (e.g. filenames listed in a
-    // hostile Hub repo) and Leaflet's divIcon injects its `html:` value as
-    // innerHTML — escape every name before it reaches one.
-    var escHtml = function (s) {
-      return String(s).replace(/[&<>"']/g, function (c) {
-        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-      });
-    };
     fetch('labels.json')
       .then(function(r) { return r.json(); })
       .then(function(data) {
@@ -968,6 +972,36 @@ mod tests {
             pyramid_ext: "avif".to_string(),
             entities: Vec::new(),
         }
+    }
+
+    /// Scene labels reach Leaflet's `L.control.layers(baseLayers, …)`, which
+    /// renders each layer's name as innerHTML — a hostile label (from a
+    /// labels.json carried in an untrusted tiles bundle via `--regen-html`,
+    /// or from a plugin's `SceneTag.label`) would inject markup into the
+    /// viewer page. Every use of a scene label as a base-layer key must be
+    /// wrapped in `escHtml` at the sink.
+    #[test]
+    fn scene_labels_are_html_escaped_before_leaflet_layers_control() {
+        let evil = "<img src=x onerror=alert(1)>";
+        let mut sv = scene(evil, 560, 64);
+        sv.label = evil.to_string();
+        let html = build_html_multi(&[sv], "t", &[], &Branding::default());
+        // The label is interpolated into the inline `var SCENES` JSON, so its
+        // raw text appears there inside a JS string — but the layers-control
+        // sink must only ever see it wrapped in escHtml.
+        assert!(
+            html.contains("baseLayers[escHtml(SCENES[i].label)]"),
+            "per-scene layer keys must be escHtml-wrapped: {html}"
+        );
+        assert!(
+            html.contains("baseLayers[escHtml(activeScene.label)].addTo(map)"),
+            "the default scene's layer key must be escHtml-wrapped: {html}"
+        );
+        assert!(
+            !html.contains("baseLayers[SCENES[i].label]")
+                && !html.contains("baseLayers[activeScene.label].addTo"),
+            "no unwrapped scene label may reach the innerHTML sink: {html}"
+        );
     }
 
     /// Multi-scene parity with [`tall_canvas_tile_layer_renders_below_pyramid_root`]:

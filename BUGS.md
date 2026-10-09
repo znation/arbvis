@@ -8,14 +8,83 @@ unclear-invariant).
 
 ## Open
 
-### Several modules far exceed the one-sitting readability budget
+### `src/volume/html.rs` (1889 lines) exceeds the one-sitting readability budget
 
-**Found by steward 2026-10-09.** `wc -l` over `src/`: `volume/html.rs` 1889, `tiled/mod.rs` 1583, `volume/mod.rs` 1215, `data.rs` 1203, `lib.rs` 1131, `xet.rs` 1121, `volume/brick.rs` 1172 — all well past PRINCIPLES.md's "small enough to read in one sitting." Symptom: new contributors (and the plugin registry downstream, e.g. modelweightvis) must hold whole large files in mind to find the seams; the tile pipeline's geometry constants are spread across `tiled/mod.rs` ~490–591 while `lib.rs` mixes CLI parsing, routing, and orchestration.
+**Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
+"several modules" entry; siblings: tiled/mod.rs, volume/mod.rs, volume/brick.rs, xet.rs, data/mod.rs).
+Caveat recorded on inspection: the file is ~15 lines of Rust plus a ~1860-line embedded
+Three.js template string, so a Rust-module split has poor ROI — treat as opportunistic work if a
+feature loop already touches the viewer, e.g. extracting the JS shader/uniform blocks behind named
+const segments. Do not refactor for refactoring's sake.
 
-Risk, not a runtime bug: no behavior change proposed. Suggested direction if a feature loop is already touching one of these files — split out cohesive units opportunistically (e.g. `volume/html.rs` template/markup generation from its data plumbing, `lib.rs` `Args`/routing separation), one split per tick, with tests moved alongside. Do not refactor for refactoring's sake.
+**Reproduce:** `wc -l src/volume/html.rs`.
 
-**Reproduce:** `wc -l src/*.rs src/*/*.rs | sort -rn | head`.
+### `src/tiled/mod.rs` (1575 lines) exceeds the one-sitting readability budget
+
+**Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
+"several modules" entry; siblings: volume/html.rs, volume/mod.rs, volume/brick.rs, xet.rs, data/mod.rs).
+Symptom: tile pipeline orchestration, progress plumbing, and Leaflet-regeneration glue share one file;
+the tile pipeline's geometry constants are spread across ~490–591. Suggested direction: split
+cohesive units opportunistically (e.g. `regen_html`/`regen_html_multi` regeneration path from the
+render pipeline), one split per tick, with tests moved alongside. Do not refactor for refactoring's sake.
+
+**Reproduce:** `wc -l src/tiled/mod.rs`.
+
+### `src/volume/mod.rs` (1215 lines) exceeds the one-sitting readability budget
+
+**Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
+"several modules" entry; siblings: volume/html.rs, tiled/mod.rs, volume/brick.rs, xet.rs, data/mod.rs).
+Suggested direction: split cohesive units opportunistically, one split per tick, with tests moved
+alongside. Do not refactor for refactoring's sake.
+
+**Reproduce:** `wc -l src/volume/mod.rs`.
+
+### `src/volume/brick.rs` (1172 lines) exceeds the one-sitting readability budget
+
+**Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
+"several modules" entry; siblings: volume/html.rs, tiled/mod.rs, volume/mod.rs, xet.rs, data/mod.rs).
+Suggested direction: split cohesive units opportunistically, one split per tick, with tests moved
+alongside. Do not refactor for refactoring's sake.
+
+**Reproduce:** `wc -l src/volume/brick.rs`.
+
+### `src/xet.rs` (1121 lines) exceeds the one-sitting readability budget
+
+**Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
+"several modules" entry; siblings: volume/html.rs, tiled/mod.rs, volume/mod.rs, volume/brick.rs,
+data/mod.rs). Suggested direction: split cohesive units opportunistically, one split per tick, with
+tests moved alongside. Do not refactor for refactoring's sake.
+
+**Reproduce:** `wc -l src/xet.rs`.
+
+### `src/data/mod.rs` (853 lines) exceeds the one-sitting readability budget
+
+**Found by steward 2026-10-09; split into per-file entries by bugfix 2026-10-09** (from the combined
+"several modules" entry; siblings: volume/html.rs, tiled/mod.rs, volume/mod.rs, volume/brick.rs,
+xet.rs). Already reduced by the diff-subsystem extraction (see Fixed 2026-10-09); remainder is the
+source/IO half (Data, SourceKind, Source, prepare_sources). Suggested direction: opportunistic
+splits only. Do not refactor for refactoring's sake.
+
+**Reproduce:** `wc -l src/data/mod.rs`.
+
+Note: the original combined entry also listed `lib.rs` at 1131 lines, which was stale —
+`lib.rs` is 134 lines and in budget.
 
 ## Fixed
 
-_None yet._
+### Extract the diff subsystem of the former single-file data module into `src/data/diff.rs` — fixed 2026-10-09 by bugfix
+
+**Found by steward 2026-10-09** as part of the combined "several modules exceed the one-sitting
+readability budget" entry (now decomposed into per-file entries under Open; this tick's slice:
+the data module). The diff subsystem — `DiffFill`, the built-in `DiffSourceBuilder`s
+(`JsonDiffBuilder`, `PlainBytesDiffBuilder`), `prepare_diff_sources`, and the directory byte-diff
+walker (`byte_directory_diff`, `collect_files_recursive`) — was ~370 of the original file's 1203 lines. The remainder is now `src/data/mod.rs` (853 lines). External paths are unchanged: `data/mod.rs` re-exports the moved
+items, so `crate::data::DiffFill`, `crate::data::byte_directory_diff`, the lib re-exports, and
+downstream (`tiled`, `json_diff`, `registry`, modelweightvis) all resolve as before. No behavior
+change intended; new `data::diff::tests` cover `DiffFill` colors, matched/mismatched/one-sided
+classification in `byte_directory_diff`, finetune grey fill, the `skip` predicate, and builder
+ids/priority ordering.
+
+**Validation gap:** unclear-invariant — the suite verified compile-compatibility of the move but the
+diff walker itself had no direct tests, so the classification invariants (padding, one-sided fill
+choice, skip semantics, compacted `file_idx`) had to be reconstructed before they could be pinned.

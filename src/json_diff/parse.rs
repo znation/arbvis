@@ -409,6 +409,29 @@ impl<'a> Parser<'a> {
         self.pos = start_pos + 1;
         let mut out = String::new();
         loop {
+            // Fast path: bulk-copy a run of ordinary bytes (no quote,
+            // backslash, or control byte) into `out` in one memcpy instead of
+            // one advance()/push() per byte. If the run is not valid UTF-8 as
+            // a whole, fall through to the per-byte loop, which validates each
+            // multi-byte sequence individually and substitutes the replacement
+            // character where that sequence alone fails to decode.
+            let run = self.src[self.pos..]
+                .iter()
+                .position(|&b| b < 0x20 || b == b'"' || b == b'\\');
+            match run {
+                None => {
+                    self.pos = self.src.len();
+                    return Err(self.err_at(self.pos, "unterminated string"));
+                }
+                Some(0) => {}
+                Some(n) => {
+                    let run = &self.src[self.pos..self.pos + n];
+                    if let Ok(s) = std::str::from_utf8(run) {
+                        out.push_str(s);
+                        self.pos += n;
+                    }
+                }
+            }
             match self.advance() {
                 None => {
                     return Err(self.err_at(self.pos, "unterminated string"));
@@ -785,6 +808,36 @@ mod tests {
     fn error_trailing_data() {
         let e = parse(b"42 garbage").unwrap_err();
         assert!(e.msg.contains("trailing"));
+    }
+
+    #[test]
+    fn string_fast_path_matches_per_byte_decode() {
+        // A long ordinary run exercises the bulk-copy fast path; the escaped
+        // and multi-byte fragments force fallbacks to the per-byte loop.
+        let long = "k".repeat(5000);
+        let s = format!("{{\"{long}aé\\nb\": [1]}}");
+        let doc = parse(s.as_bytes()).unwrap();
+        let keys: Vec<&str> = doc
+            .root
+            .children
+            .iter()
+            .filter_map(|c| match c {
+                Child::Member { key_decoded, .. } => Some(key_decoded.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, vec![format!("{long}aé\nb")]);
+        rt(&s);
+        // Control byte inside a long run: error offset lands on it (slow path).
+        let e = parse(b"\"aaaaaaaaaaaaaaaa\x01").unwrap_err();
+        assert!(e.msg.contains("control"), "got: {}", e.msg);
+        // Error offset lands just past the offending byte.
+        assert_eq!(e.byte_offset, 18);
+        // Invalid UTF-8 in a long run: the run's from_utf8 check fails, so the
+        // bytes fall through to the per-byte loop, which rejects the lead byte.
+        let e = parse(b"\"aaaaaaaa\xffaaaaaa\"").unwrap_err();
+        assert!(e.msg.contains("invalid UTF-8 lead byte"), "got: {}", e.msg);
+        assert_eq!(e.byte_offset, 10);
     }
 
     #[test]

@@ -83,7 +83,7 @@ impl HfTileSink {
                 let repo_id = self.spec.repo_id.clone();
                 let revision = self.spec.revision.clone();
                 // Tiles are staged at `tempdir/<prefix>/tiles/.../` (the path
-                // prefix is baked into each `tile_repo_path` and joined onto
+                // prefix is baked into each `tile_repo_path_in` and joined onto
                 // tempdir at staging time), so syncing the tempdir root puts
                 // them at the right in-repo paths without a per-file argument.
                 let _ = summary;

@@ -149,9 +149,6 @@ pub struct HfOutputSpec {
 }
 
 impl HfOutputSpec {
-    pub fn tile_repo_path(&self, z: u32, x: u32, y: u32, ext: &str) -> String {
-        self.tile_repo_path_in(None, z, x, y, ext)
-    }
     /// Scene-aware tile path: `[<prefix>/]tiles/[<scene>/]<z>/<x>/<y>.<ext>`.
     /// `scene = None` reproduces the legacy single-pyramid layout.
     pub fn tile_repo_path_in(

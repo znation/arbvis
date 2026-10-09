@@ -688,9 +688,8 @@ pub(super) async fn build_tile_plan(
         registry,
     )?;
 
-    // Today the per-plan LeafRegistry is the registry's own; in step 12 once
-    // tensor renderers move to modelweightvis it'll be the only path to get
-    // the `"arch"` renderer registered. Clone here so the plan owns its arc.
+    // Today the per-plan LeafRegistry is the registry's own. Clone here so
+    // the plan owns its arc.
     let leaf_registry = registry.leaf.clone();
 
     // Canvas geometry + overlay entities are now layout-supplied: arch
@@ -1228,8 +1227,8 @@ pub(super) fn render_one(
     })
 }
 
-// `render_one_arch` lives in `modelweightvis::leaf::ArchRegionsRenderer::render`
-// (step 12e). arbvis no longer needs the architectural render dispatch.
+// `render_one_arch` lives in `modelweightvis::leaf::ArchRegionsRenderer::render`.
+// arbvis no longer needs the architectural render dispatch.
 
 /// Pick the actual leaf tile format given the user's request and the render
 /// mode. When the user asked for AVIF and the mode produces ≤256 distinct

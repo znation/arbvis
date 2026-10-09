@@ -35,7 +35,7 @@ impl DiffFill {
 // Three built-in `DiffSourceBuilder` impls cover the file-pair diff cases.
 // Directory-pair diffs stay inline in `prepare_diff_sources` for now —
 // they'll move behind the trait when format detection migrates to
-// `modelweightvis` (step 12).
+// `modelweightvis`.
 // ---------------------------------------------------------------------------
 
 fn is_json_path(p: &Path) -> bool {
@@ -71,7 +71,7 @@ impl crate::registry::DiffSourceBuilder for JsonDiffBuilder {
     }
 }
 
-// `TensorDiffBuilder` lives in `modelweightvis::diff` (step 12e). The
+// `TensorDiffBuilder` lives in `modelweightvis::diff`. The
 // arbvis default registry no longer wires it up.
 
 /// Plain-byte diff: builds one `SourceKind::Diff` source over a same-sized

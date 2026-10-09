@@ -136,9 +136,9 @@ impl LeafRegistry {
 
     /// Registry pre-populated with the two built-in loader+renderer pairs
     /// Registry pre-populated with arbvis's own `"hilbert-bytes"`
-    /// loader+renderer pair. The `"arch"` pair (still defined in this file
-    /// for now — relocation is step 12e) is registered by
-    /// `modelweightvis::register_all` so the arbvis binary stays byte-only
+    /// loader+renderer pair. The `"arch"` pair (still defined in this file)
+    /// is registered by `modelweightvis::register_all` so the arbvis binary
+    /// stays byte-only
     /// and the modelweightvis binary picks up tensor-aware rendering.
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
@@ -216,5 +216,5 @@ impl LeafRenderer for HilbertBytesRenderer {
     }
 }
 
-// `ArchRegionsLoader` and `ArchRegionsRenderer` live in `modelweightvis::leaf`
-// (step 12e). The arbvis default `LeafRegistry` no longer wires them up.
+// `ArchRegionsLoader` and `ArchRegionsRenderer` live in `modelweightvis::leaf`.
+// The arbvis default `LeafRegistry` no longer wires them up.

@@ -180,8 +180,8 @@ impl crate::registry::LayoutPlugin for HilbertLayoutPlugin {
 }
 
 // The tensor-aware layout plugins (`ArchLayoutPlugin`, the MoE summary / CKA
-// plugins) live in `modelweightvis::layout` (step 12e). The arbvis default
-// registry no longer wires them up.
+// plugins) live in `modelweightvis::layout`. The arbvis default registry no
+// longer wires them up.
 
 /// Build the layout for the given sources. Returns a byte-Hilbert layout for
 /// non-architectural runs.

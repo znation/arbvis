@@ -37,7 +37,7 @@ pub trait FormatPlugin: Send + Sync {
     fn id(&self) -> &'static str;
     /// Should this plugin handle `path`? File extension match.
     fn detects_path(&self, path: &Path) -> bool;
-    /// Mmap `path` and parse its header; populate `exts` with whatever
+    /// Read `path` and parse its header; populate `exts` with whatever
     /// the plugin wants attached. Sync (called from `prepare_sources`).
     fn populate_local(
         &self,
@@ -45,7 +45,7 @@ pub trait FormatPlugin: Send + Sync {
         file_size: u64,
         exts: &mut Extensions,
     ) -> anyhow::Result<()>;
-    /// Async variant for an already-open `Data` source (HTTP / mmap).
+    /// Async variant for an already-open `Data` source (HTTP / local snapshot).
     /// Called from `prepare_sources_from_specs`.
     fn populate_remote<'a>(
         &'a self,

@@ -183,7 +183,7 @@ pub struct Args {
     /// `--diff` (when both sides are repo-level URLs), and the MoE viewer
     /// (`--moe`).
     /// Single-file / local-path inputs always resolve through
-    /// `hf_url::resolve` + mmap and are unaffected by `--stream`.
+    /// `hf_url::resolve` + snapshot and are unaffected by `--stream`.
     #[arg(long)]
     pub(crate) stream: bool,
 }

@@ -127,7 +127,7 @@ pub(crate) async fn resolve_input_sources(
     // Streaming mode keeps hf:// inputs remote; show-xet-xorbs is the other
     // case that has to start from specs (it needs the remote spec to look up
     // xet metadata). Otherwise we can fast-path through `prepare_sources`
-    // which downloads via hf_url::resolve and mmaps the local file.
+    // which downloads via hf_url::resolve and snapshots the local file.
     if !stream && !show_xet_xorbs {
         let resolved: Vec<PathBuf> =
             futures::stream::iter(files.iter().cloned().map(resolve_input))

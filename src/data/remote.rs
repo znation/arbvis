@@ -55,7 +55,7 @@ pub async fn prepare_sources_from_specs(
     // contained file, matching the behaviour of [`prepare_sources`]. Without
     // this, a local directory pushed into the specs (e.g. by `--stream
     // ./snapshots/llama-7b/`) would yield a single Source pointing at the
-    // directory itself — load_source_data then mmaps the dir and fails.
+    // directory itself — load_source_data then reads the dir and fails.
     let expanded: Vec<InputSpec> = specs
         .iter()
         .flat_map(|spec| match spec {
@@ -160,7 +160,8 @@ pub async fn prepare_sources_from_specs(
 ///
 /// One whole-file `hf download` per source amortises that overhead across
 /// the entire file (which the renderer will read every byte of anyway). After
-/// materialization, all tile reads are mmap'd `memcpy`s — no HTTP, no throttle.
+/// materialization, all tile reads are memcpys off in-memory snapshots — no
+/// HTTP, no throttle.
 ///
 /// `populate_xet_terms` must run *before* this so the xet term metadata is
 /// captured from the still-remote `RemoteFileSpec`.

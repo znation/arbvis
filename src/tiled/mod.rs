@@ -684,10 +684,10 @@ where
     // Stage 2: load workers. Spawn up to MAX_FETCH_WORKERS. When any source
     // is remote (`Data::Http`/`LazyDiff`), each load acquires the AIMD HTTP
     // throttle before reading source bytes; workers above `active_limit` park
-    // on the throttle's Notify. When every source is local (mmap or in-memory
-    // — typical after `materialize_http_sources`), the throttle is bypassed
-    // so 128-way mmap parallelism isn't capped at the throttle's initial
-    // 4-way limit.
+    // on the throttle's Notify. When every source is local (an in-memory
+    // snapshot — typical after `materialize_http_sources`), the throttle is
+    // bypassed so 128-way local parallelism isn't capped at the throttle's
+    // initial 4-way limit.
     //
     // Dispatch is via the `LeafLoader` registry: the plan's `leaf_tile`
     // descriptor names a renderer id, the registry resolves it once before
@@ -941,7 +941,7 @@ where
 ///
 /// Each level reads the shrunk tensors' bytes again, but sources are
 /// materialised to local files before tiling (`data::materialize_http_sources`),
-/// so these are mmap memcpys served from the page cache — no HTTP, no throttle.
+/// so these are memcpys off in-memory snapshots — no HTTP, no throttle.
 /// The only repeated work is per-element decode, bounded by the (sparse) detail
 /// tile count, so accumulating levels into a sparse mini-pyramid isn't worth the
 /// quad-alignment complexity it would add.

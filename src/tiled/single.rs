@@ -13,8 +13,10 @@
 //! (black), the same background the pyramid uses.
 //!
 //! Input bytes are read through the existing `Data` handles (`load_source_data`:
-//! mmap for local files, range fetches for HTTP), one bounded chunk at a time,
-//! so a multi-GB file never gets slurped into RAM and mmap pages stay warm.
+//! an in-memory snapshot for local files, range fetches for HTTP) and processed
+//! in `CHUNK_BYTES` chunks, so remote reads stay incremental. For local files,
+//! though, the snapshot is the whole file (`std::fs::read`), so peak RAM scales
+//! with the input size; only remote sources read incrementally.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,7 +30,7 @@ use crate::layout::hilbert::hilbert_canvas;
 use crate::tiled::leaf::{local_curve_to_xy, tile_curve_frame, TILE, TILE_LOG2};
 
 /// Bytes fetched from a source per `fetch_range` call. Large enough to keep
-/// mmap/HTTP overhead negligible, small enough to bound peak RAM.
+/// per-chunk fetch overhead negligible, small enough to bound peak RAM.
 const CHUNK_BYTES: u64 = 1 << 20;
 
 /// Canvas geometry for the single-image render — the same derivation
@@ -145,13 +147,14 @@ fn scatter_offset(tile: &mut TileScatter, i: u64, geom: &SingleGeom) -> usize {
 }
 
 /// Render all `sources` (concatenated, `total` bytes) into one indexed PNG
-/// written to `out`. Reads through the mmap / range-fetch `Data` path in
+/// written to `out`. Reads through the snapshot / range-fetch `Data` path in
 /// `CHUNK_BYTES` chunks; writes to a `.tmp` sibling and renames on success.
 /// Open every source and build the cumulative-offset table used to locate a
 /// byte position's owning source.
 ///
-/// Returns the opened `Data` handles (mmap for local, lightweight handle for
-/// HTTP — mirrors `build_tile_plan`'s `load_source_data` loop) paired with
+/// Returns the opened `Data` handles (in-memory snapshot for local, a
+/// lightweight handle for HTTP — mirrors `build_tile_plan`'s `load_source_data`
+/// loop) paired with
 /// `cumulative[i]`, the concatenated offset at which source `i` begins.
 fn open_sources(sources: &[Source]) -> anyhow::Result<(Vec<Data>, Vec<u64>)> {
     let source_data: Vec<Data> = sources
@@ -202,8 +205,8 @@ pub async fn render_single_png(sources: &[Source], total: u64, out: &Path) -> an
     // chunk ahead: while the Hilbert scatter of the current chunk runs (pure
     // CPU), the next chunk's fetch is already in flight. On remote sources this
     // overlaps the HTTP round-trip with the scatter instead of serializing
-    // them; on local sources the fetch is an mmap memcpy, so a one-chunk
-    // read-ahead only warms pages slightly early. Fetch order stays ascending,
+    // them; on local sources the fetch is an in-memory byte-snapshot copy, so a
+    // one-chunk read-ahead is effectively free. Fetch order stays ascending,
     // so each source still sees one ascending range-fetch sequence.
 
     let mut pos = 0u64;

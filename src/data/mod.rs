@@ -87,7 +87,7 @@ pub enum Data {
     /// A windowed view onto another `Data`. `fetch_range(s, n)` resolves to
     /// `inner.fetch_range(base + s, n)`. Used by JSON / JSONL structure-aware
     /// diff so each one-sided structural span can expose its underlying bytes
-    /// without re-mmapping the file.
+    /// without re-fetching or re-snapshotting the underlying bytes.
     OffsetSlice {
         inner: Arc<Data>,
         base: u64,
@@ -173,7 +173,7 @@ impl Data {
     ///
     /// `Http`, `Xet`, and `LazyDiff` may all hit the network. The tile load
     /// stage uses this to skip the AIMD HTTP throttle when nothing in flight
-    /// could hit the Hub — otherwise mmap reads would be artificially capped
+    /// could hit the Hub — otherwise local reads would be artificially capped
     /// at the throttle's initial 4-way concurrency.
     pub fn is_local(&self) -> bool {
         match self {

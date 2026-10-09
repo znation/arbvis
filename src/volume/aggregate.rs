@@ -901,4 +901,299 @@ mod tests {
         let pushed: u64 = raw.iter().skip(2).step_by(4).map(|&b| b as u64).sum();
         assert_eq!(pushed, 10_000, "every input byte binned exactly once");
     }
+
+    // ---- aggregate_entities (structured entity path) ----
+
+    use crate::volume::shape::VoxelBox;
+
+    /// A shape that places one fixed entity; `entities()` rebuilds it because
+    /// `VolumeEntity` is not `Clone` (`extra: Box<dyn Any>`).
+    struct OneEntityShape {
+        shape_id: &'static str,
+        renderer_id: &'static str,
+        extent: [u32; 3],
+        bbox: VoxelBox,
+        byte_start: u64,
+        byte_len: u64,
+    }
+
+    impl VolumeShape for OneEntityShape {
+        fn id(&self) -> &'static str {
+            self.shape_id
+        }
+        fn grid_extent(&self) -> [u32; 3] {
+            self.extent
+        }
+        fn entities(&self) -> Option<Vec<VolumeEntity>> {
+            Some(vec![VolumeEntity {
+                source_idx: 0,
+                byte_start: self.byte_start,
+                byte_len: self.byte_len,
+                bbox: self.bbox,
+                renderer_id: self.renderer_id,
+                extra: Box::new(()),
+            }])
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Fills the entity's bbox with an opaque gray cell whose value is the
+    /// entity's first fetched byte, and records every `(z0, z1)` window it
+    /// was asked to render (via `render` or `render_window`).
+    struct RecordingRenderer {
+        id: &'static str,
+        windows: std::sync::Mutex<Vec<(u32, u32)>>,
+        value: u8,
+    }
+
+    impl RecordingRenderer {
+        fn fill(&self, ctx: &VoxelRenderCtx<'_>, grid: &mut VoxelGridMut<'_>, z0: u32, z1: u32) {
+            assert_eq!(ctx.bytes.first().copied(), Some(self.value), "fetched span matches");
+            let b = &ctx.entity.bbox;
+            for z in z0..z1 {
+                if z < b.z0 || z >= b.z1 {
+                    continue;
+                }
+                for y in b.y0..b.y1 {
+                    for x in b.x0..b.x1 {
+                        grid.put(
+                            x,
+                            y,
+                            z,
+                            VoxelCell {
+                                r: self.value,
+                                g: self.value,
+                                b: self.value,
+                                a: 255,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    impl VoxelRenderer for RecordingRenderer {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn render(&self, ctx: &VoxelRenderCtx<'_>, grid: &mut VoxelGridMut<'_>) {
+            self.windows.lock().unwrap().push((0, ctx.extent[2]));
+            self.fill(ctx, grid, 0, ctx.extent[2]);
+        }
+        fn render_window(
+            &self,
+            ctx: &VoxelRenderCtx<'_>,
+            grid: &mut VoxelGridMut<'_>,
+            z_range: std::ops::Range<u32>,
+        ) {
+            self.windows.lock().unwrap().push((z_range.start, z_range.end));
+            self.fill(ctx, grid, z_range.start, z_range.end);
+        }
+    }
+
+    fn entity_source(bytes: Vec<u8>) -> crate::data::Source {
+        use crate::data::SourceKind;
+        let len = bytes.len() as u64;
+        Source {
+            file_idx: 0,
+            kind: SourceKind::Buffered(bytes),
+            byte_size: len,
+            name_override: None,
+            xet_terms: None,
+            extensions: Default::default(),
+        }
+    }
+
+    fn cube2() -> VoxelBox {
+        VoxelBox {
+            x0: 1,
+            y0: 1,
+            z0: 1,
+            x1: 3,
+            y1: 3,
+            z1: 3,
+        }
+    }
+
+    /// Dense (non-streamed) path: the registered renderer receives the
+    /// fetched span, bakes exactly its bbox opaque, and nothing outside the
+    /// bbox is touched. The focus falls back to occupied-grid framing.
+    #[test]
+    fn aggregate_entities_dense_renders_bbox_and_fetched_bytes() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let shape = OneEntityShape {
+            shape_id: "fill",
+            renderer_id: "fill",
+            extent: [4, 4, 4],
+            bbox: cube2(),
+            byte_start: 2,
+            byte_len: 8,
+        };
+        let mut reg = VoxelRegistry::new();
+        let r = std::sync::Arc::new(RecordingRenderer {
+            id: "fill",
+            windows: std::sync::Mutex::new(Vec::new()),
+            value: 0xAB,
+        });
+        reg.register_renderer(r.clone());
+        let src = entity_source(vec![0u8, 1, 0xAB, 2, 3, 4, 5, 6, 7, 8]);
+        let built = aggregate_entities(
+            vec![src],
+            &shape,
+            [4, 4, 4],
+            &reg,
+            false,
+            false,
+            rt.handle().clone(),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(*r.windows.lock().unwrap(), vec![(0, 4)]);
+        assert_eq!(built.grid_extent, [4, 4, 4]);
+        assert!(built.bricks.is_none(), "dense path derives bricks upstream");
+        assert_eq!(built.volume_rgba.len(), 4 * 4 * 4 * 4);
+        // bbox voxels opaque with the entity's byte value; all others empty.
+        for z in 0..4u32 {
+            for y in 0..4u32 {
+                for x in 0..4u32 {
+                    let i = (x + y * 4 + z * 16) as usize * 4;
+                    let inside = (1..3).contains(&x) && (1..3).contains(&y) && (1..3).contains(&z);
+                    let px = &built.volume_rgba[i..i + 4];
+                    if inside {
+                        assert_eq!(px, &[0xAB, 0xAB, 0xAB, 255]);
+                    } else {
+                        assert_eq!(px, &[0, 0, 0, 0]);
+                    }
+                }
+            }
+        }
+        // Occupied focus targets the centroid (the bbox center here) and
+        // keeps the whole 2×2×2 bbox in view.
+        assert!(built
+            .focus_center
+            .iter()
+            .all(|c| c.abs() < 1e-6));
+        assert!(built.focus_radius > 0.0 && built.focus_radius <= 0.5);
+    }
+
+    /// An entity whose `renderer_id` has no registration falls back to the
+    /// shape's own id; with neither registered, the path errors out.
+    #[test]
+    fn aggregate_entities_renderer_fallback_and_error() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let shape = OneEntityShape {
+            shape_id: "fill",
+            renderer_id: "missing",
+            extent: [4, 4, 4],
+            bbox: cube2(),
+            byte_start: 0,
+            byte_len: 4,
+        };
+        // No renderer at all: the resolve error names both ids.
+        let empty = VoxelRegistry::new();
+        let err = match aggregate_entities(
+            vec![entity_source(vec![1, 2, 3, 4])],
+            &shape,
+            [4, 4, 4],
+            &empty,
+            false,
+            false,
+            rt.handle().clone(),
+            dir.path(),
+        ) {
+            Ok(_) => panic!("no renderer registered must fail"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("missing") && msg.contains("fill"), "{}", msg);
+
+        // Registering the shape id rescues the entity via the fallback.
+        let mut reg = VoxelRegistry::new();
+        let r = std::sync::Arc::new(RecordingRenderer {
+            id: "fill",
+            windows: std::sync::Mutex::new(Vec::new()),
+            value: 1,
+        });
+        reg.register_renderer(r.clone());
+        let built = aggregate_entities(
+            vec![entity_source(vec![1, 2, 3, 4])],
+            &shape,
+            [4, 4, 4],
+            &reg,
+            false,
+            false,
+            rt.handle().clone(),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(*r.windows.lock().unwrap(), vec![(0, 4)]);
+        let (vx, vy, vz) = (1u32, 1u32, 1u32); // voxel (1,1,1) inside bbox
+        let i = (vx + vy * 4 + vz * 16) as usize * 4;
+        assert_eq!(&built.volume_rgba[i..i + 4], &[1, 1, 1, 255]);
+    }
+
+    /// Streamed path: the entity renders once per brick-aligned slab its bbox
+    /// intersects, the slab loop bricks the volume (sealed bricks.bin, no
+    /// `.part` residue), and the coarse downsample keeps the baked color.
+    #[test]
+    fn aggregate_entities_streamed_bricks_slabs_and_seals() {
+        // 512×512×256: slab buffer layer is 1 MiB, so slab_depth is 128 →
+        // exactly two brick-aligned slabs (0..128, 128..256).
+        let extent = [512u32, 512, 256];
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let shape = OneEntityShape {
+            shape_id: "fill",
+            renderer_id: "fill",
+            extent,
+            bbox: VoxelBox {
+                x0: 0,
+                y0: 0,
+                z0: 0,
+                x1: 8,
+                y1: 8,
+                z1: 200,
+            },
+            byte_start: 0,
+            byte_len: 4,
+        };
+        let mut reg = VoxelRegistry::new();
+        let r = std::sync::Arc::new(RecordingRenderer {
+            id: "fill",
+            windows: std::sync::Mutex::new(Vec::new()),
+            value: 7,
+        });
+        reg.register_renderer(r.clone());
+        let built = aggregate_entities(
+            vec![entity_source(vec![7, 7, 7, 7])],
+            &shape,
+            extent,
+            &reg,
+            false,
+            true,
+            rt.handle().clone(),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(*r.windows.lock().unwrap(), vec![(0, 128), (128, 256)]);
+        let bricks = built.bricks.expect("streamed path yields a brick pool");
+        assert!(bricks.streamed);
+        assert!(bricks.occupied > 0);
+        // Sealed, not staged: bricks.bin exists and no .part residue remains.
+        assert!(dir.path().join("bricks.bin").exists());
+        assert!(!dir.path().join("bricks.bin.part").exists());
+        // The coarse downsample is bounded by COARSE_CAP and nonzero (the
+        // entity's baked voxels survive the fold).
+        let ce = built.grid_extent;
+        assert!(ce[0] <= COARSE_CAP && ce[1] <= COARSE_CAP && ce[2] <= COARSE_CAP);
+        assert!(built
+            .volume_rgba
+            .chunks_exact(4)
+            .any(|px| px[3] == 255 && px[0] == 7));
+    }
 }

@@ -366,6 +366,29 @@ pub(crate) fn default_title(user: Option<String>, name: &str, suffix: &str) -> C
     }
 }
 
+/// Fail when a run has no input files *and* stdin is a terminal.
+///
+/// With no positional FILES and no `--file-list`, the byte provider falls back
+/// to reading stdin to EOF. On an interactive terminal that reads forever —
+/// the user just sees a hang — so fail with usage guidance instead. A
+/// non-terminal stdin (pipe, file redirect) still falls through to the
+/// provider, so `arbvis < file.bin` keeps working.
+///
+/// Callers pass `stdin_is_terminal` rather than checking here so this stays
+/// unit-testable without a TTY.
+pub(crate) fn check_bare_run_inputs(
+    files_empty: bool,
+    stdin_is_terminal: bool,
+) -> anyhow::Result<()> {
+    if files_empty && stdin_is_terminal {
+        anyhow::bail!(
+            "no input files given and stdin is a terminal — pass file paths as arguments, \
+             use --file-list, or pipe data on stdin (e.g. `arbvis < file.bin`)"
+        );
+    }
+    Ok(())
+}
+
 /// Read `--files` and `--file-list` into a single flat path list.
 pub(crate) fn collect_input_files(
     files: Vec<PathBuf>,
@@ -527,6 +550,7 @@ mod grid_validation_tests {
             .contains("no streamed detail"));
     }
 
+    #[test]
     fn ignored_3d_flags_only_names_non_defaults() {
         assert!(ignored_3d_flags(1024, 0).is_empty()); // both defaults
         assert_eq!(ignored_3d_flags(512, 0), vec!["--grid"]);
@@ -537,7 +561,7 @@ mod grid_validation_tests {
 
 #[cfg(test)]
 mod png_flag_tests {
-    use super::Args;
+    use super::{check_bare_run_inputs, Args};
     use clap::Parser;
 
     #[test]
@@ -573,5 +597,21 @@ mod png_flag_tests {
             "png"
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn bare_run_input_check_fails_only_when_both_empty_and_tty() {
+        // Non-terminal stdin: the documented `arbvis < file.bin` path — never errors.
+        assert!(check_bare_run_inputs(true, false).is_ok());
+        // Files present: always fine, terminal or not.
+        assert!(check_bare_run_inputs(false, true).is_ok());
+        assert!(check_bare_run_inputs(false, false).is_ok());
+        // No files + interactive terminal: would block on stdin forever.
+        let err = check_bare_run_inputs(true, true).expect_err("should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("no input files"), "{msg}");
+        assert!(msg.contains("stdin is a terminal"), "{msg}");
+        assert!(msg.contains("--file-list"), "{msg}");
+        assert!(msg.contains("arbvis < file.bin"), "{msg}");
     }
 }

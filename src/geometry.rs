@@ -536,9 +536,7 @@ mod tests {
         let rects = file_rects(4, 100, 16, 16, 1, 4, 2);
         let total: u64 = rects
             .iter()
-            .map(|&(x0, y0, x1, y1)| {
-                (x1 - x0) as u64 * (y1 - y0) as u64
-            })
+            .map(|&(x0, y0, x1, y1)| (x1 - x0) as u64 * (y1 - y0) as u64)
             .sum();
         assert_eq!(total, 16 - 4);
     }
@@ -552,9 +550,7 @@ mod tests {
             let rects = file_rects(a, b, square_pixels, square_pixels, 1, height, 8);
             let total: u64 = rects
                 .iter()
-                .map(|&(x0, y0, x1, y1)| {
-                    (x1 - x0) as u64 * (y1 - y0) as u64
-                })
+                .map(|&(x0, y0, x1, y1)| (x1 - x0) as u64 * (y1 - y0) as u64)
                 .sum();
             assert_eq!(total, b - a, "range [{a},{b})");
         }

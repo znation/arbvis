@@ -3,13 +3,14 @@
 //! render paths it centralises).
 
 use std::borrow::Cow;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
 use crate::cli::{
-    collect_input_files, default_title, ignored_3d_flags, validate_grid, validate_volume_res,
-    volume_res_ignored_warning, Args, OutputDest,
+    check_bare_run_inputs, collect_input_files, default_title, ignored_3d_flags, validate_grid,
+    validate_volume_res, volume_res_ignored_warning, Args, OutputDest,
 };
 use crate::data::Source;
 use crate::deploy;
@@ -131,6 +132,10 @@ pub async fn run(args: Args, registry: registry::Registry) -> anyhow::Result<()>
     // reads stdin when its input list is empty). `--diff` sides are kept as an
     // ordered pair in the neutral `SourceCtx`.
     let files = collect_input_files(args.files, args.file_list)?;
+    // Guard the stdin fallback: with no files, the byte provider reads stdin
+    // to EOF, which blocks forever on an interactive terminal (see
+    // `check_bare_run_inputs`). Piped/redirected stdin is unaffected.
+    check_bare_run_inputs(files.is_empty(), std::io::stdin().is_terminal())?;
     let diff_strs: Option<[String; 2]> = args.diff.as_ref().map(|v| {
         [
             v[0].to_string_lossy().into_owned(),

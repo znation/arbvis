@@ -254,6 +254,18 @@ fn parse_hf_timeout(s: &str) -> Option<u64> {
     }
 }
 
+/// Build the `Exit` error for a failed `hf` invocation, first logging the
+/// stderr excerpt at debug level so failures are diagnosable without
+/// surfacing them in normal output.
+fn exit_error(argv_display: String, status: ExitStatus, stderr_excerpt: String) -> HfCliError {
+    log::debug!("`hf {argv_display}` failed with {status}; stderr: {stderr_excerpt}");
+    HfCliError::Exit {
+        argv: argv_display,
+        status,
+        stderr_excerpt,
+    }
+}
+
 /// Spawn `hf <args>` and return (exit status, captured stdout, captured stderr tail).
 ///
 /// stderr is forwarded to the parent process's stderr line-by-line as it
@@ -349,12 +361,7 @@ where
     let argv_display = argv_for_display(args.clone());
     let (status, _stdout, stderr_excerpt) = run_and_capture(args).await?;
     if !status.success() {
-        log::debug!("`hf {argv_display}` failed with {status}; stderr: {stderr_excerpt}");
-        return Err(HfCliError::Exit {
-            argv: argv_display,
-            status,
-            stderr_excerpt,
-        });
+        return Err(exit_error(argv_display, status, stderr_excerpt));
     }
     Ok(())
 }
@@ -378,12 +385,7 @@ where
 
     let (status, stdout, stderr_excerpt) = run_and_capture(argv).await?;
     if !status.success() {
-        log::debug!("`hf {argv_display}` failed with {status}; stderr: {stderr_excerpt}");
-        return Err(HfCliError::Exit {
-            argv: argv_display,
-            status,
-            stderr_excerpt,
-        });
+        return Err(exit_error(argv_display, status, stderr_excerpt));
     }
 
     serde_json::from_slice::<T>(&stdout).map_err(|source| HfCliError::JsonDecode {
@@ -417,12 +419,7 @@ where
 
     let (status, stdout, stderr_excerpt) = run_and_capture(argv).await?;
     if !status.success() {
-        log::debug!("`hf {argv_display}` failed with {status}; stderr: {stderr_excerpt}");
-        return Err(HfCliError::Exit {
-            argv: argv_display,
-            status,
-            stderr_excerpt,
-        });
+        return Err(exit_error(argv_display, status, stderr_excerpt));
     }
 
     let text = String::from_utf8_lossy(&stdout);
@@ -450,11 +447,7 @@ where
 pub async fn check_hf_available() -> Result<String, HfCliError> {
     let (status, stdout, stderr_excerpt) = run_and_capture(["--version"]).await?;
     if !status.success() {
-        return Err(HfCliError::Exit {
-            argv: "--version".to_string(),
-            status,
-            stderr_excerpt,
-        });
+        return Err(exit_error("--version".to_string(), status, stderr_excerpt));
     }
     Ok(String::from_utf8_lossy(&stdout).trim().to_string())
 }

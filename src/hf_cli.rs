@@ -93,7 +93,10 @@ pub struct HfTreeLfs {
 /// `impl ErrorClassify` below.
 #[derive(Debug)]
 pub enum HfCliError {
-    Spawn(std::io::Error),
+    Spawn {
+        bin: String,
+        source: std::io::Error,
+    },
     /// Reading the child's stdout failed mid-stream; the captured output is
     /// truncated, so it must not be parsed or acted on.
     StdoutRead(std::io::Error),
@@ -116,14 +119,31 @@ pub enum HfCliError {
 impl std::fmt::Display for HfCliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HfCliError::Spawn(e) => write!(
-                f,
-                "failed to spawn `hf` CLI ({e}). Install with `pip install -U huggingface_hub` or `brew install huggingface-cli`."
-            ),
-            HfCliError::Exit { argv, status, stderr_excerpt } => {
+            HfCliError::Spawn { bin, source } => {
+                if bin == "hf" {
+                    write!(
+                        f,
+                        "failed to spawn `hf` CLI ({source}). Install with `pip install -U huggingface_hub` or `brew install huggingface-cli`."
+                    )
+                } else {
+                    write!(
+                        f,
+                        "failed to spawn `{bin}` (the `hf` CLI, set via ARBVIS_HF_BIN) ({source}). Check that ARBVIS_HF_BIN names an executable on $PATH."
+                    )
+                }
+            }
+            HfCliError::Exit {
+                argv,
+                status,
+                stderr_excerpt,
+            } => {
                 write!(f, "`hf {argv}` exited {status}: {stderr_excerpt}")
             }
-            HfCliError::JsonDecode { argv, stderr_excerpt, source } => {
+            HfCliError::JsonDecode {
+                argv,
+                stderr_excerpt,
+                source,
+            } => {
                 write!(
                     f,
                     "decoding `hf {argv}` JSON output failed: {source}\nstderr tail: {stderr_excerpt}"
@@ -146,7 +166,7 @@ impl std::fmt::Display for HfCliError {
 impl std::error::Error for HfCliError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            HfCliError::Spawn(e) => Some(e),
+            HfCliError::Spawn { source, .. } => Some(source),
             HfCliError::StdoutRead(e) => Some(e),
             HfCliError::Exit { .. } => None,
             HfCliError::JsonDecode { source, .. } => Some(source),
@@ -163,7 +183,7 @@ impl ErrorClassify for HfCliError {
     fn classify(&self) -> Outcome {
         match self {
             // Missing binary won't fix itself — don't burn the AIMD retry budget on it.
-            HfCliError::Spawn(_) => Outcome::Permanent,
+            HfCliError::Spawn { .. } => Outcome::Permanent,
             // Truncated output: retrying won't heal a failed pipe read, and
             // acting on partial output would be silently wrong.
             HfCliError::StdoutRead(_) => Outcome::Permanent,
@@ -273,6 +293,15 @@ fn parse_hf_timeout(s: &str) -> Option<u64> {
     }
 }
 
+/// Wrap an I/O failure from spawning (or waiting on) the configured `hf`
+/// binary, recording which binary was involved so the message can name it.
+fn spawn_err(source: std::io::Error) -> HfCliError {
+    HfCliError::Spawn {
+        bin: hf_binary(),
+        source,
+    }
+}
+
 /// Build the `Exit` error for a failed `hf` invocation, first logging the
 /// stderr excerpt at debug level so failures are diagnosable without
 /// surfacing them in normal output.
@@ -308,7 +337,7 @@ where
     S: AsRef<OsStr>,
 {
     let mut cmd = build_cmd(args.clone());
-    let mut child = cmd.spawn().map_err(HfCliError::Spawn)?;
+    let mut child = cmd.spawn().map_err(spawn_err)?;
 
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
@@ -353,7 +382,7 @@ where
         Some(secs) => {
             let budget = std::time::Duration::from_secs(secs);
             match tokio::time::timeout(budget, child.wait()).await {
-                Ok(status) => status.map_err(HfCliError::Spawn)?,
+                Ok(status) => status.map_err(spawn_err)?,
                 Err(_) => {
                     // kill_on_drop(true) reaps on scope exit, but kill
                     // explicitly so the pipe readers below see EOF now.
@@ -366,7 +395,7 @@ where
                 }
             }
         }
-        None => child.wait().await.map_err(HfCliError::Spawn)?,
+        None => child.wait().await.map_err(spawn_err)?,
     };
 
     let stdout = match stdout_task.await {
@@ -646,8 +675,37 @@ mod tests {
 
     #[test]
     fn classify_spawn_is_permanent() {
-        let err = HfCliError::Spawn(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let err = HfCliError::Spawn {
+            bin: "hf".into(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        };
         assert_eq!(err.classify(), Outcome::Permanent);
+    }
+
+    #[test]
+    fn spawn_display_suggests_install_for_default_binary() {
+        let err = HfCliError::Spawn {
+            bin: "hf".into(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("`hf` CLI"), "unexpected message: {msg}");
+        assert!(msg.contains("pip install"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn spawn_display_names_custom_binary_from_arbvis_hf_bin() {
+        let err = HfCliError::Spawn {
+            bin: "/opt/tools/my-hf".into(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`/opt/tools/my-hf`"),
+            "unexpected message: {msg}"
+        );
+        assert!(msg.contains("ARBVIS_HF_BIN"), "unexpected message: {msg}");
+        assert!(!msg.contains("pip install"), "unexpected message: {msg}");
     }
 
     #[test]

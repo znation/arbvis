@@ -15,3 +15,30 @@ pub(crate) fn part_path(path: &Path) -> PathBuf {
     name.push(".part");
     path.with_file_name(name)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn appends_part_after_full_file_name() {
+        // The `.part` suffix attaches to the whole file name, replacing any
+        // extension, so `bricks.bin` never stages as `bricks.part`.
+        assert_eq!(part_path(Path::new("out/bricks.bin")), PathBuf::from("out/bricks.bin.part"));
+        assert_eq!(part_path(Path::new("viewer.html")), PathBuf::from("viewer.html.part"));
+    }
+
+    #[test]
+    fn keeps_parent_directory() {
+        assert_eq!(
+            part_path(Path::new("a/b/c/tiles.bin")),
+            PathBuf::from("a/b/c/tiles.bin.part")
+        );
+    }
+
+    #[test]
+    fn file_name_falls_back_to_empty_for_root() {
+        // Paths with no file name (e.g. "/") stage a dotfile next to them.
+        assert_eq!(part_path(Path::new("/")), PathBuf::from("/.part"));
+    }
+}
